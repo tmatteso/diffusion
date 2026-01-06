@@ -1,0 +1,20 @@
+# ARM64 Ubuntu 22.04
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Minimal dev tools
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 \
+    python3-pip \
+    git \
+    curl \
+    ca-certificates \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install PyTorch 2.7 CPU-only
+RUN pip3 install torch==2.7.0+cpu torchvision==0.15.2+cpu torchaudio==2.7.2 --index-url https://download.pytorch.org/whl/cpu
+
+WORKDIR /workspace
+

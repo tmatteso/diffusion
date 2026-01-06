@@ -1,0 +1,16 @@
+# CUDA + PyTorch (matches L40S)
+FROM pytorch/pytorch:2.7.0-cuda12.8-cudnn9-devel
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Minimal dev tools
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    curl \
+    ca-certificates \
+    build-essential \
+    python3-pip \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+
