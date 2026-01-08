@@ -24,6 +24,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     build-essential \
     vim \
+    wget \
     && rm -rf /var/lib/apt/lists/*
 
 # Install uv
@@ -39,6 +40,18 @@ RUN if [ "${PLATFORM}" = "arm64" ]; then \
             torchaudio==2.5.1 \
             --index-url https://download.pytorch.org/whl/cpu; \
     fi
+
+# Install foldseek
+ARG PLATFORM
+RUN if [ "${PLATFORM}" = "cuda" ]; then \
+        FOLDSEEK_BUILD="foldseek-linux-gpu.tar.gz"; \
+    elif [ "${PLATFORM}" = "arm64" ]; then \
+        FOLDSEEK_BUILD="foldseek-linux-arm64.tar.gz"; \
+    fi && \
+    wget -q https://mmseqs.com/foldseek/${FOLDSEEK_BUILD} && \
+    tar xzf ${FOLDSEEK_BUILD} && \
+    mv foldseek/bin/foldseek /usr/local/bin/ && \
+    rm -rf foldseek ${FOLDSEEK_BUILD}
 
 # Create platform info script (runs via postCreateCommand)
 RUN printf '#!/bin/bash\necho "=== Platform Info ==="\necho "Arch: $(uname -m)"\npython3 -c "import torch; print(f\"PyTorch: {torch.__version__}\"); print(f\"CUDA available: {torch.cuda.is_available()}\")"' > /usr/local/bin/show-platform && \
