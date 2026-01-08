@@ -1,0 +1,22 @@
+{
+  "name": "PyTorch Dev Container (CUDA)",
+  "build": {
+    "dockerfile": "../Dockerfile",
+    "args": {
+      "PLATFORM": "cuda"
+    }
+  },
+  "runArgs": [
+    "--gpus=all"
+  ],
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-azuretools.vscode-docker"
+      ]
+    }
+  },
+  "postCreateCommand": "show-platform",
+  "remoteUser": "root"
+}

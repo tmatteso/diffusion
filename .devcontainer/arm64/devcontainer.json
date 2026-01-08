@@ -1,0 +1,19 @@
+{
+  "name": "PyTorch Dev Container (ARM64/M1)",
+  "build": {
+    "dockerfile": "../Dockerfile",
+    "args": {
+      "PLATFORM": "arm64"
+    }
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-azuretools.vscode-docker"
+      ]
+    }
+  },
+  "postCreateCommand": "show-platform",
+  "remoteUser": "root"
+}
