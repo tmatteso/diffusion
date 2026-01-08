@@ -26,6 +26,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     vim \
     && rm -rf /var/lib/apt/lists/*
 
+# Install uv
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+ENV UV_SYSTEM_PYTHON=1
+
 # Install PyTorch for ARM64 (CUDA image already has it from base image)
 ARG PLATFORM
 RUN if [ "${PLATFORM}" = "arm64" ]; then \

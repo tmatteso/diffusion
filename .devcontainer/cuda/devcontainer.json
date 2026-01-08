@@ -17,6 +17,6 @@
       ]
     }
   },
-  "postCreateCommand": "show-platform",
+  "postCreateCommand": "uv sync && show-platform",
   "remoteUser": "root"
 }
