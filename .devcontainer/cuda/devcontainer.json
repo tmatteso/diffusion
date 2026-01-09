@@ -6,6 +6,11 @@
       "PLATFORM": "cuda"
     }
   },
+  "workspaceFolder": "/workspaces/diffusion",
+  "remoteEnv": {
+    "VIRTUAL_ENV": "/workspaces/diffusion/.venv",
+    "PATH": "/workspaces/diffusion/.venv/bin:${containerEnv:PATH}"
+  },
   "runArgs": [
     "--gpus=all"
   ],
@@ -14,9 +19,13 @@
       "extensions": [
         "ms-python.python",
         "ms-azuretools.vscode-docker"
-      ]
+      ],
+      "settings": {
+        "python.defaultInterpreterPath": "/workspaces/diffusion/.venv/bin/python",
+        "python.terminal.activateEnvironment": true
+      }
     }
   },
-  "postCreateCommand": "uv sync && show-platform",
+  "postCreateCommand": "cd /workspaces/diffusion && uv sync && echo 'source /workspaces/diffusion/.venv/bin/activate' >> ~/.bashrc && show-platform",
   "remoteUser": "root"
 }

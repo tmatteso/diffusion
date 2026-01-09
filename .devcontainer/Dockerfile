@@ -25,11 +25,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     vim \
     wget \
+    axel \
     && rm -rf /var/lib/apt/lists/*
 
 # Install uv
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
-ENV UV_SYSTEM_PYTHON=1
+ENV UV_COMPILE_BYTECODE=1
+ENV UV_LINK_MODE=copy
 
 # Install PyTorch for ARM64 (CUDA image already has it from base image)
 ARG PLATFORM
@@ -41,18 +43,9 @@ RUN if [ "${PLATFORM}" = "arm64" ]; then \
             --index-url https://download.pytorch.org/whl/cpu; \
     fi
 
-# Install foldseek
-ARG PLATFORM
-RUN if [ "${PLATFORM}" = "cuda" ]; then \
-        FOLDSEEK_BUILD="foldseek-linux-gpu.tar.gz"; \
-    elif [ "${PLATFORM}" = "arm64" ]; then \
-        FOLDSEEK_BUILD="foldseek-linux-arm64.tar.gz"; \
-    fi && \
-    wget -q https://mmseqs.com/foldseek/${FOLDSEEK_BUILD} && \
-    tar xzf ${FOLDSEEK_BUILD} && \
-    mv foldseek/bin/foldseek /usr/local/bin/ && \
-    rm -rf foldseek ${FOLDSEEK_BUILD}
-
 # Create platform info script (runs via postCreateCommand)
 RUN printf '#!/bin/bash\necho "=== Platform Info ==="\necho "Arch: $(uname -m)"\npython3 -c "import torch; print(f\"PyTorch: {torch.__version__}\"); print(f\"CUDA available: {torch.cuda.is_available()}\")"' > /usr/local/bin/show-platform && \
     chmod +x /usr/local/bin/show-platform
+
+# Set working directory
+WORKDIR /workspaces/diffusion
