@@ -5,275 +5,266 @@ import torch.distributed as dist
 
 
 class DINOLoss(nn.Module):
-    """
-    DINO v2 loss function with centering and sharpening.
-
-    Computes cross-entropy between student and teacher outputs,
-    with teacher sharpening (lower temperature) and centering to prevent collapse.
-    """
-
     def __init__(
         self,
-        out_dim: int,
-        n_crops: int = 2,
-        warmup_teacher_temp: float = 0.04,
-        teacher_temp: float = 0.04,
-        warmup_teacher_temp_epochs: int = 30,
-        student_temp: float = 0.1,
-        center_momentum: float = 0.9,
+        out_dim,
+        student_temp=0.1,
+        center_momentum=0.9,
     ):
-        """
-        Args:
-            out_dim: Dimension of the output (number of prototypes/classes)
-            n_crops: Number of global crops (typically 2)
-            warmup_teacher_temp: Initial teacher temperature
-            teacher_temp: Final teacher temperature
-            warmup_teacher_temp_epochs: Epochs to warm up teacher temperature
-            student_temp: Student temperature (higher = softer)
-            center_momentum: EMA momentum for centering
-        """
         super().__init__()
         self.student_temp = student_temp
         self.center_momentum = center_momentum
-        self.n_crops = n_crops
         self.register_buffer("center", torch.zeros(1, out_dim))
+        self.updated = True
+        self.reduce_handle = None
+        self.len_teacher_output = None
+        self.async_batch_center = None
 
-        # Teacher temperature schedule
-        self.teacher_temp_schedule = None
-        self.warmup_teacher_temp = warmup_teacher_temp
-        self.teacher_temp = teacher_temp
-        self.warmup_teacher_temp_epochs = warmup_teacher_temp_epochs
+    @torch.no_grad()
+    def softmax_center_teacher(self, teacher_output, teacher_temp):
+        self.apply_center_update()
+        # teacher centering and sharpening
+        return F.softmax((teacher_output - self.center) / teacher_temp, dim=-1)
 
-    def setup_teacher_temp_schedule(self, n_epochs: int):
-        """Setup linear warmup schedule for teacher temperature."""
-        self.teacher_temp_schedule = torch.linspace(
-            self.warmup_teacher_temp,
-            self.teacher_temp,
-            self.warmup_teacher_temp_epochs
-        )
-        # Extend with constant temperature after warmup
-        self.teacher_temp_schedule = torch.cat([
-            self.teacher_temp_schedule,
-            torch.full((n_epochs - self.warmup_teacher_temp_epochs,), self.teacher_temp)
-        ])
+    @torch.no_grad()
+    def sinkhorn_knopp_teacher(self, teacher_output, teacher_temp, n_iterations=3):
+        teacher_output = teacher_output.float()
+        world_size = dist.get_world_size() if dist.is_initialized() else 1
+        Q = torch.exp(teacher_output / teacher_temp).t()  # Q is K-by-B for consistency with notations from our paper
+        B = Q.shape[1] * world_size  # number of samples to assign
+        K = Q.shape[0]  # how many prototypes
 
-    def forward(self, student_output, teacher_output, epoch):
+        # make the matrix sums to 1
+        sum_Q = torch.sum(Q)
+        if dist.is_initialized():
+            dist.all_reduce(sum_Q)
+        Q /= sum_Q
+
+        for it in range(n_iterations):
+            # normalize each row: total weight per prototype must be 1/K
+            sum_of_rows = torch.sum(Q, dim=1, keepdim=True)
+            if dist.is_initialized():
+                dist.all_reduce(sum_of_rows)
+            Q /= sum_of_rows
+            Q /= K
+
+            # normalize each column: total weight per sample must be 1/B
+            Q /= torch.sum(Q, dim=0, keepdim=True)
+            Q /= B
+
+        Q *= B  # the columns must sum to 1 so that Q is an assignment
+        return Q.t()
+
+    def forward(self, student_output_list, teacher_out_softmaxed_centered_list):
         """
-        Args:
-            student_output: List of tensors from student network for all crops
-                           Each tensor: [batch_size, out_dim]
-            teacher_output: List of tensors from teacher network for global crops only
-                           Each tensor: [batch_size, out_dim]
-            epoch: Current epoch for temperature scheduling
-
-        Returns:
-            loss: Scalar loss value
+        Cross-entropy between softmax outputs of the teacher and student networks.
         """
-        # Get teacher temperature
-        if self.teacher_temp_schedule is not None and epoch < len(self.teacher_temp_schedule):
-            teacher_temp = self.teacher_temp_schedule[epoch]
-        else:
-            teacher_temp = self.teacher_temp
-
-        # Compute teacher outputs (only for global crops)
-        teacher_out = torch.cat([t for t in teacher_output], dim=0)
-        teacher_out = teacher_out.detach()  # Stop gradient
-
-        # Center and sharpen teacher outputs
-        teacher_out = F.softmax((teacher_out - self.center) / teacher_temp, dim=-1)
-
-        # Compute student outputs for all crops
-        student_out = torch.cat([s for s in student_output], dim=0)
-        student_out = F.log_softmax(student_out / self.student_temp, dim=-1)
-
-        # Split student outputs by crop
-        n_global_crops = len(teacher_output)
-        n_student_chunks = len(student_output)
-        student_chunks = student_out.chunk(n_student_chunks)
-        teacher_chunks = teacher_out.chunk(n_global_crops)
-
-        # Cross-entropy between all student crops and all teacher crops
+        # TODO: Use cross_entropy_distribution here
         total_loss = 0
-        n_loss_terms = 0
-
-        for t_idx, t_crop in enumerate(teacher_chunks):
-            for s_idx, s_crop in enumerate(student_chunks):
-                # Don't compare a crop with itself
-                if t_idx == s_idx and s_idx < n_global_crops:
-                    continue
-
-                # Cross-entropy: -sum(teacher * log(student))
-                loss = -torch.sum(t_crop * s_crop, dim=-1).mean()
-                total_loss += loss
-                n_loss_terms += 1
-
-        total_loss /= n_loss_terms
-
-        # Update center with EMA
-        self.update_center(teacher_out)
-
+        for s in student_output_list:
+            lsm = F.log_softmax(s / self.student_temp, dim=-1)
+            for t in teacher_out_softmaxed_centered_list:
+                loss = torch.sum(t * lsm, dim=-1)
+                total_loss -= loss.mean()
         return total_loss
 
     @torch.no_grad()
     def update_center(self, teacher_output):
-        """Update center used for teacher output centering with EMA."""
-        batch_center = torch.mean(teacher_output, dim=0, keepdim=True)
+        self.reduce_center_update(teacher_output)
 
-        # Distributed: average across all GPUs
-        if dist.is_available() and dist.is_initialized():
-            dist.all_reduce(batch_center)
-            batch_center = batch_center / dist.get_world_size()
+    @torch.no_grad()
+    def reduce_center_update(self, teacher_output):
+        self.updated = False
+        self.len_teacher_output = len(teacher_output)
+        self.async_batch_center = torch.sum(teacher_output, dim=0, keepdim=True)
+        if dist.is_initialized():
+            self.reduce_handle = dist.all_reduce(self.async_batch_center, async_op=True)
 
-        # EMA update
-        self.center = self.center * self.center_momentum + batch_center * (1 - self.center_momentum)
+    @torch.no_grad()
+    def apply_center_update(self):
+        if self.updated is False:
+            world_size = dist.get_world_size() if dist.is_initialized() else 1
+
+            if self.reduce_handle is not None:
+                self.reduce_handle.wait()
+            _t = self.async_batch_center / (self.len_teacher_output * world_size)
+
+            self.center = self.center * self.center_momentum + _t * (1 - self.center_momentum)
+
+            self.updated = True
+
+
+class iBOTPatchLoss(nn.Module):
+    def __init__(self, patch_out_dim, student_temp=0.1, center_momentum=0.9):
+        super().__init__()
+        self.student_temp = student_temp
+        self.center_momentum = center_momentum
+        self.register_buffer("center", torch.zeros(1, 1, patch_out_dim))
+        self.updated = True
+        self.reduce_handle = None
+        self.len_teacher_patch_tokens = None
+        self.async_batch_center = None
+
+    @torch.no_grad()
+    def softmax_center_teacher(self, teacher_patch_tokens, teacher_temp):
+        self.apply_center_update()
+        # teacher centering and sharpening
+        #
+        # WARNING:
+        #   as self.center is a float32, everything gets casted to float32 afterwards
+        #
+        # teacher_patch_tokens = teacher_patch_tokens.float()
+        # return F.softmax((teacher_patch_tokens.sub_(self.center.to(teacher_patch_tokens.dtype))).mul_(1 / teacher_temp), dim=-1)
+
+        return F.softmax((teacher_patch_tokens - self.center) / teacher_temp, dim=-1)
+
+        # this is experimental, keep everything in float16 and let's see what happens:
+        # return F.softmax((teacher_patch_tokens.sub_(self.center)) / teacher_temp, dim=-1)
+
+    @torch.no_grad()
+    def sinkhorn_knopp_teacher(self, teacher_output, teacher_temp, n_masked_patches_tensor, n_iterations=3):
+        teacher_output = teacher_output.float()
+        # world_size = dist.get_world_size() if dist.is_initialized() else 1
+        Q = torch.exp(teacher_output / teacher_temp).t()  # Q is K-by-B for consistency with notations from our paper
+        # B = Q.shape[1] * world_size # number of samples to assign
+        B = n_masked_patches_tensor
+        dist.all_reduce(B)
+        K = Q.shape[0]  # how many prototypes
+
+        # make the matrix sums to 1
+        sum_Q = torch.sum(Q)
+        if dist.is_initialized():
+            dist.all_reduce(sum_Q)
+        Q /= sum_Q
+
+        for it in range(n_iterations):
+            # normalize each row: total weight per prototype must be 1/K
+            sum_of_rows = torch.sum(Q, dim=1, keepdim=True)
+            if dist.is_initialized():
+                dist.all_reduce(sum_of_rows)
+            Q /= sum_of_rows
+            Q /= K
+
+            # normalize each column: total weight per sample must be 1/B
+            Q /= torch.sum(Q, dim=0, keepdim=True)
+            Q /= B
+
+        Q *= B  # the columns must sum to 1 so that Q is an assignment
+        return Q.t()
+
+    def forward(self, student_patch_tokens, teacher_patch_tokens, student_masks_flat):
+        """
+        Cross-entropy between softmax outputs of the teacher and student networks.
+        student_patch_tokens: (B, N, D) tensor
+        teacher_patch_tokens: (B, N, D) tensor
+        student_masks_flat: (B, N) tensor
+        """
+        t = teacher_patch_tokens
+        s = student_patch_tokens
+        loss = torch.sum(t * F.log_softmax(s / self.student_temp, dim=-1), dim=-1)
+        loss = torch.sum(loss * student_masks_flat.float(), dim=-1) / student_masks_flat.sum(dim=-1).clamp(min=1.0)
+        return -loss.mean()
+
+    def forward_masked(
+        self,
+        student_patch_tokens_masked,
+        teacher_patch_tokens_masked,
+        student_masks_flat,
+        n_masked_patches=None,
+        masks_weight=None,
+    ):
+        t = teacher_patch_tokens_masked
+        s = student_patch_tokens_masked
+        # loss = torch.sum(t * F.log_softmax(s / self.student_temp, dim=-1), dim=-1)
+        loss = lossfunc(t, s, self.student_temp)
+        if masks_weight is None:
+            masks_weight = (
+                (1 / student_masks_flat.sum(-1).clamp(min=1.0))
+                .unsqueeze(-1)
+                .expand_as(student_masks_flat)[student_masks_flat]
+            )
+        if n_masked_patches is not None:
+            loss = loss[:n_masked_patches]
+        loss = loss * masks_weight
+        return -loss.sum() / student_masks_flat.shape[0]
+
+    @torch.no_grad()
+    def update_center(self, teacher_patch_tokens):
+        self.reduce_center_update(teacher_patch_tokens)
+
+    @torch.no_grad()
+    def reduce_center_update(self, teacher_patch_tokens):
+        self.updated = False
+        self.len_teacher_patch_tokens = len(teacher_patch_tokens)
+        self.async_batch_center = torch.sum(teacher_patch_tokens.mean(1), dim=0, keepdim=True)
+        if dist.is_initialized():
+            self.reduce_handle = dist.all_reduce(self.async_batch_center, async_op=True)
+
+    @torch.no_grad()
+    def apply_center_update(self):
+        if self.updated is False:
+            world_size = dist.get_world_size() if dist.is_initialized() else 1
+
+            if self.reduce_handle is not None:
+                self.reduce_handle.wait()
+            _t = self.async_batch_center / (self.len_teacher_patch_tokens * world_size)
+
+            self.center = self.center * self.center_momentum + _t * (1 - self.center_momentum)
+
+            self.updated = True
 
 
 class KoLeoLoss(nn.Module):
-    """
-    KoLeo regularizer from DINO v2.
+    """Kozachenko-Leonenko entropic loss regularizer from Sablayrolles et al. - 2018 - Spreading vectors for similarity search"""
 
-    Encourages uniformity in the feature space by penalizing
-    features that are too close to their nearest neighbors.
-    This helps prevent dimensional collapse.
-    """
-
-    def __init__(self, eps: float = 1e-8):
-        """
-        Args:
-            eps: Small constant for numerical stability
-        """
+    def __init__(self):
         super().__init__()
-        self.eps = eps
+        self.pdist = nn.PairwiseDistance(2, eps=1e-8)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def pairwise_NNs_inner(self, x):
+        """
+        Pairwise nearest neighbors for L2-normalized vectors.
+        Uses Torch rather than Faiss to remain on GPU.
+        """
+        # parwise dot products (= inverse distance)
+        dots = torch.mm(x, x.t())
+        n = x.shape[0]
+        dots.view(-1)[:: (n + 1)].fill_(-1)  # Trick to fill diagonal with -1
+        # max inner prod -> min distance
+        _, I = torch.max(dots, dim=1)  # noqa: E741
+        return I
+
+    def forward(self, student_output, eps=1e-8):
         """
         Args:
-            x: Features tensor [batch_size, feature_dim]
-
-        Returns:
-            loss: Scalar KoLeo loss
+            student_output (BxD): backbone output of student
         """
-        # Normalize features
-        x = F.normalize(x, dim=-1, p=2)
-
-        # Compute pairwise distances
-        # [batch_size, batch_size]
-        pdist = torch.cdist(x, x, p=2)
-
-        # For each sample, find distance to nearest neighbor (excluding itself)
-        # Set diagonal to inf so we don't select the point itself
-        pdist = pdist + torch.eye(pdist.size(0), device=pdist.device) * 1e6
-        min_distances = torch.min(pdist, dim=-1)[0]
-
-        # KoLeo loss: negative log of nearest neighbor distances
-        # We want to maximize distances, so minimize negative log
-        loss = -torch.log(min_distances + self.eps).mean()
-
+        with torch.cuda.amp.autocast(enabled=False):
+            student_output = F.normalize(student_output, eps=eps, p=2, dim=-1)
+            I = self.pairwise_NNs_inner(student_output)  # noqa: E741
+            distances = self.pdist(student_output, student_output[I])  # BxD, BxD -> B
+            loss = -torch.log(distances + eps).mean()
         return loss
-
-
-class iBOTLoss(nn.Module):
-    """
-    iBOT (Image BERT) loss for masked image modeling in DINO v2.
-
-    Predicts masked patches using the teacher network as targets.
-    Similar to BERT masking but for images.
-    """
-
-    def __init__(
-        self,
-        out_dim: int,
-        patch_out_dim: int = None,
-        teacher_temp: float = 0.04,
-        student_temp: float = 0.1,
-        center_momentum: float = 0.9,
-    ):
-        """
-        Args:
-            out_dim: Dimension of CLS token output
-            patch_out_dim: Dimension of patch token outputs (if None, same as out_dim)
-            teacher_temp: Teacher temperature for sharpening
-            student_temp: Student temperature
-            center_momentum: EMA momentum for centering
-        """
-        super().__init__()
-        self.teacher_temp = teacher_temp
-        self.student_temp = student_temp
-        self.center_momentum = center_momentum
-
-        patch_out_dim = patch_out_dim or out_dim
-        self.register_buffer("center", torch.zeros(1, patch_out_dim))
-
-    def forward(
-        self,
-        student_patch_tokens,
-        teacher_patch_tokens,
-        student_masks=None
-    ):
-        """
-        Args:
-            student_patch_tokens: Patch tokens from student [batch_size, n_patches, dim]
-            teacher_patch_tokens: Patch tokens from teacher [batch_size, n_patches, dim]
-            student_masks: Boolean mask indicating which patches were masked [batch_size, n_patches]
-
-        Returns:
-            loss: Scalar loss value
-        """
-        # Process teacher outputs
-        teacher_patch_tokens = teacher_patch_tokens.detach()
-        teacher_patch_tokens = F.softmax(
-            (teacher_patch_tokens - self.center) / self.teacher_temp, dim=-1
-        )
-
-        # Process student outputs
-        student_patch_tokens = F.log_softmax(
-            student_patch_tokens / self.student_temp, dim=-1
-        )
-
-        # If masks provided, only compute loss on masked patches
-        if student_masks is not None:
-            # Flatten and select masked patches
-            batch_size, n_patches, dim = student_patch_tokens.shape
-            student_masked = student_patch_tokens[student_masks]
-            teacher_masked = teacher_patch_tokens[student_masks]
-
-            # Cross-entropy loss
-            loss = -torch.sum(teacher_masked * student_masked, dim=-1).mean()
-        else:
-            # Loss on all patches
-            loss = -torch.sum(teacher_patch_tokens * student_patch_tokens, dim=-1).mean()
-
-        # Update center
-        self.update_center(teacher_patch_tokens)
-
-        return loss
-
-    @torch.no_grad()
-    def update_center(self, teacher_output):
-        """Update center with EMA."""
-        # Average over batch and patches
-        batch_center = torch.mean(teacher_output, dim=[0, 1], keepdim=True)
-
-        # Distributed: average across all GPUs
-        if dist.is_available() and dist.is_initialized():
-            dist.all_reduce(batch_center)
-            batch_center = batch_center / dist.get_world_size()
-
-        # EMA update
-        self.center = self.center * self.center_momentum + batch_center * (1 - self.center_momentum)
 
 
 class DINOv2Loss(nn.Module):
     """
     Combined DINO v2 loss with DINO, KoLeo, and optional iBOT losses.
+
+    According to the DINOv2 paper, the total loss is:
+        L = L_dino + λ_koleo * L_koleo + λ_ibot * L_ibot
+
+    where:
+    - L_dino: cross-entropy loss between student and teacher [CLS] tokens
+    - L_koleo: Kozachenko-Leonenko entropy regularizer on student outputs
+    - L_ibot: masked patch prediction loss (iBOT)
     """
 
     def __init__(
         self,
         out_dim: int,
-        n_crops: int = 2,
         warmup_teacher_temp: float = 0.04,
-        teacher_temp: float = 0.04,
+        teacher_temp: float = 0.07,
         warmup_teacher_temp_epochs: int = 30,
         student_temp: float = 0.1,
         center_momentum: float = 0.9,
@@ -283,88 +274,159 @@ class DINOv2Loss(nn.Module):
     ):
         """
         Args:
-            out_dim: Dimension of the output
-            n_crops: Number of global crops
+            out_dim: Dimension of the [CLS] token output
             warmup_teacher_temp: Initial teacher temperature
-            teacher_temp: Final teacher temperature
-            warmup_teacher_temp_epochs: Epochs to warm up temperature
-            student_temp: Student temperature
+            teacher_temp: Final teacher temperature after warmup
+            warmup_teacher_temp_epochs: Number of epochs to warm up temperature
+            student_temp: Student temperature (fixed)
             center_momentum: EMA momentum for centering
-            lambda_koleo: Weight for KoLeo loss
-            lambda_ibot: Weight for iBOT loss
-            patch_out_dim: Dimension of patch outputs for iBOT
+            lambda_koleo: Weight for KoLeo loss (paper uses 0.1)
+            lambda_ibot: Weight for iBOT loss (paper uses 1.0)
+            patch_out_dim: Dimension of patch token outputs for iBOT
         """
         super().__init__()
 
         self.lambda_koleo = lambda_koleo
         self.lambda_ibot = lambda_ibot
 
-        # Main DINO loss
+        # Teacher temperature scheduling
+        self.warmup_teacher_temp = warmup_teacher_temp
+        self.teacher_temp = teacher_temp
+        self.warmup_teacher_temp_epochs = warmup_teacher_temp_epochs
+        self.teacher_temp_schedule = None
+
+        # Main DINO loss (cross-entropy on [CLS] tokens)
         self.dino_loss = DINOLoss(
             out_dim=out_dim,
-            n_crops=n_crops,
-            warmup_teacher_temp=warmup_teacher_temp,
-            teacher_temp=teacher_temp,
-            warmup_teacher_temp_epochs=warmup_teacher_temp_epochs,
             student_temp=student_temp,
             center_momentum=center_momentum,
         )
 
-        # KoLeo regularization
+        # KoLeo regularization (entropy regularizer)
         if lambda_koleo > 0:
             self.koleo_loss = KoLeoLoss()
+        else:
+            self.koleo_loss = None
 
-        # iBOT loss
-        if lambda_ibot > 0:
-            self.ibot_loss = iBOTLoss(
-                out_dim=out_dim,
+        # iBOT patch loss (masked patch prediction)
+        if lambda_ibot > 0 and patch_out_dim is not None:
+            self.ibot_patch_loss = iBOTPatchLoss(
                 patch_out_dim=patch_out_dim,
-                teacher_temp=teacher_temp,
                 student_temp=student_temp,
                 center_momentum=center_momentum,
             )
+        else:
+            self.ibot_patch_loss = None
+
+    def setup_teacher_temp_schedule(self, num_epochs):
+        """
+        Setup teacher temperature schedule with linear warmup.
+
+        Args:
+            num_epochs: Total number of training epochs
+        """
+        if self.warmup_teacher_temp_epochs > 0:
+            # Linear warmup from warmup_teacher_temp to teacher_temp
+            warmup_schedule = torch.linspace(
+                self.warmup_teacher_temp,
+                self.teacher_temp,
+                self.warmup_teacher_temp_epochs
+            )
+            # Constant temperature after warmup
+            constant_schedule = torch.full(
+                (num_epochs - self.warmup_teacher_temp_epochs,),
+                self.teacher_temp
+            )
+            self.teacher_temp_schedule = torch.cat([warmup_schedule, constant_schedule])
+        else:
+            self.teacher_temp_schedule = torch.full((num_epochs,), self.teacher_temp)
+
+    def get_teacher_temp(self, epoch):
+        """Get the teacher temperature for the current epoch."""
+        if self.teacher_temp_schedule is not None:
+            return self.teacher_temp_schedule[min(epoch, len(self.teacher_temp_schedule) - 1)].item()
+        return self.teacher_temp
 
     def forward(
         self,
         student_output,
         teacher_output,
-        student_local_cls=None,
         epoch=0,
         student_patch_tokens=None,
         teacher_patch_tokens=None,
-        student_masks=None,
+        student_masks_flat=None,
     ):
         """
+        Compute the combined DINOv2 loss.
+
         Args:
-            student_output: List of CLS token outputs from student for all crops
-            teacher_output: List of CLS token outputs from teacher for global crops
-            student_local_cls: Optional CLS tokens from local crops for KoLeo
-            epoch: Current epoch
-            student_patch_tokens: Optional patch tokens for iBOT
-            teacher_patch_tokens: Optional patch tokens for iBOT
-            student_masks: Optional masks for iBOT
+            student_output: List of student [CLS] token outputs [B, D] for each crop
+            teacher_output: List of teacher [CLS] token outputs [B, D] for global crops
+            epoch: Current epoch (for teacher temperature scheduling)
+            student_patch_tokens: Optional [B, N, D] patch tokens from student (for iBOT)
+            teacher_patch_tokens: Optional [B, N, D] patch tokens from teacher (for iBOT)
+            student_masks_flat: Optional [B, N] binary mask indicating masked patches (for iBOT)
 
         Returns:
             Dictionary with total loss and individual loss components
         """
         losses = {}
 
-        # Main DINO loss
-        dino_loss = self.dino_loss(student_output, teacher_output, epoch)
+        # Get current teacher temperature
+        teacher_temp = self.get_teacher_temp(epoch)
+
+        # 1. DINO loss: cross-entropy between student and teacher [CLS] tokens
+        # Center and sharpen teacher outputs
+        teacher_out_softmaxed_centered = []
+        for t in teacher_output:
+            t_centered = self.dino_loss.softmax_center_teacher(t, teacher_temp)
+            teacher_out_softmaxed_centered.append(t_centered)
+
+        # Compute DINO loss
+        dino_loss = self.dino_loss(student_output, teacher_out_softmaxed_centered)
         losses['dino'] = dino_loss
         total_loss = dino_loss
 
-        # KoLeo regularization (on local crops if available)
-        if self.lambda_koleo > 0 and student_local_cls is not None:
-            koleo_loss = self.koleo_loss(student_local_cls)
+        # Update teacher center
+        with torch.no_grad():
+            for t in teacher_output:
+                self.dino_loss.update_center(t)
+
+        # 2. KoLeo regularization: entropy regularizer on student outputs
+        if self.koleo_loss is not None and len(student_output) > 0:
+            # Apply KoLeo to all student outputs (concatenated)
+            student_output_cat = torch.cat([s for s in student_output], dim=0)
+            koleo_loss = self.koleo_loss(student_output_cat)
             losses['koleo'] = koleo_loss
             total_loss = total_loss + self.lambda_koleo * koleo_loss
+        else:
+            losses['koleo'] = torch.tensor(0.0, device=total_loss.device)
 
-        # iBOT loss
-        if self.lambda_ibot > 0 and student_patch_tokens is not None and teacher_patch_tokens is not None:
-            ibot_loss = self.ibot_loss(student_patch_tokens, teacher_patch_tokens, student_masks)
+        # 3. iBOT loss: masked patch prediction
+        if (self.ibot_patch_loss is not None and
+            student_patch_tokens is not None and
+            teacher_patch_tokens is not None and
+            student_masks_flat is not None):
+
+            # Center and sharpen teacher patch tokens
+            teacher_patch_softmaxed = self.ibot_patch_loss.softmax_center_teacher(
+                teacher_patch_tokens, teacher_temp
+            )
+
+            # Compute iBOT loss
+            ibot_loss = self.ibot_patch_loss(
+                student_patch_tokens,
+                teacher_patch_softmaxed,
+                student_masks_flat
+            )
             losses['ibot'] = ibot_loss
             total_loss = total_loss + self.lambda_ibot * ibot_loss
+
+            # Update teacher patch center
+            with torch.no_grad():
+                self.ibot_patch_loss.update_center(teacher_patch_tokens)
+        else:
+            losses['ibot'] = torch.tensor(0.0, device=total_loss.device)
 
         losses['total'] = total_loss
         return losses

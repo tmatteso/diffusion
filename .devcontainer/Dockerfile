@@ -26,6 +26,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     vim \
     wget \
     axel \
+    pigz \
+    pv \
     && rm -rf /var/lib/apt/lists/*
 
 # Install uv

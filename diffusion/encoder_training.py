@@ -8,7 +8,7 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 import wandb
 
-from diffusion.encoder_architecture import PackedSequenceEncoder, ResidueEmbedding, StructureTransformerEncoder
+from diffusion.encoder_architecture import PackedSequenceEncoder, ResidueEmbedding
 from diffusion.data_pipeline import create_dataloader, CenterProtein, RandomRotationTranslation3D
 from diffusion.encoder_losses import DINOv2Loss
 
@@ -70,6 +70,7 @@ class ProteinEncoderTrainer:
         scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None,
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
         teacher_momentum: float = 0.996,
+        mask_ratio: float = 0.15,
         use_wandb: bool = True,
     ):
         """
@@ -81,6 +82,7 @@ class ProteinEncoderTrainer:
             scheduler: Learning rate scheduler
             device: Device to train on
             teacher_momentum: EMA momentum for teacher
+            mask_ratio: Ratio of residues to mask for iBOT loss
             use_wandb: Whether to log to wandb
         """
         self.student = student.to(device)
@@ -89,6 +91,7 @@ class ProteinEncoderTrainer:
         self.optimizer = optimizer
         self.scheduler = scheduler
         self.device = device
+        self.mask_ratio = mask_ratio
         self.use_wandb = use_wandb
 
         # Teacher is not trainable
@@ -122,22 +125,46 @@ class ProteinEncoderTrainer:
             structures = batch['coords']  # List of [n_residues, n_atoms, 3]
 
             # Forward pass through student
-            student_outputs = self.student(structures)  # List of [n_residues, embed_dim]
+            student_out_dict = self.student(structures, return_projected=True)
+            student_backbone = student_out_dict['backbone']  # List of [n_residues, embed_dim]
+            student_projected = student_out_dict['projected']  # List of [n_residues, proj_dim]
 
             # Forward pass through teacher (no grad)
             with torch.no_grad():
-                teacher_outputs = self.teacher(structures)
+                teacher_out_dict = self.teacher(structures, return_projected=True)
+                teacher_backbone = teacher_out_dict['backbone']
+                teacher_projected = teacher_out_dict['projected']
 
-            # Compute loss
-            # For DINO, we need CLS token outputs
-            # Here we'll use global average pooling over residues as a simple approach
-            student_cls = [out.mean(dim=0, keepdim=True) for out in student_outputs]
-            teacher_cls = [out.mean(dim=0, keepdim=True) for out in teacher_outputs]
+            # Prepare inputs for DINOv2Loss
+            # For DINO loss: use global average pooling on PROJECTED embeddings as [CLS] tokens
+            # For KoLeo loss: will be applied to these same projected [CLS] tokens inside the loss
+            student_cls = [out.mean(dim=0, keepdim=True) for out in student_projected]
+            teacher_cls = [out.mean(dim=0, keepdim=True) for out in teacher_projected]
+
+            # For iBOT loss: use PROJECTED residue embeddings as patch tokens
+            # Stack into batch format [B, N, D] where B=batch_size, N=n_residues, D=proj_dim
+            # Since sequences have different lengths, we'll process each separately
+            # For now, we'll use the first structure in the batch as a simple approach
+            if len(student_projected) > 0:
+                student_patch_tokens = student_projected[0].unsqueeze(0)
+                teacher_patch_tokens = teacher_projected[0].unsqueeze(0)
+
+                # Create random mask for iBOT (mask residues for prediction)
+                # Shape: [B, N] with True = masked (used in loss), False = not masked
+                n_residues = student_patch_tokens.shape[1]
+                student_masks = torch.rand(1, n_residues, device=student_patch_tokens.device) < self.mask_ratio
+            else:
+                student_patch_tokens = None
+                teacher_patch_tokens = None
+                student_masks = None
 
             losses = self.criterion(
                 student_output=student_cls,
                 teacher_output=teacher_cls,
                 epoch=self.epoch,
+                student_patch_tokens=student_patch_tokens,
+                teacher_patch_tokens=teacher_patch_tokens,
+                student_masks_flat=student_masks,
             )
 
             loss = losses['total']
@@ -271,8 +298,11 @@ def create_model(
     depth: int = 12,
     num_heads: int = 12,
     mlp_ratio: float = 4.0,
+    proj_output_dim: int = 65536,
+    proj_hidden_dim: int = 2048,
+    proj_bottleneck_dim: int = 256,
 ) -> PackedSequenceEncoder:
-    """Create a protein structure encoder model."""
+    """Create a protein structure encoder model with projection head."""
     return PackedSequenceEncoder(
         n_atoms=n_atoms,
         embed_dim=embed_dim,
@@ -283,31 +313,51 @@ def create_model(
         drop_rate=0.0,
         attn_drop_rate=0.0,
         drop_path_rate=0.1,
+        proj_output_dim=proj_output_dim,
+        proj_hidden_dim=proj_hidden_dim,
+        proj_bottleneck_dim=proj_bottleneck_dim,
     )
 
 
 def main():
     """Main training function."""
-    # Configuration
+    # Configuration (DINOv2 paper defaults)
     config = {
+        # Model architecture
         'n_atoms': 37,
         'embed_dim': 768,
         'depth': 12,
         'num_heads': 12,
         'mlp_ratio': 4.0,
+
+        # Projection head parameters
+        'proj_output_dim': 65536,  # Projection space dimension (DINOv2 default)
+        'proj_hidden_dim': 2048,  # Projection head hidden dimension
+        'proj_bottleneck_dim': 256,  # Projection head bottleneck dimension
+
+        # Training hyperparameters
         'batch_size': 4,
         'num_epochs': 100,
         'lr': 1e-4,
         'weight_decay': 0.05,
-        'teacher_momentum': 0.996,
-        'warmup_teacher_temp': 0.04,
-        'teacher_temp': 0.07,
-        'warmup_teacher_temp_epochs': 30,
-        'student_temp': 0.1,
+
+        # DINOv2 loss parameters (from paper)
+        'teacher_momentum': 0.996,  # EMA momentum for teacher
+        'warmup_teacher_temp': 0.04,  # Initial teacher temperature
+        'teacher_temp': 0.07,  # Final teacher temperature
+        'warmup_teacher_temp_epochs': 30,  # Warmup epochs
+        'student_temp': 0.1,  # Student temperature (fixed)
+        'lambda_koleo': 0.1,  # KoLeo loss weight (paper default)
+        'lambda_ibot': 1.0,  # iBOT loss weight (paper default)
+        'mask_ratio': 0.15,  # Residue masking ratio for iBOT (BERT/iBOT default)
+
+        # Data
         'pdb_dir': 'CASP14/',
         'file_pattern': 'T*.pdb',
+
+        # Logging
         'save_dir': 'checkpoints',
-        'use_wandb': True,
+        'use_wandb': False,
     }
 
     # Initialize wandb
@@ -325,6 +375,9 @@ def main():
         depth=config['depth'],
         num_heads=config['num_heads'],
         mlp_ratio=config['mlp_ratio'],
+        proj_output_dim=config['proj_output_dim'],
+        proj_hidden_dim=config['proj_hidden_dim'],
+        proj_bottleneck_dim=config['proj_bottleneck_dim'],
     )
 
     teacher = create_model(
@@ -333,25 +386,29 @@ def main():
         depth=config['depth'],
         num_heads=config['num_heads'],
         mlp_ratio=config['mlp_ratio'],
+        proj_output_dim=config['proj_output_dim'],
+        proj_hidden_dim=config['proj_hidden_dim'],
+        proj_bottleneck_dim=config['proj_bottleneck_dim'],
     )
 
     # Initialize teacher with student weights
     teacher.load_state_dict(student.state_dict())
 
-    # Create loss function
+    # Create loss function with DINOv2 paper defaults
     print("Creating loss function...")
     criterion = DINOv2Loss(
-        out_dim=config['embed_dim'],
+        out_dim=config['proj_output_dim'],  # Use projection dimension for DINO loss
         warmup_teacher_temp=config['warmup_teacher_temp'],
         teacher_temp=config['teacher_temp'],
         warmup_teacher_temp_epochs=config['warmup_teacher_temp_epochs'],
         student_temp=config['student_temp'],
-        lambda_koleo=0.0,  # Disable KoLeo for now
-        lambda_ibot=0.0,   # Disable iBOT for now
+        lambda_koleo=config['lambda_koleo'],
+        lambda_ibot=config['lambda_ibot'],
+        patch_out_dim=config['proj_output_dim'],  # Use projection dimension for iBOT loss
     )
 
     # Setup teacher temperature schedule
-    criterion.dino_loss.setup_teacher_temp_schedule(config['num_epochs'])
+    criterion.setup_teacher_temp_schedule(config['num_epochs'])
 
     # Create optimizer and scheduler
     print("Creating optimizer...")
@@ -388,6 +445,7 @@ def main():
         optimizer=optimizer,
         scheduler=scheduler,
         teacher_momentum=config['teacher_momentum'],
+        mask_ratio=config['mask_ratio'],
         use_wandb=config['use_wandb'],
     )
 

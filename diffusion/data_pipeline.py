@@ -325,3 +325,5 @@ class RandomRotationTranslation3D:
 
         return coords_final
 
+# what are we doing now?
+# I want to make sure we are computing the loss correctly.

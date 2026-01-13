@@ -6,7 +6,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.functional import scaled_dot_product_attention
 from torch.nn.attention import SDPBackend, sdpa_kernel
-
+from torch.nn.init import trunc_normal_
+from torch.nn.utils import weight_norm
 
 class MultiHeadSelfAttention(nn.Module):
     """
@@ -257,83 +258,6 @@ class TransformerBlock(nn.Module):
         return x
 
 
-class StructureTransformerEncoder(nn.Module):
-    """
-    Structure Transformer Encoder: Stack of Transformer Blocks with Flash Attention.
-
-    Can be used for image encoding with patch embeddings or
-    for processing any sequential data.
-    """
-
-    def __init__(
-        self,
-        dim: int = 768,
-        depth: int = 12,
-        num_heads: int = 12,
-        mlp_ratio: float = 4.0,
-        qkv_bias: bool = True,
-        drop_rate: float = 0.0,
-        attn_drop_rate: float = 0.0,
-        drop_path_rate: float = 0.0,
-        norm_layer: nn.Module = nn.LayerNorm,
-    ):
-        """
-        Args:
-            dim: Embedding dimension
-            depth: Number of transformer blocks
-            num_heads: Number of attention heads
-            mlp_ratio: MLP expansion ratio
-            qkv_bias: Whether to use bias in QKV projection
-            drop_rate: Dropout rate
-            attn_drop_rate: Attention dropout rate
-            drop_path_rate: Stochastic depth rate (linearly scaled across blocks)
-            norm_layer: Normalization layer
-        """
-        super().__init__()
-        self.dim = dim
-        self.depth = depth
-
-        # Stochastic depth decay rule (linearly increase drop_path across blocks)
-        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
-
-        # Build transformer blocks
-        self.blocks = nn.ModuleList([
-            TransformerBlock(
-                dim=dim,
-                num_heads=num_heads,
-                mlp_ratio=mlp_ratio,
-                qkv_bias=qkv_bias,
-                drop=drop_rate,
-                attn_drop=attn_drop_rate,
-                drop_path=dpr[i],
-                norm_layer=norm_layer,
-            )
-            for i in range(depth)
-        ])
-
-        # Final layer norm
-        self.norm = norm_layer(dim)
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        attn_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """
-        Args:
-            x: Input tensor [batch_size, seq_len, dim]
-            attn_mask: Optional attention mask
-
-        Returns:
-            Output tensor [batch_size, seq_len, dim]
-        """
-        for block in self.blocks:
-            x = block(x, attn_mask)
-
-        x = self.norm(x)
-        return x
-
-
 
 class ResidueEmbedding(nn.Module):
     """
@@ -492,12 +416,88 @@ def pack_protein_batch(
     return packed, attention_mask, lengths
 
 
+class ProjectionHead(nn.Module):
+    """
+    Projection head for DINOv2 (3-layer MLP with bottleneck).
+
+    Projects embeddings to a lower-dimensional space for computing
+    contrastive losses. Follows the DINOv2 architecture:
+    - Three linear layers with GELU activation
+    - Bottleneck dimension before final projection
+    - L2 normalization before the last layer
+    - Weight-normalized final layer
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int,
+        hidden_dim: int = 2048,
+        bottleneck_dim: int = 256,
+        activation: nn.Module = nn.GELU,
+        drop: float = 0.0,
+        bias: bool = True,
+    ):
+        """
+        Args:
+            input_dim: Input dimension (embed_dim from backbone)
+            output_dim: Output dimension (projection space, typically 65536 for DINOv2)
+            hidden_dim: Hidden dimension for layers 1-2 (default 2048)
+            bottleneck_dim: Bottleneck dimension before final layer (default 256)
+            activation: Activation function
+            drop: Dropout rate
+            bias: Whether to use bias in linear layers
+        """
+        super().__init__()
+
+        self.fc1 = nn.Linear(input_dim, hidden_dim, bias=bias)
+        self.act = activation()
+        self.drop1 = nn.Dropout(drop)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim, bias=bias)
+        self.drop2 = nn.Dropout(drop)
+        self.fc3 = nn.Linear(hidden_dim, bottleneck_dim, bias=bias)
+        self.apply(self._init_weights)
+
+        # Weight-normalized last layer (no bias)
+        self.last_layer = weight_norm(nn.Linear(bottleneck_dim, output_dim, bias=False))
+        self.last_layer.weight_g.data.fill_(1)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            trunc_normal_(m.weight, std=0.02)
+            if isinstance(m, nn.Linear) and m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: Input tensor [..., input_dim]
+
+        Returns:
+            Output tensor [..., output_dim]
+        """
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.drop1(x)
+        x = self.fc2(x)
+        x = self.act(x)
+        x = self.drop2(x)
+        x = self.fc3(x)
+        # L2 normalize before last layer
+        eps = 1e-6 if x.dtype == torch.float16 else 1e-12
+        x = F.normalize(x, dim=-1, p=2, eps=eps)
+        x = self.last_layer(x)
+        return x
+
 class PackedSequenceEncoder(nn.Module):
     """
     Encoder that processes packed sequences efficiently (Krell et al. 2022).
 
     Combines ResidueEmbedding with sequence packing for efficient batch processing
     of variable-length protein structures without padding overhead.
+
+    Includes a shared projection head for DINOv2 that projects embeddings
+    for both DINO loss (on [CLS] tokens) and iBOT loss (on patch tokens).
     """
 
     def __init__(
@@ -511,6 +511,11 @@ class PackedSequenceEncoder(nn.Module):
         drop_rate: float = 0.0,
         attn_drop_rate: float = 0.0,
         drop_path_rate: float = 0.0,
+        norm_layer: nn.Module = nn.LayerNorm,
+        # Projection head parameters
+        proj_output_dim: int = 65536,
+        proj_hidden_dim: int = 2048,
+        proj_bottleneck_dim: int = 256,
     ):
         """
         Args:
@@ -523,8 +528,14 @@ class PackedSequenceEncoder(nn.Module):
             drop_rate: Dropout rate
             attn_drop_rate: Attention dropout rate
             drop_path_rate: Stochastic depth rate
+            norm_layer: Normalization layer
+            proj_output_dim: Output dimension for projection head
+            proj_hidden_dim: Hidden dimension for projection head
+            proj_bottleneck_dim: Bottleneck dimension for projection head
         """
         super().__init__()
+
+        self.embed_dim = embed_dim
 
         # Residue embedding
         self.residue_embed = ResidueEmbedding(
@@ -532,78 +543,80 @@ class PackedSequenceEncoder(nn.Module):
             embed_dim=embed_dim,
         )
 
-        # Transformer encoder
-        self.encoder = StructureTransformerEncoder(
-            dim=embed_dim,
-            depth=depth,
-            num_heads=num_heads,
-            mlp_ratio=mlp_ratio,
-            qkv_bias=qkv_bias,
-            drop_rate=drop_rate,
-            attn_drop_rate=attn_drop_rate,
-            drop_path_rate=drop_path_rate,
+        # Stochastic depth decay rule (linearly increase drop_path across blocks)
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
+
+        # Build transformer blocks
+        self.blocks = nn.ModuleList([
+            TransformerBlock(
+                dim=embed_dim,
+                num_heads=num_heads,
+                mlp_ratio=mlp_ratio,
+                qkv_bias=qkv_bias,
+                drop=drop_rate,
+                attn_drop=attn_drop_rate,
+                drop_path=dpr[i],
+                norm_layer=norm_layer,
+            )
+            for i in range(depth)
+        ])
+
+        # Final layer norm
+        self.norm = norm_layer(embed_dim)
+
+        # Shared projection head for both DINO and iBOT losses
+        self.projection_head = ProjectionHead(
+            input_dim=embed_dim,
+            output_dim=proj_output_dim,
+            hidden_dim=proj_hidden_dim,
+            bottleneck_dim=proj_bottleneck_dim,
         )
 
     def forward(
         self,
         structures: list[torch.Tensor],
-    ) -> list[torch.Tensor]:
+        return_projected: bool = True,
+    ) -> dict[str, list[torch.Tensor]]:
         """
         Args:
             structures: List of protein structures, each [n_residues_i, n_atoms, 3]
+            return_projected: Whether to return projected embeddings
 
         Returns:
-            encoded: List of encoded structures, each [n_residues_i, embed_dim]
+            Dictionary containing:
+                'backbone': List of backbone embeddings [n_residues_i, embed_dim]
+                'projected': List of projected embeddings [n_residues_i, proj_output_dim] (if return_projected=True)
         """
         # Pack sequences
         packed, attention_mask, lengths = pack_protein_batch(structures)
 
         # Embed residues (no batch dimension needed)
-        embedded = self.residue_embed(packed)  # [total_residues, embed_dim]
+        x = self.residue_embed(packed)  # [total_residues, embed_dim]
 
         # Add batch dimension for transformer
-        embedded = embedded.unsqueeze(0)  # [1, total_residues, embed_dim]
+        x = x.unsqueeze(0)  # [1, total_residues, embed_dim]
 
-        # Encode with transformer
-        encoded = self.encoder(embedded, attn_mask=attention_mask)  # [1, total_residues, embed_dim]
-        encoded = encoded.squeeze(0)  # [total_residues, embed_dim]
+        # Process through transformer blocks
+        for block in self.blocks:
+            x = block(x, attn_mask=attention_mask)
+
+        # Apply final layer norm
+        x = self.norm(x)
+
+        # Remove batch dimension
+        x = x.squeeze(0)  # [total_residues, embed_dim]
 
         # Unpack sequences
-        outputs = unpack_sequences(encoded, lengths)
+        backbone_outputs = unpack_sequences(x, lengths)
+
+        # Prepare return dictionary
+        outputs = {'backbone': backbone_outputs}
+
+        # Apply projection head if requested
+        if return_projected:
+            # Project each sequence through the projection head
+            projected_outputs = [self.projection_head(seq) for seq in backbone_outputs]
+            outputs['projected'] = projected_outputs
 
         return outputs
 
-
-# eventually will need 2 MLPs for the iBOT and DINO losses. 
-
-
-
-# Example usage
-if __name__ == "__main__":
-    # Single transformer block example
-    block = TransformerBlock(
-        dim=768,
-        num_heads=12,
-        mlp_ratio=4.0,
-    )
-
-    x = torch.randn(2, 197, 768)  # [batch_size, seq_len, dim]
-    out = block(x)
-    print(f"Input shape: {x.shape}")
-    print(f"Output shape: {out.shape}")
-
-    # Full encoder example
-    encoder = VisionTransformerEncoder(
-        dim=768,
-        depth=12,
-        num_heads=12,
-    )
-
-    out = encoder(x)
-    print(f"Encoder output shape: {out.shape}")
-
-    # With patch embeddings
-    patch_embed = PatchEmbedding(img_size=224, patch_size=16, embed_dim=768)
-    img = torch.randn(2, 3, 224, 224)
-    patches = patch_embed(img)
-    print(f"Patch embeddings shape: {patches.shape}")
