@@ -1,6 +1,5 @@
 .venv/
 wandb/
-uv.lock
 true_structure_mini.pdb.tar.gz
 checkpoints/
 psp-lite/
