@@ -2,6 +2,13 @@
 wandb/
 uv.lock
 true_structure_mini.pdb.tar.gz
-true_structure_mini.pdb.tar.gz.st
 checkpoints/
 psp-lite/
+# Python cache files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# macOS system files
+.DS_Store
