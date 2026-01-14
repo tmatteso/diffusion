@@ -2,10 +2,10 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+import wandb
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
-import wandb
 from diffusion.data_pipeline import RandomRotationTranslation3D, create_dataloader
 from diffusion.encoder_architecture import PackedSequenceEncoder
 from diffusion.encoder_losses import DINOv2Loss
