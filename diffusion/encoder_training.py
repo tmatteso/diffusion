@@ -103,6 +103,7 @@ class ProteinEncoderTrainer:
 
         self.global_step = 0
         self.epoch = 0
+        self.save_dir = None
 
     def train_epoch(self, dataloader):
         """
@@ -121,6 +122,10 @@ class ProteinEncoderTrainer:
         num_batches = 0
 
         for batch_idx, batch in enumerate(dataloader):
+            # Skip batches where all samples were filtered out
+            if batch is None:
+                continue
+
             # Get protein structures
             structures = batch['coords']  # List of [n_residues, n_atoms, 3]
 
@@ -142,17 +147,41 @@ class ProteinEncoderTrainer:
             teacher_cls = [out.mean(dim=0, keepdim=True) for out in teacher_projected]
 
             # For iBOT loss: use PROJECTED residue embeddings as patch tokens
-            # Stack into batch format [B, N, D] where B=batch_size, N=n_residues, D=proj_dim
-            # Since sequences have different lengths, we'll process each separately
-            # For now, we'll use the first structure in the batch as a simple approach
+            # Process all structures in the batch by padding them to same length
             if len(student_projected) > 0:
-                student_patch_tokens = student_projected[0].unsqueeze(0)
-                teacher_patch_tokens = teacher_projected[0].unsqueeze(0)
+                # Stack all structures: each becomes a separate batch item
+                # Result: [B, N, D] where B=batch_size, N=max_residues (padded), D=proj_dim
+                max_residues = max(s.shape[0] for s in student_projected)
+                batch_size = len(student_projected)
+                proj_dim = student_projected[0].shape[1]
 
-                # Create random mask for iBOT (mask residues for prediction)
-                # Shape: [B, N] with True = masked (used in loss), False = not masked
-                n_residues = student_patch_tokens.shape[1]
-                student_masks = torch.rand(1, n_residues, device=student_patch_tokens.device) < self.mask_ratio
+                # Initialize padded tensors
+                student_patch_tokens = torch.zeros(
+                    batch_size, max_residues, proj_dim,
+                    device=student_projected[0].device,
+                    dtype=student_projected[0].dtype
+                )
+                teacher_patch_tokens = torch.zeros(
+                    batch_size, max_residues, proj_dim,
+                    device=teacher_projected[0].device,
+                    dtype=teacher_projected[0].dtype
+                )
+                student_masks = torch.zeros(
+                    batch_size, max_residues,
+                    device=student_projected[0].device,
+                    dtype=torch.bool
+                )
+
+                # Fill in the data and create masks for each structure
+                for i, (s_proj, t_proj) in enumerate(zip(student_projected, teacher_projected)):
+                    n_res = s_proj.shape[0]
+                    student_patch_tokens[i, :n_res] = s_proj
+                    teacher_patch_tokens[i, :n_res] = t_proj
+
+                    # Create random mask for iBOT (mask residues for prediction)
+                    # Only mask actual residues, not padding
+                    mask = torch.rand(n_res, device=s_proj.device) < self.mask_ratio
+                    student_masks[i, :n_res] = mask
             else:
                 student_patch_tokens = None
                 teacher_patch_tokens = None
@@ -172,6 +201,20 @@ class ProteinEncoderTrainer:
             # Backward pass
             self.optimizer.zero_grad()
             loss.backward()
+
+            # Compute gradient norm before clipping for logging
+            total_norm = 0.0
+            for p in self.student.parameters():
+                if p.grad is not None:
+                    param_norm = p.grad.data.norm(2)
+                    total_norm += param_norm.item() ** 2
+            total_norm = total_norm ** 0.5
+
+            # Gradient clipping (similar to AlphaFold/transformers)
+            torch.nn.utils.clip_grad_norm_(self.student.parameters(), max_norm=1.0)
+
+            #print(f"Gradient norm: {total_norm:.2g}, Loss: {loss.item():.4f}")
+
             self.optimizer.step()
 
             # Update teacher with EMA
@@ -183,20 +226,30 @@ class ProteinEncoderTrainer:
                 epoch_losses[key] += value.item()
             num_batches += 1
 
-            if self.use_wandb and self.global_step % 10 == 0:
+            # Log to wandb and print every 10 batches
+            if self.global_step % 10 == 0:
                 log_dict = {
                     f'train/{key}': value.item()
                     for key, value in losses.items()
                 }
                 log_dict['train/lr'] = self.optimizer.param_groups[0]['lr']
+                log_dict['train/gradient_norm'] = total_norm
                 log_dict['train/step'] = self.global_step
-                wandb.log(log_dict, step=self.global_step)
+
+                if self.use_wandb:
+                    wandb.log(log_dict, step=self.global_step)
+
+                # Print losses
+                loss_str = ", ".join([f"{key}: {value.item():.4f}" for key, value in losses.items()])
+                print(f"Step {self.global_step}: {loss_str}, grad_norm: {total_norm:.2g}, lr: {self.optimizer.param_groups[0]['lr']:.2e}")
 
             self.global_step += 1
 
-            if batch_idx % 10 == 0:
-                print(f"Epoch {self.epoch} | Batch {batch_idx}/{len(dataloader)} | "
-                      f"Loss: {loss.item():.4f}")
+            # Save checkpoint every 10 batches
+            if self.global_step % 10 == 0 and hasattr(self, 'save_dir') and self.save_dir:
+                checkpoint_path = self.save_dir / f"checkpoint_step_{self.global_step}.pt"
+                self.save_checkpoint(checkpoint_path)
+                #print(f"Saved checkpoint at step {self.global_step}")
 
         # Average losses
         for key in epoch_losses:
@@ -222,14 +275,11 @@ class ProteinEncoderTrainer:
             save_dir: Directory to save checkpoints
         """
         if save_dir:
-            save_dir = Path(save_dir)
-            save_dir.mkdir(parents=True, exist_ok=True)
+            self.save_dir = Path(save_dir)
+            self.save_dir.mkdir(parents=True, exist_ok=True)
 
         for epoch in range(num_epochs):
             self.epoch = epoch
-            print(f"\n{'='*50}")
-            print(f"Epoch {epoch + 1}/{num_epochs}")
-            print(f"{'='*50}")
 
             # Train for one epoch
             epoch_losses = self.train_epoch(dataloader)
@@ -238,26 +288,11 @@ class ProteinEncoderTrainer:
             if self.scheduler:
                 self.scheduler.step()
 
-            # Log epoch summary
-            print(f"\nEpoch {epoch + 1} Summary:")
-            for key, value in epoch_losses.items():
-                print(f"  {key}: {value:.4f}")
-
-            if self.use_wandb:
-                wandb.log({
-                    f'epoch/{key}': value
-                    for key, value in epoch_losses.items()
-                }, step=self.global_step)
-
-            # Save checkpoint
-            if save_dir and (epoch + 1) % 10 == 0:
-                self.save_checkpoint(save_dir / f"checkpoint_epoch_{epoch + 1}.pt")
-
         print("\nTraining complete!")
 
         # Save final model
-        if save_dir:
-            self.save_checkpoint(save_dir / "final_model.pt")
+        if self.save_dir:
+            self.save_checkpoint(self.save_dir / "final_model.pt")
 
     def save_checkpoint(self, path: str):
         """Save model checkpoint."""
@@ -273,7 +308,7 @@ class ProteinEncoderTrainer:
             checkpoint['scheduler_state_dict'] = self.scheduler.state_dict()
 
         torch.save(checkpoint, path)
-        print(f"Checkpoint saved to {path}")
+        #print(f"Checkpoint saved to {path}")
 
     def load_checkpoint(self, path: str):
         """Load model checkpoint."""
@@ -325,20 +360,20 @@ def main():
     config = {
         # Model architecture
         'n_atoms': 37,
-        'embed_dim': 768,
+        'embed_dim': 768 // 4,
         'depth': 12,
-        'num_heads': 12,
+        'num_heads': 12 // 2,
         'mlp_ratio': 4.0,
 
         # Projection head parameters
-        'proj_output_dim': 65536,  # Projection space dimension (DINOv2 default)
-        'proj_hidden_dim': 2048,  # Projection head hidden dimension
-        'proj_bottleneck_dim': 256,  # Projection head bottleneck dimension
+        'proj_output_dim': 65536 // 16,  # Projection space dimension (DINOv2 default)
+        'proj_hidden_dim': 2048 // 16,  # Projection head hidden dimension
+        'proj_bottleneck_dim': 256 // 16,  # Projection head bottleneck dimension
 
         # Training hyperparameters
-        'batch_size': 4,
+        'batch_size': 32 // 2, #4,
         'num_epochs': 100,
-        'lr': 1e-4,
+        'lr': 1e-4 / 10000,
         'weight_decay': 0.05,
 
         # DINOv2 loss parameters (from paper)
@@ -348,12 +383,12 @@ def main():
         'warmup_teacher_temp_epochs': 30,  # Warmup epochs
         'student_temp': 0.1,  # Student temperature (fixed)
         'lambda_koleo': 0.1,  # KoLeo loss weight (paper default)
-        'lambda_ibot': 1.0,  # iBOT loss weight (paper default)
+        'lambda_ibot': 10.0, #1.0,  # iBOT loss weight (paper default)
         'mask_ratio': 0.15,  # Residue masking ratio for iBOT (BERT/iBOT default)
 
         # Data
-        'pdb_dir': 'CASP14/',
-        'file_pattern': 'T*.pdb',
+        'pdb_dir':  'psp-lite/',# 'CASP14/', #'psp-lite/',
+        'file_pattern': '*.pdb',
 
         # Logging
         'save_dir': 'checkpoints',
@@ -426,7 +461,7 @@ def main():
 
     # Create dataloader
     print("Creating dataloader...")
-    transform = RandomRotationTranslation3D(translation_range=0.0)
+    transform = RandomRotationTranslation3D(translation_range=5.0)
     dataloader = create_dataloader(
         pdb_dir=config['pdb_dir'],
         batch_size=config['batch_size'],
@@ -436,8 +471,16 @@ def main():
         file_pattern=config['file_pattern'],
     )
 
+    # Print model info
+    total_params = sum(p.numel() for p in student.parameters())
+    trainable_params = sum(p.numel() for p in student.parameters() if p.requires_grad)
+    print(f"\nModel Parameters:")
+    print(f"  Total: {total_params:,}")
+    print(f"  Trainable: {trainable_params:,}")
+    print(f"  Size: {total_params * 4 / 1024**2:.2f} MB (fp32)")
+
     # Create trainer
-    print("Creating trainer...")
+    print("\nCreating trainer...")
     trainer = ProteinEncoderTrainer(
         student=student,
         teacher=teacher,

@@ -1,4 +1,5 @@
 import os
+import json
 from pathlib import Path
 from typing import Optional, Callable, Union
 
@@ -75,6 +76,9 @@ class ProteinStructureDataset(Dataset):
     Dataset for loading protein structures from PDB files.
 
     Returns atom coordinates in the format [n_residues, n_atoms, 3].
+
+    For large datasets (>10k files), uses lazy filtering to avoid slow initialization.
+    Optionally supports metadata caching to speed up filtering.
     """
 
     def __init__(
@@ -83,6 +87,10 @@ class ProteinStructureDataset(Dataset):
         atom_types: list[str] = ATOM_TYPES,
         transform: Optional[Callable] = None,
         file_pattern: str = "*.pdb",
+        max_residues: Optional[int] = 256,
+        lazy_filter: bool = True,
+        cache_metadata: bool = True,
+        metadata_cache_file: Optional[str] = None,
     ):
         """
         Args:
@@ -90,36 +98,168 @@ class ProteinStructureDataset(Dataset):
             atom_types: List of atom types to extract
             transform: Optional transform to apply to coordinates
             file_pattern: Glob pattern to match PDB files
+            max_residues: Maximum number of residues allowed. Files with more residues are skipped.
+                         Set to None to disable filtering.
+            lazy_filter: If True, filter during __getitem__ instead of __init__ (much faster for large datasets).
+                        If False, filter during __init__ (slower but provides accurate dataset size).
+            cache_metadata: If True, cache residue counts to disk for faster subsequent initialization.
+            metadata_cache_file: Path to metadata cache file. If None, uses "{pdb_dir}/.metadata_cache.json"
         """
         self.pdb_dir = Path(pdb_dir)
         self.atom_types = atom_types
         self.transform = transform
+        self.max_residues = max_residues
+        self.lazy_filter = lazy_filter
+        self.cache_metadata = cache_metadata
+
+        # Set up metadata cache
+        if metadata_cache_file is None:
+            self.metadata_cache_file = self.pdb_dir / ".metadata_cache.json"
+        else:
+            self.metadata_cache_file = Path(metadata_cache_file)
+
+        # Load metadata cache if available
+        self.metadata = self._load_metadata_cache() if cache_metadata else {}
 
         # Find all PDB files
-        self.pdb_files = sorted(list(self.pdb_dir.glob(file_pattern)))
+        all_pdb_files = sorted(list(self.pdb_dir.glob(file_pattern)))
 
-        if len(self.pdb_files) == 0:
+        if len(all_pdb_files) == 0:
             raise ValueError(f"No PDB files found in {pdb_dir} matching {file_pattern}")
 
-        print(f"Found {len(self.pdb_files)} PDB files in {pdb_dir}")
+        # Fast initialization: lazy filtering
+        if lazy_filter:
+            self.pdb_files = all_pdb_files
+            print(f"Found {len(self.pdb_files)} PDB files in {pdb_dir}")
+            if max_residues is not None:
+                print(f"Using lazy filtering (max_residues={max_residues})")
+                print(f"Files exceeding {max_residues} residues will be skipped during iteration")
+        else:
+            # Slow but accurate: filter during initialization
+            self.pdb_files = []
+            excluded_count = 0
+
+            for pdb_file in all_pdb_files:
+                try:
+                    n_residues = self._get_residue_count(pdb_file)
+                    if max_residues is None or n_residues <= max_residues:
+                        self.pdb_files.append(pdb_file)
+                    else:
+                        excluded_count += 1
+                except Exception as e:
+                    print(f"Warning: Could not parse {pdb_file.name}: {e}")
+                    excluded_count += 1
+
+            print(f"Found {len(all_pdb_files)} PDB files in {pdb_dir}")
+            if max_residues is not None:
+                print(f"Excluded {excluded_count} files with >{max_residues} residues or parsing errors")
+            print(f"Using {len(self.pdb_files)} PDB files")
+
+            if len(self.pdb_files) == 0:
+                raise ValueError(f"No valid PDB files remaining after filtering")
+
+            # Save updated metadata cache
+            if self.cache_metadata:
+                self._save_metadata_cache()
+
+    def _load_metadata_cache(self) -> dict:
+        """Load metadata cache from disk."""
+        if self.metadata_cache_file.exists():
+            try:
+                with open(self.metadata_cache_file, 'r') as f:
+                    return json.load(f)
+            except Exception as e:
+                print(f"Warning: Could not load metadata cache: {e}")
+        return {}
+
+    def _save_metadata_cache(self):
+        """Save metadata cache to disk."""
+        try:
+            with open(self.metadata_cache_file, 'w') as f:
+                json.dump(self.metadata, f)
+        except Exception as e:
+            print(f"Warning: Could not save metadata cache: {e}")
+
+    def _get_residue_count(self, pdb_path: Path) -> int:
+        """
+        Get residue count from cache or by counting.
+
+        Args:
+            pdb_path: Path to PDB file
+
+        Returns:
+            Number of residues
+        """
+        filename = pdb_path.name
+
+        # Check cache first
+        if filename in self.metadata:
+            return self.metadata[filename]['n_residues']
+
+        # Count residues
+        n_residues = self._count_residues(pdb_path)
+
+        # Update cache
+        if self.cache_metadata:
+            self.metadata[filename] = {'n_residues': n_residues}
+
+        return n_residues
+
+    def _count_residues(self, pdb_path: Path) -> int:
+        """
+        Count the number of residues in a PDB file without parsing all atoms.
+
+        Args:
+            pdb_path: Path to PDB file
+
+        Returns:
+            Number of residues
+        """
+        residue_numbers = set()
+        with open(pdb_path, 'r') as f:
+            for line in f:
+                if line.startswith('ATOM'):
+                    res_num = int(line[22:26].strip())
+                    residue_numbers.add(res_num)
+        return len(residue_numbers)
 
     def __len__(self) -> int:
         return len(self.pdb_files)
 
-    def __getitem__(self, idx: int) -> dict:
+    def __getitem__(self, idx: int) -> Optional[dict]:
         """
         Returns:
             Dictionary containing:
                 - coords: Tensor [n_residues, n_atoms, 3]
                 - filename: Name of the PDB file
                 - n_residues: Number of residues
+            Or None if the file should be skipped (lazy filtering).
         """
         pdb_path = self.pdb_files[idx]
+
+        # Lazy filtering: check size before parsing if max_residues is set
+        if self.lazy_filter and self.max_residues is not None:
+            try:
+                n_residues = self._get_residue_count(pdb_path)
+                if n_residues > self.max_residues:
+                    return None  # Skip this file
+            except Exception:
+                return None  # Skip files that can't be parsed
 
         try:
             coords = parse_pdb_file(str(pdb_path), self.atom_types)
         except Exception as e:
-            raise RuntimeError(f"Error parsing {pdb_path}: {e}")
+            if self.lazy_filter:
+                return None  # Skip files with parsing errors
+            else:
+                raise RuntimeError(f"Error parsing {pdb_path}: {e}")
+
+        # Check size after parsing (double check)
+        if self.max_residues is not None and coords.shape[0] > self.max_residues:
+            if self.lazy_filter:
+                return None
+            else:
+                raise ValueError(f"File {pdb_path.name} has {coords.shape[0]} residues (max: {self.max_residues})")
 
         if self.transform is not None:
             coords = self.transform(coords)
@@ -131,21 +271,29 @@ class ProteinStructureDataset(Dataset):
         }
 
 
-def packed_collate_fn(batch: list[dict]) -> dict:
+def packed_collate_fn(batch: list[Optional[dict]]) -> Optional[dict]:
     """
     Collate function using sequence packing (Krell et al. 2022).
 
     No padding - returns list of variable-length sequences for efficient processing.
+    Filters out None values (skipped samples from lazy filtering).
 
     Args:
-        batch: List of dictionaries from ProteinStructureDataset
+        batch: List of dictionaries from ProteinStructureDataset (may contain None)
 
     Returns:
         Dictionary with:
             - coords: List of tensors, each [n_residues_i, n_atoms, 3]
             - lengths: [batch_size] (sequence lengths)
             - filenames: List of filenames
+        Or None if all samples were filtered out.
     """
+    # Filter out None values (skipped samples)
+    batch = [item for item in batch if item is not None]
+
+    if len(batch) == 0:
+        return None  # All samples were filtered out
+
     coords_list = [item['coords'] for item in batch]
     filenames = [item['filename'] for item in batch]
     lengths = torch.tensor([item['n_residues'] for item in batch])
@@ -164,6 +312,9 @@ def create_dataloader(
     num_workers: int = 0,
     transform: Optional[Callable] = None,
     file_pattern: str = "*.pdb",
+    max_residues: Optional[int] = 256,
+    lazy_filter: bool = True,
+    cache_metadata: bool = True,
 ) -> DataLoader:
     """
     Create a DataLoader for protein structures with sequence packing.
@@ -175,6 +326,10 @@ def create_dataloader(
         num_workers: Number of worker processes for data loading
         transform: Optional transform to apply to coordinates
         file_pattern: Glob pattern to match PDB files
+        max_residues: Maximum number of residues allowed. Files with more residues are skipped.
+                     Set to None to disable filtering.
+        lazy_filter: If True, filter during iteration (fast init). If False, filter during init (slow).
+        cache_metadata: If True, cache residue counts to disk for faster subsequent runs.
 
     Returns:
         DataLoader instance
@@ -183,6 +338,9 @@ def create_dataloader(
         pdb_dir=pdb_dir,
         transform=transform,
         file_pattern=file_pattern,
+        max_residues=max_residues,
+        lazy_filter=lazy_filter,
+        cache_metadata=cache_metadata,
     )
 
     dataloader = DataLoader(

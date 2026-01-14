@@ -4,17 +4,15 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.nn.functional import scaled_dot_product_attention
-from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.nn.init import trunc_normal_
 from torch.nn.utils import weight_norm
 
 class MultiHeadSelfAttention(nn.Module):
     """
-    Multi-Head Self-Attention using PyTorch's native Flash Attention via SDPA.
+    Multi-Head Self-Attention with manual implementation.
 
-    Uses scaled_dot_product_attention with Flash Attention backend for
-    efficient computation with reduced memory usage.
+    Uses manual attention computation for correct handling of block-diagonal masks
+    in sequence packing (PyTorch's scaled_dot_product_attention has bugs with this pattern).
     """
 
     def __init__(
@@ -71,14 +69,29 @@ class MultiHeadSelfAttention(nn.Module):
         qkv = qkv.permute(2, 0, 3, 1, 4)  # [3, B, H, N, D]
         q, k, v = qkv[0], qkv[1], qkv[2]  # Each is [B, H, N, D]
 
-        # Use PyTorch's scaled_dot_product_attention with Flash Attention backend
-        with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
-            out = scaled_dot_product_attention(
-                q, k, v,
-                attn_mask=attn_mask,
-                dropout_p=self.attn_drop if self.training else 0.0,
-                scale=self.scale,
-            )
+        # Manual attention computation (PyTorch's scaled_dot_product_attention has bugs with block-diagonal masks)
+        # Compute attention scores
+        attn_scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale  # [B, H, N, N]
+
+        # Apply mask if provided
+        if attn_mask is not None:
+            # Ensure mask has correct shape [B, 1, N, N] or [1, 1, N, N]
+            if attn_mask.dim() == 2:
+                attn_mask = attn_mask.unsqueeze(0).unsqueeze(0)  # [N, N] -> [1, 1, N, N]
+            elif attn_mask.dim() == 3:
+                attn_mask = attn_mask.unsqueeze(1)  # [B, N, N] -> [B, 1, N, N]
+
+            attn_scores = attn_scores.masked_fill(attn_mask, float('-inf'))
+
+        # Softmax over keys
+        attn_weights = F.softmax(attn_scores, dim=-1)
+
+        # Apply dropout to attention weights
+        if self.training and self.attn_drop > 0:
+            attn_weights = F.dropout(attn_weights, p=self.attn_drop, training=True)
+
+        # Apply attention to values
+        out = torch.matmul(attn_weights, v)  # [B, H, N, D]
 
         # Reshape back to [batch_size, seq_len, dim]
         out = out.transpose(1, 2).reshape(B, N, C)
@@ -183,7 +196,7 @@ class TransformerBlock(nn.Module):
     """
     Transformer Block with Multi-Head Self-Attention and Feed-Forward Network.
 
-    Uses Flash Attention via PyTorch's scaled_dot_product_attention for efficiency.
+    Uses manual attention computation for correct mask handling.
     Follows pre-norm architecture with residual connections.
     """
 

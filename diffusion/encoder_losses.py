@@ -71,6 +71,7 @@ class DINOLoss(nn.Module):
     @torch.no_grad()
     def update_center(self, teacher_output):
         self.reduce_center_update(teacher_output)
+        self.apply_center_update()
 
     @torch.no_grad()
     def reduce_center_update(self, teacher_output):
@@ -191,6 +192,7 @@ class iBOTPatchLoss(nn.Module):
     @torch.no_grad()
     def update_center(self, teacher_patch_tokens):
         self.reduce_center_update(teacher_patch_tokens)
+        self.apply_center_update()
 
     @torch.no_grad()
     def reduce_center_update(self, teacher_patch_tokens):
@@ -239,11 +241,10 @@ class KoLeoLoss(nn.Module):
         Args:
             student_output (BxD): backbone output of student
         """
-        with torch.cuda.amp.autocast(enabled=False):
-            student_output = F.normalize(student_output, eps=eps, p=2, dim=-1)
-            I = self.pairwise_NNs_inner(student_output)  # noqa: E741
-            distances = self.pdist(student_output, student_output[I])  # BxD, BxD -> B
-            loss = -torch.log(distances + eps).mean()
+        student_output = F.normalize(student_output, eps=eps, p=2, dim=-1)
+        I = self.pairwise_NNs_inner(student_output)  # noqa: E741
+        distances = self.pdist(student_output, student_output[I])  # BxD, BxD -> B
+        loss = -torch.log(distances + eps).mean()
         return loss
 
 
