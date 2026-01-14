@@ -1,7 +1,8 @@
 """Comprehensive tests for iBOT loss."""
-import pytest
+
 import torch
 import torch.nn.functional as F
+
 from diffusion.encoder_losses import iBOTPatchLoss
 
 
@@ -37,8 +38,9 @@ class TestiBOTPatchLoss:
             expected_loss += ce
         expected_loss /= batch_size
 
-        assert torch.allclose(loss, expected_loss, atol=1e-5), \
-            f"Loss mismatch: {loss} != {expected_loss}"
+        assert torch.allclose(
+            loss, expected_loss, atol=1e-5
+        ), f"Loss mismatch: {loss} != {expected_loss}"
 
     def test_no_masked_positions_gives_zero_loss(self):
         """Test that no masked positions gives zero loss."""
@@ -117,8 +119,9 @@ class TestiBOTPatchLoss:
         # Average over batch
         expected_loss /= batch_size
 
-        assert torch.allclose(loss, expected_loss, atol=1e-4), \
-            f"Loss mismatch: {loss} != {expected_loss}"
+        assert torch.allclose(
+            loss, expected_loss, atol=1e-4
+        ), f"Loss mismatch: {loss} != {expected_loss}"
 
     def test_cross_entropy_is_computed_correctly(self):
         """Test that cross-entropy is computed correctly."""
@@ -141,8 +144,9 @@ class TestiBOTPatchLoss:
         student_log_probs = F.log_softmax(student / ibot_loss.student_temp, dim=-1)
         expected_ce = -torch.sum(teacher * student_log_probs)
 
-        assert torch.allclose(loss, expected_ce, atol=1e-5), \
-            f"Cross-entropy mismatch: {loss} != {expected_ce}"
+        assert torch.allclose(
+            loss, expected_ce, atol=1e-5
+        ), f"Cross-entropy mismatch: {loss} != {expected_ce}"
 
     def test_teacher_centering(self):
         """Test that teacher centering works correctly."""
@@ -157,8 +161,9 @@ class TestiBOTPatchLoss:
         ibot_loss.update_center(teacher_patches)
 
         # Center should have updated (no longer all zeros)
-        assert not torch.allclose(ibot_loss.center, torch.zeros(1, 1, patch_out_dim)), \
-            "Center should update"
+        assert not torch.allclose(
+            ibot_loss.center, torch.zeros(1, 1, patch_out_dim)
+        ), "Center should update"
 
         # Center should be in the direction of the data
         mean_teacher = teacher_patches.mean(dim=(0, 1))
@@ -215,10 +220,12 @@ class TestiBOTPatchLoss:
         loss_perfect = ibot_loss(student_perfect, teacher_softmaxed, masks)
 
         # Loss should decrease as predictions improve
-        assert loss_good < loss_bad, \
-            f"Loss should decrease with better predictions: {loss_good} >= {loss_bad}"
-        assert loss_perfect < loss_good, \
-            f"Perfect predictions should have lowest loss: {loss_perfect} >= {loss_good}"
+        assert (
+            loss_good < loss_bad
+        ), f"Loss should decrease with better predictions: {loss_good} >= {loss_bad}"
+        assert (
+            loss_perfect < loss_good
+        ), f"Perfect predictions should have lowest loss: {loss_perfect} >= {loss_good}"
 
     def test_gradient_flow(self):
         """Test that gradients flow correctly."""
@@ -242,8 +249,9 @@ class TestiBOTPatchLoss:
             for n in range(n_patches):
                 if masks[b, n]:
                     # Masked position should have gradient
-                    assert student_patches.grad[b, n].abs().sum() > 0, \
-                        f"Masked position [{b},{n}] should have gradient"
+                    assert (
+                        student_patches.grad[b, n].abs().sum() > 0
+                    ), f"Masked position [{b},{n}] should have gradient"
 
     def test_temperature_effect(self):
         """Test that student temperature affects loss magnitude."""
@@ -286,8 +294,9 @@ class TestiBOTPatchLoss:
         loss_batch = ibot_loss(student_batch, teacher_softmaxed_batch, masks_batch)
 
         # Losses should be the same (averaged over identical samples)
-        assert torch.allclose(loss_1, loss_batch, atol=1e-5), \
-            f"Batch loss should match single sample: {loss_1} != {loss_batch}"
+        assert torch.allclose(
+            loss_1, loss_batch, atol=1e-5
+        ), f"Batch loss should match single sample: {loss_1} != {loss_batch}"
 
     def test_numerical_stability_with_extreme_values(self):
         """Test numerical stability with extreme input values."""
@@ -363,5 +372,6 @@ class TestiBOTPatchLoss:
         loss2 = ibot_loss(student_perm, teacher_softmaxed_perm, masks_perm)
 
         # Losses should be similar (might differ slightly due to centering)
-        assert abs(loss1 - loss2) < 1.0, \
-            f"Loss should be approximately invariant to permutation: {loss1} vs {loss2}"
+        assert (
+            abs(loss1 - loss2) < 1.0
+        ), f"Loss should be approximately invariant to permutation: {loss1} vs {loss2}"

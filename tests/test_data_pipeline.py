@@ -1,6 +1,7 @@
 """Tests for data pipeline components."""
-import pytest
+
 import torch
+
 from diffusion.data_pipeline import RandomRotationTranslation3D
 
 
@@ -21,10 +22,12 @@ class TestRandomRotationTranslation3D:
         transform = RandomRotationTranslation3D(translation_range=0.0)  # No translation
 
         # Create a simple structure
-        coords = torch.tensor([
-            [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],  # Residue 1
-            [[2.0, 0.0, 0.0], [3.0, 0.0, 0.0], [2.0, 1.0, 0.0]],  # Residue 2
-        ])
+        coords = torch.tensor(
+            [
+                [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],  # Residue 1
+                [[2.0, 0.0, 0.0], [3.0, 0.0, 0.0], [2.0, 1.0, 0.0]],  # Residue 2
+            ]
+        )
 
         # Compute original pairwise distances
         coords_flat = coords.reshape(-1, 3)
@@ -36,8 +39,9 @@ class TestRandomRotationTranslation3D:
         dists_rotated = torch.cdist(output_flat, output_flat)
 
         # Distances should be preserved
-        assert torch.allclose(dists_orig, dists_rotated, atol=1e-5), \
-            "Rotation does not preserve distances (not orthogonal)"
+        assert torch.allclose(
+            dists_orig, dists_rotated, atol=1e-5
+        ), "Rotation does not preserve distances (not orthogonal)"
 
     def test_translation_range(self):
         """Test that translation is within specified range."""
@@ -60,8 +64,9 @@ class TestRandomRotationTranslation3D:
             max_translation_seen = max(max_translation_seen, translation_magnitude)
 
         # Translation should be within range
-        assert max_translation_seen <= translation_range * 1.732 + 0.1, \
-            f"Translation {max_translation_seen} exceeds range {translation_range}"
+        assert (
+            max_translation_seen <= translation_range * 1.732 + 0.1
+        ), f"Translation {max_translation_seen} exceeds range {translation_range}"
 
     def test_zero_translation_range(self):
         """Test with zero translation range (rotation only)."""
@@ -77,8 +82,9 @@ class TestRandomRotationTranslation3D:
 
         # With zero translation, center of mass should only be rotated
         # The magnitude should be preserved
-        assert torch.allclose(com_orig.norm(), com_rotated.norm(), atol=1e-5), \
-            "Zero translation should preserve COM distance from origin"
+        assert torch.allclose(
+            com_orig.norm(), com_rotated.norm(), atol=1e-5
+        ), "Zero translation should preserve COM distance from origin"
 
     def test_deterministic_with_seed(self):
         """Test that transform is deterministic when seed is set."""
@@ -93,8 +99,9 @@ class TestRandomRotationTranslation3D:
         torch.manual_seed(42)
         output2 = transform(coords.clone())
 
-        assert torch.allclose(output1, output2, atol=1e-6), \
-            "Transform should be deterministic with same seed"
+        assert torch.allclose(
+            output1, output2, atol=1e-6
+        ), "Transform should be deterministic with same seed"
 
     def test_randomness_without_seed(self):
         """Test that transform is random without seed."""
@@ -147,7 +154,7 @@ class TestRandomRotationTranslation3D:
 
         # We need to extract the rotation matrix used internally
         # We'll do this by applying to basis vectors
-        basis = torch.eye(3).unsqueeze(0).unsqueeze(0)  # [1, 1, 3, 3]
+        # basis = torch.eye(3).unsqueeze(0).unsqueeze(0)  # [1, 1, 3, 3]
 
         torch.manual_seed(42)
         # Create coords and apply transform
@@ -161,8 +168,8 @@ class TestRandomRotationTranslation3D:
         rotated = transform(coords_simple)
 
         # Rotated vector should have same length as original
-        orig_length = coords_simple.norm()
-        rotated_length = (rotated - rotated.mean()).norm()  # Remove translation
+        # orig_length = coords_simple.norm()
+        # rotated_length = (rotated - rotated.mean()).norm()  # Remove translation
 
         # This test is approximate since we have translation
         # So we just check the vector has reasonable magnitude
@@ -177,12 +184,15 @@ class TestRandomRotationTranslation3D:
                 coords = torch.randn(n_residues, n_atoms, 3)
                 output = transform(coords)
 
-                assert output.shape == coords.shape, \
-                    f"Failed for shape [{n_residues}, {n_atoms}, 3]"
-                assert not torch.isnan(output).any(), \
-                    f"NaN in output for shape [{n_residues}, {n_atoms}, 3]"
-                assert not torch.isinf(output).any(), \
-                    f"Inf in output for shape [{n_residues}, {n_atoms}, 3]"
+                assert (
+                    output.shape == coords.shape
+                ), f"Failed for shape [{n_residues}, {n_atoms}, 3]"
+                assert not torch.isnan(
+                    output
+                ).any(), f"NaN in output for shape [{n_residues}, {n_atoms}, 3]"
+                assert not torch.isinf(
+                    output
+                ).any(), f"Inf in output for shape [{n_residues}, {n_atoms}, 3]"
 
     def test_edge_case_single_atom(self):
         """Test with single atom."""

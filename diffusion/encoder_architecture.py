@@ -1,11 +1,9 @@
-import math
-from typing import Optional
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.init import trunc_normal_
 from torch.nn.utils import weight_norm
+
 
 class MultiHeadSelfAttention(nn.Module):
     """
@@ -37,7 +35,7 @@ class MultiHeadSelfAttention(nn.Module):
         self.dim = dim
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
-        self.scale = self.head_dim ** -0.5
+        self.scale = self.head_dim**-0.5
 
         # QKV projection
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
@@ -52,7 +50,7 @@ class MultiHeadSelfAttention(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        attn_mask: Optional[torch.Tensor] = None,
+        attn_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -69,7 +67,6 @@ class MultiHeadSelfAttention(nn.Module):
         qkv = qkv.permute(2, 0, 3, 1, 4)  # [3, B, H, N, D]
         q, k, v = qkv[0], qkv[1], qkv[2]  # Each is [B, H, N, D]
 
-        # Manual attention computation (PyTorch's scaled_dot_product_attention has bugs with block-diagonal masks)
         # Compute attention scores
         attn_scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale  # [B, H, N, N]
 
@@ -81,7 +78,7 @@ class MultiHeadSelfAttention(nn.Module):
             elif attn_mask.dim() == 3:
                 attn_mask = attn_mask.unsqueeze(1)  # [B, N, N] -> [B, 1, N, N]
 
-            attn_scores = attn_scores.masked_fill(attn_mask, float('-inf'))
+            attn_scores = attn_scores.masked_fill(attn_mask, float("-inf"))
 
         # Softmax over keys
         attn_weights = F.softmax(attn_scores, dim=-1)
@@ -113,8 +110,8 @@ class MLP(nn.Module):
     def __init__(
         self,
         in_features: int,
-        hidden_features: Optional[int] = None,
-        out_features: Optional[int] = None,
+        hidden_features: int | None = None,
+        out_features: int | None = None,
         activation: nn.Module = nn.GELU,
         drop: float = 0.0,
         bias: bool = True,
@@ -254,7 +251,7 @@ class TransformerBlock(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        attn_mask: Optional[torch.Tensor] = None,
+        attn_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -269,7 +266,6 @@ class TransformerBlock(nn.Module):
         x = x + self.drop_path(self.mlp(self.norm2(x)))
 
         return x
-
 
 
 class ResidueEmbedding(nn.Module):
@@ -307,7 +303,7 @@ class ResidueEmbedding(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """
         Args:
             x: Protein structure [n_residues, n_atoms, 3]
@@ -351,7 +347,7 @@ def pack_sequences(
     """
     lengths = [seq.shape[0] for seq in sequences]
     total_len = sum(lengths)
-    dim = sequences[0].shape[-1]
+    # dim = sequences[0].shape[-1]
 
     # Concatenate all sequences
     packed = torch.cat(sequences, dim=0)  # [total_len, dim]
@@ -410,8 +406,8 @@ def pack_protein_batch(
     """
     lengths = [s.shape[0] for s in structures]
     total_len = sum(lengths)
-    n_atoms = structures[0].shape[1]
-    atom_dim = structures[0].shape[2]
+    # n_atoms = structures[0].shape[1]
+    # atom_dim = structures[0].shape[2]
 
     # Concatenate all structures
     packed = torch.cat(structures, dim=0)  # [total_residues, n_atoms, 3]
@@ -502,6 +498,7 @@ class ProjectionHead(nn.Module):
         x = self.last_layer(x)
         return x
 
+
 class PackedSequenceEncoder(nn.Module):
     """
     Encoder that processes packed sequences efficiently (Krell et al. 2022).
@@ -560,19 +557,21 @@ class PackedSequenceEncoder(nn.Module):
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
 
         # Build transformer blocks
-        self.blocks = nn.ModuleList([
-            TransformerBlock(
-                dim=embed_dim,
-                num_heads=num_heads,
-                mlp_ratio=mlp_ratio,
-                qkv_bias=qkv_bias,
-                drop=drop_rate,
-                attn_drop=attn_drop_rate,
-                drop_path=dpr[i],
-                norm_layer=norm_layer,
-            )
-            for i in range(depth)
-        ])
+        self.blocks = nn.ModuleList(
+            [
+                TransformerBlock(
+                    dim=embed_dim,
+                    num_heads=num_heads,
+                    mlp_ratio=mlp_ratio,
+                    qkv_bias=qkv_bias,
+                    drop=drop_rate,
+                    attn_drop=attn_drop_rate,
+                    drop_path=dpr[i],
+                    norm_layer=norm_layer,
+                )
+                for i in range(depth)
+            ]
+        )
 
         # Final layer norm
         self.norm = norm_layer(embed_dim)
@@ -598,7 +597,7 @@ class PackedSequenceEncoder(nn.Module):
         Returns:
             Dictionary containing:
                 'backbone': List of backbone embeddings [n_residues_i, embed_dim]
-                'projected': List of projected embeddings [n_residues_i, proj_output_dim] (if return_projected=True)
+                'projected': List of projected embeddings [n_residues_i, proj_output_dim]
         """
         # Pack sequences
         packed, attention_mask, lengths = pack_protein_batch(structures)
@@ -623,13 +622,12 @@ class PackedSequenceEncoder(nn.Module):
         backbone_outputs = unpack_sequences(x, lengths)
 
         # Prepare return dictionary
-        outputs = {'backbone': backbone_outputs}
+        outputs = {"backbone": backbone_outputs}
 
         # Apply projection head if requested
         if return_projected:
             # Project each sequence through the projection head
             projected_outputs = [self.projection_head(seq) for seq in backbone_outputs]
-            outputs['projected'] = projected_outputs
+            outputs["projected"] = projected_outputs
 
         return outputs
-

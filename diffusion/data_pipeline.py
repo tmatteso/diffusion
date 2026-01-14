@@ -1,26 +1,52 @@
-import os
 import json
+from collections.abc import Callable
 from pathlib import Path
-from typing import Optional, Callable, Union
 
-import torch
-from torch.utils.data import Dataset, DataLoader
 import numpy as np
-
+import torch
+from torch.utils.data import DataLoader, Dataset
 
 # Standard atom order for residues (37 atoms total for all-atom representation)
 # Based on common protein structure representations
 ATOM_TYPES = [
-    'N', 'CA', 'C', 'O',  # Backbone atoms (all residues)
-    'CB',  # Beta carbon (all except Glycine)
+    "N",
+    "CA",
+    "C",
+    "O",  # Backbone atoms (all residues)
+    "CB",  # Beta carbon (all except Glycine)
     # Side chain atoms (residue-specific, padded with zeros if missing)
-    'CG', 'CG1', 'CG2', 'OG', 'OG1', 'OG2', 'SG',
-    'CD', 'CD1', 'CD2', 'OD1', 'OD2', 'SD',
-    'CE', 'CE1', 'CE2', 'CE3', 'OE1', 'OE2', 'NE', 'NE1', 'NE2',
-    'CZ', 'CZ2', 'CZ3', 'NZ', 'OH',
-    'ND1', 'ND2',
-    'NH1', 'NH2',
-    'OXT',  # C-terminal oxygen
+    "CG",
+    "CG1",
+    "CG2",
+    "OG",
+    "OG1",
+    "OG2",
+    "SG",
+    "CD",
+    "CD1",
+    "CD2",
+    "OD1",
+    "OD2",
+    "SD",
+    "CE",
+    "CE1",
+    "CE2",
+    "CE3",
+    "OE1",
+    "OE2",
+    "NE",
+    "NE1",
+    "NE2",
+    "CZ",
+    "CZ2",
+    "CZ3",
+    "NZ",
+    "OH",
+    "ND1",
+    "ND2",
+    "NH1",
+    "NH2",
+    "OXT",  # C-terminal oxygen
 ]
 
 assert len(ATOM_TYPES) == 37, f"Expected 37 atom types, got {len(ATOM_TYPES)}"
@@ -44,9 +70,9 @@ def parse_pdb_file(pdb_path: str, atom_types: list[str] = ATOM_TYPES) -> torch.T
     # Read PDB file and extract ATOM lines
     residues = {}
 
-    with open(pdb_path, 'r') as f:
+    with open(pdb_path) as f:
         for line in f:
-            if line.startswith('ATOM'):
+            if line.startswith("ATOM"):
                 atom_name = line[12:16].strip()
                 res_num = int(line[22:26].strip())
                 x = float(line[30:38].strip())
@@ -83,14 +109,14 @@ class ProteinStructureDataset(Dataset):
 
     def __init__(
         self,
-        pdb_dir: Union[str, Path],
+        pdb_dir: str | Path,
         atom_types: list[str] = ATOM_TYPES,
-        transform: Optional[Callable] = None,
+        transform: Callable | None = None,
         file_pattern: str = "*.pdb",
-        max_residues: Optional[int] = 256,
+        max_residues: int | None = 256,
         lazy_filter: bool = True,
         cache_metadata: bool = True,
-        metadata_cache_file: Optional[str] = None,
+        metadata_cache_file: str | None = None,
     ):
         """
         Args:
@@ -100,10 +126,10 @@ class ProteinStructureDataset(Dataset):
             file_pattern: Glob pattern to match PDB files
             max_residues: Maximum number of residues allowed. Files with more residues are skipped.
                          Set to None to disable filtering.
-            lazy_filter: If True, filter during __getitem__ instead of __init__ (much faster for large datasets).
-                        If False, filter during __init__ (slower but provides accurate dataset size).
-            cache_metadata: If True, cache residue counts to disk for faster subsequent initialization.
-            metadata_cache_file: Path to metadata cache file. If None, uses "{pdb_dir}/.metadata_cache.json"
+            lazy_filter: If True, filter during __getitem__ instead of __init__ (large datasets).
+                        If False, filter during __init__ (slower but provides dataset size).
+            cache_metadata: If True, cache residue counts to disk for faster initialization.
+            metadata_cache_file: Path to metadata cache. If None, "{pdb_dir}/.metadata_cache.json"
         """
         self.pdb_dir = Path(pdb_dir)
         self.atom_types = atom_types
@@ -122,7 +148,7 @@ class ProteinStructureDataset(Dataset):
         self.metadata = self._load_metadata_cache() if cache_metadata else {}
 
         # Find all PDB files
-        all_pdb_files = sorted(list(self.pdb_dir.glob(file_pattern)))
+        all_pdb_files = sorted(self.pdb_dir.glob(file_pattern))
 
         if len(all_pdb_files) == 0:
             raise ValueError(f"No PDB files found in {pdb_dir} matching {file_pattern}")
@@ -140,23 +166,19 @@ class ProteinStructureDataset(Dataset):
             excluded_count = 0
 
             for pdb_file in all_pdb_files:
-                try:
-                    n_residues = self._get_residue_count(pdb_file)
-                    if max_residues is None or n_residues <= max_residues:
-                        self.pdb_files.append(pdb_file)
-                    else:
-                        excluded_count += 1
-                except Exception as e:
-                    print(f"Warning: Could not parse {pdb_file.name}: {e}")
+                n_residues = self._get_residue_count(pdb_file)
+                if max_residues is None or n_residues <= max_residues:
+                    self.pdb_files.append(pdb_file)
+                else:
                     excluded_count += 1
 
             print(f"Found {len(all_pdb_files)} PDB files in {pdb_dir}")
             if max_residues is not None:
-                print(f"Excluded {excluded_count} files with >{max_residues} residues or parsing errors")
+                print(f"Excluded {excluded_count} files with >{max_residues} residues")
             print(f"Using {len(self.pdb_files)} PDB files")
 
             if len(self.pdb_files) == 0:
-                raise ValueError(f"No valid PDB files remaining after filtering")
+                raise ValueError("No valid PDB files remaining after filtering")
 
             # Save updated metadata cache
             if self.cache_metadata:
@@ -166,7 +188,7 @@ class ProteinStructureDataset(Dataset):
         """Load metadata cache from disk."""
         if self.metadata_cache_file.exists():
             try:
-                with open(self.metadata_cache_file, 'r') as f:
+                with open(self.metadata_cache_file) as f:
                     return json.load(f)
             except Exception as e:
                 print(f"Warning: Could not load metadata cache: {e}")
@@ -175,7 +197,7 @@ class ProteinStructureDataset(Dataset):
     def _save_metadata_cache(self):
         """Save metadata cache to disk."""
         try:
-            with open(self.metadata_cache_file, 'w') as f:
+            with open(self.metadata_cache_file, "w") as f:
                 json.dump(self.metadata, f)
         except Exception as e:
             print(f"Warning: Could not save metadata cache: {e}")
@@ -194,14 +216,14 @@ class ProteinStructureDataset(Dataset):
 
         # Check cache first
         if filename in self.metadata:
-            return self.metadata[filename]['n_residues']
+            return self.metadata[filename]["n_residues"]
 
         # Count residues
         n_residues = self._count_residues(pdb_path)
 
         # Update cache
         if self.cache_metadata:
-            self.metadata[filename] = {'n_residues': n_residues}
+            self.metadata[filename] = {"n_residues": n_residues}
 
         return n_residues
 
@@ -216,9 +238,9 @@ class ProteinStructureDataset(Dataset):
             Number of residues
         """
         residue_numbers = set()
-        with open(pdb_path, 'r') as f:
+        with open(pdb_path) as f:
             for line in f:
-                if line.startswith('ATOM'):
+                if line.startswith("ATOM"):
                     res_num = int(line[22:26].strip())
                     residue_numbers.add(res_num)
         return len(residue_numbers)
@@ -226,7 +248,7 @@ class ProteinStructureDataset(Dataset):
     def __len__(self) -> int:
         return len(self.pdb_files)
 
-    def __getitem__(self, idx: int) -> Optional[dict]:
+    def __getitem__(self, idx: int) -> dict | None:
         """
         Returns:
             Dictionary containing:
@@ -245,33 +267,27 @@ class ProteinStructureDataset(Dataset):
                     return None  # Skip this file
             except Exception:
                 return None  # Skip files that can't be parsed
-
-        try:
-            coords = parse_pdb_file(str(pdb_path), self.atom_types)
-        except Exception as e:
-            if self.lazy_filter:
-                return None  # Skip files with parsing errors
-            else:
-                raise RuntimeError(f"Error parsing {pdb_path}: {e}")
-
+        coords = parse_pdb_file(str(pdb_path), self.atom_types)
         # Check size after parsing (double check)
         if self.max_residues is not None and coords.shape[0] > self.max_residues:
             if self.lazy_filter:
                 return None
             else:
-                raise ValueError(f"File {pdb_path.name} has {coords.shape[0]} residues (max: {self.max_residues})")
+                raise ValueError(
+                    f"File {pdb_path.name} has {coords.shape[0]} residues, >{self.max_residues})"
+                )
 
         if self.transform is not None:
             coords = self.transform(coords)
 
         return {
-            'coords': coords,
-            'filename': pdb_path.name,
-            'n_residues': coords.shape[0],
+            "coords": coords,
+            "filename": pdb_path.name,
+            "n_residues": coords.shape[0],
         }
 
 
-def packed_collate_fn(batch: list[Optional[dict]]) -> Optional[dict]:
+def packed_collate_fn(batch: list[dict | None]) -> dict | None:
     """
     Collate function using sequence packing (Krell et al. 2022).
 
@@ -294,25 +310,25 @@ def packed_collate_fn(batch: list[Optional[dict]]) -> Optional[dict]:
     if len(batch) == 0:
         return None  # All samples were filtered out
 
-    coords_list = [item['coords'] for item in batch]
-    filenames = [item['filename'] for item in batch]
-    lengths = torch.tensor([item['n_residues'] for item in batch])
+    coords_list = [item["coords"] for item in batch]
+    filenames = [item["filename"] for item in batch]
+    lengths = torch.tensor([item["n_residues"] for item in batch])
 
     return {
-        'coords': coords_list,
-        'lengths': lengths,
-        'filenames': filenames,
+        "coords": coords_list,
+        "lengths": lengths,
+        "filenames": filenames,
     }
 
 
 def create_dataloader(
-    pdb_dir: Union[str, Path],
+    pdb_dir: str | Path,
     batch_size: int = 8,
     shuffle: bool = True,
     num_workers: int = 0,
-    transform: Optional[Callable] = None,
+    transform: Callable | None = None,
     file_pattern: str = "*.pdb",
-    max_residues: Optional[int] = 256,
+    max_residues: int | None = 256,
     lazy_filter: bool = True,
     cache_metadata: bool = True,
 ) -> DataLoader:
@@ -328,7 +344,7 @@ def create_dataloader(
         file_pattern: Glob pattern to match PDB files
         max_residues: Maximum number of residues allowed. Files with more residues are skipped.
                      Set to None to disable filtering.
-        lazy_filter: If True, filter during iteration (fast init). If False, filter during init (slow).
+        lazy_filter: If True, filter during iteration (fast). If False, filter during init (slow).
         cache_metadata: If True, cache residue counts to disk for faster subsequent runs.
 
     Returns:
@@ -482,6 +498,7 @@ class RandomRotationTranslation3D:
         coords_final = coords_rotated + translation.unsqueeze(0).unsqueeze(0)
 
         return coords_final
+
 
 # what are we doing now?
 # I want to make sure we are computing the loss correctly.

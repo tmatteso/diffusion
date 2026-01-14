@@ -1,0 +1,21 @@
+{
+  "recommendations": [
+    // Python support
+    "ms-python.python",
+
+    // Ruff linter and formatter (recommended - fast and comprehensive)
+    "charliermarsh.ruff",
+
+    // Black formatter (alternative to Ruff formatting)
+    "ms-python.black-formatter",
+
+    // Pytest support
+    "ms-python.vscode-pylance",
+
+    // Jupyter notebooks
+    "ms-toolsai.jupyter",
+
+    // Git integration
+    "eamodio.gitlens"
+  ]
+}

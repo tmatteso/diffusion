@@ -1,0 +1,54 @@
+{
+  // Python settings
+  "python.defaultInterpreterPath": "${workspaceFolder}/.venv/bin/python",
+
+  // Ruff linter configuration
+  "[python]": {
+    "editor.defaultFormatter": "charliermarsh.ruff",
+    "editor.formatOnSave": true,
+    "editor.codeActionsOnSave": {
+      "source.organizeImports": "explicit",
+      "source.fixAll": "explicit"
+    }
+  },
+
+  // Enable Ruff for linting
+  "ruff.enable": true,
+  "ruff.lint.enable": true,
+  "ruff.format.args": [],
+  "ruff.lint.args": [],
+  "ruff.importStrategy": "fromEnvironment",
+
+  // Black formatter configuration (alternative to Ruff)
+  "black-formatter.args": [
+    "--config",
+    "${workspaceFolder}/pyproject.toml"
+  ],
+
+  // Show linting errors inline
+  "python.linting.enabled": true,
+  "python.linting.ruffEnabled": true,
+
+  // Editor settings for better Python experience
+  "editor.rulers": [100],
+  "files.trimTrailingWhitespace": true,
+  "files.insertFinalNewline": true,
+
+  // Test configuration
+  "python.testing.pytestEnabled": true,
+  "python.testing.pytestArgs": [
+    "tests",
+    "-v"
+  ],
+
+  // File exclusions
+  "files.exclude": {
+    "**/__pycache__": true,
+    "**/*.pyc": true,
+    "**/.pytest_cache": true,
+    "**/.ruff_cache": true
+  },
+
+  // Jupyter
+  "jupyter.widgetScriptSources": ["jsdelivr.com", "unpkg.com"]
+}

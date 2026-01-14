@@ -3,14 +3,14 @@ Comprehensive tests for encoder loss functions.
 
 Tests for numerical stability, gradient flow, and correctness of DINO, KoLeo, and iBOT losses.
 """
-import pytest
+
 import torch
-import torch.nn as nn
+
 from diffusion.encoder_losses import (
     DINOLoss,
+    DINOv2Loss,
     KoLeoLoss,
     iBOTPatchLoss,
-    DINOv2Loss,
 )
 
 
@@ -27,8 +27,7 @@ class TestDINOLoss:
 
         # Process teacher output
         teacher_softmaxed = [
-            dino_loss.softmax_center_teacher(t, teacher_temp=0.07)
-            for t in teacher_output
+            dino_loss.softmax_center_teacher(t, teacher_temp=0.07) for t in teacher_output
         ]
 
         loss = dino_loss(student_output, teacher_softmaxed)
@@ -60,8 +59,7 @@ class TestDINOLoss:
         teacher_output = [torch.randn(4, out_dim)]
 
         teacher_softmaxed = [
-            dino_loss.softmax_center_teacher(t, teacher_temp=0.07)
-            for t in teacher_output
+            dino_loss.softmax_center_teacher(t, teacher_temp=0.07) for t in teacher_output
         ]
 
         loss = dino_loss(student_output, teacher_softmaxed)
@@ -120,8 +118,9 @@ class TestKoLeoLoss:
         loss_spread = koleo_loss(spread)
 
         # Spread points should have lower loss (more entropy)
-        assert loss_spread < loss_clustered, \
-            f"Spread loss {loss_spread} should be < clustered loss {loss_clustered}"
+        assert (
+            loss_spread < loss_clustered
+        ), f"Spread loss {loss_spread} should be < clustered loss {loss_clustered}"
 
 
 class TestiBOTPatchLoss:
@@ -229,10 +228,10 @@ class TestDINOv2Loss:
             student_masks_flat=masks,
         )
 
-        assert 'total' in losses
-        assert 'dino' in losses
-        assert 'koleo' in losses
-        assert 'ibot' in losses
+        assert "total" in losses
+        assert "dino" in losses
+        assert "koleo" in losses
+        assert "ibot" in losses
 
         for key, loss in losses.items():
             assert not torch.isnan(loss), f"{key} loss is NaN"
@@ -286,7 +285,7 @@ class TestDINOv2Loss:
             student_masks_flat=masks,
         )
 
-        losses['total'].backward()
+        losses["total"].backward()
 
         assert student_cls[0].grad is not None
         assert not torch.isnan(student_cls[0].grad).any()
@@ -312,8 +311,8 @@ class TestDINOv2Loss:
             epoch=0,
         )
 
-        assert losses['ibot'].item() == 0.0
-        assert losses['total'] == losses['dino'] + 0.1 * losses['koleo']
+        assert losses["ibot"].item() == 0.0
+        assert losses["total"] == losses["dino"] + 0.1 * losses["koleo"]
 
 
 class TestNumericalStabilityInLosses:
@@ -329,8 +328,7 @@ class TestNumericalStabilityInLosses:
         teacher_output = [torch.randn(4, out_dim) * 10.0]
 
         teacher_softmaxed = [
-            dino_loss.softmax_center_teacher(t, teacher_temp=0.07)
-            for t in teacher_output
+            dino_loss.softmax_center_teacher(t, teacher_temp=0.07) for t in teacher_output
         ]
 
         loss = dino_loss(student_output, teacher_softmaxed)
@@ -363,7 +361,7 @@ class TestNumericalStabilityInLosses:
         dino_loss = DINOLoss(out_dim=out_dim, student_temp=0.1)
 
         # Extreme case: all values large
-        student = torch.randn(4, out_dim) * 5.0
+        # student = torch.randn(4, out_dim) * 5.0
         teacher = torch.randn(4, out_dim) * 5.0
 
         teacher_softmaxed = dino_loss.softmax_center_teacher(teacher, 0.04)
@@ -401,7 +399,7 @@ class TestNumericalStabilityInLosses:
             student_masks_flat=masks,
         )
 
-        losses['total'].backward()
+        losses["total"].backward()
 
         # Check gradient magnitudes
         grad_norm_cls = student_cls[0].grad.norm().item()

@@ -1,7 +1,8 @@
 """Advanced stress tests for iBOT loss."""
-import pytest
+
 import torch
 import torch.nn.functional as F
+
 from diffusion.encoder_losses import iBOTPatchLoss
 
 
@@ -29,8 +30,9 @@ class TestiBOTPatchLossAdvanced:
         manual_ce = -torch.sum(teacher_softmaxed * student_log_probs, dim=-1)
         manual_loss = manual_ce.mean()
 
-        assert torch.allclose(loss, manual_loss, atol=1e-5), \
-            f"Loss should be cross-entropy: {loss} != {manual_loss}"
+        assert torch.allclose(
+            loss, manual_loss, atol=1e-5
+        ), f"Loss should be cross-entropy: {loss} != {manual_loss}"
 
     def test_loss_respects_probability_simplex(self):
         """Test that teacher softmax outputs are valid probability distributions."""
@@ -44,8 +46,9 @@ class TestiBOTPatchLossAdvanced:
 
         # Check each patch is a valid probability distribution
         sums = teacher_softmaxed.sum(dim=-1)
-        assert torch.allclose(sums, torch.ones_like(sums), atol=1e-5), \
-            f"Teacher softmax should sum to 1, got {sums}"
+        assert torch.allclose(
+            sums, torch.ones_like(sums), atol=1e-5
+        ), f"Teacher softmax should sum to 1, got {sums}"
 
         # All probabilities should be non-negative
         assert (teacher_softmaxed >= 0).all(), "Teacher softmax should be non-negative"
@@ -74,10 +77,8 @@ class TestiBOTPatchLossAdvanced:
             gradient_norms[temp] = grad_norm
 
         # Lower temperature should give larger gradients
-        assert gradient_norms[0.01] > gradient_norms[0.1], \
-            "Lower temp should have larger gradients"
-        assert gradient_norms[0.1] > gradient_norms[1.0], \
-            "Lower temp should have larger gradients"
+        assert gradient_norms[0.01] > gradient_norms[0.1], "Lower temp should have larger gradients"
+        assert gradient_norms[0.1] > gradient_norms[1.0], "Lower temp should have larger gradients"
 
     def test_loss_with_one_hot_teacher(self):
         """Test behavior when teacher has one-hot (peaked) distribution."""
@@ -93,12 +94,13 @@ class TestiBOTPatchLossAdvanced:
 
         masks = torch.ones(batch_size, n_patches, dtype=torch.bool)
 
-        teacher_softmaxed = ibot_loss.softmax_center_teacher(teacher_patches, 0.001)  # Low temp for peaked
+        teacher_softmaxed = ibot_loss.softmax_center_teacher(
+            teacher_patches, 0.001
+        )  # Low temp for peaked
         loss = ibot_loss(student_patches, teacher_softmaxed, masks)
 
         # Teacher should be approximately one-hot
-        assert teacher_softmaxed[:, :, 0].mean() > 0.99, \
-            "Teacher should be peaked at first class"
+        assert teacher_softmaxed[:, :, 0].mean() > 0.99, "Teacher should be peaked at first class"
 
         # Loss should be finite and positive
         assert not torch.isnan(loss) and not torch.isinf(loss)
@@ -124,20 +126,24 @@ class TestiBOTPatchLossAdvanced:
 
         # Teacher should be approximately uniform
         expected_prob = 1.0 / patch_out_dim
-        assert torch.allclose(teacher_softmaxed.mean(), torch.tensor(expected_prob), atol=1e-3), \
-            "Teacher should be approximately uniform"
+        assert torch.allclose(
+            teacher_softmaxed.mean(), torch.tensor(expected_prob), atol=1e-3
+        ), "Teacher should be approximately uniform"
 
         # Cross-entropy with uniform teacher and uniform student equals log(D)
         # This is the entropy of a uniform distribution
         expected_loss = torch.log(torch.tensor(patch_out_dim, dtype=torch.float32))
-        assert abs(loss - expected_loss) < 0.1, \
-            f"Loss with uniform teacher/student should be log(D): {loss} vs {expected_loss}"
+        assert (
+            abs(loss - expected_loss) < 0.1
+        ), f"Loss with uniform teacher/student should be log(D): {loss} vs {expected_loss}"
 
     def test_centering_reduces_loss_drift(self):
         """Test that centering prevents loss from drifting over time."""
         patch_out_dim = 256
         ibot_loss_centered = iBOTPatchLoss(patch_out_dim=patch_out_dim, center_momentum=0.9)
-        ibot_loss_nocentering = iBOTPatchLoss(patch_out_dim=patch_out_dim, center_momentum=1.0)  # No update
+        ibot_loss_nocentering = iBOTPatchLoss(
+            patch_out_dim=patch_out_dim, center_momentum=1.0
+        )  # No update
 
         batch_size, n_patches = 4, 10
         masks = torch.ones(batch_size, n_patches, dtype=torch.bool)
@@ -193,8 +199,9 @@ class TestiBOTPatchLossAdvanced:
         loss_updated = ibot_loss(student_updated, teacher_softmaxed_new, masks)
 
         # Loss should decrease after gradient step
-        assert loss_updated < loss, \
-            f"Loss should decrease after gradient step: {loss_updated} >= {loss}"
+        assert (
+            loss_updated < loss
+        ), f"Loss should decrease after gradient step: {loss_updated} >= {loss}"
 
     def test_mask_sparsity_affects_gradient_sparsity(self):
         """Test that gradient sparsity matches mask sparsity."""
@@ -217,8 +224,9 @@ class TestiBOTPatchLossAdvanced:
         masked_count = masks.float().sum()
 
         # Number of non-zero gradient patches should equal number of masked patches
-        assert torch.allclose(nonzero_grads, masked_count, atol=1.0), \
-            f"Non-zero gradients {nonzero_grads} should match masked count {masked_count}"
+        assert torch.allclose(
+            nonzero_grads, masked_count, atol=1.0
+        ), f"Non-zero gradients {nonzero_grads} should match masked count {masked_count}"
 
     def test_loss_bounds_with_known_distributions(self):
         """Test loss bounds with mathematically known distributions."""
@@ -235,8 +243,9 @@ class TestiBOTPatchLossAdvanced:
         loss_identical = ibot_loss(identical, teacher_soft, masks)
 
         # For random 100-D distribution, entropy is typically 4-5 nats
-        assert 3.0 < loss_identical < 6.0, \
-            f"Loss with identical teacher/student should equal entropy (≈4-5): {loss_identical}"
+        assert (
+            3.0 < loss_identical < 6.0
+        ), f"Loss with identical teacher/student should equal entropy (≈4-5): {loss_identical}"
 
         # Case 2: Teacher uniform, student peaked -> loss should be high
         teacher_uniform = torch.zeros(batch_size, n_patches, patch_out_dim)
@@ -246,8 +255,7 @@ class TestiBOTPatchLossAdvanced:
         teacher_soft_uniform = ibot_loss.softmax_center_teacher(teacher_uniform, 1.0)
         loss_peaked = ibot_loss(student_peaked, teacher_soft_uniform, masks)
 
-        assert loss_peaked > loss_identical, \
-            "Loss should be higher when distributions differ"
+        assert loss_peaked > loss_identical, "Loss should be higher when distributions differ"
 
     def test_second_order_gradients(self):
         """Test that second-order gradients (Hessian) are computable."""
@@ -302,8 +310,9 @@ class TestiBOTPatchLossAdvanced:
 
         # Check probability mass is conserved
         mass = teacher_softmaxed.sum(dim=-1)
-        assert torch.allclose(mass, torch.ones_like(mass), atol=1e-4), \
-            f"Probability mass not conserved: {mass}"
+        assert torch.allclose(
+            mass, torch.ones_like(mass), atol=1e-4
+        ), f"Probability mass not conserved: {mass}"
 
     def test_loss_smoothness_with_small_perturbations(self):
         """Test that loss changes smoothly with small input perturbations."""
@@ -327,8 +336,9 @@ class TestiBOTPatchLossAdvanced:
 
         # Loss change should be proportional to epsilon
         loss_change = abs(loss_perturbed - loss_original)
-        assert loss_change < 0.1, \
-            f"Loss should change smoothly with small perturbation: {loss_change}"
+        assert (
+            loss_change < 0.1
+        ), f"Loss should change smoothly with small perturbation: {loss_change}"
 
     def test_loss_with_systematic_bias_in_masks(self):
         """Test with systematically biased masking patterns."""
@@ -343,10 +353,14 @@ class TestiBOTPatchLossAdvanced:
 
         # Test different biased masking patterns
         patterns = {
-            'first_half': torch.cat([torch.ones(n_patches // 2), torch.zeros(n_patches // 2)]).bool(),
-            'second_half': torch.cat([torch.zeros(n_patches // 2), torch.ones(n_patches // 2)]).bool(),
-            'alternating': torch.tensor([i % 2 == 0 for i in range(n_patches)]).bool(),
-            'block_3': torch.tensor([i % 3 == 0 for i in range(n_patches)]).bool(),
+            "first_half": torch.cat(
+                [torch.ones(n_patches // 2), torch.zeros(n_patches // 2)]
+            ).bool(),
+            "second_half": torch.cat(
+                [torch.zeros(n_patches // 2), torch.ones(n_patches // 2)]
+            ).bool(),
+            "alternating": torch.tensor([i % 2 == 0 for i in range(n_patches)]).bool(),
+            "block_3": torch.tensor([i % 3 == 0 for i in range(n_patches)]).bool(),
         }
 
         losses = {}
@@ -357,8 +371,7 @@ class TestiBOTPatchLossAdvanced:
 
         # All losses should be reasonable
         for name, loss_val in losses.items():
-            assert 0 < loss_val < 1000, \
-                f"Loss with {name} pattern is unreasonable: {loss_val}"
+            assert 0 < loss_val < 1000, f"Loss with {name} pattern is unreasonable: {loss_val}"
 
     def test_loss_convergence_under_optimization(self):
         """Test that loss actually decreases under gradient descent."""
@@ -387,8 +400,9 @@ class TestiBOTPatchLossAdvanced:
         final_loss = ibot_loss(student_patches, teacher_softmaxed, masks).item()
 
         # Loss should decrease (relaxed expectation since convergence depends on initialization)
-        assert final_loss < initial_loss * 0.5, \
-            f"Loss should decrease under optimization: {initial_loss} -> {final_loss}"
+        assert (
+            final_loss < initial_loss * 0.5
+        ), f"Loss should decrease under optimization: {initial_loss} -> {final_loss}"
 
     def test_cross_entropy_lower_bound(self):
         """Test that cross-entropy respects theoretical lower bounds."""
@@ -407,7 +421,9 @@ class TestiBOTPatchLossAdvanced:
         assert loss >= 0, f"Cross-entropy must be non-negative: {loss}"
 
         # Cross-entropy H(P, Q) >= H(P) where H(P) is entropy of teacher
-        teacher_entropy = -(teacher_softmaxed * torch.log(teacher_softmaxed + 1e-10)).sum(dim=-1).mean()
+        # teacher_entropy = (
+        #     -(teacher_softmaxed * torch.log(teacher_softmaxed + 1e-10)).sum(dim=-1).mean()
+        # )
         # Loss should be >= entropy (with some numerical tolerance)
         # Actually, cross-entropy >= entropy, but we might have numerical issues
         # So we just check it's in a reasonable range
@@ -425,9 +441,9 @@ class TestiBOTPatchLossAdvanced:
         # Test extreme temperature ratios
         # Note: extreme temperatures can cause legitimately high losses
         configs = [
-            (0.001, 1.0),   # Very cold student, hot teacher - can cause very high loss
-            (1.0, 0.001),   # Hot student, very cold teacher
-            (10.0, 0.01),   # Extreme ratio
+            (0.001, 1.0),  # Very cold student, hot teacher - can cause very high loss
+            (1.0, 0.001),  # Hot student, very cold teacher
+            (10.0, 0.01),  # Extreme ratio
         ]
 
         for student_temp, teacher_temp in configs:
@@ -435,14 +451,13 @@ class TestiBOTPatchLossAdvanced:
             teacher_softmaxed = ibot_loss.softmax_center_teacher(teacher_patches, teacher_temp)
             loss = ibot_loss(student_patches, teacher_softmaxed, masks)
 
-            assert not torch.isnan(loss), \
-                f"Loss is NaN with temps ({student_temp}, {teacher_temp})"
-            assert not torch.isinf(loss), \
-                f"Loss is Inf with temps ({student_temp}, {teacher_temp})"
+            assert not torch.isnan(loss), f"Loss is NaN with temps ({student_temp}, {teacher_temp})"
+            assert not torch.isinf(loss), f"Loss is Inf with temps ({student_temp}, {teacher_temp})"
             # Very extreme temperature ratios can legitimately cause high CE
             # Cold student (0.001) is extremely peaked and can have CE >> log(D)
-            assert 0 <= loss < 5000, \
-                f"Loss out of bounds with temps ({student_temp}, {teacher_temp}): {loss}"
+            assert (
+                0 <= loss < 5000
+            ), f"Loss out of bounds with temps ({student_temp}, {teacher_temp}): {loss}"
 
     def test_loss_respects_information_theory_bounds(self):
         """Test that loss respects information-theoretic bounds."""
@@ -461,8 +476,9 @@ class TestiBOTPatchLossAdvanced:
 
         # Loss with uniform should be approximately log(D)
         expected_uniform = torch.log(torch.tensor(float(patch_out_dim)))
-        assert abs(loss_uniform - expected_uniform) < 0.5, \
-            f"Uniform cross-entropy should be ~log(D): {loss_uniform} vs {expected_uniform}"
+        assert (
+            abs(loss_uniform - expected_uniform) < 0.5
+        ), f"Uniform cross-entropy should be ~log(D): {loss_uniform} vs {expected_uniform}"
 
         # Peaked distributions
         teacher_peaked = torch.zeros(batch_size, n_patches, patch_out_dim)
@@ -473,5 +489,6 @@ class TestiBOTPatchLossAdvanced:
         loss_peaked = ibot_loss(student_peaked, teacher_soft_peaked, masks)
 
         # Loss with matching peaked distributions should be near 0
-        assert loss_peaked < 1.0, \
-            f"Matching peaked distributions should have low loss: {loss_peaked}"
+        assert (
+            loss_peaked < 1.0
+        ), f"Matching peaked distributions should have low loss: {loss_peaked}"

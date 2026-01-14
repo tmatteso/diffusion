@@ -3,20 +3,17 @@ Comprehensive tests for encoder architecture.
 
 Tests for numerical stability, gradient flow, and correctness.
 """
+
 import pytest
 import torch
-import torch.nn as nn
+
 from diffusion.encoder_architecture import (
     MultiHeadSelfAttention,
-    MLP,
-    DropPath,
-    TransformerBlock,
-    ResidueEmbedding,
+    PackedSequenceEncoder,
+    ProjectionHead,
+    pack_protein_batch,
     pack_sequences,
     unpack_sequences,
-    pack_protein_batch,
-    ProjectionHead,
-    PackedSequenceEncoder,
 )
 
 
@@ -143,8 +140,9 @@ class TestProjectionHead:
 
         # Hook to capture input to last layer
         captured = {}
+
         def hook(module, input, output):
-            captured['input'] = input[0]
+            captured["input"] = input[0]
 
         handle = proj.last_layer.register_forward_hook(hook)
 
@@ -154,9 +152,10 @@ class TestProjectionHead:
         handle.remove()
 
         # Check that input to last layer has norm ~1
-        norms = torch.norm(captured['input'], dim=-1)
-        assert torch.allclose(norms, torch.ones_like(norms), atol=1e-5), \
-            f"Input to last layer not normalized: norms={norms}"
+        norms = torch.norm(captured["input"], dim=-1)
+        assert torch.allclose(
+            norms, torch.ones_like(norms), atol=1e-5
+        ), f"Input to last layer not normalized: norms={norms}"
 
     def test_weight_normalization(self):
         """Test that last layer uses weight normalization."""
@@ -166,8 +165,8 @@ class TestProjectionHead:
         proj = ProjectionHead(input_dim=input_dim, output_dim=output_dim)
 
         # Check that last layer has weight_g and weight_v (weight norm parameters)
-        assert hasattr(proj.last_layer, 'weight_g'), "Last layer not weight-normalized"
-        assert hasattr(proj.last_layer, 'weight_v'), "Last layer not weight-normalized"
+        assert hasattr(proj.last_layer, "weight_g"), "Last layer not weight-normalized"
+        assert hasattr(proj.last_layer, "weight_v"), "Last layer not weight-normalized"
 
     def test_output_magnitude(self):
         """Test that output values have reasonable magnitude."""
@@ -184,8 +183,7 @@ class TestProjectionHead:
         # Each output is a dot product between unit vectors, so should be in [-1, 1]
         # But with 256 dimensions, max can be larger due to summation
         # Let's check that it's not extreme (say, < 10)
-        assert out.abs().max() < 10.0, \
-            f"Output values too large: max={out.abs().max()}"
+        assert out.abs().max() < 10.0, f"Output values too large: max={out.abs().max()}"
 
     def test_gradient_magnitude(self):
         """Test that gradients don't explode."""
@@ -203,8 +201,7 @@ class TestProjectionHead:
         for name, param in proj.named_parameters():
             if param.grad is not None:
                 grad_norm = param.grad.norm().item()
-                assert grad_norm < 1000, \
-                    f"Gradient explosion in {name}: norm={grad_norm}"
+                assert grad_norm < 1000, f"Gradient explosion in {name}: norm={grad_norm}"
 
 
 class TestPackingFunctions:
@@ -221,7 +218,7 @@ class TestPackingFunctions:
         unpacked = unpack_sequences(packed, lengths)
 
         assert len(unpacked) == len(sequences)
-        for orig, rec in zip(sequences, unpacked):
+        for orig, rec in zip(sequences, unpacked, strict=True):
             assert torch.allclose(orig, rec), "Pack/unpack not inverse"
 
     def test_attention_mask_shape(self):
@@ -245,13 +242,13 @@ class TestPackingFunctions:
 
         # Check that sequences can't attend to each other
         # seq1 is at indices 0-4, seq2 is at indices 5-7
-        assert mask[0, 5].item() == True, "Should block cross-sequence attention"
-        assert mask[5, 0].item() == True, "Should block cross-sequence attention"
+        assert mask[0, 5].item(), "Should block cross-sequence attention"
+        assert mask[5, 0].item(), "Should block cross-sequence attention"
 
         # Check that within-sequence attention is allowed
-        assert mask[0, 0].item() == False, "Should allow within-sequence attention"
-        assert mask[0, 4].item() == False, "Should allow within-sequence attention"
-        assert mask[5, 7].item() == False, "Should allow within-sequence attention"
+        assert not mask[0, 0].item(), "Should allow within-sequence attention"
+        assert not mask[0, 4].item(), "Should allow within-sequence attention"
+        assert not mask[5, 7].item(), "Should allow within-sequence attention"
 
     def test_pack_protein_batch(self):
         """Test packing protein structures."""
@@ -287,14 +284,14 @@ class TestPackedSequenceEncoder:
 
         output = encoder(structures, return_projected=True)
 
-        assert 'backbone' in output
-        assert 'projected' in output
-        assert len(output['backbone']) == 2
-        assert len(output['projected']) == 2
-        assert output['backbone'][0].shape == (10, 48)
-        assert output['backbone'][1].shape == (15, 48)
-        assert output['projected'][0].shape == (10, 256)
-        assert output['projected'][1].shape == (15, 256)
+        assert "backbone" in output
+        assert "projected" in output
+        assert len(output["backbone"]) == 2
+        assert len(output["projected"]) == 2
+        assert output["backbone"][0].shape == (10, 48)
+        assert output["backbone"][1].shape == (15, 48)
+        assert output["projected"][0].shape == (10, 256)
+        assert output["projected"][1].shape == (15, 256)
 
     def test_no_nans_in_forward(self):
         """Test that forward pass doesn't produce NaNs."""
@@ -311,9 +308,9 @@ class TestPackedSequenceEncoder:
 
         output = encoder(structures, return_projected=True)
 
-        for seq in output['backbone']:
+        for seq in output["backbone"]:
             assert not torch.isnan(seq).any(), "NaN in backbone output"
-        for seq in output['projected']:
+        for seq in output["projected"]:
             assert not torch.isnan(seq).any(), "NaN in projected output"
 
     def test_gradient_flow(self):
@@ -332,7 +329,7 @@ class TestPackedSequenceEncoder:
         output = encoder(structures, return_projected=True)
 
         # Compute loss
-        loss = sum(seq.sum() for seq in output['projected'])
+        loss = sum(seq.sum() for seq in output["projected"])
         loss.backward()
 
         # Check that input has gradients
@@ -360,7 +357,7 @@ class TestPackedSequenceEncoder:
         structures = [struct1]
 
         output = encoder(structures, return_projected=True)
-        loss = sum(seq.sum() for seq in output['projected'])
+        loss = sum(seq.sum() for seq in output["projected"])
         loss.backward()
 
         # Compute total gradient norm
@@ -369,7 +366,7 @@ class TestPackedSequenceEncoder:
             if param.grad is not None:
                 param_norm = param.grad.data.norm(2)
                 total_norm += param_norm.item() ** 2
-        total_norm = total_norm ** 0.5
+        total_norm = total_norm**0.5
 
         assert total_norm < 10000, f"Gradient explosion: norm={total_norm}"
 
@@ -395,14 +392,14 @@ class TestPackedSequenceEncoder:
         out_batch = encoder([struct1, struct2], return_projected=True)
 
         # Results should be identical
-        assert torch.allclose(out1['backbone'][0], out_batch['backbone'][0], atol=1e-5)
-        assert torch.allclose(out2['backbone'][0], out_batch['backbone'][1], atol=1e-5)
-        assert torch.allclose(out1['projected'][0], out_batch['projected'][0], atol=1e-5)
-        assert torch.allclose(out2['projected'][0], out_batch['projected'][1], atol=1e-5)
+        assert torch.allclose(out1["backbone"][0], out_batch["backbone"][0], atol=1e-5)
+        assert torch.allclose(out2["backbone"][0], out_batch["backbone"][1], atol=1e-5)
+        assert torch.allclose(out1["projected"][0], out_batch["projected"][0], atol=1e-5)
+        assert torch.allclose(out2["projected"][0], out_batch["projected"][1], atol=1e-5)
 
     def test_sdpa_backend_consistency(self):
         """Test that batch consistency holds across different SDPA backends."""
-        from torch.nn.attention import sdpa_kernel, SDPBackend
+        from torch.nn.attention import SDPBackend, sdpa_kernel
 
         torch.manual_seed(42)
         struct1 = torch.randn(10, 37, 3)
@@ -423,9 +420,8 @@ class TestPackedSequenceEncoder:
                 out1_math = encoder([struct1], return_projected=False)
                 out_both_math = encoder([struct1, struct2], return_projected=False)
 
-        diff_math = (out1_math['backbone'][0] - out_both_math['backbone'][0]).abs().max()
-        assert diff_math < 1e-5, \
-            f"MATH backend inconsistent: diff={diff_math:.2e}"
+        diff_math = (out1_math["backbone"][0] - out_both_math["backbone"][0]).abs().max()
+        assert diff_math < 1e-5, f"MATH backend inconsistent: diff={diff_math:.2e}"
 
 
 class TestNumericalStability:
@@ -475,10 +471,9 @@ class TestNumericalStability:
         output = encoder(structures, return_projected=True)
 
         # Check for numerical issues
-        for seq in output['projected']:
+        for seq in output["projected"]:
             assert not torch.isnan(seq).any(), "NaN in high-dim projection"
             assert not torch.isinf(seq).any(), "Inf in high-dim projection"
 
             # Check that values are reasonable
-            assert seq.abs().max() < 100, \
-                f"Projection values too large: max={seq.abs().max()}"
+            assert seq.abs().max() < 100, f"Projection values too large: max={seq.abs().max()}"
