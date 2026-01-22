@@ -23,6 +23,6 @@
       }
     }
   },
-  "postCreateCommand": "cd /workspaces/diffusion && uv sync --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple && echo 'source /workspaces/diffusion/.venv/bin/activate' >> ~/.bashrc && show-platform",
+  "postCreateCommand": "cd /workspaces/diffusion && uv venv && uv pip install -e . --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple && uv pip install black ruff pytest pytest-cov && echo 'source /workspaces/diffusion/.venv/bin/activate' >> ~/.bashrc && show-platform",
   "remoteUser": "root"
 }
