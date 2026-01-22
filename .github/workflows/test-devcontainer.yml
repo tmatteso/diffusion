@@ -1,0 +1,43 @@
+name: Test with Devcontainer
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Build and run tests in devcontainer
+      uses: devcontainers/ci@v0.3
+      with:
+        # Use the ARM64 devcontainer (CPU PyTorch for CI)
+        configFile: .devcontainer/arm64/devcontainer.json
+
+        # Run the test commands inside the container
+        runCmd: |
+          set -e
+
+          echo "=== Container Environment ==="
+          show-platform
+          python --version
+          which python
+
+          echo ""
+          echo "=== Running Black check ==="
+          black --check --diff .
+
+          echo ""
+          echo "=== Running Ruff check ==="
+          ruff check .
+
+          echo ""
+          echo "=== Running pytest ==="
+          pytest tests/ -v --tb=short --cov=diffusion --cov-report=term-missing
