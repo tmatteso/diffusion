@@ -23,6 +23,6 @@
       }
     }
   },
-  "postCreateCommand": "cd /workspaces/diffusion && UV_INDEX_URL=https://download.pytorch.org/whl/cpu UV_EXTRA_INDEX_URL=https://pypi.org/simple UV_INDEX_STRATEGY=first-index uv sync && echo 'source /workspaces/diffusion/.venv/bin/activate' >> ~/.bashrc && show-platform",
+  "postCreateCommand": "cd /workspaces/diffusion && UV_INDEX_URL=https://download.pytorch.org/whl/cpu UV_EXTRA_INDEX_URL=https://pypi.org/simple UV_INDEX_STRATEGY=first-index uv sync --refresh && echo 'source /workspaces/diffusion/.venv/bin/activate' >> ~/.bashrc && show-platform",
   "remoteUser": "root"
 }
