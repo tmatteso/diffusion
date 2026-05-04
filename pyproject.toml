@@ -29,10 +29,24 @@ name = "pytorch-cpu"
 url = "https://download.pytorch.org/whl/cpu"
 explicit = true
 
+[[tool.uv.index]]
+name = "pytorch-cuda"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
 [tool.uv.sources]
-torch = [{ index = "pytorch-cpu" }]
-torchvision = [{ index = "pytorch-cpu" }]
-torchaudio = [{ index = "pytorch-cpu" }]
+torch = [
+    { index = "pytorch-cpu", marker = "platform_machine == 'aarch64'" },
+    { index = "pytorch-cuda", marker = "platform_machine == 'x86_64'" },
+]
+torchvision = [
+    { index = "pytorch-cpu", marker = "platform_machine == 'aarch64'" },
+    { index = "pytorch-cuda", marker = "platform_machine == 'x86_64'" },
+]
+torchaudio = [
+    { index = "pytorch-cpu", marker = "platform_machine == 'aarch64'" },
+    { index = "pytorch-cuda", marker = "platform_machine == 'x86_64'" },
+]
 
 [dependency-groups]
 dev = [
