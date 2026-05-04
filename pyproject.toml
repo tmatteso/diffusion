@@ -4,9 +4,9 @@ version = "0.1.0"
 description = "PyTorch diffusion project"
 requires-python = ">=3.10"
 dependencies = [
-    "torch>=2.5.1",
-    "torchvision>=0.20.1",
-    "torchaudio>=2.5.1",
+    "torch>=2.7.0",
+    "torchvision>=0.22.0",
+    "torchaudio>=2.7.0",
     "wandb>=0.18.0",
     "pandas>=2.0.0",
     "py3Dmol>=2.0.0",
@@ -31,7 +31,7 @@ explicit = true
 
 [[tool.uv.index]]
 name = "pytorch-cuda"
-url = "https://download.pytorch.org/whl/cu124"
+url = "https://download.pytorch.org/whl/cu128"
 explicit = true
 
 [tool.uv.sources]

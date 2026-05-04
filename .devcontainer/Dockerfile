@@ -4,7 +4,7 @@
 ARG PLATFORM=arm64
 
 # For CUDA: Use PyTorch CUDA image
-FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-devel AS base-cuda
+FROM pytorch/pytorch:2.7.0-cuda12.8-cudnn9-devel AS base-cuda
 
 # For ARM64: Use Ubuntu with CPU PyTorch
 FROM ubuntu:22.04 AS base-arm64
@@ -41,9 +41,9 @@ ENV UV_LINK_MODE=copy
 ARG PLATFORM
 RUN if [ "${PLATFORM}" = "arm64" ]; then \
         pip3 install --no-cache-dir \
-            torch==2.5.1 \
-            torchvision==0.20.1 \
-            torchaudio==2.5.1 \
+            torch==2.7.0 \
+            torchvision==0.22.0 \
+            torchaudio==2.7.0 \
             --index-url https://download.pytorch.org/whl/cpu; \
     fi
 
