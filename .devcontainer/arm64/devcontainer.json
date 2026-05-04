@@ -9,8 +9,8 @@
   },
   "workspaceFolder": "/workspaces/diffusion",
   "remoteEnv": {
-    "VIRTUAL_ENV": "/workspaces/diffusion/.venv",
-    "PATH": "/workspaces/diffusion/.venv/bin:${containerEnv:PATH}",
+    "VIRTUAL_ENV": "/opt/venv",
+    "PATH": "/opt/venv/bin:${containerEnv:PATH}",
     "PYTHONPATH": "/workspaces/diffusion",
     "SSH_AUTH_SOCK": "/ssh-agent"
   },
@@ -25,7 +25,7 @@
         "ms-toolsai.jupyter"
       ],
       "settings": {
-        "python.defaultInterpreterPath": "/workspaces/diffusion/.venv/bin/python",
+        "python.defaultInterpreterPath": "/opt/venv/bin/python",
         "python.terminal.activateEnvironment": true
       }
     },
@@ -36,11 +36,11 @@
         "ms-toolsai.jupyter"
       ],
       "settings": {
-        "python.defaultInterpreterPath": "/workspaces/diffusion/.venv/bin/python",
+        "python.defaultInterpreterPath": "/opt/venv/bin/python",
         "python.terminal.activateEnvironment": true
       }
     }
   },
-  "postCreateCommand": "python -m ipykernel install --user --name=diffusion --display-name='Python (diffusion)' && echo 'source /workspaces/diffusion/.venv/bin/activate' >> ~/.bashrc && show-platform",
+  "postCreateCommand": "python -m ipykernel install --user --name=diffusion --display-name='Python (diffusion)' && echo 'source /opt/venv/bin/activate' >> ~/.bashrc && show-platform",
   "remoteUser": "root"
 }

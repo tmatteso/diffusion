@@ -51,6 +51,8 @@ RUN if [ "${PLATFORM}" = "arm64" ]; then \
 RUN printf '#!/bin/bash\necho "=== Platform Info ==="\necho "Arch: $(uname -m)"\npython3 -c "import torch; print(f\"PyTorch: {torch.__version__}\"); print(f\"CUDA available: {torch.cuda.is_available()}\")"' > /usr/local/bin/show-platform && \
     chmod +x /usr/local/bin/show-platform
 
+ENV UV_PROJECT_ENVIRONMENT=/opt/venv
+
 WORKDIR /workspaces/diffusion
 
 # Install project dependencies into the image — cached as a layer, only re-runs when lockfile changes
