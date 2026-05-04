@@ -9,9 +9,6 @@ FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-devel AS base-cuda
 # For ARM64: Use Ubuntu with CPU PyTorch
 FROM ubuntu:22.04 AS base-arm64
 
-# Select based on PLATFORM build argument
-FROM base-${PLATFORM}
-
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
 
@@ -20,6 +17,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     python3-pip \
     git \
+    openssh-client \
     curl \
     ca-certificates \
     build-essential \

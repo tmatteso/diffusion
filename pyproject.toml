@@ -8,11 +8,31 @@ dependencies = [
     "torchvision>=0.20.1",
     "torchaudio>=2.5.1",
     "wandb>=0.18.0",
+    "pandas>=2.0.0",
+    "py3Dmol>=2.0.0",
+    "beartype>=0.18.0",
+    "einops>=0.8.0",
+    "jaxtyping>=0.2.0",
+    "structlog>=24.0.0",
+    "tqdm>=4.0.0",
 ]
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["pallatom"]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu" }]
+torchvision = [{ index = "pytorch-cpu" }]
+torchaudio = [{ index = "pytorch-cpu" }]
 
 [dependency-groups]
 dev = [
@@ -20,6 +40,9 @@ dev = [
     "ruff>=0.1.0",
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
+    "ipykernel>=6.0.0",
+    "ipywidgets>=8.0.0",
+    "jupyter>=1.0.0",
 ]
 
 [tool.black]
@@ -45,8 +68,13 @@ ignore = []
 [tool.ruff.lint.isort]
 known-first-party = ["diffusion"]
 
+[tool.pyright]
+reportInvalidTypeForm = "none"
+reportIndexIssue = "none"
+
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tests", "pallatom/tests"]
+pythonpath = ["pallatom"]
 python_files = ["test_*.py"]
 python_functions = ["test_*"]
 addopts = "-v --tb=short"

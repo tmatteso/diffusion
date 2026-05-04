@@ -9,13 +9,30 @@
   "workspaceFolder": "/workspaces/diffusion",
   "remoteEnv": {
     "VIRTUAL_ENV": "/workspaces/diffusion/.venv",
-    "PATH": "/workspaces/diffusion/.venv/bin:${containerEnv:PATH}"
+    "PATH": "/workspaces/diffusion/.venv/bin:${containerEnv:PATH}",
+    "PYTHONPATH": "/workspaces/diffusion",
+    "SSH_AUTH_SOCK": "/ssh-agent"
   },
+  "mounts": [
+    "source=${localEnv:SSH_AUTH_SOCK},target=/ssh-agent,type=bind"
+  ],
   "customizations": {
     "vscode": {
       "extensions": [
         "ms-python.python",
-        "ms-azuretools.vscode-docker"
+        "ms-azuretools.vscode-docker",
+        "ms-toolsai.jupyter"
+      ],
+      "settings": {
+        "python.defaultInterpreterPath": "/workspaces/diffusion/.venv/bin/python",
+        "python.terminal.activateEnvironment": true
+      }
+    },
+    "cursor": {
+      "extensions": [
+        "ms-python.python",
+        "ms-azuretools.vscode-docker",
+        "ms-toolsai.jupyter"
       ],
       "settings": {
         "python.defaultInterpreterPath": "/workspaces/diffusion/.venv/bin/python",
@@ -23,6 +40,6 @@
       }
     }
   },
-  "postCreateCommand": "cd /workspaces/diffusion && rm -f uv.lock && UV_INDEX_URL=https://download.pytorch.org/whl/cpu UV_EXTRA_INDEX_URL=https://pypi.org/simple UV_INDEX_STRATEGY=first-index uv lock && uv sync && echo 'source /workspaces/diffusion/.venv/bin/activate' >> ~/.bashrc && show-platform",
+  "postCreateCommand": "cd /workspaces/diffusion && rm -f uv.lock && uv lock && uv sync && python -m ipykernel install --user --name=diffusion --display-name='Python (diffusion)' && echo 'source /workspaces/diffusion/.venv/bin/activate' >> ~/.bashrc && show-platform",
   "remoteUser": "root"
 }

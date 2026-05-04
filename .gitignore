@@ -1,6 +1,14 @@
 .venv/
+# Coverage
+.coverage
+.coverage.*
+htmlcov/
+# wandb
 wandb/
-true_structure_mini.pdb.tar.gz
+# repo specific ignores
+pallatom/data/
+train_datasets/
+eval_datasets/
 checkpoints/
 psp-lite/
 # Python cache files
@@ -8,6 +16,13 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
-
+# pytest cache
+.pytest_cache/
+# ruff cache
+.ruff_cache/
 # macOS system files
 .DS_Store
+# Build / packaging
+dist/
+build/
+*.egg-info/

@@ -9,8 +9,12 @@
   "workspaceFolder": "/workspaces/diffusion",
   "remoteEnv": {
     "VIRTUAL_ENV": "/workspaces/diffusion/.venv",
-    "PATH": "/workspaces/diffusion/.venv/bin:${containerEnv:PATH}"
+    "PATH": "/workspaces/diffusion/.venv/bin:${containerEnv:PATH}",
+    "SSH_AUTH_SOCK": "/ssh-agent"
   },
+  "mounts": [
+    "source=${localEnv:SSH_AUTH_SOCK},target=/ssh-agent,type=bind"
+  ],
   "runArgs": [
     "--gpus=all"
   ],

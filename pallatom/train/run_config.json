@@ -1,0 +1,68 @@
+{
+  "training": {
+    "num_epochs": 50,
+    "lr": 0.0003,
+    "weight_decay": 0.0001,
+    "grad_clip": 2.0,
+    "pretrained_weights": "pallatom_best_best.pt"
+  },
+  "model": {
+    "f_ref_dim": 35,
+    "n_bins": 39,
+    "c_atom": 16,
+    "c_pair": 16,
+    "c_res": 32,
+    "c_atompair": 2,
+    "K_unit": 3
+  },
+  "noise": {
+    "sigma_data": 19.2368,
+    "sigma_max": 42.3689,
+    "sigma_min": 3.807123,
+    "P_mean": 2.5416,
+    "P_std": 1.2048
+  },
+  "distogram_res": {
+    "min_dist": 3.25,
+    "max_dist": 50.75,
+    "n_bins": 38,
+    "tok_emb_dim": 32
+  },
+  "distogram_atom": {
+    "min_dist": 0.0,
+    "max_dist": 10.0,
+    "n_bins": 22,
+    "tok_emb_dim": 32
+  },
+  "loss": {
+    "lam": 1.0,
+    "alpha_0": 0.25,
+    "alpha_1": 1.0,
+    "alpha_2": 0.5,
+    "alpha_3": 0.5,
+    "alpha_4": 1.0,
+    "gamma": 0.99,
+    "smooth_lddt_cutoff": 15
+  },
+  "checkpoint": {
+    "checkpoint_path": "pallatom_best_best.pt",
+    "save_every": 1
+  },
+  "logging": {
+    "log_interval": 1,
+    "use_wandb": true,
+    "wandb_project": "pallatom-training"
+  },
+  "loader": {
+    "max_seq_length": 128,
+    "batch_size": 2
+  },
+  "train_loader": {
+    "max_seq_length": 128,
+    "batch_size": 2
+  },
+  "test_loader": {
+    "max_seq_length": 128,
+    "batch_size": 2
+  }
+}
