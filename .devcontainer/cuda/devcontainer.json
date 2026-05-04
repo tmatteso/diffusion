@@ -2,7 +2,7 @@
   "name": "PyTorch Dev Container (CUDA)",
   "build": {
     "dockerfile": "../Dockerfile",
-    "context": "..",
+    "context": "${localWorkspaceFolder}",
     "args": {
       "PLATFORM": "cuda"
     }
