@@ -9,6 +9,10 @@ FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-devel AS base-cuda
 # For ARM64: Use Ubuntu with CPU PyTorch
 FROM ubuntu:22.04 AS base-arm64
 
+# Select base based on PLATFORM arg — this makes the devcontainer CLI pick the right stage
+ARG PLATFORM
+FROM base-${PLATFORM} AS base
+
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
 
