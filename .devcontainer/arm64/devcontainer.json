@@ -2,6 +2,7 @@
   "name": "PyTorch Dev Container (ARM64/M1)",
   "build": {
     "dockerfile": "../Dockerfile",
+    "context": "..",
     "args": {
       "PLATFORM": "arm64"
     }
@@ -40,6 +41,6 @@
       }
     }
   },
-  "postCreateCommand": "cd /workspaces/diffusion && rm -f uv.lock && uv lock && uv sync && python -m ipykernel install --user --name=diffusion --display-name='Python (diffusion)' && echo 'source /workspaces/diffusion/.venv/bin/activate' >> ~/.bashrc && show-platform",
+  "postCreateCommand": "python -m ipykernel install --user --name=diffusion --display-name='Python (diffusion)' && echo 'source /workspaces/diffusion/.venv/bin/activate' >> ~/.bashrc && show-platform",
   "remoteUser": "root"
 }

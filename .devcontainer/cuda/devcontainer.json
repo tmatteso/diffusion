@@ -2,6 +2,7 @@
   "name": "PyTorch Dev Container (CUDA)",
   "build": {
     "dockerfile": "../Dockerfile",
+    "context": "..",
     "args": {
       "PLATFORM": "cuda"
     }
@@ -26,6 +27,6 @@
       }
     }
   },
-  "postCreateCommand": "cd /workspaces/diffusion && uv sync && echo 'source /workspaces/diffusion/.venv/bin/activate' >> ~/.bashrc && show-platform",
+  "postCreateCommand": "echo 'source /workspaces/diffusion/.venv/bin/activate' >> ~/.bashrc && show-platform",
   "remoteUser": "root"
 }
