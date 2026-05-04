@@ -53,6 +53,14 @@ RUN printf '#!/bin/bash\necho "=== Platform Info ==="\necho "Arch: $(uname -m)"\
 
 ENV UV_PROJECT_ENVIRONMENT=/opt/venv
 
+# For CUDA: inherit conda's PyTorch into the venv to avoid re-downloading it
+ARG PLATFORM
+RUN if [ "${PLATFORM}" = "cuda" ]; then \
+        uv venv /opt/venv --system-site-packages --python /opt/conda/bin/python3; \
+    else \
+        uv venv /opt/venv; \
+    fi
+
 WORKDIR /workspaces/diffusion
 
 # Install project dependencies into the image — cached as a layer, only re-runs when lockfile changes
