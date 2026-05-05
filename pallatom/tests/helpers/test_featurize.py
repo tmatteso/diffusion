@@ -1,6 +1,7 @@
 import dataclasses
 import pytest
 import torch
+import torch.nn as nn
 from einops import rearrange, reduce
 
 from helpers.featurize import Distogram, FeaturizedBatch, ProteinBatch, ResidueIndexEmbedding, featurize_batch
@@ -272,8 +273,13 @@ def atom_distogram_fn(tcfg: TrainConfig) -> Distogram:
 
 
 @pytest.fixture
-def featurized_batch(protein_batch, tcfg, c_beta_distogram_fn, atom_distogram_fn) -> FeaturizedBatch:
-    return featurize_batch(protein_batch, tcfg, c_beta_distogram_fn, atom_distogram_fn, device="cpu")
+def index_embedding(tcfg: TrainConfig):
+    return nn.Embedding(tcfg.model.max_residues, tcfg.model.c_res)
+
+
+@pytest.fixture
+def featurized_batch(protein_batch, tcfg, c_beta_distogram_fn, atom_distogram_fn, index_embedding) -> FeaturizedBatch:
+    return featurize_batch(protein_batch, tcfg, c_beta_distogram_fn, atom_distogram_fn, index_embedding, device="cpu")
 
 
 # ---------------------------------------------------------------------------

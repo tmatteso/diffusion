@@ -15,13 +15,14 @@ class TrainingParams(BaseModel):
 class ModelParams(BaseModel):
     model_config = ConfigDict(frozen=True)
 
-    f_ref_dim:  int = Field(35, gt=0)   # 5 atoms × 7 features
-    n_bins:     int = Field(39, gt=0)   # distogram bins for TemplateEmbedder (38 + 1 overflow bin)
-    c_atom:     int = Field(16, gt=0) # was 128
-    c_pair:     int = Field(16, gt=0) # was 128
-    c_res:      int = Field(32, gt=0) # was 256
-    c_atompair: int = Field(2, gt=0) # was 16
-    K_unit:     int = Field(3, gt=0)
+    f_ref_dim:     int = Field(35, gt=0)   # 5 atoms × 7 features
+    n_bins:        int = Field(39, gt=0)   # distogram bins for TemplateEmbedder (38 + 1 overflow bin)
+    c_atom:        int = Field(16, gt=0)
+    c_pair:        int = Field(16, gt=0)
+    c_res:         int = Field(32, gt=0)
+    c_atompair:    int = Field(2, gt=0)
+    K_unit:        int = Field(3, gt=0)
+    max_residues:  int = Field(256, gt=0)
 
 
 class NoiseScheduleParams(BaseModel):

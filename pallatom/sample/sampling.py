@@ -206,12 +206,13 @@ class EDMSampler:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_sampling_context(
-    N_res:         int,
-    batch_size:    int = 1,
-    n_templ_bins:  int = 38,
-    n_atom_bins:   int = 22,
-    c_res_embed:   int = 32,        # must match the dim used in featurize_batch
-    device:        str = "cpu",
+    N_res:           int,
+    index_embedding: nn.Embedding,
+    batch_size:      int = 1,
+    n_templ_bins:    int = 38,
+    n_atom_bins:     int = 22,
+    c_res_embed:     int = 32,
+    device:          str = "cpu",
 ) -> FeaturizedBatch:
     """
     Build the static context FeaturizedBatch for unconditional backbone generation.
@@ -257,8 +258,7 @@ def build_sampling_context(
     )
 
     # ── Residue position embedding ───────────────────────────────────────────
-    residue_index:   Int[torch.Tensor,   "N_res"]           = torch.arange(N_res, dtype=torch.long, device=device)
-    index_embedding: nn.Embedding                            = nn.Embedding(256, c_res_embed).to(device)
+    residue_index: Int[torch.Tensor, "N_res"] = torch.arange(N_res, dtype=torch.long, device=device)
     with torch.no_grad():
         f_residue_idx_single: Float[torch.Tensor, "N_res c_res_embed"] = index_embedding(residue_index)
 
@@ -351,7 +351,11 @@ if __name__ == "__main__":
         K_unit=mp.K_unit,
         sigma_data=noise.sigma_data,
     ).to(device)
-    model.load_state_dict(torch.load(scfg.checkpoint.checkpoint_path, map_location=device))
+    ckpt = torch.load(scfg.checkpoint.checkpoint_path, map_location=device)
+    model.load_state_dict(ckpt["model"])
+    index_embedding = nn.Embedding(mp.max_residues, mp.c_res).to(device)
+    index_embedding.load_state_dict(ckpt["index_embedding"])
+    index_embedding.eval()
     model.eval()
 
     N_RES:     int = gen.n_res
@@ -359,7 +363,7 @@ if __name__ == "__main__":
     B_SAMPLE:  int = gen.n_samples  # generate all samples in one batched call
 
     context:     FeaturizedBatch = build_sampling_context(
-        N_RES, batch_size=B_SAMPLE, n_templ_bins=mp.n_bins, device=device
+        N_RES, index_embedding, batch_size=B_SAMPLE, n_templ_bins=mp.n_bins, device=device
     )
     edm_precond: EDMPrecond      = EDMPrecond(
         model, context,

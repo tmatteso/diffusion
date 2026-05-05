@@ -1,4 +1,5 @@
 import dataclasses
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -186,6 +187,7 @@ def featurize_batch(
     tcfg: TrainConfig,
     c_beta_distogram_fn: Distogram,
     atom_distogram_fn: Distogram,
+    index_embedding: nn.Embedding,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
 ) -> FeaturizedBatch:
     B:     int = len(batch.seq)
@@ -195,16 +197,15 @@ def featurize_batch(
     # ── Shared noise for the whole batch ──────────────────────────────────────
     sigma_min, sigma_max = tcfg.noise.sigma_min, tcfg.noise.sigma_max
     P_std, P_mean        = tcfg.noise.P_std,     tcfg.noise.P_mean
-    ln_sigma: Float[torch.Tensor, "1"] = torch.randn(1) * P_std + P_mean
+    ln_sigma: Float[torch.Tensor, "1"] = torch.randn(1, device=device) * P_std + P_mean
     sigma:    Float[torch.Tensor, "1"] = torch.exp(ln_sigma)
-    t_hat:         float = sigma.item()
-    t_normalized:  float = (
-        (torch.log(sigma) - torch.log(torch.tensor(sigma_min))) /
-        (torch.log(torch.tensor(sigma_max)) - torch.log(torch.tensor(sigma_min)))
-    ).item()
+    t_hat:        float = sigma.item()
+    t_normalized: float = (
+        (math.log(t_hat) - math.log(sigma_min)) /
+        (math.log(sigma_max) - math.log(sigma_min))
+    )
 
     # ── Shared helpers reused across all items ────────────────────────────────
-    index_embedding = nn.Embedding(256, c_res).to(device)
     ala_ref_pos  = _ref_pos_for_residue("ALA").to(device)       # (5, 3)
     ala_ref_elem = ATOM5_ELEMENTS.float().to(device)             # (5, 4)
 

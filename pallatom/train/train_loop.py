@@ -43,6 +43,7 @@ def evaluate(
     tcfg: TrainConfig,
     distogram_res: Distogram,
     distogram_atom: Distogram,
+    index_embedding: nn.Embedding,
     device: str,
 ) -> dict[str, float]:
     """Full-dataset evaluation pass. Returns mean loss per metric."""
@@ -61,7 +62,7 @@ def evaluate(
     lp = tcfg.loss
 
     for batch in loader:
-        featurized_batch = featurize_batch(_to_protein_batch(batch), tcfg, distogram_res, distogram_atom, device)
+        featurized_batch = featurize_batch(_to_protein_batch(batch), tcfg, distogram_res, distogram_atom, index_embedding, device)
 
         (
             r_denoised,
@@ -162,6 +163,7 @@ def train(
     test_loader: torch.utils.data.DataLoader,
     distogram_res: Distogram,
     distogram_atom: Distogram,
+    index_embedding: nn.Embedding,
     device: str,
 ) -> None:
     tp = tcfg.training
@@ -169,7 +171,11 @@ def train(
     lg = tcfg.logging
     ck = tcfg.checkpoint
 
-    optimizer = Adam(model.parameters(), lr=tp.lr, weight_decay=tp.weight_decay)
+    optimizer = Adam(
+        list(model.parameters()) + list(index_embedding.parameters()),
+        lr=tp.lr,
+        weight_decay=tp.weight_decay,
+    )
     scheduler = CosineAnnealingLR(optimizer, T_max=tp.num_epochs, eta_min=tp.lr * 0.01)
 
     best_val_loss = float("inf")
@@ -183,7 +189,7 @@ def train(
         pbar = tqdm(train_loader, desc=f"Epoch {epoch:03d}/{tp.num_epochs}", leave=False)
 
         for batch in pbar:
-            featurized_batch = featurize_batch(_to_protein_batch(batch), tcfg, distogram_res, distogram_atom, device)
+            featurized_batch = featurize_batch(_to_protein_batch(batch), tcfg, distogram_res, distogram_atom, index_embedding, device)
 
             (
                 r_denoised,
@@ -288,7 +294,7 @@ def train(
              epoch_res_dist, epoch_atom_dist, epoch_intermediate_loss],
         )}
 
-        avg_val = evaluate(model, test_loader, tcfg, distogram_res, distogram_atom, device)
+        avg_val = evaluate(model, test_loader, tcfg, distogram_res, distogram_atom, index_embedding, device)
         model.train()
 
         log.info(
@@ -314,10 +320,10 @@ def train(
 
         if avg_val["total loss"] < best_val_loss:
             best_val_loss = avg_val["total loss"]
-            torch.save(model.state_dict(), ck.checkpoint_path)
+            torch.save({"model": model.state_dict(), "index_embedding": index_embedding.state_dict()}, ck.checkpoint_path)
 
         if epoch % ck.save_every == 0:
-            torch.save(model.state_dict(), f"checkpoint_epoch_{epoch:03d}.pt")
+            torch.save({"model": model.state_dict(), "index_embedding": index_embedding.state_dict()}, f"checkpoint_epoch_{epoch:03d}.pt")
 
 
 class _FileLogProcessor:
@@ -389,14 +395,16 @@ if __name__ == "__main__":
         ).to(device)
 
         if tcfg.training.pretrained_weights is not None:
-            state = torch.load(tcfg.training.pretrained_weights, map_location=device)
-            model.load_state_dict(state)
+            ckpt = torch.load(tcfg.training.pretrained_weights, map_location=device)
+            model.load_state_dict(ckpt["model"])
+            index_embedding.load_state_dict(ckpt["index_embedding"])
             log.info("loaded pretrained weights", path=tcfg.training.pretrained_weights)
 
         dr = tcfg.distogram_res
         da = tcfg.distogram_atom
-        distogram_res  = Distogram(n_bins=dr.n_bins, min_dist=dr.min_dist, max_dist=dr.max_dist, overflow_bin=True).to(device)
-        distogram_atom = Distogram(n_bins=da.n_bins, min_dist=da.min_dist, max_dist=da.max_dist).to(device)
+        distogram_res   = Distogram(n_bins=dr.n_bins, min_dist=dr.min_dist, max_dist=dr.max_dist, overflow_bin=True).to(device)
+        distogram_atom  = Distogram(n_bins=da.n_bins, min_dist=da.min_dist, max_dist=da.max_dist).to(device)
+        index_embedding = nn.Embedding(tcfg.model.max_residues, tcfg.model.c_res).to(device)
 
         if tcfg.logging.use_wandb:
             wandb.init(project=tcfg.logging.wandb_project, config=tcfg.model_dump())
@@ -408,6 +416,7 @@ if __name__ == "__main__":
             test_loader=val_loader,
             distogram_res=distogram_res,
             distogram_atom=distogram_atom,
+            index_embedding=index_embedding,
             device=device,
         )
     except Exception as _exc:

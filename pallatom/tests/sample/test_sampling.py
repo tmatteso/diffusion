@@ -4,6 +4,7 @@ from unittest.mock import MagicMock
 import numpy as np
 import pytest
 import torch
+import torch.nn as nn
 from einops import reduce
 
 from helpers.featurize import FeaturizedBatch
@@ -80,8 +81,13 @@ def coords5() -> np.ndarray:
 
 
 @pytest.fixture
-def context() -> FeaturizedBatch:
-    return build_sampling_context(N_RES)
+def index_embedding() -> nn.Embedding:
+    return nn.Embedding(256, 32)
+
+
+@pytest.fixture
+def context(index_embedding) -> FeaturizedBatch:
+    return build_sampling_context(N_RES, index_embedding)
 
 
 @pytest.fixture
@@ -112,7 +118,7 @@ def bare_sampler() -> EDMSampler:
 
 @pytest.fixture
 def context_c_res_64() -> FeaturizedBatch:
-    return build_sampling_context(N_RES, c_res_embed=64)
+    return build_sampling_context(N_RES, nn.Embedding(256, 64), c_res_embed=64)
 
 
 @pytest.fixture
@@ -327,20 +333,21 @@ def test_build_sampling_context_placeholder_scalars(context):
 
 
 def test_build_sampling_context_n_atom_scales_linearly_with_n_res():
-    small = build_sampling_context(N_RES)
-    large = build_sampling_context(N_RES * 2)
+    emb = nn.Embedding(256, 32)
+    small = build_sampling_context(N_RES, emb)
+    large = build_sampling_context(N_RES * 2, emb)
     assert large.ref_pos.shape[1]    == 2 * small.ref_pos.shape[1]
     assert large.tok_idx.shape[1]    == 2 * small.tok_idx.shape[1]
     assert large.center_uid.shape[1] == 2 * small.center_uid.shape[1]
 
 
 def test_build_sampling_context_custom_n_templ_bins():
-    ctx = build_sampling_context(N_RES, n_templ_bins=20)
+    ctx = build_sampling_context(N_RES, nn.Embedding(256, 32), n_templ_bins=20)
     assert ctx.gt_res_distogram.shape == (1, N_RES, N_RES, 20)
 
 
 def test_build_sampling_context_custom_n_atom_bins():
-    ctx = build_sampling_context(N_RES, n_atom_bins=10)
+    ctx = build_sampling_context(N_RES, nn.Embedding(256, 32), n_atom_bins=10)
     assert ctx.gt_atom_distogram_sparse.shape[3] == 10  # (B, N_atom, K, n_atom_bins)
 
 

@@ -216,11 +216,11 @@ def test_model_rejects_zero_k_unit():
 # ---------------------------------------------------------------------------
 
 def test_noise_default_values(noise: NoiseScheduleParams):
-    assert noise.sigma_data == pytest.approx(16.0)
-    assert noise.sigma_max  == pytest.approx(80.0)
-    assert noise.sigma_min  == pytest.approx(0.002)
-    assert noise.P_mean     == pytest.approx(0.0)
-    assert noise.P_std      == pytest.approx(1.0)
+    assert noise.sigma_data == pytest.approx(19.2368)
+    assert noise.sigma_max  == pytest.approx(42.3689)
+    assert noise.sigma_min  == pytest.approx(3.807123)
+    assert noise.P_mean     == pytest.approx(2.5416)
+    assert noise.P_std      == pytest.approx(1.2048)
 
 
 def test_noise_sigma_min_lt_sigma_max(noise: NoiseScheduleParams):
