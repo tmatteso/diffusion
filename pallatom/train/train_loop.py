@@ -394,17 +394,17 @@ if __name__ == "__main__":
             sigma_data=tcfg.noise.sigma_data,
         ).to(device)
 
-        if tcfg.training.pretrained_weights is not None:
-            ckpt = torch.load(tcfg.training.pretrained_weights, map_location=device)
-            model.load_state_dict(ckpt["model"])
-            index_embedding.load_state_dict(ckpt["index_embedding"])
-            log.info("loaded pretrained weights", path=tcfg.training.pretrained_weights)
-
         dr = tcfg.distogram_res
         da = tcfg.distogram_atom
         distogram_res   = Distogram(n_bins=dr.n_bins, min_dist=dr.min_dist, max_dist=dr.max_dist, overflow_bin=True).to(device)
         distogram_atom  = Distogram(n_bins=da.n_bins, min_dist=da.min_dist, max_dist=da.max_dist).to(device)
         index_embedding = nn.Embedding(tcfg.model.max_residues, tcfg.model.c_res).to(device)
+
+        if tcfg.training.pretrained_weights is not None:
+            ckpt = torch.load(tcfg.training.pretrained_weights, map_location=device)
+            model.load_state_dict(ckpt["model"])
+            index_embedding.load_state_dict(ckpt["index_embedding"])
+            log.info("loaded pretrained weights", path=tcfg.training.pretrained_weights)
 
         if tcfg.logging.use_wandb:
             wandb.init(project=tcfg.logging.wandb_project, config=tcfg.model_dump())
