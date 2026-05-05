@@ -1,0 +1,57 @@
+name: Deploy Docs to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Only one deployment runs at a time; queued runs wait for the in-progress one.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      # Install only the doc toolchain — no torch/CUDA needed (AutoAPI parses
+      # source files as AST; it does not import the package).
+      - name: Install doc dependencies
+        run: |
+          pip install \
+            "sphinx>=7.0" \
+            "sphinx-autoapi>=3.0" \
+            "autodoc-pydantic>=2.2" \
+            "furo>=2024.1" \
+            "sphinx-copybutton>=0.5" \
+            "pydantic>=2.0"
+
+      - name: Build HTML
+        run: sphinx-build -M html docs/ docs/_build
+
+      - uses: actions/configure-pages@v4
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs/_build/html
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/deploy-pages@v4
+        id: deployment

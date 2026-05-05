@@ -17,10 +17,12 @@ from architecture.atom_transformers import LinearNoBias
 class PairformerBlock(nn.Module):
     """
     One block of the Pairformer operating purely on pair embeddings v_ij.
+
     Uses:
-      - Row-wise gated self-attention  (triangle attention, rows)
-      - Column-wise gated self-attention (triangle attention, cols)
-      - Pair transition FFN
+
+    - Row-wise gated self-attention  (triangle attention, rows)
+    - Column-wise gated self-attention (triangle attention, cols)
+    - Pair transition FFN
     """
     def __init__(self, c: int, n_heads: int = 4):
         super().__init__()

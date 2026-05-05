@@ -1,0 +1,2223 @@
+<!doctype html>
+<html class="no-js" lang="en" data-content_root="./">
+  <head><meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <meta name="color-scheme" content="light dark"><link rel="index" title="Index" href="#"><link rel="search" title="Search" href="search.html">
+
+    <!-- Generated with Sphinx 8.1.3 and Furo 2025.12.19 --><title>Index - pallatom</title>
+<link rel="stylesheet" type="text/css" href="_static/pygments.css?v=d111a655" />
+    <link rel="stylesheet" type="text/css" href="_static/styles/furo.css?v=7bdb33bb" />
+    <link rel="stylesheet" type="text/css" href="_static/graphviz.css?v=4ae1632d" />
+    <link rel="stylesheet" type="text/css" href="_static/autodoc_pydantic.css" />
+    <link rel="stylesheet" type="text/css" href="_static/styles/furo-extensions.css?v=8dab3a3b" />
+    
+    
+
+
+<style>
+  body {
+    --color-code-background: #f2f2f2;
+  --color-code-foreground: #1e1e1e;
+  
+  }
+  @media not print {
+    body[data-theme="dark"] {
+      --color-code-background: #202020;
+  --color-code-foreground: #d0d0d0;
+  
+    }
+    @media (prefers-color-scheme: dark) {
+      body:not([data-theme="light"]) {
+        --color-code-background: #202020;
+  --color-code-foreground: #d0d0d0;
+  
+      }
+    }
+  }
+</style></head>
+  <body>
+    
+    <script>
+      document.body.dataset.theme = localStorage.getItem("theme") || "auto";
+    </script>
+    
+
+<svg xmlns="http://www.w3.org/2000/svg" style="display: none;">
+  <symbol id="svg-toc" viewBox="0 0 24 24">
+    <title>Contents</title>
+    <svg stroke="currentColor" fill="currentColor" stroke-width="0" viewBox="0 0 1024 1024">
+      <path d="M408 442h480c4.4 0 8-3.6 8-8v-56c0-4.4-3.6-8-8-8H408c-4.4 0-8 3.6-8 8v56c0 4.4 3.6 8 8 8zm-8 204c0 4.4 3.6 8 8 8h480c4.4 0 8-3.6 8-8v-56c0-4.4-3.6-8-8-8H408c-4.4 0-8 3.6-8 8v56zm504-486H120c-4.4 0-8 3.6-8 8v56c0 4.4 3.6 8 8 8h784c4.4 0 8-3.6 8-8v-56c0-4.4-3.6-8-8-8zm0 632H120c-4.4 0-8 3.6-8 8v56c0 4.4 3.6 8 8 8h784c4.4 0 8-3.6 8-8v-56c0-4.4-3.6-8-8-8zM115.4 518.9L271.7 642c5.8 4.6 14.4.5 14.4-6.9V388.9c0-7.4-8.5-11.5-14.4-6.9L115.4 505.1a8.74 8.74 0 0 0 0 13.8z"/>
+    </svg>
+  </symbol>
+  <symbol id="svg-menu" viewBox="0 0 24 24">
+    <title>Menu</title>
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+      stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="feather-menu">
+      <line x1="3" y1="12" x2="21" y2="12"></line>
+      <line x1="3" y1="6" x2="21" y2="6"></line>
+      <line x1="3" y1="18" x2="21" y2="18"></line>
+    </svg>
+  </symbol>
+  <symbol id="svg-arrow-right" viewBox="0 0 24 24">
+    <title>Expand</title>
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+      stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="feather-chevron-right">
+      <polyline points="9 18 15 12 9 6"></polyline>
+    </svg>
+  </symbol>
+  <symbol id="svg-sun" viewBox="0 0 24 24">
+    <title>Light mode</title>
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+      stroke-width="1" stroke-linecap="round" stroke-linejoin="round" class="feather-sun">
+      <circle cx="12" cy="12" r="5"></circle>
+      <line x1="12" y1="1" x2="12" y2="3"></line>
+      <line x1="12" y1="21" x2="12" y2="23"></line>
+      <line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line>
+      <line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line>
+      <line x1="1" y1="12" x2="3" y2="12"></line>
+      <line x1="21" y1="12" x2="23" y2="12"></line>
+      <line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line>
+      <line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line>
+    </svg>
+  </symbol>
+  <symbol id="svg-moon" viewBox="0 0 24 24">
+    <title>Dark mode</title>
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+      stroke-width="1" stroke-linecap="round" stroke-linejoin="round" class="icon-tabler-moon">
+      <path stroke="none" d="M0 0h24v24H0z" fill="none" />
+      <path d="M12 3c.132 0 .263 0 .393 0a7.5 7.5 0 0 0 7.92 12.446a9 9 0 1 1 -8.313 -12.454z" />
+    </svg>
+  </symbol>
+  <symbol id="svg-sun-with-moon" viewBox="0 0 24 24">
+    <title>Auto light/dark, in light mode</title>
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+      stroke-width="1" stroke-linecap="round" stroke-linejoin="round"
+      class="icon-custom-derived-from-feather-sun-and-tabler-moon">
+      <path style="opacity: 50%" d="M 5.411 14.504 C 5.471 14.504 5.532 14.504 5.591 14.504 C 3.639 16.319 4.383 19.569 6.931 20.352 C 7.693 20.586 8.512 20.551 9.25 20.252 C 8.023 23.207 4.056 23.725 2.11 21.184 C 0.166 18.642 1.702 14.949 4.874 14.536 C 5.051 14.512 5.231 14.5 5.411 14.5 L 5.411 14.504 Z"/>
+      <line x1="14.5" y1="3.25" x2="14.5" y2="1.25"/>
+      <line x1="14.5" y1="15.85" x2="14.5" y2="17.85"/>
+      <line x1="10.044" y1="5.094" x2="8.63" y2="3.68"/>
+      <line x1="19" y1="14.05" x2="20.414" y2="15.464"/>
+      <line x1="8.2" y1="9.55" x2="6.2" y2="9.55"/>
+      <line x1="20.8" y1="9.55" x2="22.8" y2="9.55"/>
+      <line x1="10.044" y1="14.006" x2="8.63" y2="15.42"/>
+      <line x1="19" y1="5.05" x2="20.414" y2="3.636"/>
+      <circle cx="14.5" cy="9.55" r="3.6"/>
+    </svg>
+  </symbol>
+  <symbol id="svg-moon-with-sun" viewBox="0 0 24 24">
+    <title>Auto light/dark, in dark mode</title>
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+      stroke-width="1" stroke-linecap="round" stroke-linejoin="round"
+      class="icon-custom-derived-from-feather-sun-and-tabler-moon">
+      <path d="M 8.282 7.007 C 8.385 7.007 8.494 7.007 8.595 7.007 C 5.18 10.184 6.481 15.869 10.942 17.24 C 12.275 17.648 13.706 17.589 15 17.066 C 12.851 22.236 5.91 23.143 2.505 18.696 C -0.897 14.249 1.791 7.786 7.342 7.063 C 7.652 7.021 7.965 7 8.282 7 L 8.282 7.007 Z"/>
+      <line style="opacity: 50%" x1="18" y1="3.705" x2="18" y2="2.5"/>
+      <line style="opacity: 50%" x1="18" y1="11.295" x2="18" y2="12.5"/>
+      <line style="opacity: 50%" x1="15.316" y1="4.816" x2="14.464" y2="3.964"/>
+      <line style="opacity: 50%" x1="20.711" y1="10.212" x2="21.563" y2="11.063"/>
+      <line style="opacity: 50%" x1="14.205" y1="7.5" x2="13.001" y2="7.5"/>
+      <line style="opacity: 50%" x1="21.795" y1="7.5" x2="23" y2="7.5"/>
+      <line style="opacity: 50%" x1="15.316" y1="10.184" x2="14.464" y2="11.036"/>
+      <line style="opacity: 50%" x1="20.711" y1="4.789" x2="21.563" y2="3.937"/>
+      <circle style="opacity: 50%" cx="18" cy="7.5" r="2.169"/>
+    </svg>
+  </symbol>
+  <symbol id="svg-pencil" viewBox="0 0 24 24">
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+      stroke-width="1" stroke-linecap="round" stroke-linejoin="round" class="icon-tabler-pencil-code">
+      <path d="M4 20h4l10.5 -10.5a2.828 2.828 0 1 0 -4 -4l-10.5 10.5v4" />
+      <path d="M13.5 6.5l4 4" />
+      <path d="M20 21l2 -2l-2 -2" />
+      <path d="M17 17l-2 2l2 2" />
+    </svg>
+  </symbol>
+  <symbol id="svg-eye" viewBox="0 0 24 24">
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+      stroke-width="1" stroke-linecap="round" stroke-linejoin="round" class="icon-tabler-eye-code">
+      <path stroke="none" d="M0 0h24v24H0z" fill="none" />
+      <path d="M10 12a2 2 0 1 0 4 0a2 2 0 0 0 -4 0" />
+      <path
+        d="M11.11 17.958c-3.209 -.307 -5.91 -2.293 -8.11 -5.958c2.4 -4 5.4 -6 9 -6c3.6 0 6.6 2 9 6c-.21 .352 -.427 .688 -.647 1.008" />
+      <path d="M20 21l2 -2l-2 -2" />
+      <path d="M17 17l-2 2l2 2" />
+    </svg>
+  </symbol>
+</svg>
+
+<input type="checkbox" class="sidebar-toggle" name="__navigation" id="__navigation" aria-label="Toggle site navigation sidebar">
+<input type="checkbox" class="sidebar-toggle" name="__toc" id="__toc" aria-label="Toggle table of contents sidebar">
+<label class="overlay sidebar-overlay" for="__navigation"></label>
+<label class="overlay toc-overlay" for="__toc"></label>
+
+<a class="skip-to-content muted-link" href="#furo-main-content">Skip to content</a>
+
+
+
+<div class="page">
+  <header class="mobile-header">
+    <div class="header-left">
+      <label class="nav-overlay-icon" for="__navigation">
+        <span class="icon"><svg><use href="#svg-menu"></use></svg></span>
+      </label>
+    </div>
+    <div class="header-center">
+      <a href="index.html"><div class="brand">pallatom</div></a>
+    </div>
+    <div class="header-right">
+      <div class="theme-toggle-container theme-toggle-header">
+        <button class="theme-toggle" aria-label="Toggle Light / Dark / Auto color theme">
+          <svg class="theme-icon-when-auto-light"><use href="#svg-sun-with-moon"></use></svg>
+          <svg class="theme-icon-when-auto-dark"><use href="#svg-moon-with-sun"></use></svg>
+          <svg class="theme-icon-when-dark"><use href="#svg-moon"></use></svg>
+          <svg class="theme-icon-when-light"><use href="#svg-sun"></use></svg>
+        </button>
+      </div>
+      <label class="toc-overlay-icon toc-header-icon no-toc" for="__toc">
+        <span class="icon"><svg><use href="#svg-toc"></use></svg></span>
+      </label>
+    </div>
+  </header>
+  <aside class="sidebar-drawer">
+    <div class="sidebar-container">
+      
+      <div class="sidebar-sticky"><a class="sidebar-brand" href="index.html">
+  
+  <span class="sidebar-brand-text">pallatom</span>
+  
+</a><form class="sidebar-search-container" method="get" action="search.html" role="search">
+  <input class="sidebar-search" placeholder="Search" name="q" aria-label="Search">
+  <input type="hidden" name="check_keywords" value="yes">
+  <input type="hidden" name="area" value="default">
+</form>
+<div id="searchbox"></div><div class="sidebar-scroll"><div class="sidebar-tree">
+  <p class="caption" role="heading"><span class="caption-text">API Reference</span></p>
+<ul>
+<li class="toctree-l1 has-children"><a class="reference internal" href="autoapi/index.html">API Reference</a><input aria-label="Toggle navigation of API Reference" class="toctree-checkbox" id="toctree-checkbox-1" name="toctree-checkbox-1" role="switch" type="checkbox"/><label for="toctree-checkbox-1"><span class="icon"><svg><use href="#svg-arrow-right"></use></svg></span></label><ul>
+<li class="toctree-l2 has-children"><a class="reference internal" href="autoapi/pallatom/index.html">pallatom</a><input aria-label="Toggle navigation of pallatom" class="toctree-checkbox" id="toctree-checkbox-2" name="toctree-checkbox-2" role="switch" type="checkbox"/><label for="toctree-checkbox-2"><span class="icon"><svg><use href="#svg-arrow-right"></use></svg></span></label><ul>
+<li class="toctree-l3 has-children"><a class="reference internal" href="autoapi/pallatom/architecture/index.html">pallatom.architecture</a><input aria-label="Toggle navigation of pallatom.architecture" class="toctree-checkbox" id="toctree-checkbox-3" name="toctree-checkbox-3" role="switch" type="checkbox"/><label for="toctree-checkbox-3"><span class="icon"><svg><use href="#svg-arrow-right"></use></svg></span></label><ul>
+<li class="toctree-l4"><a class="reference internal" href="autoapi/pallatom/architecture/atom_transformers/index.html">pallatom.architecture.atom_transformers</a></li>
+<li class="toctree-l4"><a class="reference internal" href="autoapi/pallatom/architecture/losses/index.html">pallatom.architecture.losses</a></li>
+<li class="toctree-l4"><a class="reference internal" href="autoapi/pallatom/architecture/main_trunk/index.html">pallatom.architecture.main_trunk</a></li>
+<li class="toctree-l4"><a class="reference internal" href="autoapi/pallatom/architecture/node_update/index.html">pallatom.architecture.node_update</a></li>
+<li class="toctree-l4"><a class="reference internal" href="autoapi/pallatom/architecture/pair_update/index.html">pallatom.architecture.pair_update</a></li>
+<li class="toctree-l4"><a class="reference internal" href="autoapi/pallatom/architecture/pairformer_stack/index.html">pallatom.architecture.pairformer_stack</a></li>
+<li class="toctree-l4"><a class="reference internal" href="autoapi/pallatom/architecture/template_embedder/index.html">pallatom.architecture.template_embedder</a></li>
+</ul>
+</li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="autoapi/pallatom/helpers/index.html">pallatom.helpers</a><input aria-label="Toggle navigation of pallatom.helpers" class="toctree-checkbox" id="toctree-checkbox-4" name="toctree-checkbox-4" role="switch" type="checkbox"/><label for="toctree-checkbox-4"><span class="icon"><svg><use href="#svg-arrow-right"></use></svg></span></label><ul>
+<li class="toctree-l4"><a class="reference internal" href="autoapi/pallatom/helpers/alignment/index.html">pallatom.helpers.alignment</a></li>
+<li class="toctree-l4"><a class="reference internal" href="autoapi/pallatom/helpers/atom_utils/index.html">pallatom.helpers.atom_utils</a></li>
+<li class="toctree-l4"><a class="reference internal" href="autoapi/pallatom/helpers/compute_EDM_data_params/index.html">pallatom.helpers.compute_EDM_data_params</a></li>
+<li class="toctree-l4"><a class="reference internal" href="autoapi/pallatom/helpers/data/index.html">pallatom.helpers.data</a></li>
+<li class="toctree-l4"><a class="reference internal" href="autoapi/pallatom/helpers/featurize/index.html">pallatom.helpers.featurize</a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="autoapi/sampling/index.html">sampling</a></li>
+<li class="toctree-l2"><a class="reference internal" href="autoapi/train_loop/index.html">train_loop</a></li>
+<li class="toctree-l2"><a class="reference internal" href="autoapi/train_config/index.html">train_config</a></li>
+<li class="toctree-l2"><a class="reference internal" href="autoapi/sample_config/index.html">sample_config</a></li>
+</ul>
+</li>
+</ul>
+
+</div>
+</div>
+
+      </div>
+      
+    </div>
+  </aside>
+  <div class="main">
+    <div class="content">
+      <div class="article-container">
+        <a href="#" class="back-to-top muted-link">
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+            <path d="M13 20h-2V8l-5.5 5.5-1.42-1.42L12 4.16l7.92 7.92-1.42 1.42L13 8v12z"></path>
+          </svg>
+          <span>Back to top</span>
+        </a>
+        <div class="content-icon-container">
+          <div class="theme-toggle-container theme-toggle-content">
+            <button class="theme-toggle" aria-label="Toggle Light / Dark / Auto color theme">
+              <svg class="theme-icon-when-auto-light"><use href="#svg-sun-with-moon"></use></svg>
+              <svg class="theme-icon-when-auto-dark"><use href="#svg-moon-with-sun"></use></svg>
+              <svg class="theme-icon-when-dark"><use href="#svg-moon"></use></svg>
+              <svg class="theme-icon-when-light"><use href="#svg-sun"></use></svg>
+            </button>
+          </div>
+          <label class="toc-overlay-icon toc-content-icon no-toc" for="__toc">
+            <span class="icon"><svg><use href="#svg-toc"></use></svg></span>
+          </label>
+        </div>
+        <article role="main" id="furo-main-content">
+          
+<section class="genindex-section">
+  <h1 id="index">Index</h1>
+  <div class="genindex-jumpbox"><a href="#_"><strong>_</strong></a> | <a href="#A"><strong>A</strong></a> | <a href="#B"><strong>B</strong></a> | <a href="#C"><strong>C</strong></a> | <a href="#D"><strong>D</strong></a> | <a href="#E"><strong>E</strong></a> | <a href="#F"><strong>F</strong></a> | <a href="#G"><strong>G</strong></a> | <a href="#H"><strong>H</strong></a> | <a href="#I"><strong>I</strong></a> | <a href="#J"><strong>J</strong></a> | <a href="#K"><strong>K</strong></a> | <a href="#L"><strong>L</strong></a> | <a href="#M"><strong>M</strong></a> | <a href="#N"><strong>N</strong></a> | <a href="#O"><strong>O</strong></a> | <a href="#P"><strong>P</strong></a> | <a href="#Q"><strong>Q</strong></a> | <a href="#R"><strong>R</strong></a> | <a href="#S"><strong>S</strong></a> | <a href="#T"><strong>T</strong></a> | <a href="#U"><strong>U</strong></a> | <a href="#V"><strong>V</strong></a> | <a href="#W"><strong>W</strong></a></div>
+</section>
+<section id="_" class="genindex-section">
+  <h2>_</h2>
+  <table style="width: 100%" class="indextable genindextable"><tr>
+    <td style="width: 33%; vertical-align: top;"><ul>
+        <li><a href="autoapi/sample_config/index.html#sample_config.GenerationParams.__class_vars__">__class_vars__ (sample_config.GenerationParams attribute)</a>
+
+        <ul>
+          <li><a href="autoapi/sample_config/index.html#sample_config.SampleCheckpointParams.__class_vars__">(sample_config.SampleCheckpointParams attribute)</a>
+</li>
+          <li><a href="autoapi/sample_config/index.html#sample_config.SampleConfig.__class_vars__">(sample_config.SampleConfig attribute)</a>
+</li>
+          <li><a href="autoapi/sample_config/index.html#sample_config.SampleOutputParams.__class_vars__">(sample_config.SampleOutputParams attribute)</a>
+</li>
+          <li><a href="autoapi/sample_config/index.html#sample_config.SamplerParams.__class_vars__">(sample_config.SamplerParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.AtomDistogramParams.__class_vars__">(train_config.AtomDistogramParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.CheckpointParams.__class_vars__">(train_config.CheckpointParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.LoaderConfig.__class_vars__">(train_config.LoaderConfig attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.LoggingParams.__class_vars__">(train_config.LoggingParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.LossParams.__class_vars__">(train_config.LossParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.ModelParams.__class_vars__">(train_config.ModelParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.NoiseScheduleParams.__class_vars__">(train_config.NoiseScheduleParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.ResidueDistogramParams.__class_vars__">(train_config.ResidueDistogramParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.TrainConfig.__class_vars__">(train_config.TrainConfig attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.TrainingParams.__class_vars__">(train_config.TrainingParams attribute)</a>
+</li>
+        </ul></li>
+        <li><a href="autoapi/pallatom/helpers/data/index.html#pallatom.helpers.data.ProteinDataset.__del__">__del__() (pallatom.helpers.data.ProteinDataset method)</a>
+</li>
+        <li><a href="autoapi/pallatom/helpers/data/index.html#pallatom.helpers.data.ProteinDataset.__getitem__">__getitem__() (pallatom.helpers.data.ProteinDataset method)</a>
+</li>
+        <li><a href="autoapi/pallatom/helpers/data/index.html#pallatom.helpers.data.ProteinDataset.__getstate__">__getstate__() (pallatom.helpers.data.ProteinDataset method)</a>
+</li>
+        <li><a href="autoapi/pallatom/helpers/data/index.html#pallatom.helpers.data.ProteinDataset.__len__">__len__() (pallatom.helpers.data.ProteinDataset method)</a>
+</li>
+        <li><a href="autoapi/sample_config/index.html#sample_config.GenerationParams.__private_attributes__">__private_attributes__ (sample_config.GenerationParams attribute)</a>
+
+        <ul>
+          <li><a href="autoapi/sample_config/index.html#sample_config.SampleCheckpointParams.__private_attributes__">(sample_config.SampleCheckpointParams attribute)</a>
+</li>
+          <li><a href="autoapi/sample_config/index.html#sample_config.SampleConfig.__private_attributes__">(sample_config.SampleConfig attribute)</a>
+</li>
+          <li><a href="autoapi/sample_config/index.html#sample_config.SampleOutputParams.__private_attributes__">(sample_config.SampleOutputParams attribute)</a>
+</li>
+          <li><a href="autoapi/sample_config/index.html#sample_config.SamplerParams.__private_attributes__">(sample_config.SamplerParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.AtomDistogramParams.__private_attributes__">(train_config.AtomDistogramParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.CheckpointParams.__private_attributes__">(train_config.CheckpointParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.LoaderConfig.__private_attributes__">(train_config.LoaderConfig attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.LoggingParams.__private_attributes__">(train_config.LoggingParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.LossParams.__private_attributes__">(train_config.LossParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.ModelParams.__private_attributes__">(train_config.ModelParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.NoiseScheduleParams.__private_attributes__">(train_config.NoiseScheduleParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.ResidueDistogramParams.__private_attributes__">(train_config.ResidueDistogramParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.TrainConfig.__private_attributes__">(train_config.TrainConfig attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.TrainingParams.__private_attributes__">(train_config.TrainingParams attribute)</a>
+</li>
+        </ul></li>
+        <li><a href="autoapi/sample_config/index.html#sample_config.GenerationParams.__pydantic_complete__">__pydantic_complete__ (sample_config.GenerationParams attribute)</a>
+
+        <ul>
+          <li><a href="autoapi/sample_config/index.html#sample_config.SampleCheckpointParams.__pydantic_complete__">(sample_config.SampleCheckpointParams attribute)</a>
+</li>
+          <li><a href="autoapi/sample_config/index.html#sample_config.SampleConfig.__pydantic_complete__">(sample_config.SampleConfig attribute)</a>
+</li>
+          <li><a href="autoapi/sample_config/index.html#sample_config.SampleOutputParams.__pydantic_complete__">(sample_config.SampleOutputParams attribute)</a>
+</li>
+          <li><a href="autoapi/sample_config/index.html#sample_config.SamplerParams.__pydantic_complete__">(sample_config.SamplerParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.AtomDistogramParams.__pydantic_complete__">(train_config.AtomDistogramParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.CheckpointParams.__pydantic_complete__">(train_config.CheckpointParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.LoaderConfig.__pydantic_complete__">(train_config.LoaderConfig attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.LoggingParams.__pydantic_complete__">(train_config.LoggingParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.LossParams.__pydantic_complete__">(train_config.LossParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.ModelParams.__pydantic_complete__">(train_config.ModelParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.NoiseScheduleParams.__pydantic_complete__">(train_config.NoiseScheduleParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.ResidueDistogramParams.__pydantic_complete__">(train_config.ResidueDistogramParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.TrainConfig.__pydantic_complete__">(train_config.TrainConfig attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.TrainingParams.__pydantic_complete__">(train_config.TrainingParams attribute)</a>
+</li>
+        </ul></li>
+        <li><a href="autoapi/sample_config/index.html#sample_config.GenerationParams.__pydantic_computed_fields__">__pydantic_computed_fields__ (sample_config.GenerationParams attribute)</a>
+
+        <ul>
+          <li><a href="autoapi/sample_config/index.html#sample_config.SampleCheckpointParams.__pydantic_computed_fields__">(sample_config.SampleCheckpointParams attribute)</a>
+</li>
+          <li><a href="autoapi/sample_config/index.html#sample_config.SampleConfig.__pydantic_computed_fields__">(sample_config.SampleConfig attribute)</a>
+</li>
+          <li><a href="autoapi/sample_config/index.html#sample_config.SampleOutputParams.__pydantic_computed_fields__">(sample_config.SampleOutputParams attribute)</a>
+</li>
+          <li><a href="autoapi/sample_config/index.html#sample_config.SamplerParams.__pydantic_computed_fields__">(sample_config.SamplerParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.AtomDistogramParams.__pydantic_computed_fields__">(train_config.AtomDistogramParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.CheckpointParams.__pydantic_computed_fields__">(train_config.CheckpointParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.LoaderConfig.__pydantic_computed_fields__">(train_config.LoaderConfig attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.LoggingParams.__pydantic_computed_fields__">(train_config.LoggingParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.LossParams.__pydantic_computed_fields__">(train_config.LossParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.ModelParams.__pydantic_computed_fields__">(train_config.ModelParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.NoiseScheduleParams.__pydantic_computed_fields__">(train_config.NoiseScheduleParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.ResidueDistogramParams.__pydantic_computed_fields__">(train_config.ResidueDistogramParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.TrainConfig.__pydantic_computed_fields__">(train_config.TrainConfig attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.TrainingParams.__pydantic_computed_fields__">(train_config.TrainingParams attribute)</a>
+</li>
+        </ul></li>
+        <li><a href="autoapi/sample_config/index.html#sample_config.GenerationParams.__pydantic_core_schema__">__pydantic_core_schema__ (sample_config.GenerationParams attribute)</a>
+
+        <ul>
+          <li><a href="autoapi/sample_config/index.html#sample_config.SampleCheckpointParams.__pydantic_core_schema__">(sample_config.SampleCheckpointParams attribute)</a>
+</li>
+          <li><a href="autoapi/sample_config/index.html#sample_config.SampleConfig.__pydantic_core_schema__">(sample_config.SampleConfig attribute)</a>
+</li>
+          <li><a href="autoapi/sample_config/index.html#sample_config.SampleOutputParams.__pydantic_core_schema__">(sample_config.SampleOutputParams attribute)</a>
+</li>
+          <li><a href="autoapi/sample_config/index.html#sample_config.SamplerParams.__pydantic_core_schema__">(sample_config.SamplerParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.AtomDistogramParams.__pydantic_core_schema__">(train_config.AtomDistogramParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.CheckpointParams.__pydantic_core_schema__">(train_config.CheckpointParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.LoaderConfig.__pydantic_core_schema__">(train_config.LoaderConfig attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.LoggingParams.__pydantic_core_schema__">(train_config.LoggingParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.LossParams.__pydantic_core_schema__">(train_config.LossParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.ModelParams.__pydantic_core_schema__">(train_config.ModelParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.NoiseScheduleParams.__pydantic_core_schema__">(train_config.NoiseScheduleParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.ResidueDistogramParams.__pydantic_core_schema__">(train_config.ResidueDistogramParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.TrainConfig.__pydantic_core_schema__">(train_config.TrainConfig attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.TrainingParams.__pydantic_core_schema__">(train_config.TrainingParams attribute)</a>
+</li>
+        </ul></li>
+        <li><a href="autoapi/sample_config/index.html#sample_config.GenerationParams.__pydantic_custom_init__">__pydantic_custom_init__ (sample_config.GenerationParams attribute)</a>
+
+        <ul>
+          <li><a href="autoapi/sample_config/index.html#sample_config.SampleCheckpointParams.__pydantic_custom_init__">(sample_config.SampleCheckpointParams attribute)</a>
+</li>
+          <li><a href="autoapi/sample_config/index.html#sample_config.SampleConfig.__pydantic_custom_init__">(sample_config.SampleConfig attribute)</a>
+</li>
+          <li><a href="autoapi/sample_config/index.html#sample_config.SampleOutputParams.__pydantic_custom_init__">(sample_config.SampleOutputParams attribute)</a>
+</li>
+          <li><a href="autoapi/sample_config/index.html#sample_config.SamplerParams.__pydantic_custom_init__">(sample_config.SamplerParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.AtomDistogramParams.__pydantic_custom_init__">(train_config.AtomDistogramParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.CheckpointParams.__pydantic_custom_init__">(train_config.CheckpointParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.LoaderConfig.__pydantic_custom_init__">(train_config.LoaderConfig attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.LoggingParams.__pydantic_custom_init__">(train_config.LoggingParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.LossParams.__pydantic_custom_init__">(train_config.LossParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.ModelParams.__pydantic_custom_init__">(train_config.ModelParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.NoiseScheduleParams.__pydantic_custom_init__">(train_config.NoiseScheduleParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.ResidueDistogramParams.__pydantic_custom_init__">(train_config.ResidueDistogramParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.TrainConfig.__pydantic_custom_init__">(train_config.TrainConfig attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.TrainingParams.__pydantic_custom_init__">(train_config.TrainingParams attribute)</a>
+</li>
+        </ul></li>
+        <li><a href="autoapi/sample_config/index.html#sample_config.GenerationParams.__pydantic_decorators__">__pydantic_decorators__ (sample_config.GenerationParams attribute)</a>
+
+        <ul>
+          <li><a href="autoapi/sample_config/index.html#sample_config.SampleCheckpointParams.__pydantic_decorators__">(sample_config.SampleCheckpointParams attribute)</a>
+</li>
+          <li><a href="autoapi/sample_config/index.html#sample_config.SampleConfig.__pydantic_decorators__">(sample_config.SampleConfig attribute)</a>
+</li>
+          <li><a href="autoapi/sample_config/index.html#sample_config.SampleOutputParams.__pydantic_decorators__">(sample_config.SampleOutputParams attribute)</a>
+</li>
+          <li><a href="autoapi/sample_config/index.html#sample_config.SamplerParams.__pydantic_decorators__">(sample_config.SamplerParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.AtomDistogramParams.__pydantic_decorators__">(train_config.AtomDistogramParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.CheckpointParams.__pydantic_decorators__">(train_config.CheckpointParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.LoaderConfig.__pydantic_decorators__">(train_config.LoaderConfig attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.LoggingParams.__pydantic_decorators__">(train_config.LoggingParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.LossParams.__pydantic_decorators__">(train_config.LossParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.ModelParams.__pydantic_decorators__">(train_config.ModelParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.NoiseScheduleParams.__pydantic_decorators__">(train_config.NoiseScheduleParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.ResidueDistogramParams.__pydantic_decorators__">(train_config.ResidueDistogramParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.TrainConfig.__pydantic_decorators__">(train_config.TrainConfig attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.TrainingParams.__pydantic_decorators__">(train_config.TrainingParams attribute)</a>
+</li>
+        </ul></li>
+        <li><a href="autoapi/sample_config/index.html#sample_config.GenerationParams.__pydantic_extra__">__pydantic_extra__ (sample_config.GenerationParams attribute)</a>
+
+        <ul>
+          <li><a href="autoapi/sample_config/index.html#sample_config.SampleCheckpointParams.__pydantic_extra__">(sample_config.SampleCheckpointParams attribute)</a>
+</li>
+          <li><a href="autoapi/sample_config/index.html#sample_config.SampleConfig.__pydantic_extra__">(sample_config.SampleConfig attribute)</a>
+</li>
+          <li><a href="autoapi/sample_config/index.html#sample_config.SampleOutputParams.__pydantic_extra__">(sample_config.SampleOutputParams attribute)</a>
+</li>
+          <li><a href="autoapi/sample_config/index.html#sample_config.SamplerParams.__pydantic_extra__">(sample_config.SamplerParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.AtomDistogramParams.__pydantic_extra__">(train_config.AtomDistogramParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.CheckpointParams.__pydantic_extra__">(train_config.CheckpointParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.LoaderConfig.__pydantic_extra__">(train_config.LoaderConfig attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.LoggingParams.__pydantic_extra__">(train_config.LoggingParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.LossParams.__pydantic_extra__">(train_config.LossParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.ModelParams.__pydantic_extra__">(train_config.ModelParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.NoiseScheduleParams.__pydantic_extra__">(train_config.NoiseScheduleParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.ResidueDistogramParams.__pydantic_extra__">(train_config.ResidueDistogramParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.TrainConfig.__pydantic_extra__">(train_config.TrainConfig attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.TrainingParams.__pydantic_extra__">(train_config.TrainingParams attribute)</a>
+</li>
+        </ul></li>
+        <li><a href="autoapi/sample_config/index.html#sample_config.GenerationParams.__pydantic_fields__">__pydantic_fields__ (sample_config.GenerationParams attribute)</a>
+
+        <ul>
+          <li><a href="autoapi/sample_config/index.html#sample_config.SampleCheckpointParams.__pydantic_fields__">(sample_config.SampleCheckpointParams attribute)</a>
+</li>
+          <li><a href="autoapi/sample_config/index.html#sample_config.SampleConfig.__pydantic_fields__">(sample_config.SampleConfig attribute)</a>
+</li>
+          <li><a href="autoapi/sample_config/index.html#sample_config.SampleOutputParams.__pydantic_fields__">(sample_config.SampleOutputParams attribute)</a>
+</li>
+          <li><a href="autoapi/sample_config/index.html#sample_config.SamplerParams.__pydantic_fields__">(sample_config.SamplerParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.AtomDistogramParams.__pydantic_fields__">(train_config.AtomDistogramParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.CheckpointParams.__pydantic_fields__">(train_config.CheckpointParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.LoaderConfig.__pydantic_fields__">(train_config.LoaderConfig attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.LoggingParams.__pydantic_fields__">(train_config.LoggingParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.LossParams.__pydantic_fields__">(train_config.LossParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.ModelParams.__pydantic_fields__">(train_config.ModelParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.NoiseScheduleParams.__pydantic_fields__">(train_config.NoiseScheduleParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.ResidueDistogramParams.__pydantic_fields__">(train_config.ResidueDistogramParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.TrainConfig.__pydantic_fields__">(train_config.TrainConfig attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.TrainingParams.__pydantic_fields__">(train_config.TrainingParams attribute)</a>
+</li>
+        </ul></li>
+    </ul></td>
+    <td style="width: 33%; vertical-align: top;"><ul>
+        <li><a href="autoapi/sample_config/index.html#sample_config.GenerationParams.__pydantic_fields_set__">__pydantic_fields_set__ (sample_config.GenerationParams attribute)</a>
+
+        <ul>
+          <li><a href="autoapi/sample_config/index.html#sample_config.SampleCheckpointParams.__pydantic_fields_set__">(sample_config.SampleCheckpointParams attribute)</a>
+</li>
+          <li><a href="autoapi/sample_config/index.html#sample_config.SampleConfig.__pydantic_fields_set__">(sample_config.SampleConfig attribute)</a>
+</li>
+          <li><a href="autoapi/sample_config/index.html#sample_config.SampleOutputParams.__pydantic_fields_set__">(sample_config.SampleOutputParams attribute)</a>
+</li>
+          <li><a href="autoapi/sample_config/index.html#sample_config.SamplerParams.__pydantic_fields_set__">(sample_config.SamplerParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.AtomDistogramParams.__pydantic_fields_set__">(train_config.AtomDistogramParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.CheckpointParams.__pydantic_fields_set__">(train_config.CheckpointParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.LoaderConfig.__pydantic_fields_set__">(train_config.LoaderConfig attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.LoggingParams.__pydantic_fields_set__">(train_config.LoggingParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.LossParams.__pydantic_fields_set__">(train_config.LossParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.ModelParams.__pydantic_fields_set__">(train_config.ModelParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.NoiseScheduleParams.__pydantic_fields_set__">(train_config.NoiseScheduleParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.ResidueDistogramParams.__pydantic_fields_set__">(train_config.ResidueDistogramParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.TrainConfig.__pydantic_fields_set__">(train_config.TrainConfig attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.TrainingParams.__pydantic_fields_set__">(train_config.TrainingParams attribute)</a>
+</li>
+        </ul></li>
+        <li><a href="autoapi/sample_config/index.html#sample_config.GenerationParams.__pydantic_generic_metadata__">__pydantic_generic_metadata__ (sample_config.GenerationParams attribute)</a>
+
+        <ul>
+          <li><a href="autoapi/sample_config/index.html#sample_config.SampleCheckpointParams.__pydantic_generic_metadata__">(sample_config.SampleCheckpointParams attribute)</a>
+</li>
+          <li><a href="autoapi/sample_config/index.html#sample_config.SampleConfig.__pydantic_generic_metadata__">(sample_config.SampleConfig attribute)</a>
+</li>
+          <li><a href="autoapi/sample_config/index.html#sample_config.SampleOutputParams.__pydantic_generic_metadata__">(sample_config.SampleOutputParams attribute)</a>
+</li>
+          <li><a href="autoapi/sample_config/index.html#sample_config.SamplerParams.__pydantic_generic_metadata__">(sample_config.SamplerParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.AtomDistogramParams.__pydantic_generic_metadata__">(train_config.AtomDistogramParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.CheckpointParams.__pydantic_generic_metadata__">(train_config.CheckpointParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.LoaderConfig.__pydantic_generic_metadata__">(train_config.LoaderConfig attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.LoggingParams.__pydantic_generic_metadata__">(train_config.LoggingParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.LossParams.__pydantic_generic_metadata__">(train_config.LossParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.ModelParams.__pydantic_generic_metadata__">(train_config.ModelParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.NoiseScheduleParams.__pydantic_generic_metadata__">(train_config.NoiseScheduleParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.ResidueDistogramParams.__pydantic_generic_metadata__">(train_config.ResidueDistogramParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.TrainConfig.__pydantic_generic_metadata__">(train_config.TrainConfig attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.TrainingParams.__pydantic_generic_metadata__">(train_config.TrainingParams attribute)</a>
+</li>
+        </ul></li>
+        <li><a href="autoapi/sample_config/index.html#sample_config.GenerationParams.__pydantic_parent_namespace__">__pydantic_parent_namespace__ (sample_config.GenerationParams attribute)</a>
+
+        <ul>
+          <li><a href="autoapi/sample_config/index.html#sample_config.SampleCheckpointParams.__pydantic_parent_namespace__">(sample_config.SampleCheckpointParams attribute)</a>
+</li>
+          <li><a href="autoapi/sample_config/index.html#sample_config.SampleConfig.__pydantic_parent_namespace__">(sample_config.SampleConfig attribute)</a>
+</li>
+          <li><a href="autoapi/sample_config/index.html#sample_config.SampleOutputParams.__pydantic_parent_namespace__">(sample_config.SampleOutputParams attribute)</a>
+</li>
+          <li><a href="autoapi/sample_config/index.html#sample_config.SamplerParams.__pydantic_parent_namespace__">(sample_config.SamplerParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.AtomDistogramParams.__pydantic_parent_namespace__">(train_config.AtomDistogramParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.CheckpointParams.__pydantic_parent_namespace__">(train_config.CheckpointParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.LoaderConfig.__pydantic_parent_namespace__">(train_config.LoaderConfig attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.LoggingParams.__pydantic_parent_namespace__">(train_config.LoggingParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.LossParams.__pydantic_parent_namespace__">(train_config.LossParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.ModelParams.__pydantic_parent_namespace__">(train_config.ModelParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.NoiseScheduleParams.__pydantic_parent_namespace__">(train_config.NoiseScheduleParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.ResidueDistogramParams.__pydantic_parent_namespace__">(train_config.ResidueDistogramParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.TrainConfig.__pydantic_parent_namespace__">(train_config.TrainConfig attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.TrainingParams.__pydantic_parent_namespace__">(train_config.TrainingParams attribute)</a>
+</li>
+        </ul></li>
+        <li><a href="autoapi/sample_config/index.html#sample_config.GenerationParams.__pydantic_post_init__">__pydantic_post_init__ (sample_config.GenerationParams attribute)</a>
+
+        <ul>
+          <li><a href="autoapi/sample_config/index.html#sample_config.SampleCheckpointParams.__pydantic_post_init__">(sample_config.SampleCheckpointParams attribute)</a>
+</li>
+          <li><a href="autoapi/sample_config/index.html#sample_config.SampleConfig.__pydantic_post_init__">(sample_config.SampleConfig attribute)</a>
+</li>
+          <li><a href="autoapi/sample_config/index.html#sample_config.SampleOutputParams.__pydantic_post_init__">(sample_config.SampleOutputParams attribute)</a>
+</li>
+          <li><a href="autoapi/sample_config/index.html#sample_config.SamplerParams.__pydantic_post_init__">(sample_config.SamplerParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.AtomDistogramParams.__pydantic_post_init__">(train_config.AtomDistogramParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.CheckpointParams.__pydantic_post_init__">(train_config.CheckpointParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.LoaderConfig.__pydantic_post_init__">(train_config.LoaderConfig attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.LoggingParams.__pydantic_post_init__">(train_config.LoggingParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.LossParams.__pydantic_post_init__">(train_config.LossParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.ModelParams.__pydantic_post_init__">(train_config.ModelParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.NoiseScheduleParams.__pydantic_post_init__">(train_config.NoiseScheduleParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.ResidueDistogramParams.__pydantic_post_init__">(train_config.ResidueDistogramParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.TrainConfig.__pydantic_post_init__">(train_config.TrainConfig attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.TrainingParams.__pydantic_post_init__">(train_config.TrainingParams attribute)</a>
+</li>
+        </ul></li>
+        <li><a href="autoapi/sample_config/index.html#sample_config.GenerationParams.__pydantic_private__">__pydantic_private__ (sample_config.GenerationParams attribute)</a>
+
+        <ul>
+          <li><a href="autoapi/sample_config/index.html#sample_config.SampleCheckpointParams.__pydantic_private__">(sample_config.SampleCheckpointParams attribute)</a>
+</li>
+          <li><a href="autoapi/sample_config/index.html#sample_config.SampleConfig.__pydantic_private__">(sample_config.SampleConfig attribute)</a>
+</li>
+          <li><a href="autoapi/sample_config/index.html#sample_config.SampleOutputParams.__pydantic_private__">(sample_config.SampleOutputParams attribute)</a>
+</li>
+          <li><a href="autoapi/sample_config/index.html#sample_config.SamplerParams.__pydantic_private__">(sample_config.SamplerParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.AtomDistogramParams.__pydantic_private__">(train_config.AtomDistogramParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.CheckpointParams.__pydantic_private__">(train_config.CheckpointParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.LoaderConfig.__pydantic_private__">(train_config.LoaderConfig attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.LoggingParams.__pydantic_private__">(train_config.LoggingParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.LossParams.__pydantic_private__">(train_config.LossParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.ModelParams.__pydantic_private__">(train_config.ModelParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.NoiseScheduleParams.__pydantic_private__">(train_config.NoiseScheduleParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.ResidueDistogramParams.__pydantic_private__">(train_config.ResidueDistogramParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.TrainConfig.__pydantic_private__">(train_config.TrainConfig attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.TrainingParams.__pydantic_private__">(train_config.TrainingParams attribute)</a>
+</li>
+        </ul></li>
+        <li><a href="autoapi/sample_config/index.html#sample_config.GenerationParams.__pydantic_root_model__">__pydantic_root_model__ (sample_config.GenerationParams attribute)</a>
+
+        <ul>
+          <li><a href="autoapi/sample_config/index.html#sample_config.SampleCheckpointParams.__pydantic_root_model__">(sample_config.SampleCheckpointParams attribute)</a>
+</li>
+          <li><a href="autoapi/sample_config/index.html#sample_config.SampleConfig.__pydantic_root_model__">(sample_config.SampleConfig attribute)</a>
+</li>
+          <li><a href="autoapi/sample_config/index.html#sample_config.SampleOutputParams.__pydantic_root_model__">(sample_config.SampleOutputParams attribute)</a>
+</li>
+          <li><a href="autoapi/sample_config/index.html#sample_config.SamplerParams.__pydantic_root_model__">(sample_config.SamplerParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.AtomDistogramParams.__pydantic_root_model__">(train_config.AtomDistogramParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.CheckpointParams.__pydantic_root_model__">(train_config.CheckpointParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.LoaderConfig.__pydantic_root_model__">(train_config.LoaderConfig attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.LoggingParams.__pydantic_root_model__">(train_config.LoggingParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.LossParams.__pydantic_root_model__">(train_config.LossParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.ModelParams.__pydantic_root_model__">(train_config.ModelParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.NoiseScheduleParams.__pydantic_root_model__">(train_config.NoiseScheduleParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.ResidueDistogramParams.__pydantic_root_model__">(train_config.ResidueDistogramParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.TrainConfig.__pydantic_root_model__">(train_config.TrainConfig attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.TrainingParams.__pydantic_root_model__">(train_config.TrainingParams attribute)</a>
+</li>
+        </ul></li>
+        <li><a href="autoapi/sample_config/index.html#sample_config.GenerationParams.__pydantic_serializer__">__pydantic_serializer__ (sample_config.GenerationParams attribute)</a>
+
+        <ul>
+          <li><a href="autoapi/sample_config/index.html#sample_config.SampleCheckpointParams.__pydantic_serializer__">(sample_config.SampleCheckpointParams attribute)</a>
+</li>
+          <li><a href="autoapi/sample_config/index.html#sample_config.SampleConfig.__pydantic_serializer__">(sample_config.SampleConfig attribute)</a>
+</li>
+          <li><a href="autoapi/sample_config/index.html#sample_config.SampleOutputParams.__pydantic_serializer__">(sample_config.SampleOutputParams attribute)</a>
+</li>
+          <li><a href="autoapi/sample_config/index.html#sample_config.SamplerParams.__pydantic_serializer__">(sample_config.SamplerParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.AtomDistogramParams.__pydantic_serializer__">(train_config.AtomDistogramParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.CheckpointParams.__pydantic_serializer__">(train_config.CheckpointParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.LoaderConfig.__pydantic_serializer__">(train_config.LoaderConfig attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.LoggingParams.__pydantic_serializer__">(train_config.LoggingParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.LossParams.__pydantic_serializer__">(train_config.LossParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.ModelParams.__pydantic_serializer__">(train_config.ModelParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.NoiseScheduleParams.__pydantic_serializer__">(train_config.NoiseScheduleParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.ResidueDistogramParams.__pydantic_serializer__">(train_config.ResidueDistogramParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.TrainConfig.__pydantic_serializer__">(train_config.TrainConfig attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.TrainingParams.__pydantic_serializer__">(train_config.TrainingParams attribute)</a>
+</li>
+        </ul></li>
+        <li><a href="autoapi/sample_config/index.html#sample_config.GenerationParams.__pydantic_validator__">__pydantic_validator__ (sample_config.GenerationParams attribute)</a>
+
+        <ul>
+          <li><a href="autoapi/sample_config/index.html#sample_config.SampleCheckpointParams.__pydantic_validator__">(sample_config.SampleCheckpointParams attribute)</a>
+</li>
+          <li><a href="autoapi/sample_config/index.html#sample_config.SampleConfig.__pydantic_validator__">(sample_config.SampleConfig attribute)</a>
+</li>
+          <li><a href="autoapi/sample_config/index.html#sample_config.SampleOutputParams.__pydantic_validator__">(sample_config.SampleOutputParams attribute)</a>
+</li>
+          <li><a href="autoapi/sample_config/index.html#sample_config.SamplerParams.__pydantic_validator__">(sample_config.SamplerParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.AtomDistogramParams.__pydantic_validator__">(train_config.AtomDistogramParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.CheckpointParams.__pydantic_validator__">(train_config.CheckpointParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.LoaderConfig.__pydantic_validator__">(train_config.LoaderConfig attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.LoggingParams.__pydantic_validator__">(train_config.LoggingParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.LossParams.__pydantic_validator__">(train_config.LossParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.ModelParams.__pydantic_validator__">(train_config.ModelParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.NoiseScheduleParams.__pydantic_validator__">(train_config.NoiseScheduleParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.ResidueDistogramParams.__pydantic_validator__">(train_config.ResidueDistogramParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.TrainConfig.__pydantic_validator__">(train_config.TrainConfig attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.TrainingParams.__pydantic_validator__">(train_config.TrainingParams attribute)</a>
+</li>
+        </ul></li>
+        <li><a href="autoapi/sample_config/index.html#sample_config.GenerationParams.__signature__">__signature__ (sample_config.GenerationParams attribute)</a>
+
+        <ul>
+          <li><a href="autoapi/sample_config/index.html#sample_config.SampleCheckpointParams.__signature__">(sample_config.SampleCheckpointParams attribute)</a>
+</li>
+          <li><a href="autoapi/sample_config/index.html#sample_config.SampleConfig.__signature__">(sample_config.SampleConfig attribute)</a>
+</li>
+          <li><a href="autoapi/sample_config/index.html#sample_config.SampleOutputParams.__signature__">(sample_config.SampleOutputParams attribute)</a>
+</li>
+          <li><a href="autoapi/sample_config/index.html#sample_config.SamplerParams.__signature__">(sample_config.SamplerParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.AtomDistogramParams.__signature__">(train_config.AtomDistogramParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.CheckpointParams.__signature__">(train_config.CheckpointParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.LoaderConfig.__signature__">(train_config.LoaderConfig attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.LoggingParams.__signature__">(train_config.LoggingParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.LossParams.__signature__">(train_config.LossParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.ModelParams.__signature__">(train_config.ModelParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.NoiseScheduleParams.__signature__">(train_config.NoiseScheduleParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.ResidueDistogramParams.__signature__">(train_config.ResidueDistogramParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.TrainConfig.__signature__">(train_config.TrainConfig attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.TrainingParams.__signature__">(train_config.TrainingParams attribute)</a>
+</li>
+        </ul></li>
+    </ul></td>
+  </tr></table>
+</section>
+
+<section id="A" class="genindex-section">
+  <h2>A</h2>
+  <table style="width: 100%" class="indextable genindextable"><tr>
+    <td style="width: 33%; vertical-align: top;"><ul>
+        <li><a href="autoapi/pallatom/helpers/featurize/index.html#pallatom.helpers.featurize.FeaturizedBatch.aa_indices">aa_indices (pallatom.helpers.featurize.FeaturizedBatch attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/helpers/atom_utils/index.html#pallatom.helpers.atom_utils.Protein.aatype">aatype (pallatom.helpers.atom_utils.Protein attribute)</a>
+</li>
+        <li><a href="autoapi/train_config/index.html#train_config.LossParams.alpha_0">alpha_0 (train_config.LossParams attribute)</a>
+</li>
+        <li><a href="autoapi/train_config/index.html#train_config.LossParams.alpha_1">alpha_1 (train_config.LossParams attribute)</a>
+</li>
+        <li><a href="autoapi/train_config/index.html#train_config.LossParams.alpha_2">alpha_2 (train_config.LossParams attribute)</a>
+</li>
+        <li><a href="autoapi/train_config/index.html#train_config.LossParams.alpha_3">alpha_3 (train_config.LossParams attribute)</a>
+</li>
+        <li><a href="autoapi/train_config/index.html#train_config.LossParams.alpha_4">alpha_4 (train_config.LossParams attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/helpers/alignment/index.html#pallatom.helpers.alignment.apply_transform">apply_transform() (in module pallatom.helpers.alignment)</a>
+</li>
+        <li><a href="autoapi/pallatom/helpers/atom_utils/index.html#pallatom.helpers.atom_utils.ATOM37_C">ATOM37_C (in module pallatom.helpers.atom_utils)</a>
+</li>
+        <li><a href="autoapi/pallatom/helpers/atom_utils/index.html#pallatom.helpers.atom_utils.ATOM37_CA">ATOM37_CA (in module pallatom.helpers.atom_utils)</a>
+</li>
+        <li><a href="autoapi/pallatom/helpers/atom_utils/index.html#pallatom.helpers.atom_utils.ATOM37_CB">ATOM37_CB (in module pallatom.helpers.atom_utils)</a>
+</li>
+        <li><a href="autoapi/pallatom/helpers/atom_utils/index.html#pallatom.helpers.atom_utils.ATOM37_N">ATOM37_N (in module pallatom.helpers.atom_utils)</a>
+</li>
+        <li><a href="autoapi/pallatom/helpers/atom_utils/index.html#pallatom.helpers.atom_utils.ATOM37_O">ATOM37_O (in module pallatom.helpers.atom_utils)</a>
+</li>
+        <li><a href="autoapi/pallatom/helpers/atom_utils/index.html#pallatom.helpers.atom_utils.atom37_to_atom5">atom37_to_atom5() (in module pallatom.helpers.atom_utils)</a>
+</li>
+        <li><a href="autoapi/pallatom/helpers/atom_utils/index.html#pallatom.helpers.atom_utils.atom37_to_cb">atom37_to_cb() (in module pallatom.helpers.atom_utils)</a>
+</li>
+        <li><a href="autoapi/pallatom/helpers/atom_utils/index.html#pallatom.helpers.atom_utils.ATOM5_C">ATOM5_C (in module pallatom.helpers.atom_utils)</a>
+</li>
+        <li><a href="autoapi/pallatom/helpers/atom_utils/index.html#pallatom.helpers.atom_utils.ATOM5_CA">ATOM5_CA (in module pallatom.helpers.atom_utils)</a>
+</li>
+        <li><a href="autoapi/pallatom/helpers/atom_utils/index.html#pallatom.helpers.atom_utils.ATOM5_CB">ATOM5_CB (in module pallatom.helpers.atom_utils)</a>
+</li>
+        <li><a href="autoapi/pallatom/helpers/atom_utils/index.html#pallatom.helpers.atom_utils.ATOM5_ELEMENTS">ATOM5_ELEMENTS (in module pallatom.helpers.atom_utils)</a>
+</li>
+        <li><a href="autoapi/pallatom/helpers/featurize/index.html#pallatom.helpers.featurize.FeaturizedBatch.atom5_mask">atom5_mask (pallatom.helpers.featurize.FeaturizedBatch attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/helpers/atom_utils/index.html#pallatom.helpers.atom_utils.ATOM5_N">ATOM5_N (in module pallatom.helpers.atom_utils)</a>
+</li>
+    </ul></td>
+    <td style="width: 33%; vertical-align: top;"><ul>
+        <li><a href="autoapi/pallatom/helpers/atom_utils/index.html#pallatom.helpers.atom_utils.ATOM5_NAMES">ATOM5_NAMES (in module pallatom.helpers.atom_utils)</a>
+</li>
+        <li><a href="autoapi/pallatom/helpers/atom_utils/index.html#pallatom.helpers.atom_utils.ATOM5_O">ATOM5_O (in module pallatom.helpers.atom_utils)</a>
+</li>
+        <li><a href="autoapi/sampling/index.html#sampling.ATOM5_TO_ATOM37">ATOM5_TO_ATOM37 (in module sampling)</a>
+</li>
+        <li><a href="autoapi/sampling/index.html#sampling.atom5_to_atom37">atom5_to_atom37() (in module sampling)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/main_trunk/index.html#pallatom.architecture.main_trunk.MainTrunk.atom_decoders">atom_decoders (pallatom.architecture.main_trunk.MainTrunk attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/main_trunk/index.html#pallatom.architecture.main_trunk.MainTrunk.atom_distogram_head">atom_distogram_head (pallatom.architecture.main_trunk.MainTrunk attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/main_trunk/index.html#pallatom.architecture.main_trunk.MainTrunk.atom_encoder">atom_encoder (pallatom.architecture.main_trunk.MainTrunk attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/losses/index.html#pallatom.architecture.losses.atom_loss">atom_loss() (in module pallatom.architecture.losses)</a>
+</li>
+        <li><a href="autoapi/pallatom/helpers/atom_utils/index.html#pallatom.helpers.atom_utils.Protein.atom_mask">atom_mask (pallatom.helpers.atom_utils.Protein attribute)</a>
+
+        <ul>
+          <li><a href="autoapi/pallatom/helpers/featurize/index.html#pallatom.helpers.featurize.ProteinBatch.atom_mask">(pallatom.helpers.featurize.ProteinBatch attribute)</a>
+</li>
+        </ul></li>
+        <li><a href="autoapi/pallatom/helpers/atom_utils/index.html#pallatom.helpers.atom_utils.Protein.atom_positions">atom_positions (pallatom.helpers.atom_utils.Protein attribute)</a>
+
+        <ul>
+          <li><a href="autoapi/pallatom/helpers/featurize/index.html#pallatom.helpers.featurize.ProteinBatch.atom_positions">(pallatom.helpers.featurize.ProteinBatch attribute)</a>
+</li>
+        </ul></li>
+        <li><a href="autoapi/pallatom/helpers/atom_utils/index.html#pallatom.helpers.atom_utils.atom_types">atom_types (in module pallatom.helpers.atom_utils)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/atom_transformers/index.html#pallatom.architecture.atom_transformers.AtomAttentionDecoder">AtomAttentionDecoder (class in pallatom.architecture.atom_transformers)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/main_trunk/index.html#pallatom.architecture.main_trunk.AtomDistogramHead">AtomDistogramHead (class in pallatom.architecture.main_trunk)</a>
+</li>
+        <li><a href="autoapi/train_config/index.html#train_config.AtomDistogramParams">AtomDistogramParams (class in train_config)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/atom_transformers/index.html#pallatom.architecture.atom_transformers.AtomFeatureEncoder">AtomFeatureEncoder (class in pallatom.architecture.atom_transformers)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/atom_transformers/index.html#pallatom.architecture.atom_transformers.AtomTransformer">AtomTransformer (class in pallatom.architecture.atom_transformers)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/atom_transformers/index.html#pallatom.architecture.atom_transformers.AtomTransformerBlock">AtomTransformerBlock (class in pallatom.architecture.atom_transformers)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/node_update/index.html#pallatom.architecture.node_update.AttentionPairBias">AttentionPairBias (class in pallatom.architecture.node_update)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/node_update/index.html#pallatom.architecture.node_update.NodeUpdate.attn_pair_bias">attn_pair_bias (pallatom.architecture.node_update.NodeUpdate attribute)</a>
+</li>
+    </ul></td>
+  </tr></table>
+</section>
+
+<section id="B" class="genindex-section">
+  <h2>B</h2>
+  <table style="width: 100%" class="indextable genindextable"><tr>
+    <td style="width: 33%; vertical-align: top;"><ul>
+        <li><a href="autoapi/pallatom/helpers/atom_utils/index.html#pallatom.helpers.atom_utils.Protein.b_factors">b_factors (pallatom.helpers.atom_utils.Protein attribute)</a>
+</li>
+        <li><a href="autoapi/train_config/index.html#train_config.LoaderConfig.batch_size">batch_size (train_config.LoaderConfig attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/atom_transformers/index.html#pallatom.architecture.atom_transformers.AtomTransformer.blocks">blocks (pallatom.architecture.atom_transformers.AtomTransformer attribute)</a>
+
+        <ul>
+          <li><a href="autoapi/pallatom/architecture/pairformer_stack/index.html#pallatom.architecture.pairformer_stack.PairformerStack.blocks">(pallatom.architecture.pairformer_stack.PairformerStack attribute)</a>
+</li>
+        </ul></li>
+    </ul></td>
+    <td style="width: 33%; vertical-align: top;"><ul>
+        <li><a href="autoapi/sampling/index.html#sampling.build_sampling_context">build_sampling_context() (in module sampling)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/atom_transformers/index.html#pallatom.architecture.atom_transformers.build_sparse_pairs">build_sparse_pairs() (in module pallatom.architecture.atom_transformers)</a>
+</li>
+        <li><a href="autoapi/sampling/index.html#sampling.build_template_context">build_template_context() (in module sampling)</a>
+</li>
+    </ul></td>
+  </tr></table>
+</section>
+
+<section id="C" class="genindex-section">
+  <h2>C</h2>
+  <table style="width: 100%" class="indextable genindextable"><tr>
+    <td style="width: 33%; vertical-align: top;"><ul>
+        <li><a href="autoapi/train_config/index.html#train_config.ModelParams.c_atom">c_atom (train_config.ModelParams attribute)</a>
+</li>
+        <li><a href="autoapi/train_config/index.html#train_config.ModelParams.c_atompair">c_atompair (train_config.ModelParams attribute)</a>
+</li>
+        <li><a href="autoapi/train_config/index.html#train_config.ModelParams.c_pair">c_pair (train_config.ModelParams attribute)</a>
+</li>
+        <li><a href="autoapi/train_config/index.html#train_config.ModelParams.c_res">c_res (train_config.ModelParams attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/helpers/atom_utils/index.html#pallatom.helpers.atom_utils.center_positions">center_positions() (in module pallatom.helpers.atom_utils)</a>
+</li>
+        <li><a href="autoapi/pallatom/helpers/featurize/index.html#pallatom.helpers.featurize.FeaturizedBatch.center_uid">center_uid (pallatom.helpers.featurize.FeaturizedBatch attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/pair_update/index.html#pallatom.architecture.pair_update.TransformRBF.centers">centers (pallatom.architecture.pair_update.TransformRBF attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/helpers/atom_utils/index.html#pallatom.helpers.atom_utils.Protein.chain_index">chain_index (pallatom.helpers.atom_utils.Protein attribute)</a>
+</li>
+    </ul></td>
+    <td style="width: 33%; vertical-align: top;"><ul>
+        <li><a href="autoapi/sample_config/index.html#sample_config.SampleConfig.checkpoint">checkpoint (sample_config.SampleConfig attribute)</a>
+
+        <ul>
+          <li><a href="autoapi/train_config/index.html#train_config.TrainConfig.checkpoint">(train_config.TrainConfig attribute)</a>
+</li>
+        </ul></li>
+        <li><a href="autoapi/sample_config/index.html#sample_config.SampleCheckpointParams.checkpoint_path">checkpoint_path (sample_config.SampleCheckpointParams attribute)</a>
+
+        <ul>
+          <li><a href="autoapi/train_config/index.html#train_config.CheckpointParams.checkpoint_path">(train_config.CheckpointParams attribute)</a>
+</li>
+        </ul></li>
+        <li><a href="autoapi/train_config/index.html#train_config.CheckpointParams">CheckpointParams (class in train_config)</a>
+</li>
+        <li><a href="autoapi/pallatom/helpers/compute_EDM_data_params/index.html#pallatom.helpers.compute_EDM_data_params.compute_edm_noise_params">compute_edm_noise_params() (in module pallatom.helpers.compute_EDM_data_params)</a>
+</li>
+        <li><a href="autoapi/pallatom/helpers/compute_EDM_data_params/index.html#pallatom.helpers.compute_EDM_data_params.compute_sigma_data">compute_sigma_data() (in module pallatom.helpers.compute_EDM_data_params)</a>
+</li>
+        <li><a href="autoapi/sampling/index.html#sampling.EDMPrecond.context">context (sampling.EDMPrecond attribute)</a>
+</li>
+    </ul></td>
+  </tr></table>
+</section>
+
+<section id="D" class="genindex-section">
+  <h2>D</h2>
+  <table style="width: 100%" class="indextable genindextable"><tr>
+    <td style="width: 33%; vertical-align: top;"><ul>
+        <li><a href="autoapi/pallatom/architecture/main_trunk/index.html#pallatom.architecture.main_trunk.AtomDistogramHead.d_max">d_max (pallatom.architecture.main_trunk.AtomDistogramHead attribute)</a>
+
+        <ul>
+          <li><a href="autoapi/pallatom/architecture/main_trunk/index.html#pallatom.architecture.main_trunk.ResidueDistogramHead.d_max">(pallatom.architecture.main_trunk.ResidueDistogramHead attribute)</a>
+</li>
+        </ul></li>
+        <li><a href="autoapi/pallatom/architecture/main_trunk/index.html#pallatom.architecture.main_trunk.AtomDistogramHead.d_min">d_min (pallatom.architecture.main_trunk.AtomDistogramHead attribute)</a>
+
+        <ul>
+          <li><a href="autoapi/pallatom/architecture/main_trunk/index.html#pallatom.architecture.main_trunk.ResidueDistogramHead.d_min">(pallatom.architecture.main_trunk.ResidueDistogramHead attribute)</a>
+</li>
+        </ul></li>
+        <li><a href="autoapi/sample_config/index.html#sample_config.SamplerParams.ddim_steps">ddim_steps (sample_config.SamplerParams attribute)</a>
+</li>
+        <li><a href="autoapi/sampling/index.html#sampling.EDMSampler.denoiser">denoiser (sampling.EDMSampler attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/helpers/featurize/index.html#pallatom.helpers.featurize.Distogram">Distogram (class in pallatom.helpers.featurize)</a>
+</li>
+        <li><a href="autoapi/train_config/index.html#train_config.TrainConfig.distogram_atom">distogram_atom (train_config.TrainConfig attribute)</a>
+</li>
+    </ul></td>
+    <td style="width: 33%; vertical-align: top;"><ul>
+        <li><a href="autoapi/pallatom/architecture/losses/index.html#pallatom.architecture.losses.distogram_loss_atom">distogram_loss_atom() (in module pallatom.architecture.losses)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/losses/index.html#pallatom.architecture.losses.distogram_loss_residue">distogram_loss_residue() (in module pallatom.architecture.losses)</a>
+</li>
+        <li><a href="autoapi/train_config/index.html#train_config.TrainConfig.distogram_res">distogram_res (train_config.TrainConfig attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/pair_update/index.html#pallatom.architecture.pair_update.PairUpdate.drop_col">drop_col (pallatom.architecture.pair_update.PairUpdate attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/pair_update/index.html#pallatom.architecture.pair_update.PairUpdate.drop_row">drop_row (pallatom.architecture.pair_update.PairUpdate attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/node_update/index.html#pallatom.architecture.node_update.NodeUpdate.dropout_row">dropout_row (pallatom.architecture.node_update.NodeUpdate attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/pair_update/index.html#pallatom.architecture.pair_update.DropoutColumnwise">DropoutColumnwise (class in pallatom.architecture.pair_update)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/pair_update/index.html#pallatom.architecture.pair_update.DropoutRowwise">DropoutRowwise (class in pallatom.architecture.pair_update)</a>
+</li>
+    </ul></td>
+  </tr></table>
+</section>
+
+<section id="E" class="genindex-section">
+  <h2>E</h2>
+  <table style="width: 100%" class="indextable genindextable"><tr>
+    <td style="width: 33%; vertical-align: top;"><ul>
+        <li><a href="autoapi/sampling/index.html#sampling.EDMPrecond">EDMPrecond (class in sampling)</a>
+</li>
+        <li><a href="autoapi/sampling/index.html#sampling.EDMSampler">EDMSampler (class in sampling)</a>
+</li>
+    </ul></td>
+    <td style="width: 33%; vertical-align: top;"><ul>
+        <li><a href="autoapi/pallatom/helpers/featurize/index.html#pallatom.helpers.featurize.ResidueIndexEmbedding.embed">embed (pallatom.helpers.featurize.ResidueIndexEmbedding attribute)</a>
+</li>
+        <li><a href="autoapi/train_loop/index.html#train_loop.evaluate">evaluate() (in module train_loop)</a>
+</li>
+        <li><a href="autoapi/pallatom/helpers/featurize/index.html#pallatom.helpers.featurize.Distogram.extra_repr">extra_repr() (pallatom.helpers.featurize.Distogram method)</a>
+</li>
+    </ul></td>
+  </tr></table>
+</section>
+
+<section id="F" class="genindex-section">
+  <h2>F</h2>
+  <table style="width: 100%" class="indextable genindextable"><tr>
+    <td style="width: 33%; vertical-align: top;"><ul>
+        <li><a href="autoapi/pallatom/helpers/featurize/index.html#pallatom.helpers.featurize.FeaturizedBatch.f_pseudo_beta_mask">f_pseudo_beta_mask (pallatom.helpers.featurize.FeaturizedBatch attribute)</a>
+</li>
+        <li><a href="autoapi/train_config/index.html#train_config.ModelParams.f_ref_dim">f_ref_dim (train_config.ModelParams attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/helpers/featurize/index.html#pallatom.helpers.featurize.FeaturizedBatch.f_residue_idx">f_residue_idx (pallatom.helpers.featurize.FeaturizedBatch attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/helpers/featurize/index.html#pallatom.helpers.featurize.featurize_batch">featurize_batch() (in module pallatom.helpers.featurize)</a>
+</li>
+        <li><a href="autoapi/pallatom/helpers/featurize/index.html#pallatom.helpers.featurize.FeaturizedBatch">FeaturizedBatch (class in pallatom.helpers.featurize)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/atom_transformers/index.html#pallatom.architecture.atom_transformers.AtomTransformerBlock.ff1">ff1 (pallatom.architecture.atom_transformers.AtomTransformerBlock attribute)</a>
+
+        <ul>
+          <li><a href="autoapi/pallatom/architecture/pair_update/index.html#pallatom.architecture.pair_update.Transition.ff1">(pallatom.architecture.pair_update.Transition attribute)</a>
+</li>
+          <li><a href="autoapi/pallatom/architecture/pairformer_stack/index.html#pallatom.architecture.pairformer_stack.PairformerBlock.ff1">(pallatom.architecture.pairformer_stack.PairformerBlock attribute)</a>
+</li>
+        </ul></li>
+        <li><a href="autoapi/pallatom/architecture/atom_transformers/index.html#pallatom.architecture.atom_transformers.AtomTransformerBlock.ff2">ff2 (pallatom.architecture.atom_transformers.AtomTransformerBlock attribute)</a>
+
+        <ul>
+          <li><a href="autoapi/pallatom/architecture/pair_update/index.html#pallatom.architecture.pair_update.Transition.ff2">(pallatom.architecture.pair_update.Transition attribute)</a>
+</li>
+          <li><a href="autoapi/pallatom/architecture/pairformer_stack/index.html#pallatom.architecture.pairformer_stack.PairformerBlock.ff2">(pallatom.architecture.pairformer_stack.PairformerBlock attribute)</a>
+</li>
+        </ul></li>
+        <li><a href="autoapi/pallatom/architecture/atom_transformers/index.html#pallatom.architecture.atom_transformers.AtomAttentionDecoder.forward">forward() (pallatom.architecture.atom_transformers.AtomAttentionDecoder method)</a>
+
+        <ul>
+          <li><a href="autoapi/pallatom/architecture/atom_transformers/index.html#pallatom.architecture.atom_transformers.AtomFeatureEncoder.forward">(pallatom.architecture.atom_transformers.AtomFeatureEncoder method)</a>
+</li>
+          <li><a href="autoapi/pallatom/architecture/atom_transformers/index.html#pallatom.architecture.atom_transformers.AtomTransformer.forward">(pallatom.architecture.atom_transformers.AtomTransformer method)</a>
+</li>
+          <li><a href="autoapi/pallatom/architecture/atom_transformers/index.html#pallatom.architecture.atom_transformers.AtomTransformerBlock.forward">(pallatom.architecture.atom_transformers.AtomTransformerBlock method)</a>
+</li>
+          <li><a href="autoapi/pallatom/architecture/main_trunk/index.html#pallatom.architecture.main_trunk.AtomDistogramHead.forward">(pallatom.architecture.main_trunk.AtomDistogramHead method)</a>
+</li>
+          <li><a href="autoapi/pallatom/architecture/main_trunk/index.html#pallatom.architecture.main_trunk.MainTrunk.forward">(pallatom.architecture.main_trunk.MainTrunk method)</a>
+</li>
+          <li><a href="autoapi/pallatom/architecture/main_trunk/index.html#pallatom.architecture.main_trunk.RelativePositionEncoding.forward">(pallatom.architecture.main_trunk.RelativePositionEncoding method)</a>
+</li>
+          <li><a href="autoapi/pallatom/architecture/main_trunk/index.html#pallatom.architecture.main_trunk.ResidueDistogramHead.forward">(pallatom.architecture.main_trunk.ResidueDistogramHead method)</a>
+</li>
+          <li><a href="autoapi/pallatom/architecture/main_trunk/index.html#pallatom.architecture.main_trunk.TimeFourierEmbedding.forward">(pallatom.architecture.main_trunk.TimeFourierEmbedding method)</a>
+</li>
+          <li><a href="autoapi/pallatom/architecture/node_update/index.html#pallatom.architecture.node_update.AttentionPairBias.forward">(pallatom.architecture.node_update.AttentionPairBias method)</a>
+</li>
+          <li><a href="autoapi/pallatom/architecture/node_update/index.html#pallatom.architecture.node_update.NodeUpdate.forward">(pallatom.architecture.node_update.NodeUpdate method)</a>
+</li>
+          <li><a href="autoapi/pallatom/architecture/pair_update/index.html#pallatom.architecture.pair_update.DropoutColumnwise.forward">(pallatom.architecture.pair_update.DropoutColumnwise method)</a>
+</li>
+          <li><a href="autoapi/pallatom/architecture/pair_update/index.html#pallatom.architecture.pair_update.DropoutRowwise.forward">(pallatom.architecture.pair_update.DropoutRowwise method)</a>
+</li>
+          <li><a href="autoapi/pallatom/architecture/pair_update/index.html#pallatom.architecture.pair_update.PairUpdate.forward">(pallatom.architecture.pair_update.PairUpdate method)</a>
+</li>
+          <li><a href="autoapi/pallatom/architecture/pair_update/index.html#pallatom.architecture.pair_update.TransformRBF.forward">(pallatom.architecture.pair_update.TransformRBF method)</a>
+</li>
+          <li><a href="autoapi/pallatom/architecture/pair_update/index.html#pallatom.architecture.pair_update.Transition.forward">(pallatom.architecture.pair_update.Transition method)</a>
+</li>
+          <li><a href="autoapi/pallatom/architecture/pair_update/index.html#pallatom.architecture.pair_update.TriangleAttentionEndingNodeWithBias.forward">(pallatom.architecture.pair_update.TriangleAttentionEndingNodeWithBias method)</a>
+</li>
+          <li><a href="autoapi/pallatom/architecture/pair_update/index.html#pallatom.architecture.pair_update.TriangleAttentionStartingNodeWithBias.forward">(pallatom.architecture.pair_update.TriangleAttentionStartingNodeWithBias method)</a>
+</li>
+          <li><a href="autoapi/pallatom/architecture/pairformer_stack/index.html#pallatom.architecture.pairformer_stack.PairformerBlock.forward">(pallatom.architecture.pairformer_stack.PairformerBlock method)</a>
+</li>
+          <li><a href="autoapi/pallatom/architecture/pairformer_stack/index.html#pallatom.architecture.pairformer_stack.PairformerStack.forward">(pallatom.architecture.pairformer_stack.PairformerStack method)</a>
+</li>
+          <li><a href="autoapi/pallatom/architecture/template_embedder/index.html#pallatom.architecture.template_embedder.TemplateEmbedder.forward">(pallatom.architecture.template_embedder.TemplateEmbedder method)</a>
+</li>
+          <li><a href="autoapi/pallatom/helpers/featurize/index.html#pallatom.helpers.featurize.Distogram.forward">(pallatom.helpers.featurize.Distogram method)</a>
+</li>
+          <li><a href="autoapi/pallatom/helpers/featurize/index.html#pallatom.helpers.featurize.ResidueIndexEmbedding.forward">(pallatom.helpers.featurize.ResidueIndexEmbedding method)</a>
+</li>
+          <li><a href="autoapi/sampling/index.html#sampling.EDMPrecond.forward">(sampling.EDMPrecond method)</a>
+</li>
+        </ul></li>
+    </ul></td>
+    <td style="width: 33%; vertical-align: top;"><ul>
+        <li><a href="autoapi/pallatom/architecture/main_trunk/index.html#pallatom.architecture.main_trunk.TimeFourierEmbedding.freqs">freqs (pallatom.architecture.main_trunk.TimeFourierEmbedding attribute)</a>
+</li>
+    </ul></td>
+  </tr></table>
+</section>
+
+<section id="G" class="genindex-section">
+  <h2>G</h2>
+  <table style="width: 100%" class="indextable genindextable"><tr>
+    <td style="width: 33%; vertical-align: top;"><ul>
+        <li><a href="autoapi/pallatom/architecture/pairformer_stack/index.html#pallatom.architecture.pairformer_stack.PairformerBlock.g_col">g_col (pallatom.architecture.pairformer_stack.PairformerBlock attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/pairformer_stack/index.html#pallatom.architecture.pairformer_stack.PairformerBlock.g_row">g_row (pallatom.architecture.pairformer_stack.PairformerBlock attribute)</a>
+</li>
+        <li><a href="autoapi/train_config/index.html#train_config.LossParams.gamma">gamma (train_config.LossParams attribute)</a>
+</li>
+        <li><a href="autoapi/sample_config/index.html#sample_config.SampleConfig.generation">generation (sample_config.SampleConfig attribute)</a>
+</li>
+        <li><a href="autoapi/sample_config/index.html#sample_config.GenerationParams">GenerationParams (class in sample_config)</a>
+</li>
+    </ul></td>
+    <td style="width: 33%; vertical-align: top;"><ul>
+        <li><a href="autoapi/pallatom/helpers/atom_utils/index.html#pallatom.helpers.atom_utils.get_cb_coords">get_cb_coords() (in module pallatom.helpers.atom_utils)</a>
+</li>
+        <li><a href="autoapi/train_config/index.html#train_config.TrainingParams.grad_clip">grad_clip (train_config.TrainingParams attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/helpers/featurize/index.html#pallatom.helpers.featurize.FeaturizedBatch.gt_atom_distogram_mask_sparse">gt_atom_distogram_mask_sparse (pallatom.helpers.featurize.FeaturizedBatch attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/helpers/featurize/index.html#pallatom.helpers.featurize.FeaturizedBatch.gt_atom_distogram_sparse">gt_atom_distogram_sparse (pallatom.helpers.featurize.FeaturizedBatch attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/helpers/featurize/index.html#pallatom.helpers.featurize.FeaturizedBatch.gt_res_distogram">gt_res_distogram (pallatom.helpers.featurize.FeaturizedBatch attribute)</a>
+</li>
+    </ul></td>
+  </tr></table>
+</section>
+
+<section id="H" class="genindex-section">
+  <h2>H</h2>
+  <table style="width: 100%" class="indextable genindextable"><tr>
+    <td style="width: 33%; vertical-align: top;"><ul>
+        <li><a href="autoapi/pallatom/architecture/atom_transformers/index.html#pallatom.architecture.atom_transformers.AtomTransformerBlock.head_dim">head_dim (pallatom.architecture.atom_transformers.AtomTransformerBlock attribute)</a>
+
+        <ul>
+          <li><a href="autoapi/pallatom/architecture/node_update/index.html#pallatom.architecture.node_update.AttentionPairBias.head_dim">(pallatom.architecture.node_update.AttentionPairBias attribute)</a>
+</li>
+          <li><a href="autoapi/pallatom/architecture/pair_update/index.html#pallatom.architecture.pair_update.TriangleAttentionEndingNodeWithBias.head_dim">(pallatom.architecture.pair_update.TriangleAttentionEndingNodeWithBias attribute)</a>
+</li>
+          <li><a href="autoapi/pallatom/architecture/pair_update/index.html#pallatom.architecture.pair_update.TriangleAttentionStartingNodeWithBias.head_dim">(pallatom.architecture.pair_update.TriangleAttentionStartingNodeWithBias attribute)</a>
+</li>
+          <li><a href="autoapi/pallatom/architecture/pairformer_stack/index.html#pallatom.architecture.pairformer_stack.PairformerBlock.head_dim">(pallatom.architecture.pairformer_stack.PairformerBlock attribute)</a>
+</li>
+        </ul></li>
+    </ul></td>
+  </tr></table>
+</section>
+
+<section id="I" class="genindex-section">
+  <h2>I</h2>
+  <table style="width: 100%" class="indextable genindextable"><tr>
+    <td style="width: 33%; vertical-align: top;"><ul>
+        <li><a href="autoapi/pallatom/architecture/main_trunk/index.html#pallatom.architecture.main_trunk.MainTrunk.inter_proj_seq">inter_proj_seq (pallatom.architecture.main_trunk.MainTrunk attribute)</a>
+</li>
+    </ul></td>
+    <td style="width: 33%; vertical-align: top;"><ul>
+        <li><a href="autoapi/pallatom/architecture/main_trunk/index.html#pallatom.architecture.main_trunk.MainTrunk.inter_seq_logits">inter_seq_logits (pallatom.architecture.main_trunk.MainTrunk attribute)</a>
+</li>
+    </ul></td>
+  </tr></table>
+</section>
+
+<section id="J" class="genindex-section">
+  <h2>J</h2>
+  <table style="width: 100%" class="indextable genindextable"><tr>
+    <td style="width: 33%; vertical-align: top;"><ul>
+        <li><a href="autoapi/pallatom/helpers/data/index.html#pallatom.helpers.data.ProteinDataset.jsonl_path">jsonl_path (pallatom.helpers.data.ProteinDataset attribute)</a>
+</li>
+    </ul></td>
+  </tr></table>
+</section>
+
+<section id="K" class="genindex-section">
+  <h2>K</h2>
+  <table style="width: 100%" class="indextable genindextable"><tr>
+    <td style="width: 33%; vertical-align: top;"><ul>
+        <li><a href="autoapi/pallatom/architecture/pairformer_stack/index.html#pallatom.architecture.pairformer_stack.PairformerBlock.k_col">k_col (pallatom.architecture.pairformer_stack.PairformerBlock attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/pairformer_stack/index.html#pallatom.architecture.pairformer_stack.PairformerBlock.k_row">k_row (pallatom.architecture.pairformer_stack.PairformerBlock attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/main_trunk/index.html#pallatom.architecture.main_trunk.MainTrunk.K_unit">K_unit (pallatom.architecture.main_trunk.MainTrunk attribute)</a>
+
+        <ul>
+          <li><a href="autoapi/train_config/index.html#train_config.ModelParams.K_unit">(train_config.ModelParams attribute)</a>
+</li>
+        </ul></li>
+    </ul></td>
+    <td style="width: 33%; vertical-align: top;"><ul>
+        <li><a href="autoapi/pallatom/helpers/alignment/index.html#pallatom.helpers.alignment.kabsch_align">kabsch_align() (in module pallatom.helpers.alignment)</a>
+</li>
+        <li><a href="autoapi/pallatom/helpers/alignment/index.html#pallatom.helpers.alignment.kabsch_rmsd">kabsch_rmsd() (in module pallatom.helpers.alignment)</a>
+</li>
+        <li><a href="autoapi/pallatom/helpers/alignment/index.html#pallatom.helpers.alignment.kabsch_rotation">kabsch_rotation() (in module pallatom.helpers.alignment)</a>
+</li>
+    </ul></td>
+  </tr></table>
+</section>
+
+<section id="L" class="genindex-section">
+  <h2>L</h2>
+  <table style="width: 100%" class="indextable genindextable"><tr>
+    <td style="width: 33%; vertical-align: top;"><ul>
+        <li><a href="autoapi/train_config/index.html#train_config.LossParams.lam">lam (train_config.LossParams attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/atom_transformers/index.html#pallatom.architecture.atom_transformers.LinearNoBias">LinearNoBias (class in pallatom.architecture.atom_transformers)</a>
+</li>
+        <li><a href="autoapi/train_config/index.html#train_config.TrainConfig.loader">loader (train_config.TrainConfig attribute)</a>
+</li>
+        <li><a href="autoapi/train_config/index.html#train_config.LoaderConfig">LoaderConfig (class in train_config)</a>
+</li>
+        <li><a href="autoapi/sampling/index.html#sampling.log">log (in module sampling)</a>
+
+        <ul>
+          <li><a href="autoapi/train_loop/index.html#train_loop.log">(in module train_loop)</a>
+</li>
+        </ul></li>
+        <li><a href="autoapi/train_config/index.html#train_config.LoggingParams.log_interval">log_interval (train_config.LoggingParams attribute)</a>
+</li>
+    </ul></td>
+    <td style="width: 33%; vertical-align: top;"><ul>
+        <li><a href="autoapi/train_config/index.html#train_config.TrainConfig.logging">logging (train_config.TrainConfig attribute)</a>
+</li>
+        <li><a href="autoapi/train_config/index.html#train_config.LoggingParams">LoggingParams (class in train_config)</a>
+</li>
+        <li><a href="autoapi/train_config/index.html#train_config.TrainConfig.loss">loss (train_config.TrainConfig attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/main_trunk/index.html#pallatom.architecture.main_trunk.AtomDistogramHead.loss">loss() (pallatom.architecture.main_trunk.AtomDistogramHead method)</a>
+
+        <ul>
+          <li><a href="autoapi/pallatom/architecture/main_trunk/index.html#pallatom.architecture.main_trunk.ResidueDistogramHead.loss">(pallatom.architecture.main_trunk.ResidueDistogramHead method)</a>
+</li>
+        </ul></li>
+        <li><a href="autoapi/train_config/index.html#train_config.LossParams">LossParams (class in train_config)</a>
+</li>
+        <li><a href="autoapi/train_config/index.html#train_config.TrainingParams.lr">lr (train_config.TrainingParams attribute)</a>
+</li>
+    </ul></td>
+  </tr></table>
+</section>
+
+<section id="M" class="genindex-section">
+  <h2>M</h2>
+  <table style="width: 100%" class="indextable genindextable"><tr>
+    <td style="width: 33%; vertical-align: top;"><ul>
+        <li><a href="autoapi/pallatom/architecture/atom_transformers/index.html#pallatom.architecture.atom_transformers.AtomFeatureEncoder.m">m (pallatom.architecture.atom_transformers.AtomFeatureEncoder attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/main_trunk/index.html#pallatom.architecture.main_trunk.MainTrunk">MainTrunk (class in pallatom.architecture.main_trunk)</a>
+</li>
+        <li><a href="autoapi/pallatom/helpers/data/index.html#pallatom.helpers.data.make_data_loaders">make_data_loaders() (in module pallatom.helpers.data)</a>
+</li>
+        <li><a href="autoapi/pallatom/helpers/atom_utils/index.html#pallatom.helpers.atom_utils.make_fixed_size">make_fixed_size() (in module pallatom.helpers.atom_utils)</a>
+</li>
+        <li><a href="autoapi/pallatom/helpers/atom_utils/index.html#pallatom.helpers.atom_utils.make_np_example">make_np_example() (in module pallatom.helpers.atom_utils)</a>
+</li>
+        <li><a href="autoapi/pallatom/helpers/featurize/index.html#pallatom.helpers.featurize.Distogram.max_dist">max_dist (pallatom.helpers.featurize.Distogram attribute)</a>
+
+        <ul>
+          <li><a href="autoapi/train_config/index.html#train_config.AtomDistogramParams.max_dist">(train_config.AtomDistogramParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.ResidueDistogramParams.max_dist">(train_config.ResidueDistogramParams attribute)</a>
+</li>
+        </ul></li>
+        <li><a href="autoapi/pallatom/architecture/main_trunk/index.html#pallatom.architecture.main_trunk.RelativePositionEncoding.max_rel">max_rel (pallatom.architecture.main_trunk.RelativePositionEncoding attribute)</a>
+</li>
+        <li><a href="autoapi/train_config/index.html#train_config.ModelParams.max_residues">max_residues (train_config.ModelParams attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/helpers/data/index.html#pallatom.helpers.data.ProteinDataset.max_seq_length">max_seq_length (pallatom.helpers.data.ProteinDataset attribute)</a>
+
+        <ul>
+          <li><a href="autoapi/train_config/index.html#train_config.LoaderConfig.max_seq_length">(train_config.LoaderConfig attribute)</a>
+</li>
+        </ul></li>
+        <li><a href="autoapi/pallatom/architecture/losses/index.html#pallatom.architecture.losses.med_loss">med_loss() (in module pallatom.architecture.losses)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/losses/index.html#pallatom.architecture.losses.med_loss_per_block">med_loss_per_block() (in module pallatom.architecture.losses)</a>
+</li>
+        <li><a href="autoapi/pallatom/helpers/featurize/index.html#pallatom.helpers.featurize.Distogram.min_dist">min_dist (pallatom.helpers.featurize.Distogram attribute)</a>
+
+        <ul>
+          <li><a href="autoapi/train_config/index.html#train_config.AtomDistogramParams.min_dist">(train_config.AtomDistogramParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.ResidueDistogramParams.min_dist">(train_config.ResidueDistogramParams attribute)</a>
+</li>
+        </ul></li>
+        <li><a href="autoapi/train_config/index.html#train_config.ResidueDistogramParams.min_lt_max">min_lt_max() (train_config.ResidueDistogramParams method)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/atom_transformers/index.html#pallatom.architecture.atom_transformers.AtomAttentionDecoder.mlp_p">mlp_p (pallatom.architecture.atom_transformers.AtomAttentionDecoder attribute)</a>
+
+        <ul>
+          <li><a href="autoapi/pallatom/architecture/atom_transformers/index.html#pallatom.architecture.atom_transformers.AtomFeatureEncoder.mlp_p">(pallatom.architecture.atom_transformers.AtomFeatureEncoder attribute)</a>
+</li>
+        </ul></li>
+        <li><a href="autoapi/sample_config/index.html#sample_config.SampleConfig.model">model (sample_config.SampleConfig attribute)</a>
+
+        <ul>
+          <li><a href="autoapi/sampling/index.html#sampling.EDMPrecond.model">(sampling.EDMPrecond attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.TrainConfig.model">(train_config.TrainConfig attribute)</a>
+</li>
+        </ul></li>
+        <li><a href="autoapi/sample_config/index.html#sample_config.GenerationParams.model_config">model_config (sample_config.GenerationParams attribute)</a>
+
+        <ul>
+          <li><a href="autoapi/sample_config/index.html#sample_config.SampleCheckpointParams.model_config">(sample_config.SampleCheckpointParams attribute)</a>
+</li>
+          <li><a href="autoapi/sample_config/index.html#sample_config.SampleConfig.model_config">(sample_config.SampleConfig attribute)</a>
+</li>
+          <li><a href="autoapi/sample_config/index.html#sample_config.SampleOutputParams.model_config">(sample_config.SampleOutputParams attribute)</a>
+</li>
+          <li><a href="autoapi/sample_config/index.html#sample_config.SamplerParams.model_config">(sample_config.SamplerParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.CheckpointParams.model_config">(train_config.CheckpointParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.LoaderConfig.model_config">(train_config.LoaderConfig attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.LoggingParams.model_config">(train_config.LoggingParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.LossParams.model_config">(train_config.LossParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.ModelParams.model_config">(train_config.ModelParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.NoiseScheduleParams.model_config">(train_config.NoiseScheduleParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.ResidueDistogramParams.model_config">(train_config.ResidueDistogramParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.TrainConfig.model_config">(train_config.TrainConfig attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.TrainingParams.model_config">(train_config.TrainingParams attribute)</a>
+</li>
+        </ul></li>
+    </ul></td>
+    <td style="width: 33%; vertical-align: top;"><ul>
+        <li><a href="autoapi/train_config/index.html#train_config.ModelParams">ModelParams (class in train_config)</a>
+</li>
+        <li>
+    module
+
+        <ul>
+          <li><a href="autoapi/pallatom/index.html#module-pallatom">pallatom</a>
+</li>
+          <li><a href="autoapi/pallatom/architecture/index.html#module-pallatom.architecture">pallatom.architecture</a>
+</li>
+          <li><a href="autoapi/pallatom/architecture/atom_transformers/index.html#module-pallatom.architecture.atom_transformers">pallatom.architecture.atom_transformers</a>
+</li>
+          <li><a href="autoapi/pallatom/architecture/losses/index.html#module-pallatom.architecture.losses">pallatom.architecture.losses</a>
+</li>
+          <li><a href="autoapi/pallatom/architecture/main_trunk/index.html#module-pallatom.architecture.main_trunk">pallatom.architecture.main_trunk</a>
+</li>
+          <li><a href="autoapi/pallatom/architecture/node_update/index.html#module-pallatom.architecture.node_update">pallatom.architecture.node_update</a>
+</li>
+          <li><a href="autoapi/pallatom/architecture/pair_update/index.html#module-pallatom.architecture.pair_update">pallatom.architecture.pair_update</a>
+</li>
+          <li><a href="autoapi/pallatom/architecture/pairformer_stack/index.html#module-pallatom.architecture.pairformer_stack">pallatom.architecture.pairformer_stack</a>
+</li>
+          <li><a href="autoapi/pallatom/architecture/template_embedder/index.html#module-pallatom.architecture.template_embedder">pallatom.architecture.template_embedder</a>
+</li>
+          <li><a href="autoapi/pallatom/helpers/index.html#module-pallatom.helpers">pallatom.helpers</a>
+</li>
+          <li><a href="autoapi/pallatom/helpers/alignment/index.html#module-pallatom.helpers.alignment">pallatom.helpers.alignment</a>
+</li>
+          <li><a href="autoapi/pallatom/helpers/atom_utils/index.html#module-pallatom.helpers.atom_utils">pallatom.helpers.atom_utils</a>
+</li>
+          <li><a href="autoapi/pallatom/helpers/compute_EDM_data_params/index.html#module-pallatom.helpers.compute_EDM_data_params">pallatom.helpers.compute_EDM_data_params</a>
+</li>
+          <li><a href="autoapi/pallatom/helpers/data/index.html#module-pallatom.helpers.data">pallatom.helpers.data</a>
+</li>
+          <li><a href="autoapi/pallatom/helpers/featurize/index.html#module-pallatom.helpers.featurize">pallatom.helpers.featurize</a>
+</li>
+          <li><a href="autoapi/sample_config/index.html#module-sample_config">sample_config</a>
+</li>
+          <li><a href="autoapi/sampling/index.html#module-sampling">sampling</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#module-train_config">train_config</a>
+</li>
+          <li><a href="autoapi/train_loop/index.html#module-train_loop">train_loop</a>
+</li>
+        </ul></li>
+    </ul></td>
+  </tr></table>
+</section>
+
+<section id="N" class="genindex-section">
+  <h2>N</h2>
+  <table style="width: 100%" class="indextable genindextable"><tr>
+    <td style="width: 33%; vertical-align: top;"><ul>
+        <li><a href="autoapi/pallatom/architecture/main_trunk/index.html#pallatom.architecture.main_trunk.AtomDistogramHead.n_bins">n_bins (pallatom.architecture.main_trunk.AtomDistogramHead attribute)</a>
+
+        <ul>
+          <li><a href="autoapi/pallatom/architecture/main_trunk/index.html#pallatom.architecture.main_trunk.ResidueDistogramHead.n_bins">(pallatom.architecture.main_trunk.ResidueDistogramHead attribute)</a>
+</li>
+          <li><a href="autoapi/pallatom/helpers/featurize/index.html#pallatom.helpers.featurize.Distogram.n_bins">(pallatom.helpers.featurize.Distogram attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.AtomDistogramParams.n_bins">(train_config.AtomDistogramParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.ModelParams.n_bins">(train_config.ModelParams attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.ResidueDistogramParams.n_bins">(train_config.ResidueDistogramParams attribute)</a>
+</li>
+        </ul></li>
+        <li><a href="autoapi/pallatom/architecture/atom_transformers/index.html#pallatom.architecture.atom_transformers.AtomTransformerBlock.n_heads">n_heads (pallatom.architecture.atom_transformers.AtomTransformerBlock attribute)</a>
+
+        <ul>
+          <li><a href="autoapi/pallatom/architecture/node_update/index.html#pallatom.architecture.node_update.AttentionPairBias.n_heads">(pallatom.architecture.node_update.AttentionPairBias attribute)</a>
+</li>
+          <li><a href="autoapi/pallatom/architecture/pair_update/index.html#pallatom.architecture.pair_update.TriangleAttentionEndingNodeWithBias.n_heads">(pallatom.architecture.pair_update.TriangleAttentionEndingNodeWithBias attribute)</a>
+</li>
+          <li><a href="autoapi/pallatom/architecture/pair_update/index.html#pallatom.architecture.pair_update.TriangleAttentionStartingNodeWithBias.n_heads">(pallatom.architecture.pair_update.TriangleAttentionStartingNodeWithBias attribute)</a>
+</li>
+          <li><a href="autoapi/pallatom/architecture/pairformer_stack/index.html#pallatom.architecture.pairformer_stack.PairformerBlock.n_heads">(pallatom.architecture.pairformer_stack.PairformerBlock attribute)</a>
+</li>
+        </ul></li>
+        <li><a href="autoapi/sample_config/index.html#sample_config.GenerationParams.n_res">n_res (sample_config.GenerationParams attribute)</a>
+</li>
+        <li><a href="autoapi/sample_config/index.html#sample_config.GenerationParams.n_samples">n_samples (sample_config.GenerationParams attribute)</a>
+</li>
+        <li><a href="autoapi/sampling/index.html#sampling.NATOM">NATOM (in module sampling)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/main_trunk/index.html#pallatom.architecture.main_trunk.MainTrunk.node_updates">node_updates (pallatom.architecture.main_trunk.MainTrunk attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/node_update/index.html#pallatom.architecture.node_update.NodeUpdate">NodeUpdate (class in pallatom.architecture.node_update)</a>
+</li>
+        <li><a href="autoapi/sample_config/index.html#sample_config.SampleConfig.noise">noise (sample_config.SampleConfig attribute)</a>
+
+        <ul>
+          <li><a href="autoapi/train_config/index.html#train_config.TrainConfig.noise">(train_config.TrainConfig attribute)</a>
+</li>
+        </ul></li>
+        <li><a href="autoapi/train_config/index.html#train_config.NoiseScheduleParams">NoiseScheduleParams (class in train_config)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/main_trunk/index.html#pallatom.architecture.main_trunk.AtomDistogramHead.norm">norm (pallatom.architecture.main_trunk.AtomDistogramHead attribute)</a>
+
+        <ul>
+          <li><a href="autoapi/pallatom/architecture/main_trunk/index.html#pallatom.architecture.main_trunk.ResidueDistogramHead.norm">(pallatom.architecture.main_trunk.ResidueDistogramHead attribute)</a>
+</li>
+          <li><a href="autoapi/pallatom/architecture/pair_update/index.html#pallatom.architecture.pair_update.Transition.norm">(pallatom.architecture.pair_update.Transition attribute)</a>
+</li>
+          <li><a href="autoapi/pallatom/architecture/pair_update/index.html#pallatom.architecture.pair_update.TriangleAttentionEndingNodeWithBias.norm">(pallatom.architecture.pair_update.TriangleAttentionEndingNodeWithBias attribute)</a>
+</li>
+          <li><a href="autoapi/pallatom/architecture/pair_update/index.html#pallatom.architecture.pair_update.TriangleAttentionStartingNodeWithBias.norm">(pallatom.architecture.pair_update.TriangleAttentionStartingNodeWithBias attribute)</a>
+</li>
+        </ul></li>
+    </ul></td>
+    <td style="width: 33%; vertical-align: top;"><ul>
+        <li><a href="autoapi/pallatom/architecture/pair_update/index.html#pallatom.architecture.pair_update.TriangleAttentionEndingNodeWithBias.norm_b">norm_b (pallatom.architecture.pair_update.TriangleAttentionEndingNodeWithBias attribute)</a>
+
+        <ul>
+          <li><a href="autoapi/pallatom/architecture/pair_update/index.html#pallatom.architecture.pair_update.TriangleAttentionStartingNodeWithBias.norm_b">(pallatom.architecture.pair_update.TriangleAttentionStartingNodeWithBias attribute)</a>
+</li>
+        </ul></li>
+        <li><a href="autoapi/pallatom/architecture/atom_transformers/index.html#pallatom.architecture.atom_transformers.AtomTransformerBlock.norm_c">norm_c (pallatom.architecture.atom_transformers.AtomTransformerBlock attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/pairformer_stack/index.html#pallatom.architecture.pairformer_stack.PairformerBlock.norm_col">norm_col (pallatom.architecture.pairformer_stack.PairformerBlock attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/atom_transformers/index.html#pallatom.architecture.atom_transformers.AtomTransformerBlock.norm_ff">norm_ff (pallatom.architecture.atom_transformers.AtomTransformerBlock attribute)</a>
+
+        <ul>
+          <li><a href="autoapi/pallatom/architecture/pairformer_stack/index.html#pallatom.architecture.pairformer_stack.PairformerBlock.norm_ff">(pallatom.architecture.pairformer_stack.PairformerBlock attribute)</a>
+</li>
+        </ul></li>
+        <li><a href="autoapi/pallatom/architecture/atom_transformers/index.html#pallatom.architecture.atom_transformers.AtomTransformerBlock.norm_pair">norm_pair (pallatom.architecture.atom_transformers.AtomTransformerBlock attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/atom_transformers/index.html#pallatom.architecture.atom_transformers.AtomTransformerBlock.norm_q">norm_q (pallatom.architecture.atom_transformers.AtomTransformerBlock attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/atom_transformers/index.html#pallatom.architecture.atom_transformers.AtomAttentionDecoder.norm_q_out">norm_q_out (pallatom.architecture.atom_transformers.AtomAttentionDecoder attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/pairformer_stack/index.html#pallatom.architecture.pairformer_stack.PairformerBlock.norm_row">norm_row (pallatom.architecture.pairformer_stack.PairformerBlock attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/node_update/index.html#pallatom.architecture.node_update.AttentionPairBias.norm_s">norm_s (pallatom.architecture.node_update.AttentionPairBias attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/atom_transformers/index.html#pallatom.architecture.atom_transformers.AtomAttentionDecoder.norm_s_c">norm_s_c (pallatom.architecture.atom_transformers.AtomAttentionDecoder attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/atom_transformers/index.html#pallatom.architecture.atom_transformers.AtomFeatureEncoder.norm_s_init">norm_s_init (pallatom.architecture.atom_transformers.AtomFeatureEncoder attribute)</a>
+
+        <ul>
+          <li><a href="autoapi/pallatom/architecture/main_trunk/index.html#pallatom.architecture.main_trunk.MainTrunk.norm_s_init">(pallatom.architecture.main_trunk.MainTrunk attribute)</a>
+</li>
+        </ul></li>
+        <li><a href="autoapi/pallatom/architecture/atom_transformers/index.html#pallatom.architecture.atom_transformers.AtomAttentionDecoder.norm_s_q">norm_s_q (pallatom.architecture.atom_transformers.AtomAttentionDecoder attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/node_update/index.html#pallatom.architecture.node_update.AttentionPairBias.norm_t">norm_t (pallatom.architecture.node_update.AttentionPairBias attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/template_embedder/index.html#pallatom.architecture.template_embedder.TemplateEmbedder.norm_v">norm_v (pallatom.architecture.template_embedder.TemplateEmbedder attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/atom_transformers/index.html#pallatom.architecture.atom_transformers.AtomAttentionDecoder.norm_z">norm_z (pallatom.architecture.atom_transformers.AtomAttentionDecoder attribute)</a>
+
+        <ul>
+          <li><a href="autoapi/pallatom/architecture/node_update/index.html#pallatom.architecture.node_update.AttentionPairBias.norm_z">(pallatom.architecture.node_update.AttentionPairBias attribute)</a>
+</li>
+          <li><a href="autoapi/pallatom/architecture/template_embedder/index.html#pallatom.architecture.template_embedder.TemplateEmbedder.norm_z">(pallatom.architecture.template_embedder.TemplateEmbedder attribute)</a>
+</li>
+        </ul></li>
+        <li><a href="autoapi/pallatom/architecture/atom_transformers/index.html#pallatom.architecture.atom_transformers.AtomFeatureEncoder.norm_z_init">norm_z_init (pallatom.architecture.atom_transformers.AtomFeatureEncoder attribute)</a>
+</li>
+        <li><a href="autoapi/train_config/index.html#train_config.TrainingParams.num_epochs">num_epochs (train_config.TrainingParams attribute)</a>
+</li>
+    </ul></td>
+  </tr></table>
+</section>
+
+<section id="O" class="genindex-section">
+  <h2>O</h2>
+  <table style="width: 100%" class="indextable genindextable"><tr>
+    <td style="width: 33%; vertical-align: top;"><ul>
+        <li><a href="autoapi/pallatom/architecture/pairformer_stack/index.html#pallatom.architecture.pairformer_stack.PairformerBlock.out_col">out_col (pallatom.architecture.pairformer_stack.PairformerBlock attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/pairformer_stack/index.html#pallatom.architecture.pairformer_stack.PairformerBlock.out_row">out_row (pallatom.architecture.pairformer_stack.PairformerBlock attribute)</a>
+</li>
+    </ul></td>
+    <td style="width: 33%; vertical-align: top;"><ul>
+        <li><a href="autoapi/sample_config/index.html#sample_config.SampleConfig.output">output (sample_config.SampleConfig attribute)</a>
+</li>
+        <li><a href="autoapi/sample_config/index.html#sample_config.SampleOutputParams.output_path">output_path (sample_config.SampleOutputParams attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/helpers/featurize/index.html#pallatom.helpers.featurize.Distogram.overflow_bin">overflow_bin (pallatom.helpers.featurize.Distogram attribute)</a>
+</li>
+    </ul></td>
+  </tr></table>
+</section>
+
+<section id="P" class="genindex-section">
+  <h2>P</h2>
+  <table style="width: 100%" class="indextable genindextable"><tr>
+    <td style="width: 33%; vertical-align: top;"><ul>
+        <li><a href="autoapi/pallatom/architecture/pair_update/index.html#pallatom.architecture.pair_update.DropoutColumnwise.p">p (pallatom.architecture.pair_update.DropoutColumnwise attribute)</a>
+
+        <ul>
+          <li><a href="autoapi/pallatom/architecture/pair_update/index.html#pallatom.architecture.pair_update.DropoutRowwise.p">(pallatom.architecture.pair_update.DropoutRowwise attribute)</a>
+</li>
+        </ul></li>
+        <li><a href="autoapi/train_config/index.html#train_config.NoiseScheduleParams.P_mean">P_mean (train_config.NoiseScheduleParams attribute)</a>
+</li>
+        <li><a href="autoapi/train_config/index.html#train_config.NoiseScheduleParams.P_std">P_std (train_config.NoiseScheduleParams attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/atom_transformers/index.html#pallatom.architecture.atom_transformers.AtomTransformerBlock.pair_bias">pair_bias (pallatom.architecture.atom_transformers.AtomTransformerBlock attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/main_trunk/index.html#pallatom.architecture.main_trunk.MainTrunk.pair_updates">pair_updates (pallatom.architecture.main_trunk.MainTrunk attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/template_embedder/index.html#pallatom.architecture.template_embedder.TemplateEmbedder.pairformer">pairformer (pallatom.architecture.template_embedder.TemplateEmbedder attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/pairformer_stack/index.html#pallatom.architecture.pairformer_stack.PairformerBlock">PairformerBlock (class in pallatom.architecture.pairformer_stack)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/pairformer_stack/index.html#pallatom.architecture.pairformer_stack.PairformerStack">PairformerStack (class in pallatom.architecture.pairformer_stack)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/pair_update/index.html#pallatom.architecture.pair_update.PairUpdate">PairUpdate (class in pallatom.architecture.pair_update)</a>
+</li>
+        <li>
+    pallatom
+
+        <ul>
+          <li><a href="autoapi/pallatom/index.html#module-pallatom">module</a>
+</li>
+        </ul></li>
+        <li>
+    pallatom.architecture
+
+        <ul>
+          <li><a href="autoapi/pallatom/architecture/index.html#module-pallatom.architecture">module</a>
+</li>
+        </ul></li>
+        <li>
+    pallatom.architecture.atom_transformers
+
+        <ul>
+          <li><a href="autoapi/pallatom/architecture/atom_transformers/index.html#module-pallatom.architecture.atom_transformers">module</a>
+</li>
+        </ul></li>
+        <li>
+    pallatom.architecture.losses
+
+        <ul>
+          <li><a href="autoapi/pallatom/architecture/losses/index.html#module-pallatom.architecture.losses">module</a>
+</li>
+        </ul></li>
+        <li>
+    pallatom.architecture.main_trunk
+
+        <ul>
+          <li><a href="autoapi/pallatom/architecture/main_trunk/index.html#module-pallatom.architecture.main_trunk">module</a>
+</li>
+        </ul></li>
+        <li>
+    pallatom.architecture.node_update
+
+        <ul>
+          <li><a href="autoapi/pallatom/architecture/node_update/index.html#module-pallatom.architecture.node_update">module</a>
+</li>
+        </ul></li>
+        <li>
+    pallatom.architecture.pair_update
+
+        <ul>
+          <li><a href="autoapi/pallatom/architecture/pair_update/index.html#module-pallatom.architecture.pair_update">module</a>
+</li>
+        </ul></li>
+        <li>
+    pallatom.architecture.pairformer_stack
+
+        <ul>
+          <li><a href="autoapi/pallatom/architecture/pairformer_stack/index.html#module-pallatom.architecture.pairformer_stack">module</a>
+</li>
+        </ul></li>
+        <li>
+    pallatom.architecture.template_embedder
+
+        <ul>
+          <li><a href="autoapi/pallatom/architecture/template_embedder/index.html#module-pallatom.architecture.template_embedder">module</a>
+</li>
+        </ul></li>
+        <li>
+    pallatom.helpers
+
+        <ul>
+          <li><a href="autoapi/pallatom/helpers/index.html#module-pallatom.helpers">module</a>
+</li>
+        </ul></li>
+        <li>
+    pallatom.helpers.alignment
+
+        <ul>
+          <li><a href="autoapi/pallatom/helpers/alignment/index.html#module-pallatom.helpers.alignment">module</a>
+</li>
+        </ul></li>
+        <li>
+    pallatom.helpers.atom_utils
+
+        <ul>
+          <li><a href="autoapi/pallatom/helpers/atom_utils/index.html#module-pallatom.helpers.atom_utils">module</a>
+</li>
+        </ul></li>
+        <li>
+    pallatom.helpers.compute_EDM_data_params
+
+        <ul>
+          <li><a href="autoapi/pallatom/helpers/compute_EDM_data_params/index.html#module-pallatom.helpers.compute_EDM_data_params">module</a>
+</li>
+        </ul></li>
+        <li>
+    pallatom.helpers.data
+
+        <ul>
+          <li><a href="autoapi/pallatom/helpers/data/index.html#module-pallatom.helpers.data">module</a>
+</li>
+        </ul></li>
+        <li>
+    pallatom.helpers.featurize
+
+        <ul>
+          <li><a href="autoapi/pallatom/helpers/featurize/index.html#module-pallatom.helpers.featurize">module</a>
+</li>
+        </ul></li>
+    </ul></td>
+    <td style="width: 33%; vertical-align: top;"><ul>
+        <li><a href="autoapi/pallatom/helpers/compute_EDM_data_params/index.html#pallatom.helpers.compute_EDM_data_params.parser">parser (in module pallatom.helpers.compute_EDM_data_params)</a>
+
+        <ul>
+          <li><a href="autoapi/sampling/index.html#sampling.parser">(in module sampling)</a>
+</li>
+          <li><a href="autoapi/train_loop/index.html#train_loop.parser">(in module train_loop)</a>
+</li>
+        </ul></li>
+        <li><a href="autoapi/pallatom/helpers/atom_utils/index.html#pallatom.helpers.atom_utils.PDB_CHAIN_IDS">PDB_CHAIN_IDS (in module pallatom.helpers.atom_utils)</a>
+</li>
+        <li><a href="autoapi/pallatom/helpers/atom_utils/index.html#pallatom.helpers.atom_utils.PDB_MAX_CHAINS">PDB_MAX_CHAINS (in module pallatom.helpers.atom_utils)</a>
+</li>
+        <li><a href="autoapi/train_config/index.html#train_config.TrainingParams.pretrained_weights">pretrained_weights (train_config.TrainingParams attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/main_trunk/index.html#pallatom.architecture.main_trunk.RelativePositionEncoding.proj">proj (pallatom.architecture.main_trunk.RelativePositionEncoding attribute)</a>
+
+        <ul>
+          <li><a href="autoapi/pallatom/architecture/main_trunk/index.html#pallatom.architecture.main_trunk.TimeFourierEmbedding.proj">(pallatom.architecture.main_trunk.TimeFourierEmbedding attribute)</a>
+</li>
+          <li><a href="autoapi/pallatom/architecture/pair_update/index.html#pallatom.architecture.pair_update.TransformRBF.proj">(pallatom.architecture.pair_update.TransformRBF attribute)</a>
+</li>
+        </ul></li>
+        <li><a href="autoapi/pallatom/architecture/main_trunk/index.html#pallatom.architecture.main_trunk.AtomDistogramHead.proj1">proj1 (pallatom.architecture.main_trunk.AtomDistogramHead attribute)</a>
+
+        <ul>
+          <li><a href="autoapi/pallatom/architecture/main_trunk/index.html#pallatom.architecture.main_trunk.ResidueDistogramHead.proj1">(pallatom.architecture.main_trunk.ResidueDistogramHead attribute)</a>
+</li>
+        </ul></li>
+        <li><a href="autoapi/pallatom/architecture/main_trunk/index.html#pallatom.architecture.main_trunk.AtomDistogramHead.proj2">proj2 (pallatom.architecture.main_trunk.AtomDistogramHead attribute)</a>
+
+        <ul>
+          <li><a href="autoapi/pallatom/architecture/main_trunk/index.html#pallatom.architecture.main_trunk.ResidueDistogramHead.proj2">(pallatom.architecture.main_trunk.ResidueDistogramHead attribute)</a>
+</li>
+        </ul></li>
+        <li><a href="autoapi/pallatom/architecture/template_embedder/index.html#pallatom.architecture.template_embedder.TemplateEmbedder.proj_a">proj_a (pallatom.architecture.template_embedder.TemplateEmbedder attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/atom_transformers/index.html#pallatom.architecture.atom_transformers.AtomFeatureEncoder.proj_agg">proj_agg (pallatom.architecture.atom_transformers.AtomFeatureEncoder attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/atom_transformers/index.html#pallatom.architecture.atom_transformers.AtomFeatureEncoder.proj_cl_pair">proj_cl_pair (pallatom.architecture.atom_transformers.AtomFeatureEncoder attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/atom_transformers/index.html#pallatom.architecture.atom_transformers.AtomFeatureEncoder.proj_cm_pair">proj_cm_pair (pallatom.architecture.atom_transformers.AtomFeatureEncoder attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/atom_transformers/index.html#pallatom.architecture.atom_transformers.AtomFeatureEncoder.proj_d_vec">proj_d_vec (pallatom.architecture.atom_transformers.AtomFeatureEncoder attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/atom_transformers/index.html#pallatom.architecture.atom_transformers.AtomFeatureEncoder.proj_fref_c">proj_fref_c (pallatom.architecture.atom_transformers.AtomFeatureEncoder attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/atom_transformers/index.html#pallatom.architecture.atom_transformers.AtomFeatureEncoder.proj_inv_sq">proj_inv_sq (pallatom.architecture.atom_transformers.AtomFeatureEncoder attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/template_embedder/index.html#pallatom.architecture.template_embedder.TemplateEmbedder.proj_out">proj_out (pallatom.architecture.template_embedder.TemplateEmbedder attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/atom_transformers/index.html#pallatom.architecture.atom_transformers.AtomAttentionDecoder.proj_r">proj_r (pallatom.architecture.atom_transformers.AtomAttentionDecoder attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/atom_transformers/index.html#pallatom.architecture.atom_transformers.AtomFeatureEncoder.proj_r_scaled">proj_r_scaled (pallatom.architecture.atom_transformers.AtomFeatureEncoder attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/main_trunk/index.html#pallatom.architecture.main_trunk.MainTrunk.proj_residue_idx">proj_residue_idx (pallatom.architecture.main_trunk.MainTrunk attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/atom_transformers/index.html#pallatom.architecture.atom_transformers.AtomAttentionDecoder.proj_s_c">proj_s_c (pallatom.architecture.atom_transformers.AtomAttentionDecoder attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/atom_transformers/index.html#pallatom.architecture.atom_transformers.AtomFeatureEncoder.proj_s_init">proj_s_init (pallatom.architecture.atom_transformers.AtomFeatureEncoder attribute)</a>
+
+        <ul>
+          <li><a href="autoapi/pallatom/architecture/main_trunk/index.html#pallatom.architecture.main_trunk.MainTrunk.proj_s_init">(pallatom.architecture.main_trunk.MainTrunk attribute)</a>
+</li>
+        </ul></li>
+        <li><a href="autoapi/pallatom/architecture/atom_transformers/index.html#pallatom.architecture.atom_transformers.AtomAttentionDecoder.proj_s_q">proj_s_q (pallatom.architecture.atom_transformers.AtomAttentionDecoder attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/main_trunk/index.html#pallatom.architecture.main_trunk.MainTrunk.proj_seq">proj_seq (pallatom.architecture.main_trunk.MainTrunk attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/node_update/index.html#pallatom.architecture.node_update.AttentionPairBias.proj_t">proj_t (pallatom.architecture.node_update.AttentionPairBias attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/atom_transformers/index.html#pallatom.architecture.atom_transformers.AtomFeatureEncoder.proj_v">proj_v (pallatom.architecture.atom_transformers.AtomFeatureEncoder attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/atom_transformers/index.html#pallatom.architecture.atom_transformers.AtomAttentionDecoder.proj_z">proj_z (pallatom.architecture.atom_transformers.AtomAttentionDecoder attribute)</a>
+
+        <ul>
+          <li><a href="autoapi/pallatom/architecture/template_embedder/index.html#pallatom.architecture.template_embedder.TemplateEmbedder.proj_z">(pallatom.architecture.template_embedder.TemplateEmbedder attribute)</a>
+</li>
+        </ul></li>
+        <li><a href="autoapi/pallatom/architecture/atom_transformers/index.html#pallatom.architecture.atom_transformers.AtomFeatureEncoder.proj_z_init">proj_z_init (pallatom.architecture.atom_transformers.AtomFeatureEncoder attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/helpers/atom_utils/index.html#pallatom.helpers.atom_utils.Protein">Protein (class in pallatom.helpers.atom_utils)</a>
+</li>
+        <li><a href="autoapi/pallatom/helpers/featurize/index.html#pallatom.helpers.featurize.ProteinBatch">ProteinBatch (class in pallatom.helpers.featurize)</a>
+</li>
+        <li><a href="autoapi/pallatom/helpers/data/index.html#pallatom.helpers.data.ProteinDataset">ProteinDataset (class in pallatom.helpers.data)</a>
+</li>
+        <li><a href="autoapi/pallatom/helpers/atom_utils/index.html#pallatom.helpers.atom_utils.pseudo_cb">pseudo_cb() (in module pallatom.helpers.atom_utils)</a>
+</li>
+    </ul></td>
+  </tr></table>
+</section>
+
+<section id="Q" class="genindex-section">
+  <h2>Q</h2>
+  <table style="width: 100%" class="indextable genindextable"><tr>
+    <td style="width: 33%; vertical-align: top;"><ul>
+        <li><a href="autoapi/pallatom/architecture/pairformer_stack/index.html#pallatom.architecture.pairformer_stack.PairformerBlock.q_col">q_col (pallatom.architecture.pairformer_stack.PairformerBlock attribute)</a>
+</li>
+    </ul></td>
+    <td style="width: 33%; vertical-align: top;"><ul>
+        <li><a href="autoapi/pallatom/architecture/pairformer_stack/index.html#pallatom.architecture.pairformer_stack.PairformerBlock.q_row">q_row (pallatom.architecture.pairformer_stack.PairformerBlock attribute)</a>
+</li>
+    </ul></td>
+  </tr></table>
+</section>
+
+<section id="R" class="genindex-section">
+  <h2>R</h2>
+  <table style="width: 100%" class="indextable genindextable"><tr>
+    <td style="width: 33%; vertical-align: top;"><ul>
+        <li><a href="autoapi/pallatom/helpers/featurize/index.html#pallatom.helpers.featurize.FeaturizedBatch.r_gt">r_gt (pallatom.helpers.featurize.FeaturizedBatch attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/helpers/featurize/index.html#pallatom.helpers.featurize.FeaturizedBatch.r_input">r_input (pallatom.helpers.featurize.FeaturizedBatch attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/pair_update/index.html#pallatom.architecture.pair_update.PairUpdate.rbf">rbf (pallatom.architecture.pair_update.PairUpdate attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/helpers/featurize/index.html#pallatom.helpers.featurize.FeaturizedBatch.ref_element">ref_element (pallatom.helpers.featurize.FeaturizedBatch attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/helpers/featurize/index.html#pallatom.helpers.featurize.FeaturizedBatch.ref_pos">ref_pos (pallatom.helpers.featurize.FeaturizedBatch attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/helpers/featurize/index.html#pallatom.helpers.featurize.FeaturizedBatch.ref_space_uid">ref_space_uid (pallatom.helpers.featurize.FeaturizedBatch attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/main_trunk/index.html#pallatom.architecture.main_trunk.MainTrunk.rel_pos_enc">rel_pos_enc (pallatom.architecture.main_trunk.MainTrunk attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/main_trunk/index.html#pallatom.architecture.main_trunk.RelativePositionEncoding">RelativePositionEncoding (class in pallatom.architecture.main_trunk)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/main_trunk/index.html#pallatom.architecture.main_trunk.MainTrunk.residue_distogram_head">residue_distogram_head (pallatom.architecture.main_trunk.MainTrunk attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/helpers/atom_utils/index.html#pallatom.helpers.atom_utils.Protein.residue_index">residue_index (pallatom.helpers.atom_utils.Protein attribute)</a>
+
+        <ul>
+          <li><a href="autoapi/pallatom/helpers/featurize/index.html#pallatom.helpers.featurize.ProteinBatch.residue_index">(pallatom.helpers.featurize.ProteinBatch attribute)</a>
+</li>
+        </ul></li>
+    </ul></td>
+    <td style="width: 33%; vertical-align: top;"><ul>
+        <li><a href="autoapi/pallatom/helpers/featurize/index.html#pallatom.helpers.featurize.FeaturizedBatch.residue_mask">residue_mask (pallatom.helpers.featurize.FeaturizedBatch attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/main_trunk/index.html#pallatom.architecture.main_trunk.ResidueDistogramHead">ResidueDistogramHead (class in pallatom.architecture.main_trunk)</a>
+</li>
+        <li><a href="autoapi/train_config/index.html#train_config.ResidueDistogramParams">ResidueDistogramParams (class in train_config)</a>
+</li>
+        <li><a href="autoapi/pallatom/helpers/featurize/index.html#pallatom.helpers.featurize.ResidueIndexEmbedding">ResidueIndexEmbedding (class in pallatom.helpers.featurize)</a>
+</li>
+        <li><a href="autoapi/pallatom/helpers/atom_utils/index.html#pallatom.helpers.atom_utils.restype_1to3">restype_1to3 (in module pallatom.helpers.atom_utils)</a>
+</li>
+        <li><a href="autoapi/pallatom/helpers/atom_utils/index.html#pallatom.helpers.atom_utils.restype_num">restype_num (in module pallatom.helpers.atom_utils)</a>
+</li>
+        <li><a href="autoapi/pallatom/helpers/atom_utils/index.html#pallatom.helpers.atom_utils.restype_order">restype_order (in module pallatom.helpers.atom_utils)</a>
+</li>
+        <li><a href="autoapi/pallatom/helpers/atom_utils/index.html#pallatom.helpers.atom_utils.restypes">restypes (in module pallatom.helpers.atom_utils)</a>
+</li>
+        <li><a href="autoapi/sample_config/index.html#sample_config.SamplerParams.rho">rho (sample_config.SamplerParams attribute)</a>
+
+        <ul>
+          <li><a href="autoapi/sampling/index.html#sampling.EDMSampler.rho">(sampling.EDMSampler attribute)</a>
+</li>
+        </ul></li>
+        <li><a href="autoapi/pallatom/helpers/atom_utils/index.html#pallatom.helpers.atom_utils.rigid_group_atom_positions">rigid_group_atom_positions (in module pallatom.helpers.atom_utils)</a>
+</li>
+        <li><a href="autoapi/pallatom/helpers/alignment/index.html#pallatom.helpers.alignment.rmsd">rmsd() (in module pallatom.helpers.alignment)</a>
+</li>
+    </ul></td>
+  </tr></table>
+</section>
+
+<section id="S" class="genindex-section">
+  <h2>S</h2>
+  <table style="width: 100%" class="indextable genindextable"><tr>
+    <td style="width: 33%; vertical-align: top;"><ul>
+        <li><a href="autoapi/sample_config/index.html#sample_config.SamplerParams.S_churn">S_churn (sample_config.SamplerParams attribute)</a>
+
+        <ul>
+          <li><a href="autoapi/sampling/index.html#sampling.EDMSampler.S_churn">(sampling.EDMSampler attribute)</a>
+</li>
+        </ul></li>
+        <li><a href="autoapi/sample_config/index.html#sample_config.SamplerParams.S_noise">S_noise (sample_config.SamplerParams attribute)</a>
+
+        <ul>
+          <li><a href="autoapi/sampling/index.html#sampling.EDMSampler.S_noise">(sampling.EDMSampler attribute)</a>
+</li>
+        </ul></li>
+        <li><a href="autoapi/sample_config/index.html#sample_config.SamplerParams.S_tmax">S_tmax (sample_config.SamplerParams attribute)</a>
+
+        <ul>
+          <li><a href="autoapi/sampling/index.html#sampling.EDMSampler.S_tmax">(sampling.EDMSampler attribute)</a>
+</li>
+        </ul></li>
+        <li><a href="autoapi/sample_config/index.html#sample_config.SamplerParams.S_tmin">S_tmin (sample_config.SamplerParams attribute)</a>
+
+        <ul>
+          <li><a href="autoapi/sampling/index.html#sampling.EDMSampler.S_tmin">(sampling.EDMSampler attribute)</a>
+</li>
+        </ul></li>
+        <li><a href="autoapi/sampling/index.html#sampling.EDMSampler.sample">sample() (sampling.EDMSampler method)</a>
+</li>
+        <li>
+    sample_config
+
+        <ul>
+          <li><a href="autoapi/sample_config/index.html#module-sample_config">module</a>
+</li>
+        </ul></li>
+        <li><a href="autoapi/sample_config/index.html#sample_config.SampleCheckpointParams">SampleCheckpointParams (class in sample_config)</a>
+</li>
+        <li><a href="autoapi/sample_config/index.html#sample_config.SampleConfig">SampleConfig (class in sample_config)</a>
+</li>
+        <li><a href="autoapi/sample_config/index.html#sample_config.SampleOutputParams">SampleOutputParams (class in sample_config)</a>
+</li>
+        <li><a href="autoapi/sample_config/index.html#sample_config.SampleConfig.sampler">sampler (sample_config.SampleConfig attribute)</a>
+</li>
+        <li><a href="autoapi/sample_config/index.html#sample_config.SamplerParams">SamplerParams (class in sample_config)</a>
+</li>
+        <li>
+    sampling
+
+        <ul>
+          <li><a href="autoapi/sampling/index.html#module-sampling">module</a>
+</li>
+        </ul></li>
+    </ul></td>
+    <td style="width: 33%; vertical-align: top;"><ul>
+        <li><a href="autoapi/train_config/index.html#train_config.CheckpointParams.save_every">save_every (train_config.CheckpointParams attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/helpers/featurize/index.html#pallatom.helpers.featurize.ProteinBatch.seq">seq (pallatom.helpers.featurize.ProteinBatch attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/main_trunk/index.html#pallatom.architecture.main_trunk.MainTrunk.seq_logits">seq_logits (pallatom.architecture.main_trunk.MainTrunk attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/pair_update/index.html#pallatom.architecture.pair_update.TransformRBF.sigma">sigma (pallatom.architecture.pair_update.TransformRBF attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/main_trunk/index.html#pallatom.architecture.main_trunk.MainTrunk.sigma_data">sigma_data (pallatom.architecture.main_trunk.MainTrunk attribute)</a>
+
+        <ul>
+          <li><a href="autoapi/train_config/index.html#train_config.NoiseScheduleParams.sigma_data">(train_config.NoiseScheduleParams attribute)</a>
+</li>
+        </ul></li>
+        <li><a href="autoapi/sampling/index.html#sampling.EDMPrecond.sigma_max">sigma_max (sampling.EDMPrecond attribute)</a>
+
+        <ul>
+          <li><a href="autoapi/sampling/index.html#sampling.EDMSampler.sigma_max">(sampling.EDMSampler attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.NoiseScheduleParams.sigma_max">(train_config.NoiseScheduleParams attribute)</a>
+</li>
+        </ul></li>
+        <li><a href="autoapi/sampling/index.html#sampling.EDMPrecond.sigma_min">sigma_min (sampling.EDMPrecond attribute)</a>
+
+        <ul>
+          <li><a href="autoapi/sampling/index.html#sampling.EDMSampler.sigma_min">(sampling.EDMSampler attribute)</a>
+</li>
+          <li><a href="autoapi/train_config/index.html#train_config.NoiseScheduleParams.sigma_min">(train_config.NoiseScheduleParams attribute)</a>
+</li>
+        </ul></li>
+        <li><a href="autoapi/train_config/index.html#train_config.NoiseScheduleParams.sigma_min_lt_max">sigma_min_lt_max() (train_config.NoiseScheduleParams method)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/main_trunk/index.html#pallatom.architecture.main_trunk.sinusoidal_encoding">sinusoidal_encoding() (in module pallatom.architecture.main_trunk)</a>
+</li>
+        <li><a href="autoapi/train_config/index.html#train_config.LossParams.smooth_lddt_cutoff">smooth_lddt_cutoff (train_config.LossParams attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/losses/index.html#pallatom.architecture.losses.smooth_lddt_loss">smooth_lddt_loss() (in module pallatom.architecture.losses)</a>
+</li>
+    </ul></td>
+  </tr></table>
+</section>
+
+<section id="T" class="genindex-section">
+  <h2>T</h2>
+  <table style="width: 100%" class="indextable genindextable"><tr>
+    <td style="width: 33%; vertical-align: top;"><ul>
+        <li><a href="autoapi/pallatom/helpers/featurize/index.html#pallatom.helpers.featurize.FeaturizedBatch.t_hat">t_hat (pallatom.helpers.featurize.FeaturizedBatch attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/helpers/featurize/index.html#pallatom.helpers.featurize.FeaturizedBatch.t_normalized">t_normalized (pallatom.helpers.featurize.FeaturizedBatch attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/main_trunk/index.html#pallatom.architecture.main_trunk.MainTrunk.template_embedder">template_embedder (pallatom.architecture.main_trunk.MainTrunk attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/template_embedder/index.html#pallatom.architecture.template_embedder.TemplateEmbedder">TemplateEmbedder (class in pallatom.architecture.template_embedder)</a>
+</li>
+        <li><a href="autoapi/train_config/index.html#train_config.TrainConfig.test_loader">test_loader (train_config.TrainConfig attribute)</a>
+</li>
+        <li><a href="autoapi/train_config/index.html#train_config.TestLoaderConfig">TestLoaderConfig (in module train_config)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/main_trunk/index.html#pallatom.architecture.main_trunk.MainTrunk.time_fourier">time_fourier (pallatom.architecture.main_trunk.MainTrunk attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/main_trunk/index.html#pallatom.architecture.main_trunk.TimeFourierEmbedding">TimeFourierEmbedding (class in pallatom.architecture.main_trunk)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/pair_update/index.html#pallatom.architecture.pair_update.TriangleAttentionEndingNodeWithBias.to_b">to_b (pallatom.architecture.pair_update.TriangleAttentionEndingNodeWithBias attribute)</a>
+
+        <ul>
+          <li><a href="autoapi/pallatom/architecture/pair_update/index.html#pallatom.architecture.pair_update.TriangleAttentionStartingNodeWithBias.to_b">(pallatom.architecture.pair_update.TriangleAttentionStartingNodeWithBias attribute)</a>
+</li>
+        </ul></li>
+        <li><a href="autoapi/pallatom/architecture/node_update/index.html#pallatom.architecture.node_update.AttentionPairBias.to_bias">to_bias (pallatom.architecture.node_update.AttentionPairBias attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/node_update/index.html#pallatom.architecture.node_update.AttentionPairBias.to_g">to_g (pallatom.architecture.node_update.AttentionPairBias attribute)</a>
+
+        <ul>
+          <li><a href="autoapi/pallatom/architecture/pair_update/index.html#pallatom.architecture.pair_update.TriangleAttentionEndingNodeWithBias.to_g">(pallatom.architecture.pair_update.TriangleAttentionEndingNodeWithBias attribute)</a>
+</li>
+          <li><a href="autoapi/pallatom/architecture/pair_update/index.html#pallatom.architecture.pair_update.TriangleAttentionStartingNodeWithBias.to_g">(pallatom.architecture.pair_update.TriangleAttentionStartingNodeWithBias attribute)</a>
+</li>
+        </ul></li>
+        <li><a href="autoapi/pallatom/architecture/atom_transformers/index.html#pallatom.architecture.atom_transformers.AtomTransformerBlock.to_k">to_k (pallatom.architecture.atom_transformers.AtomTransformerBlock attribute)</a>
+
+        <ul>
+          <li><a href="autoapi/pallatom/architecture/node_update/index.html#pallatom.architecture.node_update.AttentionPairBias.to_k">(pallatom.architecture.node_update.AttentionPairBias attribute)</a>
+</li>
+          <li><a href="autoapi/pallatom/architecture/pair_update/index.html#pallatom.architecture.pair_update.TriangleAttentionEndingNodeWithBias.to_k">(pallatom.architecture.pair_update.TriangleAttentionEndingNodeWithBias attribute)</a>
+</li>
+          <li><a href="autoapi/pallatom/architecture/pair_update/index.html#pallatom.architecture.pair_update.TriangleAttentionStartingNodeWithBias.to_k">(pallatom.architecture.pair_update.TriangleAttentionStartingNodeWithBias attribute)</a>
+</li>
+        </ul></li>
+        <li><a href="autoapi/pallatom/architecture/atom_transformers/index.html#pallatom.architecture.atom_transformers.AtomTransformerBlock.to_out">to_out (pallatom.architecture.atom_transformers.AtomTransformerBlock attribute)</a>
+
+        <ul>
+          <li><a href="autoapi/pallatom/architecture/node_update/index.html#pallatom.architecture.node_update.AttentionPairBias.to_out">(pallatom.architecture.node_update.AttentionPairBias attribute)</a>
+</li>
+          <li><a href="autoapi/pallatom/architecture/pair_update/index.html#pallatom.architecture.pair_update.TriangleAttentionEndingNodeWithBias.to_out">(pallatom.architecture.pair_update.TriangleAttentionEndingNodeWithBias attribute)</a>
+</li>
+          <li><a href="autoapi/pallatom/architecture/pair_update/index.html#pallatom.architecture.pair_update.TriangleAttentionStartingNodeWithBias.to_out">(pallatom.architecture.pair_update.TriangleAttentionStartingNodeWithBias attribute)</a>
+</li>
+        </ul></li>
+        <li><a href="autoapi/pallatom/helpers/atom_utils/index.html#pallatom.helpers.atom_utils.to_pdb">to_pdb() (in module pallatom.helpers.atom_utils)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/atom_transformers/index.html#pallatom.architecture.atom_transformers.AtomTransformerBlock.to_q">to_q (pallatom.architecture.atom_transformers.AtomTransformerBlock attribute)</a>
+
+        <ul>
+          <li><a href="autoapi/pallatom/architecture/node_update/index.html#pallatom.architecture.node_update.AttentionPairBias.to_q">(pallatom.architecture.node_update.AttentionPairBias attribute)</a>
+</li>
+          <li><a href="autoapi/pallatom/architecture/pair_update/index.html#pallatom.architecture.pair_update.TriangleAttentionEndingNodeWithBias.to_q">(pallatom.architecture.pair_update.TriangleAttentionEndingNodeWithBias attribute)</a>
+</li>
+          <li><a href="autoapi/pallatom/architecture/pair_update/index.html#pallatom.architecture.pair_update.TriangleAttentionStartingNodeWithBias.to_q">(pallatom.architecture.pair_update.TriangleAttentionStartingNodeWithBias attribute)</a>
+</li>
+        </ul></li>
+    </ul></td>
+    <td style="width: 33%; vertical-align: top;"><ul>
+        <li><a href="autoapi/pallatom/architecture/atom_transformers/index.html#pallatom.architecture.atom_transformers.AtomTransformerBlock.to_v">to_v (pallatom.architecture.atom_transformers.AtomTransformerBlock attribute)</a>
+
+        <ul>
+          <li><a href="autoapi/pallatom/architecture/node_update/index.html#pallatom.architecture.node_update.AttentionPairBias.to_v">(pallatom.architecture.node_update.AttentionPairBias attribute)</a>
+</li>
+          <li><a href="autoapi/pallatom/architecture/pair_update/index.html#pallatom.architecture.pair_update.TriangleAttentionEndingNodeWithBias.to_v">(pallatom.architecture.pair_update.TriangleAttentionEndingNodeWithBias attribute)</a>
+</li>
+          <li><a href="autoapi/pallatom/architecture/pair_update/index.html#pallatom.architecture.pair_update.TriangleAttentionStartingNodeWithBias.to_v">(pallatom.architecture.pair_update.TriangleAttentionStartingNodeWithBias attribute)</a>
+</li>
+        </ul></li>
+        <li><a href="autoapi/train_config/index.html#train_config.ResidueDistogramParams.tok_emb_dim">tok_emb_dim (train_config.ResidueDistogramParams attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/helpers/featurize/index.html#pallatom.helpers.featurize.FeaturizedBatch.tok_idx">tok_idx (pallatom.helpers.featurize.FeaturizedBatch attribute)</a>
+</li>
+        <li><a href="autoapi/train_loop/index.html#train_loop.train">train() (in module train_loop)</a>
+</li>
+        <li>
+    train_config
+
+        <ul>
+          <li><a href="autoapi/train_config/index.html#module-train_config">module</a>
+</li>
+        </ul></li>
+        <li><a href="autoapi/train_config/index.html#train_config.TrainConfig.train_loader">train_loader (train_config.TrainConfig attribute)</a>
+</li>
+        <li>
+    train_loop
+
+        <ul>
+          <li><a href="autoapi/train_loop/index.html#module-train_loop">module</a>
+</li>
+        </ul></li>
+        <li><a href="autoapi/train_config/index.html#train_config.TrainConfig">TrainConfig (class in train_config)</a>
+</li>
+        <li><a href="autoapi/train_config/index.html#train_config.TrainConfig.training">training (train_config.TrainConfig attribute)</a>
+</li>
+        <li><a href="autoapi/train_config/index.html#train_config.TrainingParams">TrainingParams (class in train_config)</a>
+</li>
+        <li><a href="autoapi/train_config/index.html#train_config.TrainLoaderConfig">TrainLoaderConfig (in module train_config)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/atom_transformers/index.html#pallatom.architecture.atom_transformers.AtomAttentionDecoder.transformer">transformer (pallatom.architecture.atom_transformers.AtomAttentionDecoder attribute)</a>
+
+        <ul>
+          <li><a href="autoapi/pallatom/architecture/atom_transformers/index.html#pallatom.architecture.atom_transformers.AtomFeatureEncoder.transformer">(pallatom.architecture.atom_transformers.AtomFeatureEncoder attribute)</a>
+</li>
+        </ul></li>
+        <li><a href="autoapi/pallatom/architecture/pair_update/index.html#pallatom.architecture.pair_update.TransformRBF">TransformRBF (class in pallatom.architecture.pair_update)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/pair_update/index.html#pallatom.architecture.pair_update.Transition">Transition (class in pallatom.architecture.pair_update)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/node_update/index.html#pallatom.architecture.node_update.NodeUpdate.transition">transition (pallatom.architecture.node_update.NodeUpdate attribute)</a>
+
+        <ul>
+          <li><a href="autoapi/pallatom/architecture/pair_update/index.html#pallatom.architecture.pair_update.PairUpdate.transition">(pallatom.architecture.pair_update.PairUpdate attribute)</a>
+</li>
+        </ul></li>
+        <li><a href="autoapi/pallatom/architecture/pair_update/index.html#pallatom.architecture.pair_update.PairUpdate.tri_end">tri_end (pallatom.architecture.pair_update.PairUpdate attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/pair_update/index.html#pallatom.architecture.pair_update.PairUpdate.tri_start">tri_start (pallatom.architecture.pair_update.PairUpdate attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/pair_update/index.html#pallatom.architecture.pair_update.TriangleAttentionEndingNodeWithBias">TriangleAttentionEndingNodeWithBias (class in pallatom.architecture.pair_update)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/pair_update/index.html#pallatom.architecture.pair_update.TriangleAttentionStartingNodeWithBias">TriangleAttentionStartingNodeWithBias (class in pallatom.architecture.pair_update)</a>
+</li>
+    </ul></td>
+  </tr></table>
+</section>
+
+<section id="U" class="genindex-section">
+  <h2>U</h2>
+  <table style="width: 100%" class="indextable genindextable"><tr>
+    <td style="width: 33%; vertical-align: top;"><ul>
+        <li><a href="autoapi/train_config/index.html#train_config.LoggingParams.use_wandb">use_wandb (train_config.LoggingParams attribute)</a>
+</li>
+    </ul></td>
+  </tr></table>
+</section>
+
+<section id="V" class="genindex-section">
+  <h2>V</h2>
+  <table style="width: 100%" class="indextable genindextable"><tr>
+    <td style="width: 33%; vertical-align: top;"><ul>
+        <li><a href="autoapi/pallatom/architecture/pairformer_stack/index.html#pallatom.architecture.pairformer_stack.PairformerBlock.v_col">v_col (pallatom.architecture.pairformer_stack.PairformerBlock attribute)</a>
+</li>
+    </ul></td>
+    <td style="width: 33%; vertical-align: top;"><ul>
+        <li><a href="autoapi/pallatom/architecture/pairformer_stack/index.html#pallatom.architecture.pairformer_stack.PairformerBlock.v_row">v_row (pallatom.architecture.pairformer_stack.PairformerBlock attribute)</a>
+</li>
+    </ul></td>
+  </tr></table>
+</section>
+
+<section id="W" class="genindex-section">
+  <h2>W</h2>
+  <table style="width: 100%" class="indextable genindextable"><tr>
+    <td style="width: 33%; vertical-align: top;"><ul>
+        <li><a href="autoapi/train_config/index.html#train_config.LoggingParams.wandb_project">wandb_project (train_config.LoggingParams attribute)</a>
+</li>
+        <li><a href="autoapi/train_config/index.html#train_config.TrainingParams.weight_decay">weight_decay (train_config.TrainingParams attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/main_trunk/index.html#pallatom.architecture.main_trunk.AtomDistogramHead.window">window (pallatom.architecture.main_trunk.AtomDistogramHead attribute)</a>
+</li>
+        <li><a href="autoapi/pallatom/architecture/atom_transformers/index.html#pallatom.architecture.atom_transformers.WINDOW_SIZE">WINDOW_SIZE (in module pallatom.architecture.atom_transformers)</a>
+</li>
+    </ul></td>
+    <td style="width: 33%; vertical-align: top;"><ul>
+        <li><a href="autoapi/pallatom/architecture/atom_transformers/index.html#pallatom.architecture.atom_transformers.AtomAttentionDecoder.window_size">window_size (pallatom.architecture.atom_transformers.AtomAttentionDecoder attribute)</a>
+
+        <ul>
+          <li><a href="autoapi/pallatom/architecture/atom_transformers/index.html#pallatom.architecture.atom_transformers.AtomFeatureEncoder.window_size">(pallatom.architecture.atom_transformers.AtomFeatureEncoder attribute)</a>
+</li>
+          <li><a href="autoapi/pallatom/architecture/atom_transformers/index.html#pallatom.architecture.atom_transformers.AtomTransformer.window_size">(pallatom.architecture.atom_transformers.AtomTransformer attribute)</a>
+</li>
+          <li><a href="autoapi/pallatom/architecture/atom_transformers/index.html#pallatom.architecture.atom_transformers.AtomTransformerBlock.window_size">(pallatom.architecture.atom_transformers.AtomTransformerBlock attribute)</a>
+</li>
+        </ul></li>
+    </ul></td>
+  </tr></table>
+</section>
+
+
+        </article>
+      </div>
+      <footer>
+        
+        <div class="related-pages">
+          
+          
+        </div>
+        <div class="bottom-of-page">
+          <div class="left-details">
+            <div class="copyright">
+                Copyright &#169; 2024, tmatteso
+            </div>
+            Made with <a href="https://www.sphinx-doc.org/">Sphinx</a> and <a class="muted-link" href="https://pradyunsg.me">@pradyunsg</a>'s
+            
+            <a href="https://github.com/pradyunsg/furo">Furo</a>
+            
+          </div>
+          <div class="right-details">
+            
+          </div>
+        </div>
+        
+      </footer>
+    </div>
+    <aside class="toc-drawer no-toc">
+      
+      
+      
+    </aside>
+  </div>
+</div><script src="_static/documentation_options.js?v=01f34227"></script>
+    <script src="_static/doctools.js?v=9bcbadda"></script>
+    <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="_static/scripts/furo.js?v=46bd48cc"></script>
+    </body>
+</html>

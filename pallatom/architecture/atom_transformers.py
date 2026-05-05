@@ -40,7 +40,7 @@ def build_sparse_pairs(
     Args:
         tok_idx     : [N]  residue index (0-based) for each atom
         window_size : total window span in residues (default 32)
-                      atom l attends to m iff |tok_idx[l] - tok_idx[m]| < window_size // 2
+                      atom l attends to m iff ``|tok_idx[l] - tok_idx[m]|`` < window_size // 2
 
     Returns:
         neighbor_idx : [N, K]  atom indices of each neighbour; padding slots → 0

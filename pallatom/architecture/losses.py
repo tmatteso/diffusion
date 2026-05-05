@@ -215,6 +215,9 @@ def smooth_lddt_loss(
     Smooth lDDT loss — Algorithm 8 (simplified AF3 version for all-atom design).
 
     Exact algorithm:
+
+    .. code-block:: none
+
         1. δr_lm     = ||r_l  − r_m||          (predicted pairwise distances)
         2. δr_lm_GT  = ||r_l_GT − r_m_GT||     (GT pairwise distances)
         3. δ_lm      = |δr_lm_GT − δr_lm|      (absolute distance difference)

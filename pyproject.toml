@@ -15,6 +15,8 @@ dependencies = [
     "jaxtyping>=0.2.0",
     "structlog>=24.0.0",
     "tqdm>=4.0.0",
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.0",
 ]
 
 [build-system]
@@ -48,6 +50,13 @@ torchaudio = [
 ]
 
 [dependency-groups]
+docs = [
+    "sphinx>=7.0",
+    "sphinx-autoapi>=3.0",
+    "autodoc-pydantic>=2.2",
+    "furo>=2024.1",
+    "sphinx-copybutton>=0.5",
+]
 dev = [
     "black>=24.0.0",
     "ruff>=0.1.0",

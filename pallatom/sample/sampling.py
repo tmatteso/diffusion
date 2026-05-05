@@ -14,7 +14,7 @@ from jaxtyping import Bool, Float, Int, jaxtyped
 log = structlog.get_logger()
 
 from architecture.main_trunk import MainTrunk
-from helpers.featurize import FeaturizedBatch
+from helpers.featurize import Distogram, FeaturizedBatch
 from helpers.atom_utils import (
     ATOM5_ELEMENTS,
     ATOM37_N, ATOM37_CA, ATOM37_C, ATOM37_O, ATOM37_CB,
@@ -291,6 +291,81 @@ def build_sampling_context(
         center_uid=tile(center_uid_single),
         gt_atom_distogram_sparse=torch.zeros(B, N_atom, K, n_atom_bins, dtype=torch.float32, device=device),
         gt_atom_distogram_mask_sparse=torch.zeros(B, N_atom, K, dtype=torch.bool, device=device),
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3b.  Template context builder
+#
+#  Like build_sampling_context but populates gt_res_distogram and
+#  f_pseudo_beta_mask from supplied pseudo-Cβ coordinates.
+#
+#  For a partial template set template_mask=1 only for known residues;
+#  TemplateEmbedder contributes pair signal only where both residues have mask=1
+#  via its b_mask = f_i^mask · f_j^mask term.
+# ─────────────────────────────────────────────────────────────────────────────
+
+@jaxtyped(typechecker=beartype)
+def build_template_context(
+    N_res:           int,
+    index_embedding: nn.Embedding,
+    template_cb:     Float[torch.Tensor, "N_res 3"],
+    template_mask:   Float[torch.Tensor, "N_res"],
+    batch_size:      int = 1,
+    n_templ_bins:    int = 39,
+    n_atom_bins:     int = 22,
+    c_res_embed:     int = 32,
+    device:          str = "cpu",
+) -> FeaturizedBatch:
+    """
+    Build the static context FeaturizedBatch for template-guided backbone generation.
+
+    For full template conditioning pass template_mask=torch.ones(N_res).
+    For partial template (motif scaffolding) set template_mask to 1 for residues
+    with known coordinates and 0 for residues to be designed de novo.
+
+    Parameters
+    ----------
+    N_res          : number of residues
+    index_embedding: trained residue index embedding
+    template_cb    : pseudo-Cβ coordinates, shape (N_res, 3)
+    template_mask  : 1.0 = residue has valid template coords, 0.0 = unknown
+    batch_size     : B — number of samples to generate in parallel
+    n_templ_bins   : total distogram bins including overflow (default 39 = 38 + 1)
+    """
+    cb  = template_cb.to(device)
+    msk = template_mask.bool().to(device)
+
+    distogram_fn = Distogram(
+        n_bins=n_templ_bins - 1,   # overflow_bin=True adds one extra bin
+        min_dist=3.25,
+        max_dist=50.75,
+        overflow_bin=True,
+    ).to(device)
+
+    with torch.no_grad():
+        f_disto, _ = distogram_fn(cb, msk)   # (N_res, N_res, n_templ_bins)
+
+    B = batch_size
+    gt_res_distogram:  Int[torch.Tensor, "B N_res N_res n_templ_bins"] = repeat(
+        f_disto.long(), "n1 n2 bins -> b n1 n2 bins", b=B
+    )
+    f_pseudo_beta_mask: Int[torch.Tensor, "B N_res"] = repeat(
+        template_mask.long().to(device), "n -> b n", b=B
+    )
+
+    ctx = build_sampling_context(
+        N_res, index_embedding,
+        batch_size=batch_size,
+        n_templ_bins=n_templ_bins,
+        n_atom_bins=n_atom_bins,
+        c_res_embed=c_res_embed,
+        device=device,
+    )
+    return dataclasses.replace(
+        ctx,
+        gt_res_distogram=gt_res_distogram,
+        f_pseudo_beta_mask=f_pseudo_beta_mask,
     )
 
 

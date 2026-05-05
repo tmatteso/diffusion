@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 import torch
 import torch.nn as nn
-from einops import reduce
+from einops import rearrange, reduce
 
 from helpers.featurize import FeaturizedBatch
 from sample.sampling import (
@@ -15,6 +15,7 @@ from sample.sampling import (
     EDMSampler,
     atom5_to_atom37,
     build_sampling_context,
+    build_template_context,
 )
 
 torch.manual_seed(0)
@@ -681,3 +682,192 @@ def test_edm_sampler_s_tmin_above_sigma_max_disables_injection(
     torch.manual_seed(5)
     out_stoch = identity_stoch_sampler_tmin_high.sample((1, N_ATOM, 3), steps=5)
     assert torch.allclose(out_det, out_stoch)
+
+
+# ---------------------------------------------------------------------------
+# build_template_context — fixtures
+# ---------------------------------------------------------------------------
+
+N_TEMPL_BINS = 39   # 38 distance bins + 1 overflow, matching ModelParams.n_bins
+MOTIF_START  = 1    # residues [1, 3) are known in the partial-template fixture
+MOTIF_END    = 3
+
+
+@pytest.fixture
+def template_cb() -> torch.Tensor:
+    return torch.randn(N_RES, 3)
+
+
+@pytest.fixture
+def full_mask() -> torch.Tensor:
+    return torch.ones(N_RES)
+
+
+@pytest.fixture
+def partial_mask() -> torch.Tensor:
+    mask = torch.zeros(N_RES)
+    mask[MOTIF_START:MOTIF_END] = 1.0
+    return mask
+
+
+@pytest.fixture
+def full_template_context(index_embedding, template_cb, full_mask) -> FeaturizedBatch:
+    return build_template_context(
+        N_RES, index_embedding, template_cb, full_mask, n_templ_bins=N_TEMPL_BINS
+    )
+
+
+@pytest.fixture
+def partial_template_context(index_embedding, template_cb, partial_mask) -> FeaturizedBatch:
+    return build_template_context(
+        N_RES, index_embedding, template_cb, partial_mask, n_templ_bins=N_TEMPL_BINS
+    )
+
+
+# ---------------------------------------------------------------------------
+# build_template_context — return type
+# ---------------------------------------------------------------------------
+
+def test_build_template_context_returns_featurized_batch(full_template_context):
+    assert isinstance(full_template_context, FeaturizedBatch)
+
+
+# ---------------------------------------------------------------------------
+# build_template_context — tensor shapes
+# ---------------------------------------------------------------------------
+
+def test_build_template_context_gt_res_distogram_shape(full_template_context):
+    assert full_template_context.gt_res_distogram.shape == (1, N_RES, N_RES, N_TEMPL_BINS)
+
+
+def test_build_template_context_f_pseudo_beta_mask_shape(full_template_context):
+    assert full_template_context.f_pseudo_beta_mask.shape == (1, N_RES)
+
+
+def test_build_template_context_batch_size_sets_leading_dim(index_embedding, template_cb, full_mask):
+    ctx = build_template_context(
+        N_RES, index_embedding, template_cb, full_mask, batch_size=3, n_templ_bins=N_TEMPL_BINS
+    )
+    assert ctx.gt_res_distogram.shape[0] == 3
+    assert ctx.f_pseudo_beta_mask.shape[0] == 3
+
+
+def test_build_template_context_custom_n_templ_bins(index_embedding, template_cb, full_mask):
+    ctx = build_template_context(
+        N_RES, index_embedding, template_cb, full_mask, n_templ_bins=20
+    )
+    assert ctx.gt_res_distogram.shape == (1, N_RES, N_RES, 20)
+
+
+# ---------------------------------------------------------------------------
+# build_template_context — tensor dtypes
+# ---------------------------------------------------------------------------
+
+def test_build_template_context_gt_res_distogram_dtype_is_long(full_template_context):
+    assert full_template_context.gt_res_distogram.dtype == torch.long
+
+
+def test_build_template_context_f_pseudo_beta_mask_dtype_is_long(full_template_context):
+    assert full_template_context.f_pseudo_beta_mask.dtype == torch.long
+
+
+# ---------------------------------------------------------------------------
+# build_template_context — full template mask values
+# ---------------------------------------------------------------------------
+
+def test_build_template_context_full_mask_f_pseudo_beta_mask_all_ones(full_template_context):
+    assert (full_template_context.f_pseudo_beta_mask == 1).all()
+
+
+def test_build_template_context_gt_res_distogram_is_valid_one_hot(full_template_context):
+    bin_sums = reduce(
+        full_template_context.gt_res_distogram.float(), "b i j bins -> b i j", "sum"
+    )
+    assert torch.allclose(bin_sums, torch.ones_like(bin_sums))
+
+
+def test_build_template_context_gt_res_distogram_is_symmetric(full_template_context):
+    disto = full_template_context.gt_res_distogram
+    assert torch.equal(disto, rearrange(disto, "b i j k -> b j i k"))
+
+
+def test_build_template_context_gt_res_distogram_is_nonzero_for_full_template(full_template_context):
+    # At least one bin per pair must be 1; the sum over bins is always 1 but we
+    # additionally verify the max along the bin dim is 1 everywhere.
+    assert (reduce(full_template_context.gt_res_distogram, "b i j bins -> b i j", "max") == 1).all()
+
+
+# ---------------------------------------------------------------------------
+# build_template_context — partial template mask values
+# ---------------------------------------------------------------------------
+
+def test_build_template_context_partial_motif_residues_have_mask_one(partial_template_context):
+    mask = partial_template_context.f_pseudo_beta_mask[0]
+    assert (mask[MOTIF_START:MOTIF_END] == 1).all()
+
+
+def test_build_template_context_partial_non_motif_residues_have_mask_zero(partial_template_context):
+    mask = partial_template_context.f_pseudo_beta_mask[0]
+    non_motif = torch.cat([mask[:MOTIF_START], mask[MOTIF_END:]])
+    assert (non_motif == 0).all()
+
+
+def test_build_template_context_partial_mask_differs_from_full_mask(
+    full_template_context, partial_template_context
+):
+    assert not torch.equal(
+        full_template_context.f_pseudo_beta_mask,
+        partial_template_context.f_pseudo_beta_mask,
+    )
+
+
+def test_build_template_context_zero_mask_gives_zero_f_pseudo_beta_mask(
+    index_embedding, template_cb
+):
+    zero_mask = torch.zeros(N_RES)
+    ctx = build_template_context(
+        N_RES, index_embedding, template_cb, zero_mask, n_templ_bins=N_TEMPL_BINS
+    )
+    assert (ctx.f_pseudo_beta_mask == 0).all()
+
+
+# ---------------------------------------------------------------------------
+# build_template_context — static fields inherited from build_sampling_context
+# ---------------------------------------------------------------------------
+
+def test_build_template_context_static_fields_match_unconditional_context(
+    index_embedding, template_cb, full_mask
+):
+    tmpl_ctx = build_template_context(
+        N_RES, index_embedding, template_cb, full_mask, n_templ_bins=N_TEMPL_BINS
+    )
+    base_ctx = build_sampling_context(N_RES, index_embedding, n_templ_bins=N_TEMPL_BINS)
+    assert torch.equal(tmpl_ctx.ref_pos,    base_ctx.ref_pos)
+    assert torch.equal(tmpl_ctx.tok_idx,    base_ctx.tok_idx)
+    assert torch.equal(tmpl_ctx.center_uid, base_ctx.center_uid)
+    assert torch.equal(tmpl_ctx.ref_element, base_ctx.ref_element)
+
+
+def test_build_template_context_r_input_placeholder_is_zero(full_template_context):
+    assert (full_template_context.r_input == 0).all()
+
+
+# ---------------------------------------------------------------------------
+# build_template_context — sensitivity to coordinates
+# ---------------------------------------------------------------------------
+
+def test_build_template_context_different_coords_give_different_distograms(
+    index_embedding, full_mask
+):
+    # Scale by 20 Å so pairwise distances span multiple bins (bin range 3.25–50.75 Å).
+    torch.manual_seed(11)
+    cb_a = torch.randn(N_RES, 3) * 20.0
+    torch.manual_seed(22)
+    cb_b = torch.randn(N_RES, 3) * 20.0
+    ctx_a = build_template_context(
+        N_RES, index_embedding, cb_a, full_mask, n_templ_bins=N_TEMPL_BINS
+    )
+    ctx_b = build_template_context(
+        N_RES, index_embedding, cb_b, full_mask, n_templ_bins=N_TEMPL_BINS
+    )
+    assert not torch.equal(ctx_a.gt_res_distogram, ctx_b.gt_res_distogram)

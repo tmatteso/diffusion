@@ -33,8 +33,9 @@ class Distogram(nn.Module):
 
     Precomputes bin edges once at init; forward() maps per-residue coordinates
     → one-hot distogram + validity mask.  Accepts either:
-      • (..., N, 3)    — single atom per residue (e.g. pseudo-Cβ), auto-expanded to (..., N, 1, 3)
-      • (..., N, A, 3) — A atoms per residue (e.g. atom5, atom37)
+
+    - ``(..., N, 3)``    — single atom per residue (e.g. pseudo-Cβ), auto-expanded to ``(..., N, 1, 3)``
+    - ``(..., N, A, 3)`` — A atoms per residue (e.g. atom5, atom37)
 
     Args:
         n_bins:       Number of distance bins.
