@@ -7,6 +7,12 @@ components.
 
 .. toctree::
    :maxdepth: 1
+   :caption: Architecture
+
+   architecture
+
+.. toctree::
+   :maxdepth: 1
    :caption: API Reference
 
    autoapi/index

@@ -1,6 +1,8 @@
 # diffusion
 Tinkering with Advances in Diffusion / Flow Modeling
 
+**[API Docs](https://tmatteso.github.io/diffusion/)**
+
 ---
 
 ## Setting up the devcontainer on a new CUDA machine

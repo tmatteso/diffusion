@@ -11,6 +11,7 @@ copyright = "2024, tmatteso"
 extensions = [
     "sphinx.ext.napoleon",
     "sphinx.ext.intersphinx",
+    "sphinxcontrib.mermaid",
     "autoapi.extension",
     "sphinxcontrib.autodoc_pydantic",
 ]

@@ -1,13 +1,13 @@
 <!doctype html>
 <html class="no-js" lang="en" data-content_root="./">
-  <head>
-<meta charset="utf-8">
+  <head><meta charset="utf-8">
     <meta name="viewport" content="width=device-width,initial-scale=1">
-    <meta name="color-scheme" content="light dark"><link rel="index" title="Index" href="genindex.html"><link rel="search" title="Search" href="#">
+    <meta name="color-scheme" content="light dark"><meta name="viewport" content="width=device-width, initial-scale=1" />
+<link rel="index" title="Index" href="genindex.html"><link rel="search" title="Search" href="search.html"><link rel="next" title="API Reference" href="autoapi/index.html"><link rel="prev" title="pallatom" href="index.html">
 
     <!-- Generated with Sphinx 8.1.3 and Furo 2025.12.19 -->
-<meta name="robots" content="noindex" />
-<title>Search - pallatom</title><link rel="stylesheet" type="text/css" href="_static/pygments.css?v=d111a655" />
+        <title>Architecture - pallatom</title>
+      <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=d111a655" />
     <link rel="stylesheet" type="text/css" href="_static/styles/furo.css?v=7bdb33bb" />
     <link rel="stylesheet" type="text/css" href="_static/graphviz.css?v=4ae1632d" />
     <link rel="stylesheet" type="text/css" href="_static/autodoc_pydantic.css" />
@@ -174,7 +174,7 @@
           <svg class="theme-icon-when-light"><use href="#svg-sun"></use></svg>
         </button>
       </div>
-      <label class="toc-overlay-icon toc-header-icon no-toc" for="__toc">
+      <label class="toc-overlay-icon toc-header-icon" for="__toc">
         <span class="icon"><svg><use href="#svg-toc"></use></svg></span>
       </label>
     </div>
@@ -186,15 +186,15 @@
   
   <span class="sidebar-brand-text">pallatom</span>
   
-</a><form class="sidebar-search-container" method="get" action="#" role="search">
+</a><form class="sidebar-search-container" method="get" action="search.html" role="search">
   <input class="sidebar-search" placeholder="Search" name="q" aria-label="Search">
   <input type="hidden" name="check_keywords" value="yes">
   <input type="hidden" name="area" value="default">
 </form>
 <div id="searchbox"></div><div class="sidebar-scroll"><div class="sidebar-tree">
   <p class="caption" role="heading"><span class="caption-text">Architecture</span></p>
-<ul>
-<li class="toctree-l1"><a class="reference internal" href="architecture.html">Architecture</a></li>
+<ul class="current">
+<li class="toctree-l1 current current-page"><a class="current reference internal" href="#">Architecture</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">API Reference</span></p>
 <ul>
@@ -245,7 +245,13 @@
           <span>Back to top</span>
         </a>
         <div class="content-icon-container">
-          <div class="theme-toggle-container theme-toggle-content">
+          <div class="view-this-page">
+  <a class="muted-link" href="_sources/architecture.rst.txt" title="View this page">
+    <svg><use href="#svg-eye"></use></svg>
+    <span class="visually-hidden">View this page</span>
+  </a>
+</div>
+<div class="theme-toggle-container theme-toggle-content">
             <button class="theme-toggle" aria-label="Toggle Light / Dark / Auto color theme">
               <svg class="theme-icon-when-auto-light"><use href="#svg-sun-with-moon"></use></svg>
               <svg class="theme-icon-when-auto-dark"><use href="#svg-moon-with-sun"></use></svg>
@@ -253,30 +259,175 @@
               <svg class="theme-icon-when-light"><use href="#svg-sun"></use></svg>
             </button>
           </div>
-          <label class="toc-overlay-icon toc-content-icon no-toc" for="__toc">
+          <label class="toc-overlay-icon toc-content-icon" for="__toc">
             <span class="icon"><svg><use href="#svg-toc"></use></svg></span>
           </label>
         </div>
         <article role="main" id="furo-main-content">
-          
-<noscript>
-<div class="admonition error">
-  <p class="admonition-title">Error</p>
-  <p>
-    Please activate JavaScript to enable the search functionality.
-  </p>
-</div>
-</noscript>
+          <section id="architecture">
+<h1>Architecture<a class="headerlink" href="#architecture" title="Link to this heading">¶</a></h1>
+<p>Visual overview of the <strong>pallatom</strong> denoising network.
+Diagrams follow the <code class="docutils literal notranslate"><span class="pre">forward()</span></code> call order; tensor shapes use the
+named-dimension conventions documented in <code class="docutils literal notranslate"><span class="pre">pallatom/CLAUDE.md</span></code>
+(e.g. <code class="docutils literal notranslate"><span class="pre">N_atom</span></code>, <code class="docutils literal notranslate"><span class="pre">N_res</span></code>, <code class="docutils literal notranslate"><span class="pre">c_pair</span></code>, <code class="docutils literal notranslate"><span class="pre">K</span></code>).</p>
+<nav class="contents local" id="on-this-page">
+<p class="topic-title">On this page</p>
+<ul class="simple">
+<li><p><a class="reference internal" href="#maintrunk-algorithm-2" id="id1">MainTrunk (Algorithm 2)</a></p></li>
+<li><p><a class="reference internal" href="#decoder-loop-x-k-unit" id="id2">Decoder Loop (x K_unit)</a></p></li>
+<li><p><a class="reference internal" href="#atomfeatureencoder-algorithm-4" id="id3">AtomFeatureEncoder (Algorithm 4)</a></p></li>
+</ul>
+</nav>
+<hr class="docutils" />
+<section id="maintrunk-algorithm-2">
+<h2><a class="toc-backref" href="#id1" role="doc-backlink">MainTrunk (Algorithm 2)</a><a class="headerlink" href="#maintrunk-algorithm-2" title="Link to this heading">¶</a></h2>
+<p><a class="reference internal" href="autoapi/pallatom/architecture/main_trunk/index.html#pallatom.architecture.main_trunk.MainTrunk" title="pallatom.architecture.main_trunk.MainTrunk"><code class="xref py py-class docutils literal notranslate"><span class="pre">MainTrunk</span></code></a> takes a
+<a class="reference internal" href="autoapi/pallatom/helpers/featurize/index.html#pallatom.helpers.featurize.FeaturizedBatch" title="pallatom.helpers.featurize.FeaturizedBatch"><code class="xref py py-class docutils literal notranslate"><span class="pre">FeaturizedBatch</span></code></a> and returns denoised atom
+positions plus auxiliary sequence and distogram logits.</p>
+<pre  class="mermaid">
+        flowchart TD
+    classDef inp  fill:#dbeafe,stroke:#3b82f6
+    classDef proc fill:#d1fae5,stroke:#059669
+    classDef skip fill:#fef3c7,stroke:#d97706
+    classDef out  fill:#fce7f3,stroke:#db2777
 
-<div id="search-results"></div>
+    I1([&quot;r_input  [B, N_atom, 3]&quot;]):::inp
+    I2([&quot;f_residue_idx  [B, N_res, c_res]&quot;]):::inp
+    I3([&quot;f_distogram · pseudo_beta_mask&quot;]):::inp
+    I4([&quot;ref_pos · ref_element · ref_uid&quot;]):::inp
+    I5([&quot;t_hat · t_normalized&quot;]):::inp
+
+    I1  --&gt; P1[&quot;r_scaled = r_input / sqrt(sigma_data^2 + t_hat^2)&quot;]:::proc
+    I2  --&gt; P2[&quot;s_init = Linear(f_residue_idx)&quot;]:::proc
+    I5  --&gt; P3[&quot;t_i = TimeFourierEmbedding(0.25 * log(t_hat / sigma_data))&quot;]:::proc
+    P2  --&gt; P4[&quot;s_init += t_i&quot;]:::proc
+    P3  --&gt; P4
+
+    P4  --&gt; P5[&quot;z_ij = RelativePositionEncoding&quot;]:::proc
+    I3  --&gt; P6[&quot;z_ij += TemplateEmbedder(f_distogram, z_ij, t)&quot;]:::proc
+    P5  --&gt; P6
+
+    P1  --&gt; P7[&quot;AtomFeatureEncoder  (Algorithm 4)&quot;]:::proc
+    I4  --&gt; P7
+    P4  --&gt; P7
+    P6  --&gt; P7
+    P7  --&gt; SK1([&quot;s_i  [B, N_res, c_res]&quot;]):::skip
+    P7  --&gt; SK2([&quot;q_skip · c_skip  [B, N_atom, c_atom]&quot;]):::skip
+    P7  --&gt; SK3([&quot;p_skip  [B, N_atom, K, c_atompair]&quot;]):::skip
+    P7  --&gt; SK4([&quot;c_l  [B, N_atom, c_atom]&quot;]):::skip
+
+    SK1 --&gt; P8[&quot;s_i += proj(LN(s_init))&quot;]:::proc
+    P4  --&gt; P8
+
+    P8  --&gt; DL[&quot;Decoder Loop x K_unit&quot;]:::proc
+    SK2 --&gt; DL
+    SK4 --&gt; DL
+    P6  --&gt; DL
+
+    DL  --&gt; O1([&quot;r_denoised  [B, N_atom, 3]&quot;]):::out
+    DL  --&gt; O2([&quot;f_seq_logits  [B, N_res, 20]&quot;]):::out
+    DL  --&gt; O3([&quot;residue_distogram_logits  [B, N_res, N_res, n_bins]&quot;]):::out
+    SK3 --&gt; O4([&quot;atom_distogram_logits  [B, N_atom, K, n_atom_bins]&quot;]):::out
+    </pre></section>
+<hr class="docutils" />
+<section id="decoder-loop-x-k-unit">
+<h2><a class="toc-backref" href="#id2" role="doc-backlink">Decoder Loop (x K_unit)</a><a class="headerlink" href="#decoder-loop-x-k-unit" title="Link to this heading">¶</a></h2>
+<p>Each iteration of the <code class="docutils literal notranslate"><span class="pre">K_unit</span></code> loop refines all three representations:
+residue single <code class="docutils literal notranslate"><span class="pre">s_i</span></code>, pair <code class="docutils literal notranslate"><span class="pre">z_ij</span></code>, and atom context <code class="docutils literal notranslate"><span class="pre">c_l</span></code>.
+The EDM blend formula ensures the denoised coordinates are always on the
+correct noise-level manifold.</p>
+<pre  class="mermaid">
+        flowchart TD
+    classDef proc fill:#d1fae5,stroke:#059669
+    classDef acc  fill:#fef3c7,stroke:#d97706
+    classDef out  fill:#fce7f3,stroke:#db2777
+
+    IN([&quot;s_i · z_ij · t_i · q_skip · c_skip · p_skip · c_l\nr_input · r_updates = 0&quot;]):::acc
+
+    IN  --&gt; NU[&quot;NodeUpdate\n  s_i = Update(s_i, t_i, z_ij)&quot;]:::proc
+    NU  --&gt; AD[&quot;AtomAttentionDecoder\n  r_update, c_l = Decode(q_skip, p_skip, c_skip, c_l, s_i, z_ij)&quot;]:::proc
+    AD  --&gt; RU[&quot;r_updates += r_update&quot;]:::acc
+    RU  --&gt; RD[&quot;r_denoised = EDM blend\n  sigma^2 * r_input + sigma*t_hat * r_updates\n  ——————————————\n  sigma^2 + t_hat^2&quot;]:::acc
+    RD  --&gt; IH([&quot;intermediate stack\n  r_denoised_k · aa_logits_k&quot;]):::out
+    RD  --&gt; RC[&quot;r_center = r_denoised at center_uid&quot;]:::acc
+    RC  --&gt; PU[&quot;PairUpdate\n  z_ij = Update(z_ij, r_center)&quot;]:::proc
+    PU  -.-&gt;|&quot;repeat for next k&quot;| NU
+
+    PU  --&gt; FN([&quot;final: r_denoised · z_ij · q_skip&quot;]):::acc
+    </pre></section>
+<hr class="docutils" />
+<section id="atomfeatureencoder-algorithm-4">
+<h2><a class="toc-backref" href="#id3" role="doc-backlink">AtomFeatureEncoder (Algorithm 4)</a><a class="headerlink" href="#atomfeatureencoder-algorithm-4" title="Link to this heading">¶</a></h2>
+<p>Builds per-atom and per-residue embeddings using a sparse
+<a class="reference internal" href="autoapi/pallatom/architecture/atom_transformers/index.html#pallatom.architecture.atom_transformers.AtomTransformer" title="pallatom.architecture.atom_transformers.AtomTransformer"><code class="xref py py-class docutils literal notranslate"><span class="pre">AtomTransformer</span></code></a>.
+All pair tensors are <code class="docutils literal notranslate"><span class="pre">[B,</span> <span class="pre">N_atom,</span> <span class="pre">K,</span> <span class="pre">*]</span></code> — the <code class="docutils literal notranslate"><span class="pre">N_atom</span> <span class="pre">x</span> <span class="pre">N_atom</span></code> dense
+grid is never materialised.</p>
+<pre  class="mermaid">
+        flowchart TD
+    classDef inp  fill:#dbeafe,stroke:#3b82f6
+    classDef proc fill:#d1fae5,stroke:#059669
+    classDef skip fill:#fef3c7,stroke:#d97706
+    classDef out  fill:#fce7f3,stroke:#db2777
+
+    A1([&quot;ref_pos · ref_element&quot;]):::inp
+    A2([&quot;s_input  [B, N_res, c_res]&quot;]):::inp
+    A3([&quot;z_input  [B, N_res, N_res, c_pair]&quot;]):::inp
+    A4([&quot;r_scaled  [B, N_atom, 3]&quot;]):::inp
+    A5([&quot;tok_idx  [B, N_atom]&quot;]):::inp
+
+    A5  --&gt; SP[&quot;Build sparse pairs\ntok_idx -&gt; N x K neighbor index\n(32-residue local window)&quot;]:::proc
+
+    A1  --&gt; FR[&quot;f_ref = tile(ref_pos, ref_element) per atom&quot;]:::proc
+    FR  --&gt; CL[&quot;c_l = Linear(f_ref)  [B, N_atom, c_atom]&quot;]:::proc
+    CL  --&gt; CS([&quot;c_skip  saved&quot;]):::skip
+
+    CL &amp; A4 --&gt; QS[&quot;q_skip = c_l + proj(r_scaled)&quot;]:::proc
+    QS  --&gt; QSS([&quot;q_skip  saved&quot;]):::skip
+
+    SP &amp; CL --&gt; PM[&quot;p_lm = atom-pair features\n(distance · chain validity · c_l projections)&quot;]:::proc
+    A3  --&gt; PM
+
+    A2 &amp; CL --&gt; CL2[&quot;c_l += proj(LN(s_input[tok_idx]))&quot;]:::proc
+    PM  --&gt; PML[&quot;p_lm += proj(LN(z_input[tok_l, tok_m]))\np_lm += MLP(p_lm)&quot;]:::proc
+    PML --&gt; PS([&quot;p_skip  saved&quot;]):::skip
+
+    QSS &amp; CL2 &amp; PML &amp; SP --&gt; AT[&quot;AtomTransformer\n3 x AtomTransformerBlock\n(sparse K-neighbor attention)&quot;]:::proc
+
+    AT  --&gt; MP[&quot;s_i = mean-pool(ReLU(proj(q_skip)), tok_idx)&quot;]:::proc
+
+    MP  --&gt; O1([&quot;s_i  [B, N_res, c_res]&quot;]):::out
+    AT  --&gt; O2([&quot;q_skip  [B, N_atom, c_atom]&quot;]):::out
+    CS  --&gt; O3([&quot;c_skip  [B, N_atom, c_atom]&quot;]):::out
+    PS  --&gt; O4([&quot;p_skip  [B, N_atom, K, c_atompair]&quot;]):::out
+    CL2 --&gt; O5([&quot;c_l  [B, N_atom, c_atom]&quot;]):::out
+    </pre></section>
+</section>
 
         </article>
       </div>
       <footer>
         
         <div class="related-pages">
-          
-          
+          <a class="next-page" href="autoapi/index.html">
+              <div class="page-info">
+                <div class="context">
+                  <span>Next</span>
+                </div>
+                <div class="title">API Reference</div>
+              </div>
+              <svg class="furo-related-icon"><use href="#svg-arrow-right"></use></svg>
+            </a>
+          <a class="prev-page" href="index.html">
+              <svg class="furo-related-icon"><use href="#svg-arrow-right"></use></svg>
+              <div class="page-info">
+                <div class="context">
+                  <span>Previous</span>
+                </div>
+                
+                <div class="title">Home</div>
+                
+              </div>
+            </a>
         </div>
         <div class="bottom-of-page">
           <div class="left-details">
@@ -295,8 +446,29 @@
         
       </footer>
     </div>
-    <aside class="toc-drawer no-toc">
+    <aside class="toc-drawer">
       
+      
+      <div class="toc-sticky toc-scroll">
+        <div class="toc-title-container">
+          <span class="toc-title">
+            On this page
+          </span>
+        </div>
+        <div class="toc-tree-container">
+          <div class="toc-tree">
+            <ul>
+<li><a class="reference internal" href="#">Architecture</a><ul>
+<li><a class="reference internal" href="#maintrunk-algorithm-2">MainTrunk (Algorithm 2)</a></li>
+<li><a class="reference internal" href="#decoder-loop-x-k-unit">Decoder Loop (x K_unit)</a></li>
+<li><a class="reference internal" href="#atomfeatureencoder-algorithm-4">AtomFeatureEncoder (Algorithm 4)</a></li>
+</ul>
+</li>
+</ul>
+
+          </div>
+        </div>
+      </div>
       
       
     </aside>
@@ -741,8 +913,5 @@ mermaid.initialize(
 
 window.addEventListener("load", load);
 window.runMermaid = runMermaid;</script>
-    
-<script src="_static/searchtools.js"></script>
-<script src="_static/language_data.js"></script>
-<script src="searchindex.js"></script></body>
+    </body>
 </html>
