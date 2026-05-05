@@ -6,12 +6,6 @@ Diagrams follow the ``forward()`` call order; tensor shapes use the
 named-dimension conventions documented in ``pallatom/CLAUDE.md``
 (e.g. ``N_atom``, ``N_res``, ``c_pair``, ``K``).
 
-.. contents:: On this page
-   :local:
-   :depth: 1
-
-----
-
 MainTrunk (Algorithm 2)
 -----------------------
 
@@ -21,11 +15,12 @@ positions plus auxiliary sequence and distogram logits.
 
 .. mermaid::
 
+   %%{init: {'theme': 'base', 'themeVariables': {'fontSize': '15px'}}}%%
    flowchart TD
-       classDef inp  fill:#dbeafe,stroke:#3b82f6
-       classDef proc fill:#d1fae5,stroke:#059669
-       classDef skip fill:#fef3c7,stroke:#d97706
-       classDef out  fill:#fce7f3,stroke:#db2777
+       classDef inp  fill:#dbeafe,stroke:#3b82f6,color:#1e293b,font-size:13px,padding:8px
+       classDef proc fill:#d1fae5,stroke:#059669,color:#1e293b,font-size:13px,padding:8px
+       classDef skip fill:#fef3c7,stroke:#d97706,color:#1e293b,font-size:13px,padding:8px
+       classDef out  fill:#fce7f3,stroke:#db2777,color:#1e293b,font-size:13px,padding:8px
 
        I1(["r_input  [B, N_atom, 3]"]):::inp
        I2(["f_residue_idx  [B, N_res, c_res]"]):::inp
@@ -77,10 +72,11 @@ correct noise-level manifold.
 
 .. mermaid::
 
+   %%{init: {'theme': 'base', 'themeVariables': {'fontSize': '15px'}}}%%
    flowchart TD
-       classDef proc fill:#d1fae5,stroke:#059669
-       classDef acc  fill:#fef3c7,stroke:#d97706
-       classDef out  fill:#fce7f3,stroke:#db2777
+       classDef proc fill:#d1fae5,stroke:#059669,color:#1e293b,font-size:13px,padding:8px
+       classDef acc  fill:#fef3c7,stroke:#d97706,color:#1e293b,font-size:13px,padding:8px
+       classDef out  fill:#fce7f3,stroke:#db2777,color:#1e293b,font-size:13px,padding:8px
 
        IN(["s_i · z_ij · t_i · q_skip · c_skip · p_skip · c_l\nr_input · r_updates = 0"]):::acc
 
@@ -107,11 +103,12 @@ grid is never materialised.
 
 .. mermaid::
 
+   %%{init: {'theme': 'base', 'themeVariables': {'fontSize': '15px'}}}%%
    flowchart TD
-       classDef inp  fill:#dbeafe,stroke:#3b82f6
-       classDef proc fill:#d1fae5,stroke:#059669
-       classDef skip fill:#fef3c7,stroke:#d97706
-       classDef out  fill:#fce7f3,stroke:#db2777
+       classDef inp  fill:#dbeafe,stroke:#3b82f6,color:#1e293b,font-size:13px,padding:8px
+       classDef proc fill:#d1fae5,stroke:#059669,color:#1e293b,font-size:13px,padding:8px
+       classDef skip fill:#fef3c7,stroke:#d97706,color:#1e293b,font-size:13px,padding:8px
+       classDef out  fill:#fce7f3,stroke:#db2777,color:#1e293b,font-size:13px,padding:8px
 
        A1(["ref_pos · ref_element"]):::inp
        A2(["s_input  [B, N_res, c_res]"]):::inp
