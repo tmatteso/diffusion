@@ -284,18 +284,18 @@ positions plus auxiliary sequence and distogram logits.</p>
 
     I1([&quot;r_input  [B, N_atom, 3]&quot;]):::inp
     I2([&quot;f_residue_idx  [B, N_res, c_res]&quot;]):::inp
-    I3([&quot;f_distogram · pseudo_beta_mask&quot;]):::inp
-    I4([&quot;ref_pos · ref_element · ref_uid&quot;]):::inp
-    I5([&quot;t_hat · t_normalized&quot;]):::inp
+    I3([&quot;f_distogram [B, N_res, N_res, n_templ_bins]  ·  pseudo_beta_mask [B, N_res]&quot;]):::inp
+    I4([&quot;ref_pos [B, N_atom, 3]  ·  ref_element [B, N_atom, E]  ·  ref_uid [B, N_atom]&quot;]):::inp
+    I5([&quot;t_hat  ·  t_normalized&quot;]):::inp
 
-    I1  --&gt; P1[&quot;r_scaled = r_input / sqrt(sigma_data^2 + t_hat^2)&quot;]:::proc
-    I2  --&gt; P2[&quot;s_init = Linear(f_residue_idx)&quot;]:::proc
-    I5  --&gt; P3[&quot;t_i = TimeFourierEmbedding(0.25 * log(t_hat / sigma_data))&quot;]:::proc
-    P2  --&gt; P4[&quot;s_init += t_i&quot;]:::proc
+    I1  --&gt; P1[&quot;r_scaled = r_input / sqrt(sigma_data^2 + t_hat^2)  [B, N_atom, 3]&quot;]:::proc
+    I2  --&gt; P2[&quot;s_init = Linear(f_residue_idx)  [B, N_res, c_res]&quot;]:::proc
+    I5  --&gt; P3[&quot;t_i = TimeFourierEmbedding(0.25 * log(t_hat / sigma_data))  [B, N_res, c_res]&quot;]:::proc
+    P2  --&gt; P4[&quot;s_init += t_i  [B, N_res, c_res]&quot;]:::proc
     P3  --&gt; P4
 
-    P4  --&gt; P5[&quot;z_ij = RelativePositionEncoding&quot;]:::proc
-    I3  --&gt; P6[&quot;z_ij += TemplateEmbedder(f_distogram, z_ij, t)&quot;]:::proc
+    P4  --&gt; P5[&quot;z_ij = RelativePositionEncoding  [B, N_res, N_res, c_pair]&quot;]:::proc
+    I3  --&gt; P6[&quot;z_ij += TemplateEmbedder(f_distogram, z_ij, t)  [B, N_res, N_res, c_pair]&quot;]:::proc
     P5  --&gt; P6
 
     P1  --&gt; P7[&quot;AtomFeatureEncoder  (Algorithm 4)&quot;]:::proc
@@ -303,11 +303,11 @@ positions plus auxiliary sequence and distogram logits.</p>
     P4  --&gt; P7
     P6  --&gt; P7
     P7  --&gt; SK1([&quot;s_i  [B, N_res, c_res]&quot;]):::skip
-    P7  --&gt; SK2([&quot;q_skip · c_skip  [B, N_atom, c_atom]&quot;]):::skip
+    P7  --&gt; SK2([&quot;q_skip  [B, N_atom, c_atom]  ·  c_skip  [B, N_atom, c_atom]&quot;]):::skip
     P7  --&gt; SK3([&quot;p_skip  [B, N_atom, K, c_atompair]&quot;]):::skip
     P7  --&gt; SK4([&quot;c_l  [B, N_atom, c_atom]&quot;]):::skip
 
-    SK1 --&gt; P8[&quot;s_i += proj(LN(s_init))&quot;]:::proc
+    SK1 --&gt; P8[&quot;s_i += proj(LN(s_init))  [B, N_res, c_res]&quot;]:::proc
     P4  --&gt; P8
 
     P8  --&gt; DL[&quot;Decoder Loop x K_unit&quot;]:::proc
@@ -316,7 +316,7 @@ positions plus auxiliary sequence and distogram logits.</p>
     P6  --&gt; DL
 
     DL  --&gt; O1([&quot;r_denoised  [B, N_atom, 3]&quot;]):::out
-    DL  --&gt; O2([&quot;f_seq_logits  [B, N_res, 20]&quot;]):::out
+    DL  --&gt; O2([&quot;f_seq_logits  [B, N_res, n_amino]&quot;]):::out
     DL  --&gt; O3([&quot;residue_distogram_logits  [B, N_res, N_res, n_bins]&quot;]):::out
     SK3 --&gt; O4([&quot;atom_distogram_logits  [B, N_atom, K, n_atom_bins]&quot;]):::out
     </pre></section>
@@ -333,18 +333,18 @@ correct noise-level manifold.</p>
     classDef acc  fill:#fef3c7,stroke:#d97706,color:#1e293b,font-size:13px,padding:8px
     classDef out  fill:#fce7f3,stroke:#db2777,color:#1e293b,font-size:13px,padding:8px
 
-    IN([&quot;s_i · z_ij · t_i · q_skip · c_skip · p_skip · c_l\nr_input · r_updates = 0&quot;]):::acc
+    IN([&quot;s_i [B,N_res,c_res] · z_ij [B,N_res,N_res,c_pair] · t_i [B,N_res,c_res] · q_skip · c_skip · c_l [B,N_atom,c_atom] · p_skip [B,N_atom,K,c_atompair] · r_input · r_updates [B,N_atom,3]&quot;]):::acc
 
-    IN  --&gt; NU[&quot;NodeUpdate\n  s_i = Update(s_i, t_i, z_ij)&quot;]:::proc
-    NU  --&gt; AD[&quot;AtomAttentionDecoder\n  r_update, c_l = Decode(q_skip, p_skip, c_skip, c_l, s_i, z_ij)&quot;]:::proc
-    AD  --&gt; RU[&quot;r_updates += r_update&quot;]:::acc
-    RU  --&gt; RD[&quot;r_denoised = EDM blend\n  sigma^2 * r_input + sigma*t_hat * r_updates\n  ——————————————\n  sigma^2 + t_hat^2&quot;]:::acc
-    RD  --&gt; IH([&quot;intermediate stack\n  r_denoised_k · aa_logits_k&quot;]):::out
-    RD  --&gt; RC[&quot;r_center = r_denoised at center_uid&quot;]:::acc
-    RC  --&gt; PU[&quot;PairUpdate\n  z_ij = Update(z_ij, r_center)&quot;]:::proc
+    IN  --&gt; NU[&quot;NodeUpdate: s_i = Update(s_i, t_i, z_ij)  [B, N_res, c_res]&quot;]:::proc
+    NU  --&gt; AD[&quot;AtomAttentionDecoder: r_update [B,N_atom,3], c_l [B,N_atom,c_atom] = Decode(q_skip, p_skip, c_skip, c_l, s_i, z_ij)&quot;]:::proc
+    AD  --&gt; RU[&quot;r_updates += r_update  [B, N_atom, 3]&quot;]:::acc
+    RU  --&gt; RD[&quot;r_denoised = (sigma^2 * r_input + sigma*t_hat * r_updates) / (sigma^2 + t_hat^2)  [B, N_atom, 3]&quot;]:::acc
+    RD  --&gt; IH([&quot;intermediate stack: r_denoised_k [B,N_atom,3] · aa_logits_k [B,N_res,n_amino]&quot;]):::out
+    RD  --&gt; RC[&quot;r_center = r_denoised at center_uid  [B, N_res, 3]&quot;]:::acc
+    RC  --&gt; PU[&quot;PairUpdate: z_ij = Update(z_ij, r_center)  [B, N_res, N_res, c_pair]&quot;]:::proc
     PU  -.-&gt;|&quot;repeat for next k&quot;| NU
 
-    PU  --&gt; FN([&quot;final: r_denoised · z_ij · q_skip&quot;]):::acc
+    PU  --&gt; FN([&quot;final: r_denoised [B,N_atom,3] · z_ij [B,N_res,N_res,c_pair] · q_skip [B,N_atom,c_atom]&quot;]):::acc
     </pre></section>
 <hr class="docutils" />
 <section id="atomfeatureencoder-algorithm-4">
@@ -360,31 +360,31 @@ grid is never materialised.</p>
     classDef skip fill:#fef3c7,stroke:#d97706,color:#1e293b,font-size:13px,padding:8px
     classDef out  fill:#fce7f3,stroke:#db2777,color:#1e293b,font-size:13px,padding:8px
 
-    A1([&quot;ref_pos · ref_element&quot;]):::inp
+    A1([&quot;ref_pos [B, N_atom, 3]  ·  ref_element [B, N_atom, E]&quot;]):::inp
     A2([&quot;s_input  [B, N_res, c_res]&quot;]):::inp
     A3([&quot;z_input  [B, N_res, N_res, c_pair]&quot;]):::inp
     A4([&quot;r_scaled  [B, N_atom, 3]&quot;]):::inp
     A5([&quot;tok_idx  [B, N_atom]&quot;]):::inp
 
-    A5  --&gt; SP[&quot;Build sparse pairs\ntok_idx -&gt; N x K neighbor index\n(32-residue local window)&quot;]:::proc
+    A5  --&gt; SP[&quot;Build sparse pairs: neighbor_idx [N_atom, K]  ·  valid_mask [B, N_atom, K]&quot;]:::proc
 
-    A1  --&gt; FR[&quot;f_ref = tile(ref_pos, ref_element) per atom&quot;]:::proc
+    A1  --&gt; FR[&quot;f_ref = tile(ref_pos, ref_element) per atom  [B, N_atom, f_ref_dim]&quot;]:::proc
     FR  --&gt; CL[&quot;c_l = Linear(f_ref)  [B, N_atom, c_atom]&quot;]:::proc
-    CL  --&gt; CS([&quot;c_skip  saved&quot;]):::skip
+    CL  --&gt; CS([&quot;c_skip saved  [B, N_atom, c_atom]&quot;]):::skip
 
-    CL &amp; A4 --&gt; QS[&quot;q_skip = c_l + proj(r_scaled)&quot;]:::proc
-    QS  --&gt; QSS([&quot;q_skip  saved&quot;]):::skip
+    CL &amp; A4 --&gt; QS[&quot;q_skip = c_l + proj(r_scaled)  [B, N_atom, c_atom]&quot;]:::proc
+    QS  --&gt; QSS([&quot;q_skip saved  [B, N_atom, c_atom]&quot;]):::skip
 
-    SP &amp; CL --&gt; PM[&quot;p_lm = atom-pair features\n(distance · chain validity · c_l projections)&quot;]:::proc
+    SP &amp; CL --&gt; PM[&quot;p_lm = atom-pair features (distance · chain validity · c_l projections)  [B, N_atom, K, c_atompair]&quot;]:::proc
     A3  --&gt; PM
 
-    A2 &amp; CL --&gt; CL2[&quot;c_l += proj(LN(s_input[tok_idx]))&quot;]:::proc
-    PM  --&gt; PML[&quot;p_lm += proj(LN(z_input[tok_l, tok_m]))\np_lm += MLP(p_lm)&quot;]:::proc
-    PML --&gt; PS([&quot;p_skip  saved&quot;]):::skip
+    A2 &amp; CL --&gt; CL2[&quot;c_l += proj(LN(s_input[tok_idx]))  [B, N_atom, c_atom]&quot;]:::proc
+    PM  --&gt; PML[&quot;p_lm += proj(LN(z_input[tok_l, tok_m]))  then  p_lm += MLP(p_lm)  [B, N_atom, K, c_atompair]&quot;]:::proc
+    PML --&gt; PS([&quot;p_skip saved  [B, N_atom, K, c_atompair]&quot;]):::skip
 
-    QSS &amp; CL2 &amp; PML &amp; SP --&gt; AT[&quot;AtomTransformer\n3 x AtomTransformerBlock\n(sparse K-neighbor attention)&quot;]:::proc
+    QSS &amp; CL2 &amp; PML &amp; SP --&gt; AT[&quot;AtomTransformer: 3x AtomTransformerBlock (sparse K-neighbor attention)  [B, N_atom, c_atom]&quot;]:::proc
 
-    AT  --&gt; MP[&quot;s_i = mean-pool(ReLU(proj(q_skip)), tok_idx)&quot;]:::proc
+    AT  --&gt; MP[&quot;s_i = mean-pool(ReLU(proj(q_skip)), tok_idx)  [B, N_res, c_res]&quot;]:::proc
 
     MP  --&gt; O1([&quot;s_i  [B, N_res, c_res]&quot;]):::out
     AT  --&gt; O2([&quot;q_skip  [B, N_atom, c_atom]&quot;]):::out

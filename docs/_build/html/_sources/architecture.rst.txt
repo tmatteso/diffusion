@@ -23,18 +23,18 @@ positions plus auxiliary sequence and distogram logits.
 
        I1(["r_input  [B, N_atom, 3]"]):::inp
        I2(["f_residue_idx  [B, N_res, c_res]"]):::inp
-       I3(["f_distogram · pseudo_beta_mask"]):::inp
-       I4(["ref_pos · ref_element · ref_uid"]):::inp
-       I5(["t_hat · t_normalized"]):::inp
+       I3(["f_distogram [B, N_res, N_res, n_templ_bins]  ·  pseudo_beta_mask [B, N_res]"]):::inp
+       I4(["ref_pos [B, N_atom, 3]  ·  ref_element [B, N_atom, E]  ·  ref_uid [B, N_atom]"]):::inp
+       I5(["t_hat  ·  t_normalized"]):::inp
 
-       I1  --> P1["r_scaled = r_input / sqrt(sigma_data^2 + t_hat^2)"]:::proc
-       I2  --> P2["s_init = Linear(f_residue_idx)"]:::proc
-       I5  --> P3["t_i = TimeFourierEmbedding(0.25 * log(t_hat / sigma_data))"]:::proc
-       P2  --> P4["s_init += t_i"]:::proc
+       I1  --> P1["r_scaled = r_input / sqrt(sigma_data^2 + t_hat^2)  [B, N_atom, 3]"]:::proc
+       I2  --> P2["s_init = Linear(f_residue_idx)  [B, N_res, c_res]"]:::proc
+       I5  --> P3["t_i = TimeFourierEmbedding(0.25 * log(t_hat / sigma_data))  [B, N_res, c_res]"]:::proc
+       P2  --> P4["s_init += t_i  [B, N_res, c_res]"]:::proc
        P3  --> P4
 
-       P4  --> P5["z_ij = RelativePositionEncoding"]:::proc
-       I3  --> P6["z_ij += TemplateEmbedder(f_distogram, z_ij, t)"]:::proc
+       P4  --> P5["z_ij = RelativePositionEncoding  [B, N_res, N_res, c_pair]"]:::proc
+       I3  --> P6["z_ij += TemplateEmbedder(f_distogram, z_ij, t)  [B, N_res, N_res, c_pair]"]:::proc
        P5  --> P6
 
        P1  --> P7["AtomFeatureEncoder  (Algorithm 4)"]:::proc
@@ -42,11 +42,11 @@ positions plus auxiliary sequence and distogram logits.
        P4  --> P7
        P6  --> P7
        P7  --> SK1(["s_i  [B, N_res, c_res]"]):::skip
-       P7  --> SK2(["q_skip · c_skip  [B, N_atom, c_atom]"]):::skip
+       P7  --> SK2(["q_skip  [B, N_atom, c_atom]  ·  c_skip  [B, N_atom, c_atom]"]):::skip
        P7  --> SK3(["p_skip  [B, N_atom, K, c_atompair]"]):::skip
        P7  --> SK4(["c_l  [B, N_atom, c_atom]"]):::skip
 
-       SK1 --> P8["s_i += proj(LN(s_init))"]:::proc
+       SK1 --> P8["s_i += proj(LN(s_init))  [B, N_res, c_res]"]:::proc
        P4  --> P8
 
        P8  --> DL["Decoder Loop x K_unit"]:::proc
@@ -55,7 +55,7 @@ positions plus auxiliary sequence and distogram logits.
        P6  --> DL
 
        DL  --> O1(["r_denoised  [B, N_atom, 3]"]):::out
-       DL  --> O2(["f_seq_logits  [B, N_res, 20]"]):::out
+       DL  --> O2(["f_seq_logits  [B, N_res, n_amino]"]):::out
        DL  --> O3(["residue_distogram_logits  [B, N_res, N_res, n_bins]"]):::out
        SK3 --> O4(["atom_distogram_logits  [B, N_atom, K, n_atom_bins]"]):::out
 
@@ -76,18 +76,18 @@ correct noise-level manifold.
        classDef acc  fill:#fef3c7,stroke:#d97706,color:#1e293b,font-size:13px,padding:8px
        classDef out  fill:#fce7f3,stroke:#db2777,color:#1e293b,font-size:13px,padding:8px
 
-       IN(["s_i · z_ij · t_i · q_skip · c_skip · p_skip · c_l\nr_input · r_updates = 0"]):::acc
+       IN(["s_i [B,N_res,c_res] · z_ij [B,N_res,N_res,c_pair] · t_i [B,N_res,c_res] · q_skip · c_skip · c_l [B,N_atom,c_atom] · p_skip [B,N_atom,K,c_atompair] · r_input · r_updates [B,N_atom,3]"]):::acc
 
-       IN  --> NU["NodeUpdate\n  s_i = Update(s_i, t_i, z_ij)"]:::proc
-       NU  --> AD["AtomAttentionDecoder\n  r_update, c_l = Decode(q_skip, p_skip, c_skip, c_l, s_i, z_ij)"]:::proc
-       AD  --> RU["r_updates += r_update"]:::acc
-       RU  --> RD["r_denoised = EDM blend\n  sigma^2 * r_input + sigma*t_hat * r_updates\n  ——————————————\n  sigma^2 + t_hat^2"]:::acc
-       RD  --> IH(["intermediate stack\n  r_denoised_k · aa_logits_k"]):::out
-       RD  --> RC["r_center = r_denoised at center_uid"]:::acc
-       RC  --> PU["PairUpdate\n  z_ij = Update(z_ij, r_center)"]:::proc
+       IN  --> NU["NodeUpdate: s_i = Update(s_i, t_i, z_ij)  [B, N_res, c_res]"]:::proc
+       NU  --> AD["AtomAttentionDecoder: r_update [B,N_atom,3], c_l [B,N_atom,c_atom] = Decode(q_skip, p_skip, c_skip, c_l, s_i, z_ij)"]:::proc
+       AD  --> RU["r_updates += r_update  [B, N_atom, 3]"]:::acc
+       RU  --> RD["r_denoised = (sigma^2 * r_input + sigma*t_hat * r_updates) / (sigma^2 + t_hat^2)  [B, N_atom, 3]"]:::acc
+       RD  --> IH(["intermediate stack: r_denoised_k [B,N_atom,3] · aa_logits_k [B,N_res,n_amino]"]):::out
+       RD  --> RC["r_center = r_denoised at center_uid  [B, N_res, 3]"]:::acc
+       RC  --> PU["PairUpdate: z_ij = Update(z_ij, r_center)  [B, N_res, N_res, c_pair]"]:::proc
        PU  -.->|"repeat for next k"| NU
 
-       PU  --> FN(["final: r_denoised · z_ij · q_skip"]):::acc
+       PU  --> FN(["final: r_denoised [B,N_atom,3] · z_ij [B,N_res,N_res,c_pair] · q_skip [B,N_atom,c_atom]"]):::acc
 
 ----
 
@@ -107,31 +107,31 @@ grid is never materialised.
        classDef skip fill:#fef3c7,stroke:#d97706,color:#1e293b,font-size:13px,padding:8px
        classDef out  fill:#fce7f3,stroke:#db2777,color:#1e293b,font-size:13px,padding:8px
 
-       A1(["ref_pos · ref_element"]):::inp
+       A1(["ref_pos [B, N_atom, 3]  ·  ref_element [B, N_atom, E]"]):::inp
        A2(["s_input  [B, N_res, c_res]"]):::inp
        A3(["z_input  [B, N_res, N_res, c_pair]"]):::inp
        A4(["r_scaled  [B, N_atom, 3]"]):::inp
        A5(["tok_idx  [B, N_atom]"]):::inp
 
-       A5  --> SP["Build sparse pairs\ntok_idx -> N x K neighbor index\n(32-residue local window)"]:::proc
+       A5  --> SP["Build sparse pairs: neighbor_idx [N_atom, K]  ·  valid_mask [B, N_atom, K]"]:::proc
 
-       A1  --> FR["f_ref = tile(ref_pos, ref_element) per atom"]:::proc
+       A1  --> FR["f_ref = tile(ref_pos, ref_element) per atom  [B, N_atom, f_ref_dim]"]:::proc
        FR  --> CL["c_l = Linear(f_ref)  [B, N_atom, c_atom]"]:::proc
-       CL  --> CS(["c_skip  saved"]):::skip
+       CL  --> CS(["c_skip saved  [B, N_atom, c_atom]"]):::skip
 
-       CL & A4 --> QS["q_skip = c_l + proj(r_scaled)"]:::proc
-       QS  --> QSS(["q_skip  saved"]):::skip
+       CL & A4 --> QS["q_skip = c_l + proj(r_scaled)  [B, N_atom, c_atom]"]:::proc
+       QS  --> QSS(["q_skip saved  [B, N_atom, c_atom]"]):::skip
 
-       SP & CL --> PM["p_lm = atom-pair features\n(distance · chain validity · c_l projections)"]:::proc
+       SP & CL --> PM["p_lm = atom-pair features (distance · chain validity · c_l projections)  [B, N_atom, K, c_atompair]"]:::proc
        A3  --> PM
 
-       A2 & CL --> CL2["c_l += proj(LN(s_input[tok_idx]))"]:::proc
-       PM  --> PML["p_lm += proj(LN(z_input[tok_l, tok_m]))\np_lm += MLP(p_lm)"]:::proc
-       PML --> PS(["p_skip  saved"]):::skip
+       A2 & CL --> CL2["c_l += proj(LN(s_input[tok_idx]))  [B, N_atom, c_atom]"]:::proc
+       PM  --> PML["p_lm += proj(LN(z_input[tok_l, tok_m]))  then  p_lm += MLP(p_lm)  [B, N_atom, K, c_atompair]"]:::proc
+       PML --> PS(["p_skip saved  [B, N_atom, K, c_atompair]"]):::skip
 
-       QSS & CL2 & PML & SP --> AT["AtomTransformer\n3 x AtomTransformerBlock\n(sparse K-neighbor attention)"]:::proc
+       QSS & CL2 & PML & SP --> AT["AtomTransformer: 3x AtomTransformerBlock (sparse K-neighbor attention)  [B, N_atom, c_atom]"]:::proc
 
-       AT  --> MP["s_i = mean-pool(ReLU(proj(q_skip)), tok_idx)"]:::proc
+       AT  --> MP["s_i = mean-pool(ReLU(proj(q_skip)), tok_idx)  [B, N_res, c_res]"]:::proc
 
        MP  --> O1(["s_i  [B, N_res, c_res]"]):::out
        AT  --> O2(["q_skip  [B, N_atom, c_atom]"]):::out
