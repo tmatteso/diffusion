@@ -15,6 +15,9 @@
   "runArgs": [
     "--gpus=all"
   ],
+  "mounts": [
+    "source=/root/.gitconfig,target=/root/.gitconfig,type=bind,consistency=cached"
+  ],
   "customizations": {
     "vscode": {
       "extensions": [
