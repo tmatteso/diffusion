@@ -4,11 +4,14 @@ import math
 import dataclasses
 from typing import Optional
 import numpy as np
+import structlog
 import torch
 import torch.nn as nn
 from beartype import beartype
 from einops import rearrange, repeat
 from jaxtyping import Bool, Float, Int, jaxtyped
+
+log = structlog.get_logger()
 
 from architecture.main_trunk import MainTrunk
 from helpers.featurize import FeaturizedBatch
@@ -320,89 +323,131 @@ def atom5_to_atom37(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 5.  Main sampling script
+# 5.  File log processor
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _FileLogProcessor:
+    """Structlog processor that appends JSON lines to a file, then passes the event dict through."""
+
+    def __init__(self, path: str) -> None:
+        import json as _json
+        self._f = open(path, "w", buffering=1)  # line-buffered
+        self._json = _json
+
+    def __call__(self, logger, method, event_dict):
+        self._f.write(self._json.dumps(event_dict) + "\n")
+        return event_dict
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6.  Main sampling script
 # ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import argparse
     import json as _json
+    import traceback as _tb
     from pathlib import Path as _Path
 
     from sample.sample_config import SampleConfig
 
     parser = argparse.ArgumentParser(description="Sample protein structures from a trained PallAtom model")
-    parser.add_argument("--config", required=True, help="Path to SampleConfig JSON")
+    parser.add_argument("--config",   required=True, help="path to SampleConfig JSON")
+    parser.add_argument("--log_file", required=True, help="path to write structured JSON log lines")
     args = parser.parse_args()
 
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
-
-    scfg:      SampleConfig = SampleConfig.model_validate(_json.loads(_Path(args.config).read_text()))
-    mp         = scfg.model
-    noise      = scfg.noise
-    sampler_p  = scfg.sampler
-    gen        = scfg.generation
-
-    model = MainTrunk(
-        f_ref_dim=mp.f_ref_dim,
-        n_bins=mp.n_bins,
-        c_atom=mp.c_atom,
-        c_pair=mp.c_pair,
-        c_res=mp.c_res,
-        c_atompair=mp.c_atompair,
-        K_unit=mp.K_unit,
-        sigma_data=noise.sigma_data,
-    ).to(device)
-    ckpt = torch.load(scfg.checkpoint.checkpoint_path, map_location=device)
-    model.load_state_dict(ckpt["model"])
-    index_embedding = nn.Embedding(mp.max_residues, mp.c_res).to(device)
-    index_embedding.load_state_dict(ckpt["index_embedding"])
-    index_embedding.eval()
-    model.eval()
-
-    N_RES:     int = gen.n_res
-    N_atom:    int = N_RES * NATOM
-    B_SAMPLE:  int = gen.n_samples  # generate all samples in one batched call
-
-    context:     FeaturizedBatch = build_sampling_context(
-        N_RES, index_embedding, batch_size=B_SAMPLE, n_templ_bins=mp.n_bins, device=device
-    )
-    edm_precond: EDMPrecond      = EDMPrecond(
-        model, context,
-        sigma_min=noise.sigma_min,
-        sigma_max=noise.sigma_max,
-    ).to(device)
-    edm_precond.eval()
-
-    edm_sampler: EDMSampler = EDMSampler(
-        edm_precond,
-        sigma_min=noise.sigma_min,
-        sigma_max=noise.sigma_max,
-        rho=sampler_p.rho,
-        S_churn=sampler_p.S_churn,
-        S_tmin=sampler_p.S_tmin,
-        S_tmax=sampler_p.S_tmax,
-        S_noise=sampler_p.S_noise,
+    _processors = [
+        structlog.processors.TimeStamper(fmt="iso", utc=True),
+        structlog.stdlib.add_log_level,
+        structlog.processors.StackInfoRenderer(),
+        _FileLogProcessor(args.log_file),
+        structlog.dev.ConsoleRenderer(),
+    ]
+    structlog.configure(
+        processors=_processors,
+        wrapper_class=structlog.make_filtering_bound_logger(20),  # INFO level
+        context_class=dict,
+        logger_factory=structlog.PrintLoggerFactory(),
     )
 
-    coords_batch: Float[torch.Tensor, "B N_atom 3"] = edm_sampler.sample(
-        shape=(B_SAMPLE, N_atom, 3),
-        steps=sampler_p.ddim_steps,
-        device=device,
-    )
+    try:
+        device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
-    pdb_strings: list[str] = []
-    for b in range(B_SAMPLE):
-        coords_np: Float[np.ndarray, "N_res 5 3"] = rearrange(
-            coords_batch[b].cpu().numpy(), "(n a) d -> n a d", n=N_RES, a=NATOM
+        scfg:     SampleConfig = SampleConfig.model_validate(_json.loads(_Path(args.config).read_text()))
+        mp        = scfg.model
+        noise     = scfg.noise
+        sampler_p = scfg.sampler
+        gen       = scfg.generation
+        log.info("config loaded", config=args.config, n_res=gen.n_res, n_samples=gen.n_samples)
+
+        model = MainTrunk(
+            f_ref_dim=mp.f_ref_dim,
+            n_bins=mp.n_bins,
+            c_atom=mp.c_atom,
+            c_pair=mp.c_pair,
+            c_res=mp.c_res,
+            c_atompair=mp.c_atompair,
+            K_unit=mp.K_unit,
+            sigma_data=noise.sigma_data,
+        ).to(device)
+        ckpt = torch.load(scfg.checkpoint.checkpoint_path, map_location=device)
+        model.load_state_dict(ckpt["model"])
+        index_embedding = nn.Embedding(mp.max_residues, mp.c_res).to(device)
+        index_embedding.load_state_dict(ckpt["index_embedding"])
+        index_embedding.eval()
+        model.eval()
+        log.info("model loaded", checkpoint=scfg.checkpoint.checkpoint_path, device=device)
+
+        N_RES:    int = gen.n_res
+        N_atom:   int = N_RES * NATOM
+        B_SAMPLE: int = gen.n_samples
+
+        context:     FeaturizedBatch = build_sampling_context(
+            N_RES, index_embedding, batch_size=B_SAMPLE, n_templ_bins=mp.n_bins, device=device
         )
-        x_37, mask_37 = atom5_to_atom37(coords_np)
-        prot = Protein(
-            atom_positions=x_37,
-            atom_mask=mask_37,
-            residue_index=np.arange(N_RES, dtype=np.int32),
-            aatype=np.zeros(N_RES, dtype=np.int32),
-            chain_index=np.zeros(N_RES, dtype=np.int32),
-            b_factors=np.ones((N_RES, 37), dtype=np.float32),
-        )
-        pdb_strings.append(to_pdb(prot))
+        edm_precond: EDMPrecond = EDMPrecond(
+            model, context,
+            sigma_min=noise.sigma_min,
+            sigma_max=noise.sigma_max,
+        ).to(device)
+        edm_precond.eval()
 
-    _Path(scfg.output.output_path).write_text(_json.dumps(pdb_strings))
+        edm_sampler: EDMSampler = EDMSampler(
+            edm_precond,
+            sigma_min=noise.sigma_min,
+            sigma_max=noise.sigma_max,
+            rho=sampler_p.rho,
+            S_churn=sampler_p.S_churn,
+            S_tmin=sampler_p.S_tmin,
+            S_tmax=sampler_p.S_tmax,
+            S_noise=sampler_p.S_noise,
+        )
+
+        log.info("sampling", n_res=N_RES, n_samples=B_SAMPLE, ddim_steps=sampler_p.ddim_steps)
+        coords_batch: Float[torch.Tensor, "B N_atom 3"] = edm_sampler.sample(
+            shape=(B_SAMPLE, N_atom, 3),
+            steps=sampler_p.ddim_steps,
+            device=device,
+        )
+        log.info("sampling complete", n_res=N_RES, n_samples=B_SAMPLE)
+
+        pdb_strings: list[str] = []
+        for b in range(B_SAMPLE):
+            coords_np: Float[np.ndarray, "N_res 5 3"] = rearrange(
+                coords_batch[b].cpu().numpy(), "(n a) d -> n a d", n=N_RES, a=NATOM
+            )
+            x_37, mask_37 = atom5_to_atom37(coords_np)
+            prot = Protein(
+                atom_positions=x_37,
+                atom_mask=mask_37,
+                residue_index=np.arange(N_RES, dtype=np.int32),
+                aatype=np.zeros(N_RES, dtype=np.int32),
+                chain_index=np.zeros(N_RES, dtype=np.int32),
+                b_factors=np.ones((N_RES, 37), dtype=np.float32),
+            )
+            pdb_strings.append(to_pdb(prot))
+
+        _Path(scfg.output.output_path).write_text(_json.dumps(pdb_strings))
+        log.info("output written", path=scfg.output.output_path, n_structures=B_SAMPLE)
+    except Exception as _exc:
+        log.error("fatal", error=str(_exc), traceback=_tb.format_exc())
+        raise SystemExit(1) from _exc
