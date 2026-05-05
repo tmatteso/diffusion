@@ -34,18 +34,17 @@ name = "pytorch-cuda"
 url = "https://download.pytorch.org/whl/cu128"
 explicit = true
 
+# torch/torchvision/torchaudio on x86_64 (CUDA) are provided by the
+# pytorch/pytorch base image — uv only manages them on aarch64 (CPU).
 [tool.uv.sources]
 torch = [
     { index = "pytorch-cpu", marker = "platform_machine == 'aarch64'" },
-    { index = "pytorch-cuda", marker = "platform_machine == 'x86_64'" },
 ]
 torchvision = [
     { index = "pytorch-cpu", marker = "platform_machine == 'aarch64'" },
-    { index = "pytorch-cuda", marker = "platform_machine == 'x86_64'" },
 ]
 torchaudio = [
     { index = "pytorch-cpu", marker = "platform_machine == 'aarch64'" },
-    { index = "pytorch-cuda", marker = "platform_machine == 'x86_64'" },
 ]
 
 [dependency-groups]
