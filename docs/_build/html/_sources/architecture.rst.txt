@@ -15,7 +15,6 @@ positions plus auxiliary sequence and distogram logits.
 
 .. mermaid::
 
-   %%{init: {'theme': 'base', 'themeVariables': {'fontSize': '15px'}}}%%
    flowchart TD
        classDef inp  fill:#dbeafe,stroke:#3b82f6,color:#1e293b,font-size:13px,padding:8px
        classDef proc fill:#d1fae5,stroke:#059669,color:#1e293b,font-size:13px,padding:8px
@@ -72,7 +71,6 @@ correct noise-level manifold.
 
 .. mermaid::
 
-   %%{init: {'theme': 'base', 'themeVariables': {'fontSize': '15px'}}}%%
    flowchart TD
        classDef proc fill:#d1fae5,stroke:#059669,color:#1e293b,font-size:13px,padding:8px
        classDef acc  fill:#fef3c7,stroke:#d97706,color:#1e293b,font-size:13px,padding:8px
@@ -103,7 +101,6 @@ grid is never materialised.
 
 .. mermaid::
 
-   %%{init: {'theme': 'base', 'themeVariables': {'fontSize': '15px'}}}%%
    flowchart TD
        classDef inp  fill:#dbeafe,stroke:#3b82f6,color:#1e293b,font-size:13px,padding:8px
        classDef proc fill:#d1fae5,stroke:#059669,color:#1e293b,font-size:13px,padding:8px

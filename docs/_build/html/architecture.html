@@ -276,8 +276,7 @@ named-dimension conventions documented in <code class="docutils literal notransl
 <a class="reference internal" href="autoapi/pallatom/helpers/featurize/index.html#pallatom.helpers.featurize.FeaturizedBatch" title="pallatom.helpers.featurize.FeaturizedBatch"><code class="xref py py-class docutils literal notranslate"><span class="pre">FeaturizedBatch</span></code></a> and returns denoised atom
 positions plus auxiliary sequence and distogram logits.</p>
 <pre  class="mermaid">
-        %%{init: {'theme': 'base', 'themeVariables': {'fontSize': '15px'}}}%%
-flowchart TD
+        flowchart TD
     classDef inp  fill:#dbeafe,stroke:#3b82f6,color:#1e293b,font-size:13px,padding:8px
     classDef proc fill:#d1fae5,stroke:#059669,color:#1e293b,font-size:13px,padding:8px
     classDef skip fill:#fef3c7,stroke:#d97706,color:#1e293b,font-size:13px,padding:8px
@@ -329,8 +328,7 @@ residue single <code class="docutils literal notranslate"><span class="pre">s_i<
 The EDM blend formula ensures the denoised coordinates are always on the
 correct noise-level manifold.</p>
 <pre  class="mermaid">
-        %%{init: {'theme': 'base', 'themeVariables': {'fontSize': '15px'}}}%%
-flowchart TD
+        flowchart TD
     classDef proc fill:#d1fae5,stroke:#059669,color:#1e293b,font-size:13px,padding:8px
     classDef acc  fill:#fef3c7,stroke:#d97706,color:#1e293b,font-size:13px,padding:8px
     classDef out  fill:#fce7f3,stroke:#db2777,color:#1e293b,font-size:13px,padding:8px
@@ -356,8 +354,7 @@ flowchart TD
 All pair tensors are <code class="docutils literal notranslate"><span class="pre">[B,</span> <span class="pre">N_atom,</span> <span class="pre">K,</span> <span class="pre">*]</span></code> — the <code class="docutils literal notranslate"><span class="pre">N_atom</span> <span class="pre">x</span> <span class="pre">N_atom</span></code> dense
 grid is never materialised.</p>
 <pre  class="mermaid">
-        %%{init: {'theme': 'base', 'themeVariables': {'fontSize': '15px'}}}%%
-flowchart TD
+        flowchart TD
     classDef inp  fill:#dbeafe,stroke:#3b82f6,color:#1e293b,font-size:13px,padding:8px
     classDef proc fill:#d1fae5,stroke:#059669,color:#1e293b,font-size:13px,padding:8px
     classDef skip fill:#fef3c7,stroke:#d97706,color:#1e293b,font-size:13px,padding:8px
