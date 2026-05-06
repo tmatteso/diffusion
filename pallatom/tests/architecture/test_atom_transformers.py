@@ -336,31 +336,31 @@ def test_atom_feature_encoder_gradient_flows_to_r_scaled(encoder, ref_pos, ref_e
 
 def test_atom_attention_decoder_r_update_shape(decoder, q_skip, p_skip, c_skip, c_l, s_input, z_input, tok_idx_batched):
     with torch.no_grad():
-        r_update, _ = decoder(q_skip, p_skip, c_skip, c_l, s_input, z_input, tok_idx_batched)
+        _, _, r_update, _ = decoder(q_skip, p_skip, c_skip, c_l, s_input, z_input, tok_idx_batched)
     assert r_update.shape == (B, N_ATOM, 3)
 
 
 def test_atom_attention_decoder_r_update_finite(decoder, q_skip, p_skip, c_skip, c_l, s_input, z_input, tok_idx_batched):
     with torch.no_grad():
-        r_update, _ = decoder(q_skip, p_skip, c_skip, c_l, s_input, z_input, tok_idx_batched)
+        _, _, r_update, _ = decoder(q_skip, p_skip, c_skip, c_l, s_input, z_input, tok_idx_batched)
     assert torch.isfinite(r_update).all()
 
 
 def test_atom_attention_decoder_c_out_shape(decoder, q_skip, p_skip, c_skip, c_l, s_input, z_input, tok_idx_batched):
     with torch.no_grad():
-        _, c_out = decoder(q_skip, p_skip, c_skip, c_l, s_input, z_input, tok_idx_batched)
+        _, _, _, c_out = decoder(q_skip, p_skip, c_skip, c_l, s_input, z_input, tok_idx_batched)
     assert c_out.shape == (B, N_ATOM, C_ATOM)
 
 
 def test_atom_attention_decoder_c_out_finite(decoder, q_skip, p_skip, c_skip, c_l, s_input, z_input, tok_idx_batched):
     with torch.no_grad():
-        _, c_out = decoder(q_skip, p_skip, c_skip, c_l, s_input, z_input, tok_idx_batched)
+        _, _, _, c_out = decoder(q_skip, p_skip, c_skip, c_l, s_input, z_input, tok_idx_batched)
     assert torch.isfinite(c_out).all()
 
 
 def test_atom_attention_decoder_gradient_flows_to_q_skip(decoder, p_skip, c_skip, c_l, s_input, z_input, tok_idx_batched):
     q_skip_g = torch.randn(B, N_ATOM, C_ATOM, requires_grad=True)
-    r_update, _ = decoder(q_skip_g, p_skip, c_skip, c_l, s_input, z_input, tok_idx_batched)
+    _, _, r_update, _ = decoder(q_skip_g, p_skip, c_skip, c_l, s_input, z_input, tok_idx_batched)
     reduce(r_update, "b n d -> ", "sum").backward()
     assert q_skip_g.grad is not None
     assert torch.isfinite(q_skip_g.grad).all()

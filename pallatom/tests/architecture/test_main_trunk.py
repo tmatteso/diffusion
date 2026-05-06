@@ -11,6 +11,7 @@ from architecture.main_trunk import (
     RelativePositionEncoding,
     ResidueDistogramHead,
     TimeFourierEmbedding,
+    scatter_mean,
     sinusoidal_encoding,
 )
 from helpers.featurize import FeaturizedBatch
@@ -345,3 +346,122 @@ def test_main_trunk_gradient_flows_to_r_input(model, featurized_batch):
     assert torch.isfinite(r_input_g.grad).all()
 
 # you need to add integration tests here. don't be afraid to use pytest mocks.
+
+
+# ---------------------------------------------------------------------------
+# scatter_mean
+# ---------------------------------------------------------------------------
+
+_SM_B = 2
+_SM_N_RES = 4
+_SM_N_ATOM = 8   # 2 atoms per residue
+_SM_C = 6
+
+
+@pytest.fixture
+def sm_src() -> Float[torch.Tensor, "B N_atom C"]:
+    return torch.arange(_SM_B * _SM_N_ATOM * _SM_C, dtype=torch.float32).reshape(
+        _SM_B, _SM_N_ATOM, _SM_C
+    )
+
+
+@pytest.fixture
+def sm_tok_idx() -> Int[torch.Tensor, "B N_atom"]:
+    # 2 atoms per residue: [0, 0, 1, 1, 2, 2, 3, 3]
+    single = torch.repeat_interleave(torch.arange(_SM_N_RES), 2)
+    return repeat(single, "n -> b n", b=_SM_B)
+
+
+@pytest.fixture
+def sm_index(sm_tok_idx) -> Int[torch.Tensor, "B N_atom"]:
+    # batch-offset flat index: tok_idx + b * N_RES
+    offset = repeat(torch.arange(_SM_B) * _SM_N_RES, "b -> b n", n=_SM_N_ATOM)
+    return sm_tok_idx + offset
+
+
+def test_scatter_mean_output_shape(sm_src, sm_index):
+    out = scatter_mean(sm_src, sm_index, _SM_B * _SM_N_RES, _SM_B)
+    assert out.shape == (_SM_B, _SM_N_RES, _SM_C)
+
+
+def test_scatter_mean_output_finite(sm_src, sm_index):
+    out = scatter_mean(sm_src, sm_index, _SM_B * _SM_N_RES, _SM_B)
+    assert torch.isfinite(out).all()
+
+
+def test_scatter_mean_known_values_uniform():
+    # B=1, 2 atoms per residue, C=1; manually verify pair-wise means
+    src = torch.tensor([[[0.], [2.], [4.], [6.]]])  # (1, 4, 1)
+    index = torch.tensor([[0, 0, 1, 1]])             # (1, 4)
+    out = scatter_mean(src, index, 2, 1)
+    expected = torch.tensor([[[1.], [5.]]])           # mean(0,2)=1, mean(4,6)=5
+    assert torch.allclose(out, expected)
+
+
+def test_scatter_mean_known_values_nonuniform():
+    # B=1, residue 0 has 3 atoms, residue 1 has 2 atoms, C=1
+    src = torch.tensor([[[1.], [3.], [5.], [7.], [9.]]])  # (1, 5, 1)
+    index = torch.tensor([[0, 0, 0, 1, 1]])               # (1, 5)
+    out = scatter_mean(src, index, 2, 1)
+    expected = torch.tensor([[[3.], [8.]]])                # mean(1,3,5)=3, mean(7,9)=8
+    assert torch.allclose(out, expected)
+
+
+def test_scatter_mean_one_atom_per_residue():
+    # 1:1 atom-to-residue mapping — output must equal src exactly
+    B_sm, N_sm, C_sm = 2, 4, 6
+    src = torch.randn(B_sm, N_sm, C_sm)
+    base   = repeat(torch.arange(N_sm), "n -> b n", b=B_sm)
+    offset = repeat(torch.arange(B_sm) * N_sm, "b -> b n", n=N_sm)
+    index  = base + offset   # [[0,1,2,3],[4,5,6,7]]
+    out = scatter_mean(src, index, B_sm * N_sm, B_sm)
+    assert torch.allclose(out, src)
+
+
+def test_scatter_mean_constant_src_returns_that_constant():
+    # Every atom in every residue holds the same value; mean must equal it
+    B_sm, N_tgt, atoms_per, C_sm = 2, 2, 3, 4
+    N_src = N_tgt * atoms_per
+    val = 3.14
+    src = torch.full((B_sm, N_src, C_sm), val)
+    tok_idx = torch.repeat_interleave(torch.arange(N_tgt), atoms_per)
+    tok_idx = repeat(tok_idx, "n -> b n", b=B_sm)
+    offset  = repeat(torch.arange(B_sm) * N_tgt, "b -> b n", n=N_src)
+    index   = tok_idx + offset
+    out = scatter_mean(src, index, B_sm * N_tgt, B_sm)
+    assert torch.allclose(out, torch.full((B_sm, N_tgt, C_sm), val))
+
+
+def test_scatter_mean_batch_items_independent():
+    # Zeroing batch item 1's src must leave batch item 0's output unchanged
+    B_sm, N_src, N_tgt, C_sm = 2, 8, 4, 6
+    src  = torch.randn(B_sm, N_src, C_sm)
+    src0 = src.clone()
+    src0[1] = 0.0
+
+    tok_base = torch.repeat_interleave(torch.arange(N_tgt), 2)  # [0,0,1,1,2,2,3,3]
+    tok_idx  = repeat(tok_base, "n -> b n", b=B_sm)
+    offset   = repeat(torch.arange(B_sm) * N_tgt, "b -> b n", n=N_src)
+    index    = tok_idx + offset
+
+    out_full = scatter_mean(src,  index, B_sm * N_tgt, B_sm)
+    out_zero = scatter_mean(src0, index, B_sm * N_tgt, B_sm)
+    assert torch.allclose(out_full[0], out_zero[0])
+
+
+def test_scatter_mean_multichannel_mean_matches_per_channel():
+    # Verify that scatter_mean is equivalent to running per-channel means manually
+    B_sm, N_tgt, atoms_per, C_sm = 1, 3, 4, 5
+    N_src = N_tgt * atoms_per
+    src = torch.randn(B_sm, N_src, C_sm)
+    tok_idx = torch.repeat_interleave(torch.arange(N_tgt), atoms_per)
+    index   = repeat(tok_idx, "n -> b n", b=B_sm)
+
+    out = scatter_mean(src, index, B_sm * N_tgt, B_sm)
+
+    # Per-residue means computed with reshape+reduce as ground truth
+    src_grouped: Float[torch.Tensor, "B N_tgt atoms_per C"] = rearrange(
+        src, "b (n a) c -> b n a c", n=N_tgt, a=atoms_per
+    )
+    expected: Float[torch.Tensor, "B N_tgt C"] = reduce(src_grouped, "b n a c -> b n c", "mean")
+    assert torch.allclose(out, expected, atol=1e-6)

@@ -57,7 +57,7 @@ positions plus auxiliary sequence and distogram logits.
        DL  --> O1(["r_denoised  [B, N_atom, 3]"]):::out
        DL  --> O2(["f_seq_logits  [B, N_res, n_amino]"]):::out
        DL  --> O3(["residue_distogram_logits  [B, N_res, N_res, n_bins]"]):::out
-       SK3 --> O4(["atom_distogram_logits  [B, N_atom, K, n_atom_bins]"]):::out
+       DL  --> O4(["atom_distogram_logits  [B, N_atom, K, n_atom_bins]"]):::out
 
 ----
 
@@ -79,7 +79,7 @@ correct noise-level manifold.
        IN(["s_i [B,N_res,c_res] · z_ij [B,N_res,N_res,c_pair] · t_i [B,N_res,c_res] · q_skip · c_skip · c_l [B,N_atom,c_atom] · p_skip [B,N_atom,K,c_atompair] · r_input · r_updates [B,N_atom,3]"]):::acc
 
        IN  --> NU["NodeUpdate: s_i = Update(s_i, t_i, z_ij)  [B, N_res, c_res]"]:::proc
-       NU  --> AD["AtomAttentionDecoder: r_update [B,N_atom,3], c_l [B,N_atom,c_atom] = Decode(q_skip, p_skip, c_skip, c_l, s_i, z_ij)"]:::proc
+       NU  --> AD["AtomAttentionDecoder: q_update [B,N_atom,c_atom], p_update [B,N_atom,K,c_atompair], r_update [B,N_atom,3], c_l [B,N_atom,c_atom] = Decode(q_skip, p_skip, c_skip, c_l, s_i, z_ij)"]:::proc
        AD  --> RU["r_updates += r_update  [B, N_atom, 3]"]:::acc
        RU  --> RD["r_denoised = (sigma^2 * r_input + sigma*t_hat * r_updates) / (sigma^2 + t_hat^2)  [B, N_atom, 3]"]:::acc
        RD  --> IH(["intermediate stack: r_denoised_k [B,N_atom,3] · aa_logits_k [B,N_res,n_amino]"]):::out
@@ -87,7 +87,7 @@ correct noise-level manifold.
        RC  --> PU["PairUpdate: z_ij = Update(z_ij, r_center)  [B, N_res, N_res, c_pair]"]:::proc
        PU  -.->|"repeat for next k"| NU
 
-       PU  --> FN(["final: r_denoised [B,N_atom,3] · z_ij [B,N_res,N_res,c_pair] · q_skip [B,N_atom,c_atom]"]):::acc
+       PU  --> FN(["final: r_denoised [B,N_atom,3] · z_ij [B,N_res,N_res,c_pair] · q_update [B,N_atom,c_atom]"]):::acc
 
 ----
 

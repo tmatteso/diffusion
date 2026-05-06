@@ -46,6 +46,37 @@ def sinusoidal_encoding(
     return torch.cat([torch.sin(args), torch.cos(args)], dim=-1)  # (..., Nres, dim)
 
 
+@jaxtyped(typechecker=beartype)
+def scatter_mean(
+    src: Float[torch.Tensor, "B N_src C"],
+    index: Int[torch.Tensor, "B N_src"],
+    num_segments: int,
+    B: int,
+) -> Float[torch.Tensor, "B N_target C"]:
+    """Per-segment mean pooling via scatter.
+
+    Maps atom-level features to residue-level by averaging all atoms that share
+    the same flat segment index.  `index` must already encode the batch offset
+    (i.e. atom j in batch item b maps to index[b, j] = tok_idx[b, j] + b * N_tgt).
+    """
+    C: int = src.size(-1)
+    device = src.device
+
+    flat_index: Int[torch.Tensor, "BN_src"]   = rearrange(index, "b n -> (b n)")
+    flat_src:   Float[torch.Tensor, "BN_src C"] = rearrange(src,   "b n c -> (b n) c")
+
+    sum_flat: Float[torch.Tensor, "BN_target C"] = torch.zeros(num_segments, C, device=device)
+    sum_flat.scatter_add_(0, flat_index.unsqueeze(1).expand(-1, C), flat_src)
+
+    cnt_flat: Float[torch.Tensor, "BN_target 1"] = torch.zeros(num_segments, 1, device=device)
+    cnt_flat.scatter_add_(0, flat_index.unsqueeze(1), torch.ones(flat_index.size(0), 1, device=device))
+
+    result: Float[torch.Tensor, "B N_target C"] = rearrange(
+        sum_flat / cnt_flat.clamp(min=1), "(b n) c -> b n c", b=B
+    )
+    return result
+
+
 # ---------------------------------------------------------------------------
 # TimeFourierEmbedding  (used in step 3)
 # ---------------------------------------------------------------------------
@@ -456,8 +487,13 @@ class MainTrunk(nn.Module):
             s_i = self.node_updates[k](s_i, t_i, z_ij)
 
             # Step 12: AtomAttentionDecoder
+            q_update: Float[torch.Tensor, "B N_atom c_atom"]
+            p_update: Float[torch.Tensor, "B N_atom K c_atompair"]
             r_update: Float[torch.Tensor, "B N_atom 3"]
-            r_update, c_l = self.atom_decoders[k](
+
+            # at a minimum this needs to return q_l for amino acid seq head
+            # seems like this should emit p_l for atom distogram head as well.
+            q_update, p_update, r_update, c_l = self.atom_decoders[k](
                 q_skip, p_skip, c_skip, c_l, s_i, z_ij, tok_idx,
             )
 
@@ -474,21 +510,8 @@ class MainTrunk(nn.Module):
 
             # Intermediate aa logits: scatter c_l atoms to residues [B, N_res, n_amino]
             proj_c: Float[torch.Tensor, "B N_atom c_res"] = F.relu(self.inter_proj_seq[k](c_l))
-            c_proj = proj_c.size(-1)
-            a_inter_flat = torch.zeros(B * N_res, c_proj, device=device)
-            a_inter_flat.scatter_add_(
-                0,
-                rearrange(tok_offset_base, "b n -> (b n)").unsqueeze(1).expand(-1, c_proj),
-                rearrange(proj_c, "b n c -> (b n) c"),
-            )
-            cnt_flat = torch.zeros(B * N_res, 1, device=device)
-            cnt_flat.scatter_add_(
-                0,
-                rearrange(tok_offset_base, "b n -> (b n)").unsqueeze(1),
-                torch.ones(B * N_atom, 1, device=device),
-            )
-            a_inter: Float[torch.Tensor, "B N_res c_res"] = rearrange(
-                a_inter_flat / cnt_flat.clamp(min=1), "(b n) c -> b n c", b=B
+            a_inter: Float[torch.Tensor, "B N_res c_res"] = scatter_mean(
+                proj_c, tok_offset_base, B * N_res, B
             )
             inter_logits: Float[torch.Tensor, "B N_res n_amino"] = self.inter_seq_logits[k](a_inter)
             intermediate_pred_aa_logit_stack.append(inter_logits)
@@ -506,31 +529,21 @@ class MainTrunk(nn.Module):
         residue_distogram_logits: Float[torch.Tensor, "B N_res N_res n_bins"] = (
             self.residue_distogram_head(z_ij)
         )
+
+        # we project the atomic-level pair representation from local atomic attention into 22 distance bins
+        # local region defined by the attention window within the 5L × 5L atomic-level map
         atom_distogram_logits: Float[torch.Tensor, "B N_atom K n_atom_bins"] = (
-            self.atom_distogram_head(p_skip)
+            self.atom_distogram_head(p_update)
         )
 
         # ------------------------------------------------------------------
         # Step 18: a_i = mean_{l: tok_idx(l)=i} ReLU(proj(q_skip))  [B, N_res, c_res]
         # ------------------------------------------------------------------
-        proj_q: Float[torch.Tensor, "B N_atom c_res"] = F.relu(self.proj_seq(q_skip))
-        c_dim = proj_q.size(-1)
-        a_flat = torch.zeros(B * N_res, c_dim, device=device)
-        a_flat.scatter_add_(
-            0,
-            rearrange(tok_offset_base, "b n -> (b n)").unsqueeze(1).expand(-1, c_dim),
-            rearrange(proj_q, "b n c -> (b n) c"),
-        )
-        cnt_a = torch.zeros(B * N_res, 1, device=device)
-        cnt_a.scatter_add_(
-            0,
-            rearrange(tok_offset_base, "b n -> (b n)").unsqueeze(1),
-            torch.ones(B * N_atom, 1, device=device),
-        )
-        a_i: Float[torch.Tensor, "B N_res c_res"] = rearrange(
-            a_flat / cnt_a.clamp(min=1), "(b n) c -> b n c", b=B
-        )
 
+        proj_q: Float[torch.Tensor, "B N_atom c_res"] = F.relu(self.proj_seq(q_update))
+        a_i: Float[torch.Tensor, "B N_res c_res"] = scatter_mean(
+            proj_q, tok_offset_base, B * N_res, B
+        )
         # Step 19: f_seq_logits = LinearNoBias(a_i)             [B, N_res, n_amino]
         f_seq_logits: Float[torch.Tensor, "B N_res n_amino"] = self.seq_logits(a_i)
 

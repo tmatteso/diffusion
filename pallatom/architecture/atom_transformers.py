@@ -554,6 +554,8 @@ class AtomAttentionDecoder(nn.Module):
         z:       Float[torch.Tensor, "B N_res N_res c_pair"],
         tok_idx: Int[torch.Tensor,   "B N_atom"],
     ) -> tuple[
+        Float[torch.Tensor, "B N_atom c_atom"],
+        Float[torch.Tensor, "B N_atom K c_atompair"],
         Float[torch.Tensor, "B N_atom 3"],
         Float[torch.Tensor, "B N_atom c_atom"],
     ]:
@@ -568,6 +570,8 @@ class AtomAttentionDecoder(nn.Module):
             tok_idx : residue index per atom [B, N_atom]
 
         Returns:
+            q        : atom query embeddings   [B, N_atom, c_atom]
+            p        : sparse pair embeddings  [B, N_atom, K, c_atompair]
             r_update : per-atom position update  [B, N_atom, 3]
             c_out    : updated atom context      [B, N_atom, c_atom]
         """
@@ -594,10 +598,14 @@ class AtomAttentionDecoder(nn.Module):
         # Step 3: p += MLP(p) residual; zero padding slots
         p = (p + self.mlp_p(p)) * rearrange(valid_mask, "b n k -> b n k 1")
 
+        # why shouldn't the atom distogram head use this p as its input?
+
         # Step 4: AtomTransformer — 32-residue sparse window
         q: Float[torch.Tensor, "B N_atom c_atom"] = self.transformer(
             q, c, p, neighbor_idx, valid_mask,
         )
+
+        # this is suspect. I believe p should be passed through the transformer as well.
 
         # Step 5: r_update = proj(LayerNorm(q))             [B, N_atom, 3]
         r_update: Float[torch.Tensor, "B N_atom 3"] = self.proj_r(self.norm_q_out(q))
@@ -605,4 +613,4 @@ class AtomAttentionDecoder(nn.Module):
         # Step 6: c_out = proj(LayerNorm(s[tok_idx])) + c_skip
         c_out: Float[torch.Tensor, "B N_atom c_atom"] = self.proj_s_c(self.norm_s_c(s[:, tok])) + c_skip
 
-        return r_update, c_out
+        return q, p, r_update, c_out

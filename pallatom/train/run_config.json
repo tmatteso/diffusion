@@ -4,7 +4,7 @@
     "lr": 0.0003,
     "weight_decay": 0.0001,
     "grad_clip": 2.0,
-    "pretrained_weights": "pallatom_best_best.pt"
+    "pretrained_weights": null
   },
   "model": {
     "f_ref_dim": 35,
@@ -13,7 +13,8 @@
     "c_pair": 16,
     "c_res": 32,
     "c_atompair": 2,
-    "K_unit": 3
+    "K_unit": 3,
+    "max_residues": 256
   },
   "noise": {
     "sigma_data": 19.2368,
