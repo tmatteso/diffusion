@@ -12,7 +12,10 @@ from jaxtyping import Float, Int, jaxtyped
 from beartype import beartype
 from helpers.featurize import Distogram, ProteinBatch, featurize_batch
 from helpers.alignment import kabsch_align
-from helpers.data import make_data_loaders
+import os
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from helpers.data import make_data_loaders, make_ddp_data_loaders
 from architecture.main_trunk import MainTrunk
 from architecture.losses import (
     atom_loss,
@@ -153,6 +156,127 @@ def evaluate(
         n_batches += 1
 
     return {k: v / max(n_batches, 1) for k, v in totals.items()}
+
+
+@torch.no_grad()
+def evaluate_ddp(
+    rank: int,
+    world_size: int,
+    model: nn.Module,
+    loader,
+    tcfg: TrainConfig,
+    distogram_res: Distogram,
+    distogram_atom: Distogram,
+    index_embedding: nn.Embedding,
+    device: str,
+) -> dict[str, float]:
+    """Distributed evaluation. Each rank processes its shard; metrics are all-reduced."""
+    model.eval()
+    metric_names = [
+        "total loss",
+        "Kabsch aligned MSE loss",
+        "Cross Entropy loss",
+        "Smooth LDDT loss",
+        "Residue Distogram loss",
+        "Atom Distogram loss",
+        "Intermediate loss",
+        "RMSD",
+    ]
+    # totals[:8] = metric sums, totals[8] = n_batches
+    totals = torch.zeros(len(metric_names) + 1, device=device)
+    lp = tcfg.loss
+
+    for batch in loader:
+        featurized_batch = featurize_batch(
+            _to_protein_batch(batch), tcfg, distogram_res, distogram_atom, index_embedding, device
+        )
+
+        (
+            r_denoised,
+            f_seq_logits,
+            residue_distogram_logits,
+            atom_distogram_logits,
+            intermediate_denoised_coord_stack,
+            intermediate_pred_aa_logit_stack,
+        ) = model(featurized_batch)
+
+        Kabsch_aligned_MSE_loss: Float[torch.Tensor, ""] = atom_loss(
+            r_denoised, featurized_batch.r_gt, featurized_batch.atom5_mask
+        ).mean()
+        CE_loss: Float[torch.Tensor, ""] = F.cross_entropy(
+            rearrange(f_seq_logits, "b n c -> (b n) c"),
+            rearrange(featurized_batch.aa_indices, "b n -> (b n)"),
+        )
+
+        gt_res_bin_idx: Int[torch.Tensor, "B N_res N_res"] = featurized_batch.gt_res_distogram.argmax(dim=-1).clamp(
+            0, residue_distogram_logits.size(-1) - 1
+        )
+        residue_distogram_loss: Float[torch.Tensor, ""] = distogram_loss_residue(
+            residue_distogram_logits,
+            gt_res_bin_idx,
+            featurized_batch.residue_mask,
+        ).mean()
+
+        atom_distogram_loss: Float[torch.Tensor, ""] = distogram_loss_atom(
+            atom_distogram_logits,
+            featurized_batch.gt_atom_distogram_sparse,
+            featurized_batch.gt_atom_distogram_mask_sparse,
+        ).mean()
+
+        lddt_loss: Float[torch.Tensor, ""] = smooth_lddt_loss(
+            r_denoised, featurized_batch.r_gt, featurized_batch.atom5_mask
+        )
+
+        K_unit = len(intermediate_denoised_coord_stack)
+        intermediate_med_loss: Float[torch.Tensor, ""] = torch.tensor(0.0, device=device)
+        for k_idx, intermediate_denoised_coord in enumerate(intermediate_denoised_coord_stack):
+            intermediate_denoised_coord: Float[torch.Tensor, "B N_atom 3"]
+            gamma_K_minus_k: float = lp.gamma ** (K_unit - k_idx - 1)
+            intermediate_med_loss = (
+                lp.lam * atom_loss(
+                    intermediate_denoised_coord, featurized_batch.r_gt, featurized_batch.atom5_mask
+                )
+                + lp.alpha_0 * F.cross_entropy(
+                    rearrange(intermediate_pred_aa_logit_stack[k_idx], "b n c -> (b n) c"),
+                    rearrange(featurized_batch.aa_indices, "b n -> (b n)"),
+                )
+            )
+            intermediate_med_loss += gamma_K_minus_k * intermediate_med_loss
+        intermediate_med_loss = (intermediate_med_loss / max(K_unit, 1)).mean()
+
+        total_loss: Float[torch.Tensor, ""] = (
+            lp.lam       * Kabsch_aligned_MSE_loss
+            + lp.alpha_0 * CE_loss
+            + lp.alpha_1 * lddt_loss
+            + lp.alpha_2 * residue_distogram_loss
+            + lp.alpha_3 * atom_distogram_loss
+            + lp.alpha_4 * intermediate_med_loss
+        )
+
+        (r_aligned,) = kabsch_align(
+            featurized_batch.r_gt, r_denoised,
+            weights=featurized_batch.atom5_mask.float(),
+        )
+        diff: Float[torch.Tensor, "B N_atom 3"] = r_denoised - r_aligned
+        sq: Float[torch.Tensor, "B N_atom"] = (diff * diff).sum(dim=-1)
+        m: Float[torch.Tensor, "B N_atom"] = featurized_batch.atom5_mask.float()
+        rmsd: Float[torch.Tensor, ""] = ((sq * m).sum() / m.sum().clamp(min=1)).sqrt()
+
+        totals[0] += total_loss.item()
+        totals[1] += Kabsch_aligned_MSE_loss.item()
+        totals[2] += CE_loss.item()
+        totals[3] += lddt_loss.item()
+        totals[4] += residue_distogram_loss.item()
+        totals[5] += atom_distogram_loss.item()
+        totals[6] += intermediate_med_loss.item()
+        totals[7] += rmsd.item()
+        totals[8] += 1.0
+
+    if world_size > 1:
+        dist.all_reduce(totals, op=dist.ReduceOp.SUM)
+
+    n_batches = totals[8].item()
+    return {k: totals[i].item() / max(n_batches, 1) for i, k in enumerate(metric_names)}
 
 
 @jaxtyped(typechecker=beartype)

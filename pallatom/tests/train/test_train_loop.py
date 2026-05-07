@@ -15,7 +15,8 @@ from train.train_config import (
     TrainConfig,
     TrainingParams,
 )
-from train.train_loop import _FileLogProcessor, _to_protein_batch, evaluate, train
+import torch.distributed as dist_module
+from train.train_loop import _FileLogProcessor, _to_protein_batch, evaluate, evaluate_ddp, train
 
 torch.manual_seed(42)
 
@@ -542,3 +543,70 @@ def test_train_wandb_log_steps_increase_across_epochs(model, loader, tcfg_wandb_
     train(model, tcfg_wandb_3ep, loader, loader, distogram_res, distogram_atom, index_embedding, "cpu")
     assert steps == sorted(steps)
     assert len(set(steps)) == 3
+
+
+# ---------------------------------------------------------------------------
+# evaluate_ddp
+# ---------------------------------------------------------------------------
+
+def test_evaluate_ddp_returns_dict(model, loader, tcfg, distogram_res, distogram_atom, index_embedding):
+    result = evaluate_ddp(0, 1, model, loader, tcfg, distogram_res, distogram_atom, index_embedding, "cpu")
+    assert isinstance(result, dict)
+
+
+def test_evaluate_ddp_returns_expected_keys(model, loader, tcfg, distogram_res, distogram_atom, index_embedding):
+    result = evaluate_ddp(0, 1, model, loader, tcfg, distogram_res, distogram_atom, index_embedding, "cpu")
+    assert set(result.keys()) == EXPECTED_EVAL_KEYS
+
+
+def test_evaluate_ddp_all_values_are_floats(model, loader, tcfg, distogram_res, distogram_atom, index_embedding):
+    result = evaluate_ddp(0, 1, model, loader, tcfg, distogram_res, distogram_atom, index_embedding, "cpu")
+    for k, v in result.items():
+        assert isinstance(v, float), f"'{k}' is {type(v)}, expected float"
+
+
+def test_evaluate_ddp_all_losses_finite(model, loader, tcfg, distogram_res, distogram_atom, index_embedding):
+    result = evaluate_ddp(0, 1, model, loader, tcfg, distogram_res, distogram_atom, index_embedding, "cpu")
+    for k, v in result.items():
+        assert v == v, f"NaN in '{k}'"
+        assert v != float("inf"), f"Inf in '{k}'"
+
+
+def test_evaluate_ddp_total_loss_non_negative(model, loader, tcfg, distogram_res, distogram_atom, index_embedding):
+    result = evaluate_ddp(0, 1, model, loader, tcfg, distogram_res, distogram_atom, index_embedding, "cpu")
+    assert result["total loss"] >= 0.0
+
+
+def test_evaluate_ddp_rmsd_non_negative(model, loader, tcfg, distogram_res, distogram_atom, index_embedding):
+    result = evaluate_ddp(0, 1, model, loader, tcfg, distogram_res, distogram_atom, index_embedding, "cpu")
+    assert result["RMSD"] >= 0.0
+
+
+def test_evaluate_ddp_sets_model_to_eval_mode(model, loader, tcfg, distogram_res, distogram_atom, index_embedding):
+    model.train()
+    evaluate_ddp(0, 1, model, loader, tcfg, distogram_res, distogram_atom, index_embedding, "cpu")
+    assert not model.training
+
+
+def test_evaluate_ddp_empty_loader_returns_zero_dict(model, tcfg, distogram_res, distogram_atom, index_embedding):
+    empty = torch.utils.data.DataLoader([], batch_size=None, collate_fn=lambda x: x)
+    result = evaluate_ddp(0, 1, model, empty, tcfg, distogram_res, distogram_atom, index_embedding, "cpu")
+    assert all(v == 0.0 for v in result.values())
+
+
+def test_evaluate_ddp_calls_all_reduce_once_when_world_size_gt_1(
+    model, loader, tcfg, distogram_res, distogram_atom, index_embedding, monkeypatch
+):
+    calls = []
+    monkeypatch.setattr(dist_module, "all_reduce", lambda t, op=None: calls.append(1))
+    evaluate_ddp(0, 2, model, loader, tcfg, distogram_res, distogram_atom, index_embedding, "cpu")
+    assert len(calls) == 1
+
+
+def test_evaluate_ddp_skips_all_reduce_when_world_size_is_1(
+    model, loader, tcfg, distogram_res, distogram_atom, index_embedding, monkeypatch
+):
+    calls = []
+    monkeypatch.setattr(dist_module, "all_reduce", lambda t, op=None: calls.append(1))
+    evaluate_ddp(0, 1, model, loader, tcfg, distogram_res, distogram_atom, index_embedding, "cpu")
+    assert len(calls) == 0
