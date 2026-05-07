@@ -1,32 +1,35 @@
 """EDM sampling from a trained MainTrunk denoising network."""
 
-import math
 import dataclasses
-from typing import Optional
+import math
+
 import numpy as np
 import structlog
 import torch
 import torch.nn as nn
+from architecture.atom_transformers import WINDOW_SIZE, build_sparse_pairs
+from architecture.main_trunk import MainTrunk
 from beartype import beartype
 from einops import rearrange, repeat
+from helpers.atom_utils import (
+    ATOM5_ELEMENTS,
+    ATOM5_NAMES,
+    ATOM37_C,
+    ATOM37_CA,
+    ATOM37_CB,
+    ATOM37_N,
+    ATOM37_O,
+    Protein,
+    atom37_to_atom5,
+    atom37_to_cb,
+    restype_order,
+    rigid_group_atom_positions,
+    to_pdb,
+)
+from helpers.featurize import Distogram, FeaturizedBatch
 from jaxtyping import Bool, Float, Int, jaxtyped
 
 log = structlog.get_logger()
-
-from architecture.main_trunk import MainTrunk
-from helpers.featurize import Distogram, FeaturizedBatch
-from helpers.atom_utils import (
-    ATOM5_ELEMENTS,
-    ATOM37_N, ATOM37_CA, ATOM37_C, ATOM37_O, ATOM37_CB,
-    Protein,
-    to_pdb,
-    rigid_group_atom_positions,
-    ATOM5_NAMES,
-    atom37_to_cb,
-    atom37_to_atom5,
-    restype_order,
-)
-from architecture.atom_transformers import build_sparse_pairs, WINDOW_SIZE
 
 # atom5 slot → atom37 index (used when writing PDB via atom37 representation)
 # atom5: N=0, CA=1, C=2, O=3, CB=4  →  atom37: N=0, CA=1, C=2, O=3, CB=4
@@ -41,7 +44,6 @@ NATOM = 5  # atoms per residue
 # conditional sampling from no amino acid sequence + full template
 
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # 1.  EDMPrecond  —  adapts MainTrunk to the D_θ(r, σ) interface
 #
@@ -53,6 +55,7 @@ NATOM = 5  # atoms per residue
 #  For unconditional generation, gt_res_distogram and f_pseudo_beta_mask
 #  are zeros (no template conditioning).
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 class EDMPrecond(nn.Module):
     """
@@ -66,16 +69,17 @@ class EDMPrecond(nn.Module):
     sigma_min : lower σ bound, used only to compute t_normalized
     sigma_max : upper σ bound, used only to compute t_normalized
     """
+
     def __init__(
         self,
-        model:     MainTrunk,
-        context:   FeaturizedBatch,
+        model: MainTrunk,
+        context: FeaturizedBatch,
         sigma_min: float = 0.002,
         sigma_max: float = 80.0,
     ):
         super().__init__()
-        self.model     = model
-        self.context   = context
+        self.model = model
+        self.context = context
         self.sigma_min = sigma_min
         self.sigma_max = sigma_max
 
@@ -83,11 +87,10 @@ class EDMPrecond(nn.Module):
     def forward(
         self,
         r_input: Float[torch.Tensor, "B N_atom 3"],
-        t_hat:   float,
+        t_hat: float,
     ) -> Float[torch.Tensor, "B N_atom 3"]:
-        t_normalized: float = (
-            (math.log(t_hat) - math.log(self.sigma_min))
-            / (math.log(self.sigma_max) - math.log(self.sigma_min))
+        t_normalized: float = (math.log(t_hat) - math.log(self.sigma_min)) / (
+            math.log(self.sigma_max) - math.log(self.sigma_min)
         )
         batch = dataclasses.replace(
             self.context,
@@ -99,11 +102,12 @@ class EDMPrecond(nn.Module):
         r_denoised, *_ = self.model(batch)
         return r_denoised
 
+
 @jaxtyped(typechecker=beartype)
 @dataclasses.dataclass(frozen=True)
-class AllAtomContext: # N_atom = N_res * 5 for atom5 representation
+class AllAtomContext:  # N_atom = N_res * 5 for atom5 representation
     # structure input
-    r_gt: Float[torch.Tensor, "B N_atom 3"] # gt atom_positions
+    r_gt: Float[torch.Tensor, "B N_atom 3"]  # gt atom_positions
     atom5_mask: Bool[torch.Tensor, "B N_atom"]
     residue_mask: Bool[torch.Tensor, "B N_res"]
     gt_atom_distogram_sparse: Float[torch.Tensor, "B N_atom K n_atom_bins"]
@@ -113,60 +117,61 @@ class AllAtomContext: # N_atom = N_res * 5 for atom5 representation
     aa_indices: Int[torch.Tensor, "B N_res"]
     f_residue_idx: Float[torch.Tensor, "B N_res c_res"]
 
+
 @jaxtyped(typechecker=beartype)
 def build_AA_context(
     atom_37_coordinate_tensor: Float[torch.Tensor, "N_res 37 3"],
     atom_37_mask: Float[torch.Tensor, "N_res 37"],
-    residue_index:  Float[torch.Tensor, "N_res"],
+    residue_index: Float[torch.Tensor, "N_res"],
     index_embedding: nn.Embedding,
     aa_sequence: str,
     atom_distogram_fn: Distogram,
     batch_size: int,
     device: str,
-    ) -> AllAtomContext:
-
+) -> AllAtomContext:
     _aa_vals = [restype_order[r] for r in aa_sequence]
-    aa_indices_i: Int[torch.Tensor, "N_res"] = torch.tensor(_aa_vals, dtype=torch.long, device=device)
+    aa_indices_i: Int[torch.Tensor, N_res] = torch.tensor(_aa_vals, dtype=torch.long, device=device)
     f_residue_idx_i: Float[torch.Tensor, "N_res c_res"] = index_embedding(residue_index.long())
 
     atom5_pos, atom5_mask = atom37_to_atom5(
         rearrange(atom_37_coordinate_tensor, "n a d -> 1 n a d"),
-        rearrange(atom_37_mask,      "n a -> 1 n a"),
+        rearrange(atom_37_mask, "n a -> 1 n a"),
     )
-    atom5_pos    = rearrange(atom5_pos, "1 n a d -> n a d")  # (N_res_i, 5, 3)
-    atom5_mask    = rearrange(atom5_mask, "1 n a -> n a")      # (N_res_i, 5)
+    atom5_pos = rearrange(atom5_pos, "1 n a d -> n a d")  # (N_res_i, 5, 3)
+    atom5_mask = rearrange(atom5_mask, "1 n a -> n a")  # (N_res_i, 5)
 
     N_res: int = atom_37_coordinate_tensor.shape[0]
-    residue_mask_i: Bool[torch.Tensor, "N_res"] = atom5_mask.any(dim=-1)
+    residue_mask_i: Bool[torch.Tensor, N_res] = atom5_mask.any(dim=-1)
     packed_flat_pos_i: Float[torch.Tensor, "N_atom 3"] = rearrange(atom5_pos, "n a d -> (n a) d")
-    packed_atom_mask_i: Bool[torch.Tensor, "N_atom"] = repeat(residue_mask_i, "n -> (n a)", a=NATOM)
-
+    packed_atom_mask_i: Bool[torch.Tensor, N_atom] = repeat(residue_mask_i, "n -> (n a)", a=NATOM)
 
     # stack all to be of shape batch_size
-    r_gt: Float[torch.Tensor, "B N_atom 3"]   = repeat(packed_flat_pos_i, "n d -> b n d",  b=batch_size)
-    atom5_mask: Bool[torch.Tensor, "B N_atom"]   = repeat(packed_atom_mask_i, "n -> b n",  b=batch_size)
+    r_gt: Float[torch.Tensor, "B N_atom 3"] = repeat(
+        packed_flat_pos_i, "n d -> b n d", b=batch_size
+    )
+    atom5_mask: Bool[torch.Tensor, "B N_atom"] = repeat(
+        packed_atom_mask_i, "n -> b n", b=batch_size
+    )
     residue_mask: Bool[torch.Tensor, "B N_res"] = repeat(residue_mask_i, "n -> b n", b=batch_size)
-    aa_indices: Int[torch.Tensor, "B N_res"] = repeat(aa_indices_i, "n -> b n",  b=batch_size)
+    aa_indices: Int[torch.Tensor, "B N_res"] = repeat(aa_indices_i, "n -> b n", b=batch_size)
     f_residue_idx: Float[torch.Tensor, "B N_res c_res"] = repeat(
-                                                                f_residue_idx_i, "n c -> b n c",
-                                                                b=batch_size
-                                                                )
+        f_residue_idx_i, "n c -> b n c", b=batch_size
+    )
     # atom distogram
     # ── Sparse atom distogram (batched) ──────────────────────────────────────
-    _tok_single: Int[torch.Tensor, "N_atom"] = (
-        torch.arange(N_res, dtype=torch.long, device=device).repeat_interleave(NATOM)
-    )
+    _tok_single: Int[torch.Tensor, N_atom] = torch.arange(
+        N_res, dtype=torch.long, device=device
+    ).repeat_interleave(NATOM)
     neighbor_idx, _ = build_sparse_pairs(_tok_single, WINDOW_SIZE)  # (N_atom, K)
-    K = neighbor_idx.shape[1]
 
     # atom_distogram_fn supports batched input: (B, N_atom, 3) → (B, N_atom, N_atom, n_bins)
     gt_atom_disto_dense, gt_atom_mask_dense = atom_distogram_fn(r_gt, atom5_mask)
     n_atom_bins: int = gt_atom_disto_dense.shape[-1]
 
     # Vectorised sparse gather: result[b, l, k] = dense[b, l, neighbor_idx[l, k]]
-    nbr_b: Int[torch.Tensor, "B N_atom K"] = repeat(neighbor_idx, 'n k -> b n k', b=batch_size)
+    nbr_b: Int[torch.Tensor, "B N_atom K"] = repeat(neighbor_idx, "n k -> b n k", b=batch_size)
     gt_atom_distogram_sparse: Float[torch.Tensor, "B N_atom K n_atom_bins"] = (
-        gt_atom_disto_dense.gather(2, repeat(nbr_b, 'b n k -> b n k d', d=n_atom_bins))
+        gt_atom_disto_dense.gather(2, repeat(nbr_b, "b n k -> b n k d", d=n_atom_bins))
     )
     gt_atom_distogram_mask_sparse: Bool[torch.Tensor, "B N_atom K"] = (
         gt_atom_mask_dense.long().gather(2, nbr_b).bool()
@@ -186,36 +191,41 @@ def build_AA_context(
         gt_atom_distogram_mask_sparse=gt_atom_distogram_mask_sparse,
     )
 
+
 @jaxtyped(typechecker=beartype)
 @dataclasses.dataclass(frozen=True)
 class TemplateContext:
     f_template_distogram: Int[torch.Tensor, "B N_res N_res n_templ_bins"]
     f_pseudo_beta_mask: Int[torch.Tensor, "B N_res"]
 
+
 @jaxtyped(typechecker=beartype)
 def build_template_context(
     ls_of_proteins: list[Protein],
-    distogram_fn:   Distogram,
-    device:         str = "cpu",
+    distogram_fn: Distogram,
+    device: str = "cpu",
 ) -> TemplateContext:
-    B: int        = len(ls_of_proteins)
     max_n_res: int = max(p.atom_positions.shape[0] for p in ls_of_proteins)
 
-    pos_list:  list[torch.Tensor] = []
+    pos_list: list[torch.Tensor] = []
     mask_list: list[torch.Tensor] = []
     for prot in ls_of_proteins:
         n_res: int = prot.atom_positions.shape[0]
-        pad:   int = max_n_res - n_res
-        pos_i  = torch.tensor(prot.atom_positions, dtype=torch.float32, device=device)
-        mask_i = torch.tensor(prot.atom_mask,      dtype=torch.float32, device=device)
+        pad: int = max_n_res - n_res
+        pos_i = torch.tensor(prot.atom_positions, dtype=torch.float32, device=device)
+        mask_i = torch.tensor(prot.atom_mask, dtype=torch.float32, device=device)
         if pad > 0:
-            pos_i  = torch.cat([pos_i,  torch.zeros(pad, 37, 3, dtype=torch.float32, device=device)], dim=0)
-            mask_i = torch.cat([mask_i, torch.zeros(pad, 37,    dtype=torch.float32, device=device)], dim=0)
+            pos_i = torch.cat(
+                [pos_i, torch.zeros(pad, 37, 3, dtype=torch.float32, device=device)], dim=0
+            )
+            mask_i = torch.cat(
+                [mask_i, torch.zeros(pad, 37, dtype=torch.float32, device=device)], dim=0
+            )
         pos_list.append(pos_i)
         mask_list.append(mask_i)
 
     atom37_positions: Float[torch.Tensor, "B N_res 37 3"] = torch.stack(pos_list)
-    atom37_mask:      Float[torch.Tensor, "B N_res 37"]   = torch.stack(mask_list)
+    atom37_mask: Float[torch.Tensor, "B N_res 37"] = torch.stack(mask_list)
 
     residue_mask: Bool[torch.Tensor, "B N_res"] = atom37_mask[:, :, ATOM37_CA].bool()
 
@@ -228,8 +238,8 @@ def build_template_context(
 
     f_disto, _ = distogram_fn(pseudo_beta_carbon_positions, residue_mask)
 
-    gt_res_distogram:   Int[torch.Tensor, "B N_res N_res n_templ_bins"] = f_disto.long()
-    f_pseudo_beta_mask: Int[torch.Tensor, "B N_res"]                    = beta_carbon_mask.long()
+    gt_res_distogram: Int[torch.Tensor, "B N_res N_res n_templ_bins"] = f_disto.long()
+    f_pseudo_beta_mask: Int[torch.Tensor, "B N_res"] = beta_carbon_mask.long()
 
     return TemplateContext(
         f_template_distogram=gt_res_distogram,
@@ -237,17 +247,15 @@ def build_template_context(
     )
 
 
-
-
-# this is the general purpose context building function. this is wrong. should take the AllAtomContext and TemplateContext as inputs
+# should take the AllAtomContext and TemplateContext as inputs
 def build_sampling_context(
-    N_res:           int,
+    N_res: int,
     index_embedding: nn.Embedding,
-    batch_size:      int = 1,
-    n_templ_bins:    int = 38,
-    n_atom_bins:     int = 22,
-    c_res_embed:     int = 32,
-    device:          str = "cpu",
+    batch_size: int = 1,
+    n_templ_bins: int = 38,
+    n_atom_bins: int = 22,
+    c_res_embed: int = 32,
+    device: str = "cpu",
 ) -> FeaturizedBatch:
     """
     Build the static context FeaturizedBatch for unconditional backbone generation.
@@ -266,9 +274,7 @@ def build_sampling_context(
 
     # ── Ala reference conformer tiled over all residues ──────────────────────
     def _ala_ref_pos() -> Float[torch.Tensor, "5 3"]:
-        pos_by_name = {
-            name: pos for name, _, pos in rigid_group_atom_positions["ALA"]
-        }
+        pos_by_name = {name: pos for name, _, pos in rigid_group_atom_positions["ALA"]}
         return torch.tensor(
             [pos_by_name.get(name, (0.0, 0.0, 0.0)) for name in ATOM5_NAMES],
             dtype=torch.float32,
@@ -285,17 +291,19 @@ def build_sampling_context(
     )
 
     # ── Index tensors (shared across batch — identical for all items) ────────
-    tok_idx_single:    Int[torch.Tensor, "N_atom"] = (
-        torch.arange(N_res, dtype=torch.long, device=device).repeat_interleave(NATOM)
-    )
-    center_uid_single: Int[torch.Tensor, "N_res"] = (
+    tok_idx_single: Int[torch.Tensor, N_atom] = torch.arange(
+        N_res, dtype=torch.long, device=device
+    ).repeat_interleave(NATOM)
+    center_uid_single: Int[torch.Tensor, N_res] = (
         torch.arange(N_res, dtype=torch.long, device=device) * NATOM + 1  # CA slot
     )
 
     # ── Residue position embedding ───────────────────────────────────────────
-    residue_index: Int[torch.Tensor, "N_res"] = torch.arange(N_res, dtype=torch.long, device=device)
+    residue_index: Int[torch.Tensor, N_res] = torch.arange(N_res, dtype=torch.long, device=device)
     with torch.no_grad():
-        f_residue_idx_single: Float[torch.Tensor, "N_res c_res_embed"] = index_embedding(residue_index)
+        f_residue_idx_single: Float[torch.Tensor, "N_res c_res_embed"] = index_embedding(
+            residue_index
+        )
 
     # ── Sparse neighbour count K (for zero-filled distogram placeholder) ─────
     _, valid_nbr = build_sparse_pairs(tok_idx_single, WINDOW_SIZE)
@@ -314,25 +322,24 @@ def build_sampling_context(
         t_normalized=0.5,
         tok_idx=tile(tok_idx_single),
         center_uid=tile(center_uid_single),
-
         # template based params:
-        gt_res_distogram=torch.zeros(B, N_res, N_res, n_templ_bins, dtype=torch.long, device=device),
+        gt_res_distogram=torch.zeros(
+            B, N_res, N_res, n_templ_bins, dtype=torch.long, device=device
+        ),
         f_pseudo_beta_mask=torch.zeros(B, N_res, dtype=torch.long, device=device),
-
         # structure input params
         r_input=torch.zeros(B, N_atom, 3, dtype=torch.float32, device=device),
         r_gt=torch.zeros(B, N_atom, 3, dtype=torch.float32, device=device),
         atom5_mask=torch.ones(B, N_atom, dtype=torch.bool, device=device),
         residue_mask=torch.ones(B, N_res, dtype=torch.bool, device=device),
-        gt_atom_distogram_sparse=torch.zeros(B, N_atom, K, n_atom_bins, dtype=torch.float32, device=device),
+        gt_atom_distogram_sparse=torch.zeros(
+            B, N_atom, K, n_atom_bins, dtype=torch.float32, device=device
+        ),
         gt_atom_distogram_mask_sparse=torch.zeros(B, N_atom, K, dtype=torch.bool, device=device),
-
-        # amino acid input params -- aa indices is the seq itself, f_residue_idx is the residue index
+        # amino acid input -- aa indices is the seq itself, f_residue_idx is the residue index
         aa_indices=torch.zeros(B, N_res, dtype=torch.long, device=device),
         f_residue_idx=tile(f_residue_idx_single),
     )
-
-
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -344,6 +351,7 @@ def build_sampling_context(
 #  Optional stochasticity: inject a small amount of noise at each step
 #  (S_churn > 0) to get the SDE variant, analogous to DDIM η > 0.
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 class EDMSampler:
     """
@@ -360,30 +368,31 @@ class EDMSampler:
     S_tmax    : float
     S_noise   : float  scaling of injected noise
     """
+
     def __init__(
         self,
-        denoiser:  EDMPrecond,
+        denoiser: EDMPrecond,
         sigma_min: float = 0.002,
         sigma_max: float = 80.0,
-        rho:       float = 7.0,
-        S_churn:   float = 0.0,
-        S_tmin:    float = 0.0,
-        S_tmax:    float = float("inf"),
-        S_noise:   float = 1.003,
+        rho: float = 7.0,
+        S_churn: float = 0.0,
+        S_tmin: float = 0.0,
+        S_tmax: float = float("inf"),
+        S_noise: float = 1.003,
     ):
-        self.denoiser  = denoiser
+        self.denoiser = denoiser
         self.sigma_min = sigma_min
         self.sigma_max = sigma_max
-        self.rho       = rho
-        self.S_churn   = S_churn
-        self.S_tmin    = S_tmin
-        self.S_tmax    = S_tmax
-        self.S_noise   = S_noise
+        self.rho = rho
+        self.S_churn = S_churn
+        self.S_tmin = S_tmin
+        self.S_tmax = S_tmax
+        self.S_noise = S_noise
 
     @jaxtyped(typechecker=beartype)
     def _sigma_schedule(
         self,
-        steps:  int,
+        steps: int,
         device: torch.device | str,
     ) -> Float[torch.Tensor, "S"]:  # S = steps + 1
         """
@@ -391,18 +400,18 @@ class EDMSampler:
         Returns a tensor of length (steps+1,) with σ_N=0 appended.
         """
         rho: float = self.rho
-        i: Float[torch.Tensor, "steps"] = torch.arange(steps, device=device).float()
-        t: Float[torch.Tensor, "steps"] = (
+        i: Float[torch.Tensor, steps] = torch.arange(steps, device=device).float()
+        t: Float[torch.Tensor, steps] = (
             self.sigma_max ** (1 / rho)
             + i / (steps - 1) * (self.sigma_min ** (1 / rho) - self.sigma_max ** (1 / rho))
         ) ** rho
-        return torch.cat([t, t.new_zeros(1)])   # (S,)  S = steps + 1
+        return torch.cat([t, t.new_zeros(1)])  # (S,)  S = steps + 1
 
     @torch.no_grad()
     @jaxtyped(typechecker=beartype)
     def sample(
         self,
-        shape: tuple[int, int, int],     # (B, N_atom, 3)
+        shape: tuple[int, int, int],  # (B, N_atom, 3)
         steps: int = 40,
         device: torch.device | str = "cpu",
     ) -> Float[torch.Tensor, "B N_atom 3"]:
@@ -410,64 +419,50 @@ class EDMSampler:
         shape : (B, N_atom, 3)  — batch of atom coordinate tensor shapes
         steps : number of ODE steps  (40 is usually plenty)
         """
-        sigmas: Float[torch.Tensor, "S"] = self._sigma_schedule(steps, device)
+        sigmas: Float[torch.Tensor, S] = self._sigma_schedule(steps, device)
 
         # pure noise initialised at σ_max — independent per batch item
         z: Float[torch.Tensor, "B N_atom 3"] = torch.randn(shape, device=device) * sigmas[0]
 
         for i in range(steps):
-            sigma_cur:  Float[torch.Tensor, ""] = sigmas[i]
+            sigma_cur: Float[torch.Tensor, ""] = sigmas[i]
             sigma_next: Float[torch.Tensor, ""] = sigmas[i + 1]
 
             # ── optional stochastic noise injection (S_churn) ──────────────
             sigma_hat: Float[torch.Tensor, ""]
             if self.S_churn > 0 and self.S_tmin <= sigma_cur <= self.S_tmax:
-                gamma:    float = min(self.S_churn / steps, math.sqrt(2) - 1)
+                gamma: float = min(self.S_churn / steps, math.sqrt(2) - 1)
                 sigma_hat = sigma_cur * (1 + gamma)
-                z = z + (sigma_hat ** 2 - sigma_cur ** 2).sqrt() \
-                      * self.S_noise * torch.randn_like(z)
+                z = z + (sigma_hat**2 - sigma_cur**2).sqrt() * self.S_noise * torch.randn_like(z)
             else:
                 sigma_hat = sigma_cur
 
             # ── first derivative (Euler predictor) ─────────────────────────
-            D_cur:  Float[torch.Tensor, "B N_atom 3"] = self.denoiser(z, sigma_hat.item())
-            d_cur:  Float[torch.Tensor, "B N_atom 3"] = (z - D_cur) / sigma_hat
+            D_cur: Float[torch.Tensor, "B N_atom 3"] = self.denoiser(z, sigma_hat.item())
+            d_cur: Float[torch.Tensor, "B N_atom 3"] = (z - D_cur) / sigma_hat
             z_next: Float[torch.Tensor, "B N_atom 3"] = z + (sigma_next - sigma_hat) * d_cur
 
             # ── second derivative (Heun corrector), skip at last step ──────
             if sigma_next > 0:
                 D_next: Float[torch.Tensor, "B N_atom 3"] = self.denoiser(z_next, sigma_next.item())
                 d_next: Float[torch.Tensor, "B N_atom 3"] = (z_next - D_next) / sigma_next
-                d_avg:  Float[torch.Tensor, "B N_atom 3"] = (d_cur + d_next) / 2.0
+                d_avg: Float[torch.Tensor, "B N_atom 3"] = (d_cur + d_next) / 2.0
                 z_next = z + (sigma_next - sigma_hat) * d_avg
 
             z = z_next
 
-        return z   # (B, N_atom, 3)  denoised atom5 coordinates
-
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 3b.  Template context builder
-#
-#  Like build_sampling_context but populates gt_res_distogram and
-#  f_pseudo_beta_mask from supplied pseudo-Cβ coordinates.
-#
-#  For a partial template set template_mask=1 only for known residues;
-#  TemplateEmbedder contributes pair signal only where both residues have mask=1
-#  via its b_mask = f_i^mask · f_j^mask term.
-# ─────────────────────────────────────────────────────────────────────────────
-
+        return z  # (B, N_atom, 3)  denoised atom5 coordinates
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 4.  PDB helper  —  atom5 (N_res, 5, 3) → atom37 (N_res, 37, 3)
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 @jaxtyped(typechecker=beartype)
 def atom5_to_atom37(
     coords_5: Float[np.ndarray, "N_res 5 3"],
-    mask_5:   Optional[Float[np.ndarray, "N_res 5"]] = None,
+    mask_5: Float[np.ndarray, "N_res 5"] | None = None,
 ) -> tuple[Float[np.ndarray, "N_res 37 3"], Float[np.ndarray, "N_res 37"]]:
     """
     Map atom5 coordinates back into the full atom37 layout.
@@ -477,13 +472,13 @@ def atom5_to_atom37(
     x_37   : (N_res, 37, 3)
     mask_37: (N_res, 37)
     """
-    N_res:   int                              = coords_5.shape[0]
-    x_37:    Float[np.ndarray, "N_res 37 3"] = np.zeros((N_res, 37, 3), dtype=np.float32)
-    mask_37: Float[np.ndarray, "N_res 37"]   = np.zeros((N_res, 37),    dtype=np.float32)
+    N_res: int = coords_5.shape[0]
+    x_37: Float[np.ndarray, "N_res 37 3"] = np.zeros((N_res, 37, 3), dtype=np.float32)
+    mask_37: Float[np.ndarray, "N_res 37"] = np.zeros((N_res, 37), dtype=np.float32)
 
     for atom5_slot, atom37_idx in enumerate(ATOM5_TO_ATOM37):
-        x_37[:, atom37_idx, :]  = coords_5[:, atom5_slot, :]
-        mask_37[:, atom37_idx]  = mask_5[:, atom5_slot] if mask_5 is not None else 1.0
+        x_37[:, atom37_idx, :] = coords_5[:, atom5_slot, :]
+        mask_37[:, atom37_idx] = mask_5[:, atom5_slot] if mask_5 is not None else 1.0
 
     return x_37, mask_37
 
@@ -492,11 +487,13 @@ def atom5_to_atom37(
 # 5.  File log processor
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 class _FileLogProcessor:
     """Structlog processor that appends JSON lines to a file, then passes the event dict through."""
 
     def __init__(self, path: str) -> None:
         import json as _json
+
         self._f = open(path, "w", buffering=1)  # line-buffered
         self._json = _json
 
@@ -516,8 +513,10 @@ if __name__ == "__main__":
 
     from sample.sample_config import SampleConfig
 
-    parser = argparse.ArgumentParser(description="Sample protein structures from a trained PallAtom model")
-    parser.add_argument("--config",   required=True, help="path to SampleConfig JSON")
+    parser = argparse.ArgumentParser(
+        description="Sample protein structures from a trained PallAtom model"
+    )
+    parser.add_argument("--config", required=True, help="path to SampleConfig JSON")
     parser.add_argument("--log_file", required=True, help="path to write structured JSON log lines")
     args = parser.parse_args()
 
@@ -538,11 +537,13 @@ if __name__ == "__main__":
     try:
         device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
-        scfg:     SampleConfig = SampleConfig.model_validate(_json.loads(_Path(args.config).read_text()))
-        mp        = scfg.model
-        noise     = scfg.noise
+        scfg: SampleConfig = SampleConfig.model_validate(
+            _json.loads(_Path(args.config).read_text())
+        )
+        mp = scfg.model
+        noise = scfg.noise
         sampler_p = scfg.sampler
-        gen       = scfg.generation
+        gen = scfg.generation
         log.info("config loaded", config=args.config, n_res=gen.n_res, n_samples=gen.n_samples)
 
         model = MainTrunk(
@@ -563,15 +564,16 @@ if __name__ == "__main__":
         model.eval()
         log.info("model loaded", checkpoint=scfg.checkpoint.checkpoint_path, device=device)
 
-        N_RES:    int = gen.n_res
-        N_atom:   int = N_RES * NATOM
+        N_RES: int = gen.n_res
+        N_atom: int = N_RES * NATOM
         B_SAMPLE: int = gen.n_samples
 
-        context:     FeaturizedBatch = build_sampling_context(
+        context: FeaturizedBatch = build_sampling_context(
             N_RES, index_embedding, batch_size=B_SAMPLE, n_templ_bins=mp.n_bins, device=device
         )
         edm_precond: EDMPrecond = EDMPrecond(
-            model, context,
+            model,
+            context,
             sigma_min=noise.sigma_min,
             sigma_max=noise.sigma_max,
         ).to(device)

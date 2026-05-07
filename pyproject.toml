@@ -63,6 +63,7 @@ dev = [
     "ruff>=0.1.0",
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
+    "pre-commit>=3.0.0",
     "ipykernel>=6.0.0",
     "ipywidgets>=8.0.0",
     "jupyter>=1.0.0",
@@ -86,7 +87,7 @@ select = [
     "C4",  # flake8-comprehensions
     "UP",  # pyupgrade
 ]
-ignore = []
+ignore = ["F722", "F821"]  # jaxtyping shape DSL triggers false positives on both rules
 
 [tool.ruff.lint.isort]
 known-first-party = ["diffusion"]
