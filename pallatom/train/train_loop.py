@@ -658,7 +658,7 @@ class _FileLogProcessor:
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Train PallAtom")
+    parser = argparse.ArgumentParser(description="Train PallAtom (DDP)")
     parser.add_argument("--data",        required=True,       help="path to proteins.jsonl")
     parser.add_argument("--splits",      required=True,       help="path to splits.json")
     parser.add_argument("--config",      default=None,        help="path to TrainConfig JSON (omit for defaults)")
@@ -666,18 +666,25 @@ if __name__ == "__main__":
     parser.add_argument("--num_workers", type=int, default=4)
     args = parser.parse_args()
 
+    dist.init_process_group(backend="nccl")
+    rank       = dist.get_rank()
+    local_rank = int(os.environ["LOCAL_RANK"])
+    world_size = dist.get_world_size()
+    device     = f"cuda:{local_rank}"
+    torch.cuda.set_device(local_rank)
+
     _processors = [
         structlog.processors.TimeStamper(fmt="iso", utc=True),
         structlog.stdlib.add_log_level,
         structlog.processors.StackInfoRenderer(),
     ]
-    if args.log_file:
+    if args.log_file and rank == 0:
         _processors.append(_FileLogProcessor(args.log_file))
     _processors.append(structlog.dev.ConsoleRenderer())
 
     structlog.configure(
         processors=_processors,
-        wrapper_class=structlog.make_filtering_bound_logger(20),  # INFO level
+        wrapper_class=structlog.make_filtering_bound_logger(20),
         context_class=dict,
         logger_factory=structlog.PrintLoggerFactory(),
     )
@@ -691,10 +698,10 @@ if __name__ == "__main__":
         else:
             tcfg = TrainConfig()
 
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-
-        train_loader, val_loader, _ = make_data_loaders(
-            tcfg, args.data, args.splits, num_workers=args.num_workers
+        train_loader, val_loader, _ = make_ddp_data_loaders(
+            tcfg, args.data, args.splits,
+            rank=rank, world_size=world_size,
+            num_workers=args.num_workers,
         )
 
         mp = tcfg.model
@@ -720,12 +727,16 @@ if __name__ == "__main__":
             ckpt = torch.load(tcfg.training.pretrained_weights, map_location=device)
             model.load_state_dict(ckpt["model"])
             index_embedding.load_state_dict(ckpt["index_embedding"])
-            log.info("loaded pretrained weights", path=tcfg.training.pretrained_weights)
+            if rank == 0:
+                log.info("loaded pretrained weights", path=tcfg.training.pretrained_weights)
 
-        if tcfg.logging.use_wandb:
+        if rank == 0 and tcfg.logging.use_wandb:
             wandb.init(project=tcfg.logging.wandb_project, config=tcfg.model_dump())
 
-        train(
+        train_ddp(
+            rank=rank,
+            local_rank=local_rank,
+            world_size=world_size,
             model=model,
             tcfg=tcfg,
             train_loader=train_loader,
@@ -733,8 +744,9 @@ if __name__ == "__main__":
             distogram_res=distogram_res,
             distogram_atom=distogram_atom,
             index_embedding=index_embedding,
-            device=device,
         )
     except Exception as _exc:
         log.error("fatal", error=str(_exc), traceback=_tb.format_exc())
         raise SystemExit(1) from _exc
+    finally:
+        dist.destroy_process_group()
