@@ -48,9 +48,10 @@ def atom_loss(
     """
     weights: Optional[Float[torch.Tensor, "... N_res"]] = mask.float() if mask is not None else None
 
-    # Align GT → denoised  (mobile=r_gt, target=r_denoised)
+    # Align GT → denoised  (mobile=r_gt, target=r_denoised).
+    # Detach so gradients flow only through r_denoised, not through the SVD.
     (r_aligned,) = kabsch_align(r_gt, r_denoised, weights=weights)
-    r_aligned: Float[torch.Tensor, "... N_res 3"]
+    r_aligned: Float[torch.Tensor, "... N_res 3"] = r_aligned.detach()
 
     # Squared residuals summed over xyz → (..., N_res)
     diff: Float[torch.Tensor, "... N_res 3"] = r_denoised - r_aligned

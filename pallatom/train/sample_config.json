@@ -6,7 +6,8 @@
     "c_pair": 16,
     "c_res": 32,
     "c_atompair": 2,
-    "K_unit": 3
+    "K_unit": 3,
+    "max_residues": 256
   },
   "noise": {
     "sigma_data": 19.2368,

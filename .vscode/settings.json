@@ -1,6 +1,6 @@
 {
   // Python settings
-  "python.defaultInterpreterPath": "${workspaceFolder}/.venv/bin/python",
+  "python.defaultInterpreterPath": "/opt/venv/bin/python",
 
   // Ruff linter configuration
   "[python]": {

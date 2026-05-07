@@ -111,9 +111,7 @@ def evaluate(
         for k_idx, intermediate_denoised_coord in enumerate(intermediate_denoised_coord_stack):
             intermediate_denoised_coord: Float[torch.Tensor, "B N_atom 3"]
             gamma_K_minus_k: float = lp.gamma ** (K_unit - k_idx - 1)
-
-
-            intermediate_med_loss = (
+            k_loss: Float[torch.Tensor, ""] = (
                 lp.lam * atom_loss(
                     intermediate_denoised_coord,
                     featurized_batch.r_gt,
@@ -124,7 +122,7 @@ def evaluate(
                     rearrange(featurized_batch.aa_indices, "b n -> (b n)"),
                     )
             )
-            intermediate_med_loss += gamma_K_minus_k * intermediate_med_loss
+            intermediate_med_loss = intermediate_med_loss + gamma_K_minus_k * k_loss
         intermediate_med_loss = (intermediate_med_loss / max(K_unit, 1)).mean()
 
         total_loss: Float[torch.Tensor, ""] = (
@@ -338,9 +336,7 @@ def train(
             for k_idx, intermediate_denoised_coord in enumerate(intermediate_denoised_coord_stack):
                 intermediate_denoised_coord: Float[torch.Tensor, "B N_atom 3"]
                 gamma_K_minus_k: float = lp.gamma ** (K_unit - k_idx - 1)
-
-
-                intermediate_med_loss = (
+                k_loss: Float[torch.Tensor, ""] = (
                     lp.lam * atom_loss(
                         intermediate_denoised_coord,
                         featurized_batch.r_gt,
@@ -351,7 +347,7 @@ def train(
                         rearrange(featurized_batch.aa_indices, "b n -> (b n)"),
                         )
                 )
-                intermediate_med_loss += gamma_K_minus_k * intermediate_med_loss
+                intermediate_med_loss = intermediate_med_loss + gamma_K_minus_k * k_loss
             intermediate_med_loss = (intermediate_med_loss / max(K_unit, 1)).mean()
 
             gt_res_bin_idx: Int[torch.Tensor, "B N_res N_res"] = featurized_batch.gt_res_distogram.argmax(dim=-1).clamp(
@@ -517,7 +513,7 @@ def train_ddp(
             for k_idx, intermediate_denoised_coord in enumerate(intermediate_denoised_coord_stack):
                 intermediate_denoised_coord: Float[torch.Tensor, "B N_atom 3"]
                 gamma_K_minus_k: float = lp.gamma ** (K_unit - k_idx - 1)
-                intermediate_med_loss = (
+                k_loss: Float[torch.Tensor, ""] = (
                     lp.lam * atom_loss(
                         intermediate_denoised_coord, featurized_batch.r_gt, featurized_batch.atom5_mask
                     )
@@ -526,7 +522,7 @@ def train_ddp(
                         rearrange(featurized_batch.aa_indices, "b n -> (b n)"),
                     )
                 )
-                intermediate_med_loss += gamma_K_minus_k * intermediate_med_loss
+                intermediate_med_loss = intermediate_med_loss + gamma_K_minus_k * k_loss
             intermediate_med_loss = (intermediate_med_loss / max(K_unit, 1)).mean()
 
             gt_res_bin_idx: Int[torch.Tensor, "B N_res N_res"] = featurized_batch.gt_res_distogram.argmax(dim=-1).clamp(
@@ -561,6 +557,15 @@ def train_ddp(
                 + lp.alpha_3 * atom_distogram_loss
                 + lp.alpha_4 * intermediate_med_loss
             )
+
+            if rank == 0 and torch.isnan(total_loss):
+                components = {
+                    "mse": Kabsch_aligned_MSE_loss, "ce": CE_loss,
+                    "lddt": lddt_loss, "res_dist": residue_distogram_loss,
+                    "atom_dist": atom_distogram_loss, "inter": intermediate_med_loss,
+                }
+                nan_keys = [k for k, v in components.items() if torch.isnan(v)]
+                log.warning("nan_loss", step=global_step, nan_components=nan_keys)
 
             optimizer.zero_grad()
             total_loss.backward()
