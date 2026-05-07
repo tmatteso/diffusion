@@ -1,10 +1,6 @@
 import pytest
 import torch
 import torch.nn.functional as F
-from beartype import beartype
-from einops import einsum, rearrange
-from jaxtyping import Bool, Float, Int, jaxtyped
-
 from architecture.losses import (
     atom_loss,
     distogram_loss_atom,
@@ -13,6 +9,9 @@ from architecture.losses import (
     med_loss_per_block,
     smooth_lddt_loss,
 )
+from beartype import beartype
+from einops import einsum, rearrange
+from jaxtyping import Bool, Float, Int, jaxtyped
 
 torch.manual_seed(42)
 
@@ -28,6 +27,7 @@ N_ATOMS = 8 * ATOMS_PER_RES  # 112
 # ---------------------------------------------------------------------------
 # Typed helpers
 # ---------------------------------------------------------------------------
+
 
 @jaxtyped(typechecker=beartype)
 def make_noisy(
@@ -85,6 +85,7 @@ def ce_via_einsum(
 # Fixtures
 # ---------------------------------------------------------------------------
 
+
 @pytest.fixture
 def coords():
     return torch.randn(B, N, 3)
@@ -98,7 +99,7 @@ def noisy_coords(coords):
 @pytest.fixture
 def half_mask():
     mask = torch.ones(B, N, dtype=torch.bool)
-    mask[:, N // 2:] = False
+    mask[:, N // 2 :] = False
     return mask
 
 
@@ -146,7 +147,7 @@ def res_onehot(res_bin_idx):
 @pytest.fixture
 def res_mask():
     mask = torch.ones(B, L_RES, dtype=torch.bool)
-    mask[:, L_RES // 2:] = False
+    mask[:, L_RES // 2 :] = False
     return mask
 
 
@@ -174,6 +175,7 @@ def atom_local_mask():
 # ---------------------------------------------------------------------------
 # atom_loss
 # ---------------------------------------------------------------------------
+
 
 def test_atom_loss_perfect_near_zero(coords):
     loss = atom_loss(coords, coords)
@@ -203,11 +205,11 @@ def test_atom_loss_gradient_flows_through_pred():
     assert torch.isfinite(r_pred.grad).all()
 
 
-def test_atom_loss_gt_grad_finite_if_present():
+def test_atom_loss_gt_receives_no_gradient():
+    r_pred = torch.randn(N, 3, requires_grad=True)
     r_gt = torch.randn(N, 3, requires_grad=True)
-    atom_loss(torch.randn(N, 3), r_gt).backward()
-    if r_gt.grad is not None:
-        assert torch.isfinite(r_gt.grad).all()
+    atom_loss(r_pred, r_gt).backward()
+    assert r_gt.grad is None
 
 
 def test_atom_loss_rotation_invariant(coords, rotation):
@@ -228,10 +230,16 @@ def test_pairwise_sq_dist_shape_symmetric():
 # med_loss
 # ---------------------------------------------------------------------------
 
+
 def test_med_loss_scalar_finite_positive(r_gt, aa_gt, r_blocks, aa_blocks):
     loss = med_loss(
-        list(r_blocks), r_gt, list(aa_blocks), aa_gt,
-        lam=LAM, alpha_0=ALPHA, gamma=GAMMA,
+        list(r_blocks),
+        r_gt,
+        list(aa_blocks),
+        aa_gt,
+        lam=LAM,
+        alpha_0=ALPHA,
+        gamma=GAMMA,
     )
     assert loss.ndim == 0
     assert torch.isfinite(loss)
@@ -240,17 +248,27 @@ def test_med_loss_scalar_finite_positive(r_gt, aa_gt, r_blocks, aa_blocks):
 
 def test_med_loss_perfect_struct_near_zero(r_gt, aa_gt, aa_blocks):
     loss = med_loss(
-        [r_gt.clone() for _ in range(K)], r_gt,
-        list(aa_blocks), aa_gt,
-        lam=LAM, alpha_0=0.0, gamma=GAMMA,
+        [r_gt.clone() for _ in range(K)],
+        r_gt,
+        list(aa_blocks),
+        aa_gt,
+        lam=LAM,
+        alpha_0=0.0,
+        gamma=GAMMA,
     )
     assert loss.item() < 1e-5
 
 
 def test_med_loss_masked_finite(r_gt, aa_gt, r_blocks, aa_blocks, half_mask):
     loss = med_loss(
-        list(r_blocks), r_gt, list(aa_blocks), aa_gt,
-        lam=LAM, alpha_0=ALPHA, gamma=GAMMA, mask=half_mask,
+        list(r_blocks),
+        r_gt,
+        list(aa_blocks),
+        aa_gt,
+        lam=LAM,
+        alpha_0=ALPHA,
+        gamma=GAMMA,
+        mask=half_mask,
     )
     assert torch.isfinite(loss)
 
@@ -265,8 +283,12 @@ def test_med_loss_block_weights_strictly_increasing():
 def test_med_loss_mismatched_blocks_raises(r_gt, aa_gt, r_blocks, aa_blocks):
     with pytest.raises(ValueError):
         med_loss(
-            list(r_blocks), r_gt, list(aa_blocks)[:-1], aa_gt,
-            lam=LAM, alpha_0=ALPHA,
+            list(r_blocks),
+            r_gt,
+            list(aa_blocks)[:-1],
+            aa_gt,
+            lam=LAM,
+            alpha_0=ALPHA,
         )
 
 
@@ -275,8 +297,13 @@ def test_med_loss_gradient_flows_to_first_block(r_gt, aa_gt):
     r_blocks_g = [r0] + [torch.randn(N, 3) for _ in range(K - 1)]
     aa_blocks_g = [torch.randn(N, VOCAB) for _ in range(K)]
     med_loss(
-        r_blocks_g, r_gt[0], aa_blocks_g, aa_gt[0],
-        lam=LAM, alpha_0=ALPHA, gamma=GAMMA,
+        r_blocks_g,
+        r_gt[0],
+        aa_blocks_g,
+        aa_gt[0],
+        lam=LAM,
+        alpha_0=ALPHA,
+        gamma=GAMMA,
     ).backward()
     assert r0.grad is not None
     assert torch.isfinite(r0.grad).all()
@@ -300,8 +327,12 @@ def test_med_loss_alpha_zero_removes_seq(r_gt, aa_gt, r_blocks, aa_blocks):
 
 def test_med_loss_per_block_shape(r_gt, aa_gt, r_blocks, aa_blocks):
     loss = med_loss_per_block(
-        r_blocks[0], r_gt, aa_blocks[0], aa_gt,
-        lam=LAM, alpha_0=ALPHA,
+        r_blocks[0],
+        r_gt,
+        aa_blocks[0],
+        aa_gt,
+        lam=LAM,
+        alpha_0=ALPHA,
     )
     assert loss.shape == (B,)
     assert torch.isfinite(loss).all()
@@ -311,12 +342,11 @@ def test_med_loss_per_block_shape(r_gt, aa_gt, r_blocks, aa_blocks):
 # smooth_lddt_loss
 # ---------------------------------------------------------------------------
 
+
 def test_smooth_lddt_identical_coords_expected_value():
     r = torch.randn(10, 3) * 0.1
     loss = smooth_lddt_loss(r, r)
-    expected = 1.0 - 0.25 * sum(
-        torch.sigmoid(torch.tensor(t)).item() for t in [0.5, 1.0, 2.0, 4.0]
-    )
+    expected = 1.0 - 0.25 * sum(torch.sigmoid(torch.tensor(t)).item() for t in [0.5, 1.0, 2.0, 4.0])
     assert abs(loss.item() - expected) < 1e-4
 
 
@@ -359,6 +389,7 @@ def test_smooth_lddt_pairwise_sq_dist_matches_einsum():
 # ---------------------------------------------------------------------------
 # distogram_loss_residue
 # ---------------------------------------------------------------------------
+
 
 def test_distogram_residue_onehot_index_same_loss(res_logits, res_bin_idx, res_onehot):
     assert torch.allclose(
@@ -406,6 +437,7 @@ def test_distogram_residue_unbatched_scalar():
 # distogram_loss_atom
 # ---------------------------------------------------------------------------
 
+
 def test_distogram_atom_local_finite_batched(atom_logits, atom_onehot, atom_local_mask):
     loss = distogram_loss_atom(atom_logits, atom_onehot, atom_local_mask)
     assert loss.shape == (B,)
@@ -450,7 +482,9 @@ def test_distogram_atom_ce_einsum_matches(atom_logits, atom_onehot):
     assert abs(loss_ref - loss_manual.item()) < 1e-5
 
 
-def test_distogram_atom_onehot_index_same_loss(atom_logits, atom_onehot, atom_bin_idx, atom_local_mask):
+def test_distogram_atom_onehot_index_same_loss(
+    atom_logits, atom_onehot, atom_bin_idx, atom_local_mask
+):
     assert torch.allclose(
         distogram_loss_atom(atom_logits, atom_onehot, atom_local_mask),
         distogram_loss_atom(atom_logits, atom_bin_idx, atom_local_mask),
