@@ -16,7 +16,8 @@ from train.train_config import (
     TrainingParams,
 )
 import torch.distributed as dist_module
-from train.train_loop import _FileLogProcessor, _to_protein_batch, evaluate, evaluate_ddp, train
+import torch.nn.parallel
+from train.train_loop import _FileLogProcessor, _to_protein_batch, evaluate, evaluate_ddp, train, train_ddp
 
 torch.manual_seed(42)
 
@@ -610,3 +611,109 @@ def test_evaluate_ddp_skips_all_reduce_when_world_size_is_1(
     monkeypatch.setattr(dist_module, "all_reduce", lambda t, op=None: calls.append(1))
     evaluate_ddp(0, 1, model, loader, tcfg, distogram_res, distogram_atom, index_embedding, "cpu")
     assert len(calls) == 0
+
+
+class _FakeDDP(nn.Module):
+    """Minimal DDP stand-in that exposes .module and works on CPU."""
+
+    def __init__(self, module, device_ids=None):
+        super().__init__()
+        self.module = module
+
+    def forward(self, *args, **kwargs):
+        return self.module(*args, **kwargs)
+
+
+class _MockSampler:
+    """DataLoader sampler with set_epoch() for verifying epoch reseeding."""
+
+    def __init__(self, data):
+        self._data = data
+        self.set_epoch_calls: list[int] = []
+
+    def __iter__(self):
+        return iter(range(len(self._data)))
+
+    def __len__(self):
+        return len(self._data)
+
+    def set_epoch(self, epoch: int) -> None:
+        self.set_epoch_calls.append(epoch)
+
+
+@pytest.fixture
+def ddp_loader(mini_batch):
+    sampler = _MockSampler([mini_batch])
+    loader = torch.utils.data.DataLoader([mini_batch], batch_size=None, sampler=sampler, collate_fn=lambda x: x)
+    return loader
+
+
+@pytest.fixture
+def patch_ddp(monkeypatch):
+    monkeypatch.setattr("train.train_loop.DDP", _FakeDDP)
+
+
+# ---------------------------------------------------------------------------
+# train_ddp
+# ---------------------------------------------------------------------------
+
+def test_train_ddp_returns_none(model, ddp_loader, tcfg, distogram_res, distogram_atom, index_embedding, patch_ddp):
+    result = train_ddp(0, 0, 1, model, tcfg, ddp_loader, ddp_loader, distogram_res, distogram_atom, index_embedding, device="cpu")
+    assert result is None
+
+
+def test_train_ddp_rank0_saves_checkpoint(model, ddp_loader, tcfg, distogram_res, distogram_atom, index_embedding, patch_ddp):
+    train_ddp(0, 0, 1, model, tcfg, ddp_loader, ddp_loader, distogram_res, distogram_atom, index_embedding, device="cpu")
+    assert os.path.exists(tcfg.checkpoint.checkpoint_path)
+
+
+def test_train_ddp_checkpoint_has_correct_keys(model, ddp_loader, tcfg, distogram_res, distogram_atom, index_embedding, patch_ddp):
+    train_ddp(0, 0, 1, model, tcfg, ddp_loader, ddp_loader, distogram_res, distogram_atom, index_embedding, device="cpu")
+    ckpt = torch.load(tcfg.checkpoint.checkpoint_path, weights_only=True)
+    assert "model" in ckpt and "index_embedding" in ckpt
+
+
+def test_train_ddp_rank1_does_not_save_checkpoint(model, ddp_loader, tcfg, distogram_res, distogram_atom, index_embedding, patch_ddp):
+    train_ddp(1, 0, 2, model, tcfg, ddp_loader, ddp_loader, distogram_res, distogram_atom, index_embedding, device="cpu")
+    assert not os.path.exists(tcfg.checkpoint.checkpoint_path)
+
+
+def test_train_ddp_calls_set_epoch_each_epoch(model, ddp_loader, tcfg_multi, distogram_res, distogram_atom, index_embedding, patch_ddp):
+    train_ddp(0, 0, 1, model, tcfg_multi, ddp_loader, ddp_loader, distogram_res, distogram_atom, index_embedding, device="cpu")
+    assert ddp_loader.sampler.set_epoch_calls == [1, 2, 3]
+
+
+def test_train_ddp_updates_model_parameters(model, ddp_loader, tcfg, distogram_res, distogram_atom, index_embedding, patch_ddp):
+    params_before = [p.clone().detach() for p in model.parameters()]
+    train_ddp(0, 0, 1, model, tcfg, ddp_loader, ddp_loader, distogram_res, distogram_atom, index_embedding, device="cpu")
+    assert any(not torch.equal(b, a) for b, a in zip(params_before, model.parameters()))
+
+
+def test_train_ddp_wandb_not_called_when_disabled(model, ddp_loader, tcfg, distogram_res, distogram_atom, index_embedding, patch_ddp, monkeypatch):
+    mock_log = MagicMock()
+    monkeypatch.setattr("train.train_loop.wandb.log", mock_log)
+    train_ddp(0, 0, 1, model, tcfg, ddp_loader, ddp_loader, distogram_res, distogram_atom, index_embedding, device="cpu")
+    mock_log.assert_not_called()
+
+
+def test_train_ddp_wandb_called_when_rank0_and_enabled(model, ddp_loader, tcfg_wandb, distogram_res, distogram_atom, index_embedding, patch_ddp, monkeypatch):
+    logged = []
+    monkeypatch.setattr("train.train_loop.wandb.log", lambda data, step: logged.append(data))
+    train_ddp(0, 0, 1, model, tcfg_wandb, ddp_loader, ddp_loader, distogram_res, distogram_atom, index_embedding, device="cpu")
+    assert len(logged) == 1
+
+
+def test_train_ddp_wandb_not_called_when_rank_nonzero(model, ddp_loader, tcfg_wandb, distogram_res, distogram_atom, index_embedding, patch_ddp, monkeypatch):
+    mock_log = MagicMock()
+    monkeypatch.setattr("train.train_loop.wandb.log", mock_log)
+    train_ddp(1, 0, 2, model, tcfg_wandb, ddp_loader, ddp_loader, distogram_res, distogram_atom, index_embedding, device="cpu")
+    mock_log.assert_not_called()
+
+
+def test_evaluate_ddp_world_size1_matches_evaluate(model, loader, tcfg, distogram_res, distogram_atom, index_embedding):
+    torch.manual_seed(42)
+    r1 = evaluate(model, loader, tcfg, distogram_res, distogram_atom, index_embedding, "cpu")
+    torch.manual_seed(42)
+    r2 = evaluate_ddp(0, 1, model, loader, tcfg, distogram_res, distogram_atom, index_embedding, "cpu")
+    for k in r1:
+        assert abs(r1[k] - r2[k]) < 1e-5, f"Mismatch for '{k}': evaluate={r1[k]}, evaluate_ddp={r2[k]}"
