@@ -5,6 +5,8 @@ import torch.utils.data
 from pathlib import Path
 from typing import Optional
 
+from torch.utils.data.distributed import DistributedSampler
+
 from helpers.atom_utils import make_fixed_size, make_np_example, center_positions
 from train.train_config import TrainConfig
 
@@ -177,4 +179,43 @@ def make_data_loaders(
             pin_memory=True,
         )
 
+    return train_loader, val_loader, test_loader
+
+
+def make_ddp_data_loaders(
+    cfg:         TrainConfig,
+    jsonl_path:  str | Path,
+    splits_path: str | Path,
+    rank:        int,
+    world_size:  int,
+    num_workers: int = 0,
+) -> tuple[
+    torch.utils.data.DataLoader,
+    torch.utils.data.DataLoader,
+    torch.utils.data.DataLoader,
+]:
+    """Build train/val/test DataLoaders backed by DistributedSampler for DDP training."""
+    with open(splits_path) as f:
+        splits: dict[str, list[str]] = json.load(f)
+
+    train_set = ProteinDataset(jsonl_path, splits["train"],      max_seq_length=cfg.train_loader.max_seq_length)
+    val_set   = ProteinDataset(jsonl_path, splits["validation"], max_seq_length=cfg.test_loader.max_seq_length)
+    test_set  = ProteinDataset(jsonl_path, splits["test"],       max_seq_length=cfg.test_loader.max_seq_length)
+
+    train_sampler = DistributedSampler(train_set, num_replicas=world_size, rank=rank, shuffle=True)
+    val_sampler   = DistributedSampler(val_set,   num_replicas=world_size, rank=rank, shuffle=False)
+    test_sampler  = DistributedSampler(test_set,  num_replicas=world_size, rank=rank, shuffle=False)
+
+    train_loader = torch.utils.data.DataLoader(
+        train_set, batch_size=cfg.train_loader.batch_size,
+        sampler=train_sampler, num_workers=num_workers, pin_memory=True,
+    )
+    val_loader = torch.utils.data.DataLoader(
+        val_set, batch_size=cfg.test_loader.batch_size,
+        sampler=val_sampler, num_workers=num_workers, pin_memory=True,
+    )
+    test_loader = torch.utils.data.DataLoader(
+        test_set, batch_size=cfg.test_loader.batch_size,
+        sampler=test_sampler, num_workers=num_workers, pin_memory=True,
+    )
     return train_loader, val_loader, test_loader
