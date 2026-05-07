@@ -217,51 +217,48 @@ def test_make_data_loaders_debug_batch_seq_is_list_of_strings(cfg, debug_jsonl_p
 # make_ddp_data_loaders
 # ---------------------------------------------------------------------------
 
-def test_make_ddp_data_loaders_returns_three_loaders(jsonl_path, splits_path):
-    cfg = TrainConfig()
+def test_make_ddp_data_loaders_returns_three_loaders(cfg, jsonl_path, splits_path):
     train_loader, val_loader, test_loader = make_ddp_data_loaders(cfg, jsonl_path, splits_path, rank=0, world_size=1)
     assert train_loader is not None
     assert val_loader is not None
     assert test_loader is not None
 
 
-def test_make_ddp_data_loaders_train_sampler_is_distributed(jsonl_path, splits_path):
-    cfg = TrainConfig()
+def test_make_ddp_data_loaders_train_sampler_is_distributed(cfg, jsonl_path, splits_path):
     train_loader, _, _ = make_ddp_data_loaders(cfg, jsonl_path, splits_path, rank=0, world_size=1)
     assert isinstance(train_loader.sampler, DistributedSampler)
 
 
-def test_make_ddp_data_loaders_val_sampler_is_distributed(jsonl_path, splits_path):
-    cfg = TrainConfig()
+def test_make_ddp_data_loaders_val_sampler_is_distributed(cfg, jsonl_path, splits_path):
     _, val_loader, _ = make_ddp_data_loaders(cfg, jsonl_path, splits_path, rank=0, world_size=1)
     assert isinstance(val_loader.sampler, DistributedSampler)
 
 
-def test_make_ddp_data_loaders_test_sampler_is_distributed(jsonl_path, splits_path):
-    cfg = TrainConfig()
+def test_make_ddp_data_loaders_test_sampler_is_distributed(cfg, jsonl_path, splits_path):
     _, _, test_loader = make_ddp_data_loaders(cfg, jsonl_path, splits_path, rank=0, world_size=1)
     assert isinstance(test_loader.sampler, DistributedSampler)
 
 
-def test_make_ddp_data_loaders_train_sampler_shuffle_true(jsonl_path, splits_path):
-    cfg = TrainConfig()
+def test_make_ddp_data_loaders_train_sampler_shuffle_true(cfg, jsonl_path, splits_path):
     train_loader, _, _ = make_ddp_data_loaders(cfg, jsonl_path, splits_path, rank=0, world_size=1)
     assert train_loader.sampler.shuffle is True
 
 
-def test_make_ddp_data_loaders_val_sampler_shuffle_false(jsonl_path, splits_path):
-    cfg = TrainConfig()
+def test_make_ddp_data_loaders_val_sampler_shuffle_false(cfg, jsonl_path, splits_path):
     _, val_loader, _ = make_ddp_data_loaders(cfg, jsonl_path, splits_path, rank=0, world_size=1)
     assert val_loader.sampler.shuffle is False
 
 
-def test_make_ddp_data_loaders_train_sampler_rank(jsonl_path, splits_path):
-    cfg = TrainConfig()
+def test_make_ddp_data_loaders_test_sampler_shuffle_false(cfg, jsonl_path, splits_path):
+    _, _, test_loader = make_ddp_data_loaders(cfg, jsonl_path, splits_path, rank=0, world_size=1)
+    assert test_loader.sampler.shuffle is False
+
+
+def test_make_ddp_data_loaders_train_sampler_rank(cfg, jsonl_path, splits_path):
     train_loader, _, _ = make_ddp_data_loaders(cfg, jsonl_path, splits_path, rank=0, world_size=2)
     assert train_loader.sampler.rank == 0
 
 
-def test_make_ddp_data_loaders_train_sampler_world_size(jsonl_path, splits_path):
-    cfg = TrainConfig()
+def test_make_ddp_data_loaders_train_sampler_world_size(cfg, jsonl_path, splits_path):
     train_loader, _, _ = make_ddp_data_loaders(cfg, jsonl_path, splits_path, rank=0, world_size=2)
     assert train_loader.sampler.num_replicas == 2
