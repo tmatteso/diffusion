@@ -7,13 +7,17 @@ import torch
 import torch.nn as nn
 from einops import rearrange, reduce
 
-from helpers.featurize import FeaturizedBatch
+from helpers.featurize import Distogram, FeaturizedBatch
+from helpers.atom_utils import Protein
 from sample.sampling import (
     ATOM5_TO_ATOM37,
     NATOM,
+    AllAtomContext,
+    TemplateContext,
     EDMPrecond,
     EDMSampler,
     atom5_to_atom37,
+    build_AA_context,
     build_sampling_context,
     build_template_context,
 )
@@ -685,189 +689,296 @@ def test_edm_sampler_s_tmin_above_sigma_max_disables_injection(
 
 
 # ---------------------------------------------------------------------------
+# build_AA_context — constants
+# ---------------------------------------------------------------------------
+
+N_RES_AA    = 6
+N_ATOM_AA   = N_RES_AA * NATOM    # 30
+AA_SEQ_AA   = "ACDEFG"            # len == N_RES_AA
+C_RES_AA    = 32
+N_ATOM_BINS = 22
+
+
+# ---------------------------------------------------------------------------
+# build_AA_context — fixtures
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def atom37_pos() -> torch.Tensor:
+    return torch.randn(N_RES_AA, 37, 3)
+
+
+@pytest.fixture
+def atom37_mask_all() -> torch.Tensor:
+    return torch.ones(N_RES_AA, 37)
+
+
+@pytest.fixture
+def residue_idx_aa() -> torch.Tensor:
+    return torch.arange(N_RES_AA, dtype=torch.float)
+
+
+@pytest.fixture
+def aa_emb() -> nn.Embedding:
+    return nn.Embedding(256, C_RES_AA)
+
+
+@pytest.fixture
+def atom_disto_fn() -> Distogram:
+    return Distogram(n_bins=N_ATOM_BINS, min_dist=2.0, max_dist=22.0)
+
+
+@pytest.fixture
+def aa_ctx(
+    atom37_pos, atom37_mask_all, residue_idx_aa, aa_emb, atom_disto_fn
+) -> AllAtomContext:
+    with torch.no_grad():
+        return build_AA_context(
+            atom_37_coordinate_tensor=atom37_pos,
+            atom_37_mask=atom37_mask_all,
+            residue_index=residue_idx_aa,
+            index_embedding=aa_emb,
+            aa_sequence=AA_SEQ_AA,
+            atom_distogram_fn=atom_disto_fn,
+            batch_size=2,
+            device="cpu",
+        )
+
+
+# ---------------------------------------------------------------------------
+# build_AA_context — return type
+# ---------------------------------------------------------------------------
+
+def test_build_aa_context_returns_all_atom_context(aa_ctx):
+    assert isinstance(aa_ctx, AllAtomContext)
+
+
+# ---------------------------------------------------------------------------
+# build_AA_context — tensor shapes
+# ---------------------------------------------------------------------------
+
+def test_build_aa_context_r_gt_shape(aa_ctx):
+    assert aa_ctx.r_gt.shape == (2, N_ATOM_AA, 3)
+
+
+def test_build_aa_context_atom5_mask_shape(aa_ctx):
+    assert aa_ctx.atom5_mask.shape == (2, N_ATOM_AA)
+
+
+def test_build_aa_context_residue_mask_shape(aa_ctx):
+    assert aa_ctx.residue_mask.shape == (2, N_RES_AA)
+
+
+def test_build_aa_context_aa_indices_shape(aa_ctx):
+    assert aa_ctx.aa_indices.shape == (2, N_RES_AA)
+
+
+def test_build_aa_context_f_residue_idx_shape(aa_ctx):
+    assert aa_ctx.f_residue_idx.shape == (2, N_RES_AA, C_RES_AA)
+
+
+def test_build_aa_context_gt_atom_distogram_sparse_atom_dim(aa_ctx):
+    assert aa_ctx.gt_atom_distogram_sparse.shape[1] == N_ATOM_AA
+
+
+def test_build_aa_context_gt_atom_distogram_sparse_n_bins(aa_ctx):
+    assert aa_ctx.gt_atom_distogram_sparse.shape[3] == N_ATOM_BINS
+
+
+def test_build_aa_context_gt_atom_distogram_mask_consistent_with_sparse(aa_ctx):
+    B_dim, N_a, K, _ = aa_ctx.gt_atom_distogram_sparse.shape
+    assert aa_ctx.gt_atom_distogram_mask_sparse.shape == (B_dim, N_a, K)
+
+
+# ---------------------------------------------------------------------------
+# build_AA_context — tensor values
+# ---------------------------------------------------------------------------
+
+def test_build_aa_context_r_gt_is_finite(aa_ctx):
+    assert torch.isfinite(aa_ctx.r_gt).all()
+
+
+def test_build_aa_context_f_residue_idx_is_finite(aa_ctx):
+    assert torch.isfinite(aa_ctx.f_residue_idx).all()
+
+
+def test_build_aa_context_gt_atom_distogram_sparse_is_finite(aa_ctx):
+    assert torch.isfinite(aa_ctx.gt_atom_distogram_sparse).all()
+
+
+def test_build_aa_context_full_mask_gives_all_true_residue_mask(aa_ctx):
+    assert aa_ctx.residue_mask.all()
+
+
+def test_build_aa_context_full_mask_gives_all_true_atom5_mask(aa_ctx):
+    assert aa_ctx.atom5_mask.all()
+
+
+def test_build_aa_context_aa_indices_match_restype_order(aa_ctx):
+    from helpers.atom_utils import restype_order as _ro
+    expected = torch.tensor([_ro[c] for c in AA_SEQ_AA], dtype=torch.long)
+    assert torch.equal(aa_ctx.aa_indices[0], expected)
+
+
+def test_build_aa_context_all_batch_slices_of_r_gt_are_identical(aa_ctx):
+    assert torch.equal(aa_ctx.r_gt[0], aa_ctx.r_gt[1])
+
+
+def test_build_aa_context_all_batch_slices_of_aa_indices_are_identical(aa_ctx):
+    assert torch.equal(aa_ctx.aa_indices[0], aa_ctx.aa_indices[1])
+
+
+def test_build_aa_context_batch_size_controls_leading_dim(
+    atom37_pos, atom37_mask_all, residue_idx_aa, aa_emb, atom_disto_fn
+):
+    with torch.no_grad():
+        ctx = build_AA_context(
+            atom37_pos, atom37_mask_all, residue_idx_aa, aa_emb,
+            AA_SEQ_AA, atom_disto_fn, batch_size=3, device="cpu",
+        )
+    assert ctx.r_gt.shape[0] == 3
+    assert ctx.aa_indices.shape[0] == 3
+
+
+# ---------------------------------------------------------------------------
+# build_template_context — constants and helpers
+# ---------------------------------------------------------------------------
+
+N_TEMPL_BINS = 39    # 38 distance bins + 1 overflow bin
+
+
+def _make_protein(n_res: int, mask_value: float = 1.0) -> Protein:
+    rng = np.random.RandomState(42)
+    return Protein(
+        atom_positions=rng.randn(n_res, 37, 3).astype(np.float32),
+        aatype=np.zeros(n_res, dtype=np.int32),
+        atom_mask=np.full((n_res, 37), mask_value, dtype=np.float32),
+        residue_index=np.arange(n_res, dtype=np.int32),
+        chain_index=np.zeros(n_res, dtype=np.int32),
+        b_factors=np.ones((n_res, 37), dtype=np.float32),
+    )
+
+
+# ---------------------------------------------------------------------------
 # build_template_context — fixtures
 # ---------------------------------------------------------------------------
 
-N_TEMPL_BINS = 39   # 38 distance bins + 1 overflow, matching ModelParams.n_bins
-MOTIF_START  = 1    # residues [1, 3) are known in the partial-template fixture
-MOTIF_END    = 3
+@pytest.fixture
+def np_protein() -> Protein:
+    return _make_protein(N_RES)
 
 
 @pytest.fixture
-def template_cb() -> torch.Tensor:
-    return torch.randn(N_RES, 3)
+def np_protein_short() -> Protein:
+    return _make_protein(N_RES - 2)    # shorter, for padding test
 
 
 @pytest.fixture
-def full_mask() -> torch.Tensor:
-    return torch.ones(N_RES)
+def templ_disto() -> Distogram:
+    return Distogram(n_bins=N_TEMPL_BINS - 1, min_dist=3.25, max_dist=50.75, overflow_bin=True)
 
 
 @pytest.fixture
-def partial_mask() -> torch.Tensor:
-    mask = torch.zeros(N_RES)
-    mask[MOTIF_START:MOTIF_END] = 1.0
-    return mask
+def template_ctx(np_protein, templ_disto) -> TemplateContext:
+    return build_template_context([np_protein], templ_disto)
 
 
 @pytest.fixture
-def full_template_context(index_embedding, template_cb, full_mask) -> FeaturizedBatch:
-    return build_template_context(
-        N_RES, index_embedding, template_cb, full_mask, n_templ_bins=N_TEMPL_BINS
-    )
-
-
-@pytest.fixture
-def partial_template_context(index_embedding, template_cb, partial_mask) -> FeaturizedBatch:
-    return build_template_context(
-        N_RES, index_embedding, template_cb, partial_mask, n_templ_bins=N_TEMPL_BINS
-    )
+def template_ctx_batch2(np_protein, templ_disto) -> TemplateContext:
+    return build_template_context([np_protein, np_protein], templ_disto)
 
 
 # ---------------------------------------------------------------------------
 # build_template_context — return type
 # ---------------------------------------------------------------------------
 
-def test_build_template_context_returns_featurized_batch(full_template_context):
-    assert isinstance(full_template_context, FeaturizedBatch)
+def test_build_template_context_returns_template_context(template_ctx):
+    assert isinstance(template_ctx, TemplateContext)
 
 
 # ---------------------------------------------------------------------------
 # build_template_context — tensor shapes
 # ---------------------------------------------------------------------------
 
-def test_build_template_context_gt_res_distogram_shape(full_template_context):
-    assert full_template_context.gt_res_distogram.shape == (1, N_RES, N_RES, N_TEMPL_BINS)
+def test_build_template_context_f_template_distogram_shape(template_ctx):
+    assert template_ctx.f_template_distogram.shape == (1, N_RES, N_RES, N_TEMPL_BINS)
 
 
-def test_build_template_context_f_pseudo_beta_mask_shape(full_template_context):
-    assert full_template_context.f_pseudo_beta_mask.shape == (1, N_RES)
+def test_build_template_context_f_pseudo_beta_mask_shape(template_ctx):
+    assert template_ctx.f_pseudo_beta_mask.shape == (1, N_RES)
 
 
-def test_build_template_context_batch_size_sets_leading_dim(index_embedding, template_cb, full_mask):
-    ctx = build_template_context(
-        N_RES, index_embedding, template_cb, full_mask, batch_size=3, n_templ_bins=N_TEMPL_BINS
-    )
-    assert ctx.gt_res_distogram.shape[0] == 3
-    assert ctx.f_pseudo_beta_mask.shape[0] == 3
-
-
-def test_build_template_context_custom_n_templ_bins(index_embedding, template_cb, full_mask):
-    ctx = build_template_context(
-        N_RES, index_embedding, template_cb, full_mask, n_templ_bins=20
-    )
-    assert ctx.gt_res_distogram.shape == (1, N_RES, N_RES, 20)
+def test_build_template_context_batch_size_is_len_proteins(template_ctx_batch2):
+    assert template_ctx_batch2.f_template_distogram.shape[0] == 2
+    assert template_ctx_batch2.f_pseudo_beta_mask.shape[0] == 2
 
 
 # ---------------------------------------------------------------------------
 # build_template_context — tensor dtypes
 # ---------------------------------------------------------------------------
 
-def test_build_template_context_gt_res_distogram_dtype_is_long(full_template_context):
-    assert full_template_context.gt_res_distogram.dtype == torch.long
+def test_build_template_context_f_template_distogram_dtype_is_long(template_ctx):
+    assert template_ctx.f_template_distogram.dtype == torch.long
 
 
-def test_build_template_context_f_pseudo_beta_mask_dtype_is_long(full_template_context):
-    assert full_template_context.f_pseudo_beta_mask.dtype == torch.long
+def test_build_template_context_f_pseudo_beta_mask_dtype_is_long(template_ctx):
+    assert template_ctx.f_pseudo_beta_mask.dtype == torch.long
 
 
 # ---------------------------------------------------------------------------
-# build_template_context — full template mask values
+# build_template_context — distogram properties
 # ---------------------------------------------------------------------------
 
-def test_build_template_context_full_mask_f_pseudo_beta_mask_all_ones(full_template_context):
-    assert (full_template_context.f_pseudo_beta_mask == 1).all()
-
-
-def test_build_template_context_gt_res_distogram_is_valid_one_hot(full_template_context):
+def test_build_template_context_distogram_is_valid_one_hot(template_ctx):
     bin_sums = reduce(
-        full_template_context.gt_res_distogram.float(), "b i j bins -> b i j", "sum"
+        template_ctx.f_template_distogram.float(), "b i j bins -> b i j", "sum"
     )
     assert torch.allclose(bin_sums, torch.ones_like(bin_sums))
 
 
-def test_build_template_context_gt_res_distogram_is_symmetric(full_template_context):
-    disto = full_template_context.gt_res_distogram
+def test_build_template_context_distogram_is_symmetric(template_ctx):
+    disto = template_ctx.f_template_distogram
     assert torch.equal(disto, rearrange(disto, "b i j k -> b j i k"))
 
 
-def test_build_template_context_gt_res_distogram_is_nonzero_for_full_template(full_template_context):
-    # At least one bin per pair must be 1; the sum over bins is always 1 but we
-    # additionally verify the max along the bin dim is 1 everywhere.
-    assert (reduce(full_template_context.gt_res_distogram, "b i j bins -> b i j", "max") == 1).all()
+def test_build_template_context_different_proteins_give_different_distograms(templ_disto):
+    rng_a = np.random.RandomState(1)
+    rng_b = np.random.RandomState(2)
+    prot_a = _make_protein(N_RES)
+    prot_b = Protein(
+        atom_positions=(rng_b.randn(N_RES, 37, 3) * 20).astype(np.float32),
+        aatype=np.zeros(N_RES, dtype=np.int32),
+        atom_mask=np.ones((N_RES, 37), dtype=np.float32),
+        residue_index=np.arange(N_RES, dtype=np.int32),
+        chain_index=np.zeros(N_RES, dtype=np.int32),
+        b_factors=np.ones((N_RES, 37), dtype=np.float32),
+    )
+    ctx_a = build_template_context([prot_a], templ_disto)
+    ctx_b = build_template_context([prot_b], templ_disto)
+    assert not torch.equal(ctx_a.f_template_distogram, ctx_b.f_template_distogram)
 
 
 # ---------------------------------------------------------------------------
-# build_template_context — partial template mask values
+# build_template_context — mask values
 # ---------------------------------------------------------------------------
 
-def test_build_template_context_partial_motif_residues_have_mask_one(partial_template_context):
-    mask = partial_template_context.f_pseudo_beta_mask[0]
-    assert (mask[MOTIF_START:MOTIF_END] == 1).all()
+def test_build_template_context_full_ca_mask_gives_all_ones_pseudo_beta_mask(template_ctx):
+    assert (template_ctx.f_pseudo_beta_mask == 1).all()
 
 
-def test_build_template_context_partial_non_motif_residues_have_mask_zero(partial_template_context):
-    mask = partial_template_context.f_pseudo_beta_mask[0]
-    non_motif = torch.cat([mask[:MOTIF_START], mask[MOTIF_END:]])
-    assert (non_motif == 0).all()
-
-
-def test_build_template_context_partial_mask_differs_from_full_mask(
-    full_template_context, partial_template_context
+def test_build_template_context_padded_residues_have_zero_pseudo_beta_mask(
+    np_protein_short, templ_disto
 ):
-    assert not torch.equal(
-        full_template_context.f_pseudo_beta_mask,
-        partial_template_context.f_pseudo_beta_mask,
-    )
+    # np_protein_short has N_RES-2 residues; batched with full-length protein it is
+    # padded to N_RES. The 2 trailing padded residues must have mask 0.
+    prot_full = _make_protein(N_RES)
+    ctx = build_template_context([prot_full, np_protein_short], templ_disto)
+    assert (ctx.f_pseudo_beta_mask[1, N_RES - 2 :] == 0).all()
 
 
-def test_build_template_context_zero_mask_gives_zero_f_pseudo_beta_mask(
-    index_embedding, template_cb
+def test_build_template_context_non_padded_residues_have_nonzero_pseudo_beta_mask(
+    np_protein_short, templ_disto
 ):
-    zero_mask = torch.zeros(N_RES)
-    ctx = build_template_context(
-        N_RES, index_embedding, template_cb, zero_mask, n_templ_bins=N_TEMPL_BINS
-    )
-    assert (ctx.f_pseudo_beta_mask == 0).all()
-
-
-# ---------------------------------------------------------------------------
-# build_template_context — static fields inherited from build_sampling_context
-# ---------------------------------------------------------------------------
-
-def test_build_template_context_static_fields_match_unconditional_context(
-    index_embedding, template_cb, full_mask
-):
-    tmpl_ctx = build_template_context(
-        N_RES, index_embedding, template_cb, full_mask, n_templ_bins=N_TEMPL_BINS
-    )
-    base_ctx = build_sampling_context(N_RES, index_embedding, n_templ_bins=N_TEMPL_BINS)
-    assert torch.equal(tmpl_ctx.ref_pos,    base_ctx.ref_pos)
-    assert torch.equal(tmpl_ctx.tok_idx,    base_ctx.tok_idx)
-    assert torch.equal(tmpl_ctx.center_uid, base_ctx.center_uid)
-    assert torch.equal(tmpl_ctx.ref_element, base_ctx.ref_element)
-
-
-def test_build_template_context_r_input_placeholder_is_zero(full_template_context):
-    assert (full_template_context.r_input == 0).all()
-
-
-# ---------------------------------------------------------------------------
-# build_template_context — sensitivity to coordinates
-# ---------------------------------------------------------------------------
-
-def test_build_template_context_different_coords_give_different_distograms(
-    index_embedding, full_mask
-):
-    # Scale by 20 Å so pairwise distances span multiple bins (bin range 3.25–50.75 Å).
-    torch.manual_seed(11)
-    cb_a = torch.randn(N_RES, 3) * 20.0
-    torch.manual_seed(22)
-    cb_b = torch.randn(N_RES, 3) * 20.0
-    ctx_a = build_template_context(
-        N_RES, index_embedding, cb_a, full_mask, n_templ_bins=N_TEMPL_BINS
-    )
-    ctx_b = build_template_context(
-        N_RES, index_embedding, cb_b, full_mask, n_templ_bins=N_TEMPL_BINS
-    )
-    assert not torch.equal(ctx_a.gt_res_distogram, ctx_b.gt_res_distogram)
+    prot_full = _make_protein(N_RES)
+    ctx = build_template_context([prot_full, np_protein_short], templ_disto)
+    assert (ctx.f_pseudo_beta_mask[1, : N_RES - 2] == 1).all()

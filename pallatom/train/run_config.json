@@ -4,7 +4,7 @@
     "lr": 0.0003,
     "weight_decay": 0.0001,
     "grad_clip": 2.0,
-    "pretrained_weights": null
+    "pretrained_weights": "pallatom_best_best.pt"
   },
   "model": {
     "f_ref_dim": 35,

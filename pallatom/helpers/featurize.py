@@ -292,7 +292,7 @@ def featurize_batch(
     )
     _center_single: Int[torch.Tensor, "N_res"] = (
         torch.arange(N_res_total, dtype=torch.long, device=device) * Natom + 1
-    )
+    ) # should always be the alpha carbon
     tok_idx:    Int[torch.Tensor, "B N_atom"] = _tok_single.unsqueeze(0).expand(B, -1).contiguous()
     center_uid: Int[torch.Tensor, "B N_res"]  = _center_single.unsqueeze(0).expand(B, -1).contiguous()
 
@@ -309,9 +309,9 @@ def featurize_batch(
     n_atom_bins: int = gt_atom_disto_dense.shape[-1]
 
     # Vectorised sparse gather: result[b, l, k] = dense[b, l, neighbor_idx[l, k]]
-    nbr_b = neighbor_idx.unsqueeze(0).expand(B, -1, -1)  # (B, N_atom, K)
+    nbr_b: Int[torch.Tensor, "B N_atom K"] = repeat(neighbor_idx, 'n k -> b n k', b=B)
     gt_atom_distogram_sparse: Float[torch.Tensor, "B N_atom K n_atom_bins"] = (
-        gt_atom_disto_dense.gather(2, nbr_b.unsqueeze(-1).expand(-1, -1, -1, n_atom_bins))
+        gt_atom_disto_dense.gather(2, repeat(nbr_b, 'b n k -> b n k d', d=n_atom_bins))
     )
     gt_atom_distogram_mask_sparse: Bool[torch.Tensor, "B N_atom K"] = (
         gt_atom_mask_dense.long().gather(2, nbr_b).bool()

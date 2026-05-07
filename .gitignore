@@ -5,6 +5,10 @@
 htmlcov/
 # wandb
 wandb/
+# checkpoints
+checkpoint_*
+# logs 
+pallatom/train/*logs.jsonl
 # repo specific ignores
 pallatom/data/
 train_datasets/
