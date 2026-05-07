@@ -667,86 +667,88 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     dist.init_process_group(backend="nccl")
-    rank       = dist.get_rank()
-    local_rank = int(os.environ["LOCAL_RANK"])
-    world_size = dist.get_world_size()
-    device     = f"cuda:{local_rank}"
-    torch.cuda.set_device(local_rank)
-
-    _processors = [
-        structlog.processors.TimeStamper(fmt="iso", utc=True),
-        structlog.stdlib.add_log_level,
-        structlog.processors.StackInfoRenderer(),
-    ]
-    if args.log_file and rank == 0:
-        _processors.append(_FileLogProcessor(args.log_file))
-    _processors.append(structlog.dev.ConsoleRenderer())
-
-    structlog.configure(
-        processors=_processors,
-        wrapper_class=structlog.make_filtering_bound_logger(20),
-        context_class=dict,
-        logger_factory=structlog.PrintLoggerFactory(),
-    )
-
-    import traceback as _tb
-
     try:
-        if args.config is not None:
-            with open(args.config) as _f:
-                tcfg = TrainConfig.model_validate_json(_f.read())
-        else:
-            tcfg = TrainConfig()
+        rank       = dist.get_rank()
+        local_rank = int(os.environ["LOCAL_RANK"])
+        world_size = dist.get_world_size()
+        device     = f"cuda:{local_rank}"
+        torch.cuda.set_device(local_rank)
 
-        train_loader, val_loader, _ = make_ddp_data_loaders(
-            tcfg, args.data, args.splits,
-            rank=rank, world_size=world_size,
-            num_workers=args.num_workers,
+        _processors = [
+            structlog.processors.TimeStamper(fmt="iso", utc=True),
+            structlog.stdlib.add_log_level,
+            structlog.processors.StackInfoRenderer(),
+        ]
+        if args.log_file and rank == 0:
+            _processors.append(_FileLogProcessor(args.log_file))
+        if rank == 0:
+            _processors.append(structlog.dev.ConsoleRenderer())
+
+        structlog.configure(
+            processors=_processors,
+            wrapper_class=structlog.make_filtering_bound_logger(20),
+            context_class=dict,
+            logger_factory=structlog.PrintLoggerFactory(),
         )
 
-        mp = tcfg.model
-        model = MainTrunk(
-            f_ref_dim=mp.f_ref_dim,
-            n_bins=mp.n_bins,
-            n_atom_bins=tcfg.distogram_atom.n_bins,
-            c_atom=mp.c_atom,
-            c_pair=mp.c_pair,
-            c_res=mp.c_res,
-            c_atompair=mp.c_atompair,
-            K_unit=mp.K_unit,
-            sigma_data=tcfg.noise.sigma_data,
-        ).to(device)
+        import traceback as _tb
 
-        dr = tcfg.distogram_res
-        da = tcfg.distogram_atom
-        distogram_res   = Distogram(n_bins=dr.n_bins, min_dist=dr.min_dist, max_dist=dr.max_dist, overflow_bin=True).to(device)
-        distogram_atom  = Distogram(n_bins=da.n_bins, min_dist=da.min_dist, max_dist=da.max_dist).to(device)
-        index_embedding = nn.Embedding(tcfg.model.max_residues, tcfg.model.c_res).to(device)
+        try:
+            if args.config is not None:
+                with open(args.config) as _f:
+                    tcfg = TrainConfig.model_validate_json(_f.read())
+            else:
+                tcfg = TrainConfig()
 
-        if tcfg.training.pretrained_weights is not None:
-            ckpt = torch.load(tcfg.training.pretrained_weights, map_location=device)
-            model.load_state_dict(ckpt["model"])
-            index_embedding.load_state_dict(ckpt["index_embedding"])
-            if rank == 0:
-                log.info("loaded pretrained weights", path=tcfg.training.pretrained_weights)
+            train_loader, val_loader, _ = make_ddp_data_loaders(
+                tcfg, args.data, args.splits,
+                rank=rank, world_size=world_size,
+                num_workers=args.num_workers,
+            )
 
-        if rank == 0 and tcfg.logging.use_wandb:
-            wandb.init(project=tcfg.logging.wandb_project, config=tcfg.model_dump())
+            mp = tcfg.model
+            model = MainTrunk(
+                f_ref_dim=mp.f_ref_dim,
+                n_bins=mp.n_bins,
+                n_atom_bins=tcfg.distogram_atom.n_bins,
+                c_atom=mp.c_atom,
+                c_pair=mp.c_pair,
+                c_res=mp.c_res,
+                c_atompair=mp.c_atompair,
+                K_unit=mp.K_unit,
+                sigma_data=tcfg.noise.sigma_data,
+            ).to(device)
 
-        train_ddp(
-            rank=rank,
-            local_rank=local_rank,
-            world_size=world_size,
-            model=model,
-            tcfg=tcfg,
-            train_loader=train_loader,
-            test_loader=val_loader,
-            distogram_res=distogram_res,
-            distogram_atom=distogram_atom,
-            index_embedding=index_embedding,
-        )
-    except Exception as _exc:
-        log.error("fatal", error=str(_exc), traceback=_tb.format_exc())
-        raise SystemExit(1) from _exc
+            dr = tcfg.distogram_res
+            da = tcfg.distogram_atom
+            distogram_res   = Distogram(n_bins=dr.n_bins, min_dist=dr.min_dist, max_dist=dr.max_dist, overflow_bin=True).to(device)
+            distogram_atom  = Distogram(n_bins=da.n_bins, min_dist=da.min_dist, max_dist=da.max_dist).to(device)
+            index_embedding = nn.Embedding(tcfg.model.max_residues, tcfg.model.c_res).to(device)
+
+            if tcfg.training.pretrained_weights is not None:
+                ckpt = torch.load(tcfg.training.pretrained_weights, map_location=device)
+                model.load_state_dict(ckpt["model"])
+                index_embedding.load_state_dict(ckpt["index_embedding"])
+                if rank == 0:
+                    log.info("loaded pretrained weights", path=tcfg.training.pretrained_weights)
+
+            if rank == 0 and tcfg.logging.use_wandb:
+                wandb.init(project=tcfg.logging.wandb_project, config=tcfg.model_dump())
+
+            train_ddp(
+                rank=rank,
+                local_rank=local_rank,
+                world_size=world_size,
+                model=model,
+                tcfg=tcfg,
+                train_loader=train_loader,
+                test_loader=val_loader,
+                distogram_res=distogram_res,
+                distogram_atom=distogram_atom,
+                index_embedding=index_embedding,
+            )
+        except Exception as _exc:
+            log.error("fatal", error=str(_exc), traceback=_tb.format_exc())
+            raise SystemExit(1) from _exc
     finally:
         dist.destroy_process_group()
