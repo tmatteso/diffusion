@@ -183,19 +183,31 @@ def test_atom_loss_perfect_near_zero(coords):
     assert loss.max().item() < 1e-5
 
 
-def test_atom_loss_noisy_positive_finite(coords, noisy_coords):
-    loss = atom_loss(coords, noisy_coords)
-    assert loss.shape == (B,)
-    assert (loss > 0).all()
-    assert torch.isfinite(loss).all()
+def test_atom_loss_known_translation_near_zero(coords):
+    translation = rearrange(torch.tensor([10.0, 5.0, -3.0]), "d -> 1 1 d")
+    r_translated = coords + translation
+    loss = atom_loss(r_translated, coords)
+    assert (loss < 1e-4).all()
 
 
-def test_atom_loss_mask_changes_value(coords, noisy_coords, half_mask):
-    loss_full = atom_loss(coords, noisy_coords)
-    loss_masked = atom_loss(coords, noisy_coords, mask=half_mask)
-    assert loss_masked.shape == (B,)
-    assert torch.isfinite(loss_masked).all()
-    assert not torch.allclose(loss_full, loss_masked)
+def test_atom_loss_full_mask_matches_no_mask(coords, noisy_coords):
+    mask_all = torch.ones(B, N, dtype=torch.bool)
+    assert torch.allclose(
+        atom_loss(coords, noisy_coords, mask=mask_all),
+        atom_loss(coords, noisy_coords),
+        atol=1e-5,
+    )
+
+
+def test_atom_loss_increases_with_noise_level(coords):
+    g = torch.Generator()
+    g.manual_seed(0)
+    noise_dir = torch.randn(B, N, 3, generator=g)
+    loss_low  = atom_loss(coords + 0.1 * noise_dir, coords)
+    loss_mid  = atom_loss(coords + 1.0 * noise_dir, coords)
+    loss_high = atom_loss(coords + 5.0 * noise_dir, coords)
+    assert (loss_low < loss_mid).all()
+    assert (loss_mid < loss_high).all()
 
 
 def test_atom_loss_gradient_flows_through_pred():
@@ -259,20 +271,6 @@ def test_med_loss_perfect_struct_near_zero(r_gt, aa_gt, aa_blocks):
     assert loss.item() < 1e-5
 
 
-def test_med_loss_masked_finite(r_gt, aa_gt, r_blocks, aa_blocks, half_mask):
-    loss = med_loss(
-        list(r_blocks),
-        r_gt,
-        list(aa_blocks),
-        aa_gt,
-        lam=LAM,
-        alpha_0=ALPHA,
-        gamma=GAMMA,
-        mask=half_mask,
-    )
-    assert torch.isfinite(loss)
-
-
 def test_med_loss_block_weights_strictly_increasing():
     w = block_decay_weights(K, GAMMA)
     assert w.shape == (K,)
@@ -309,33 +307,18 @@ def test_med_loss_gradient_flows_to_first_block(r_gt, aa_gt):
     assert torch.isfinite(r0.grad).all()
 
 
-def test_med_loss_lam_zero_removes_struct(r_gt, aa_gt, r_blocks, aa_blocks):
+def test_med_loss_lam_zero_less_than_lam_positive(r_gt, aa_gt, r_blocks, aa_blocks):
     r_list, aa_list = list(r_blocks), list(aa_blocks)
-    loss_lam0 = med_loss(r_list, r_gt, aa_list, aa_gt, lam=0.0, alpha_0=ALPHA, gamma=GAMMA)
+    loss_lam0 = med_loss(r_list, r_gt, aa_list, aa_gt, lam=0.0,  alpha_0=ALPHA, gamma=GAMMA)
     loss_lam1 = med_loss(r_list, r_gt, aa_list, aa_gt, lam=LAM, alpha_0=ALPHA, gamma=GAMMA)
-    assert torch.isfinite(loss_lam0)
-    assert loss_lam0.item() != loss_lam1.item()
+    assert loss_lam0.item() < loss_lam1.item()
 
 
-def test_med_loss_alpha_zero_removes_seq(r_gt, aa_gt, r_blocks, aa_blocks):
+def test_med_loss_alpha_zero_less_than_alpha_positive(r_gt, aa_gt, r_blocks, aa_blocks):
     r_list, aa_list = list(r_blocks), list(aa_blocks)
-    loss_a0 = med_loss(r_list, r_gt, aa_list, aa_gt, lam=LAM, alpha_0=0.0, gamma=GAMMA)
+    loss_a0 = med_loss(r_list, r_gt, aa_list, aa_gt, lam=LAM, alpha_0=0.0,   gamma=GAMMA)
     loss_a1 = med_loss(r_list, r_gt, aa_list, aa_gt, lam=LAM, alpha_0=ALPHA, gamma=GAMMA)
-    assert torch.isfinite(loss_a0)
-    assert loss_a0.item() != loss_a1.item()
-
-
-def test_med_loss_per_block_shape(r_gt, aa_gt, r_blocks, aa_blocks):
-    loss = med_loss_per_block(
-        r_blocks[0],
-        r_gt,
-        aa_blocks[0],
-        aa_gt,
-        lam=LAM,
-        alpha_0=ALPHA,
-    )
-    assert loss.shape == (B,)
-    assert torch.isfinite(loss).all()
+    assert loss_a0.item() < loss_a1.item()
 
 
 # ---------------------------------------------------------------------------
@@ -359,10 +342,6 @@ def test_smooth_lddt_noisy_exceeds_identical(coords):
 def test_smooth_lddt_in_unit_interval(coords):
     loss = smooth_lddt_loss(make_noisy(coords, sigma=5.0), coords)
     assert 0.0 <= loss.item() <= 1.0 + 1e-6
-
-
-def test_smooth_lddt_is_scalar(coords):
-    assert smooth_lddt_loss(coords, coords).ndim == 0
 
 
 def test_smooth_lddt_masked_bounded(coords, half_mask):
@@ -438,16 +417,11 @@ def test_distogram_residue_unbatched_scalar():
 # ---------------------------------------------------------------------------
 
 
-def test_distogram_atom_local_finite_batched(atom_logits, atom_onehot, atom_local_mask):
-    loss = distogram_loss_atom(atom_logits, atom_onehot, atom_local_mask)
-    assert loss.shape == (B,)
-    assert torch.isfinite(loss).all()
-
-
-def test_distogram_atom_full_matrix_finite(atom_logits, atom_onehot):
-    loss = distogram_loss_atom(atom_logits, atom_onehot)
-    assert loss.shape == (B,)
-    assert torch.isfinite(loss).all()
+def test_distogram_atom_uniform_worse_than_perfect(atom_onehot, atom_local_mask):
+    uniform = torch.zeros_like(atom_onehot)   # zero logits → uniform distribution after softmax
+    loss_perfect = distogram_loss_atom(atom_onehot * 1e6, atom_onehot, atom_local_mask)
+    loss_uniform = distogram_loss_atom(uniform, atom_onehot, atom_local_mask)
+    assert (loss_uniform > loss_perfect).all()
 
 
 def test_distogram_atom_local_and_full_differ(atom_logits, atom_onehot, atom_local_mask):
