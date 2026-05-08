@@ -392,3 +392,19 @@ def test_rbf_rotation_invariant(rbf, r_center):
         b_orig = rbf(compute_dij(r_center))
         b_rot = rbf(compute_dij(apply_rotation(r_center, R)))
     assert torch.allclose(b_orig, b_rot, atol=1e-5)
+
+
+def test_pair_update_translation_invariant(pair_update, z, r_center):
+    t = torch.randn(1, 1, 3)
+    with torch.no_grad():
+        out_orig = pair_update(z, r_center)
+        out_shift = pair_update(z, r_center + t)
+    assert torch.allclose(out_orig, out_shift, atol=1e-5)
+
+
+def test_pair_update_rotation_invariant(pair_update, z, r_center):
+    R = random_rotation()
+    with torch.no_grad():
+        out_orig = pair_update(z, r_center)
+        out_rot = pair_update(z, apply_rotation(r_center, R))
+    assert torch.allclose(out_orig, out_rot, atol=1e-5)
