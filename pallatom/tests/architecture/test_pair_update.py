@@ -358,7 +358,7 @@ def test_tri_start_changes_with_pair_bias(tri_start, z):
 # Geometric Invariance
 # Layer 1: distance computation is invariant to translation and rotation.
 # Layer 2: TransformRBF output is invariant (invariant input → invariant output).
-# Layer 3: PairUpdate end-to-end output is invariant.
+# Layer 3: PairUpdate end-to-end output is invariant (coordinates enter only through b_ij).
 # ---------------------------------------------------------------------------
 
 
