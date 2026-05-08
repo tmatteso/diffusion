@@ -1,9 +1,8 @@
 import pytest
 import torch
-from einops import einsum
-
-from helpers.alignment import apply_transform, kabsch_align, kabsch_rmsd
 from architecture.losses import atom_loss
+from einops import einsum
+from helpers.alignment import apply_transform, kabsch_align, kabsch_rmsd
 
 torch.manual_seed(42)
 N, B = 50, 8
@@ -43,23 +42,31 @@ def test_rotation_translation_rmsd_near_zero(ref, rigid_mobile):
     assert kabsch_rmsd(rigid_mobile, ref).item() < 1e-3
 
 
-def test_batched_rmsd_shape_positive_finite(batch_ref, noisy_mobile):
-    rmsds = kabsch_rmsd(noisy_mobile, batch_ref)
+def test_kabsch_rmsd_batched_rigid_transforms_near_zero(batch_ref):
+    torch.manual_seed(0)
+    mobiles = []
+    for i in range(B):
+        Q, _ = torch.linalg.qr(torch.randn(3, 3))
+        if torch.linalg.det(Q) < 0:
+            Q[:, 0] *= -1
+        t = torch.randn(1, 3)
+        mobiles.append(einsum(batch_ref[i], Q, "n d, e d -> n e") + t)
+    mobiles = torch.stack(mobiles)
+    rmsds = kabsch_rmsd(mobiles, batch_ref)
     assert rmsds.shape == (B,)
-    assert (rmsds > 0).all()
-    assert torch.isfinite(rmsds).all()
+    assert (rmsds < 5e-4).all()
 
 
 def test_masked_rmsd_near_zero(ref, rigid_mobile, tail_weights):
     assert kabsch_rmsd(rigid_mobile, ref, weights=tail_weights).item() < 1e-3
 
 
-def test_apply_transform_shape(ref, rigid_mobile):
-    full_mobile = torch.randn(N, 4, 3)
+def test_apply_transform_reconstructs_target(ref, rigid_mobile):
     _, R, c_mob, c_tgt = kabsch_align(
         rigid_mobile.unsqueeze(0), ref.unsqueeze(0), return_transform=True
     )
-    assert apply_transform(full_mobile, R, c_mob, c_tgt).shape == (N, 4, 3)
+    aligned = apply_transform(rigid_mobile, R, c_mob, c_tgt)
+    assert torch.allclose(aligned, ref, atol=1e-4)
 
 
 def test_identity_alignment_unchanged(ref):
