@@ -1,43 +1,44 @@
 import pytest
 import torch
 import torch.nn.functional as F
-from beartype import beartype
-from einops import einsum, rearrange, reduce, repeat
-from jaxtyping import Bool, Float, Int, jaxtyped
-
 from architecture.main_trunk import (
     AtomDistogramHead,
     MainTrunk,
-    RelativePositionEncoding,
     ResidueDistogramHead,
     TimeFourierEmbedding,
     scatter_mean,
     sinusoidal_encoding,
 )
+from beartype import beartype
+from einops import einsum, rearrange, reduce, repeat
 from helpers.featurize import FeaturizedBatch
+from jaxtyping import Float, Int, jaxtyped
 
 torch.manual_seed(42)
 
 B = 2
 N_RES = 50
 ATOMS_PER_RES = 3
-N_ATOM = N_RES * ATOMS_PER_RES   # 150
-E = 4                             # element one-hot dim
+N_ATOM = N_RES * ATOMS_PER_RES  # 150
+E = 4  # element one-hot dim
 C_RES = 32
 C_PAIR = 32
 C_ATOM = 32
 C_ATOMPAIR = 16
 N_BINS = 38
-N_ATOM_BINS = 22   # distinct from N_BINS; must match AtomDistogramParams.n_bins
+N_ATOM_BINS = 22  # distinct from N_BINS; must match AtomDistogramParams.n_bins
 K_UNIT = 2
 # WINDOW_SIZE=32 (half=16); interior residues span 31 residues × 3 atoms/res = 93 atom neighbours
 K_SPARSE = 93
-F_REF_DIM = ATOMS_PER_RES * (3 + E)  # encoder groups all sibling atoms: n_per_res*(pos_dim+elem_dim)
+F_REF_DIM = ATOMS_PER_RES * (
+    3 + E
+)  # encoder groups all sibling atoms: n_per_res*(pos_dim+elem_dim)
 
 
 # ---------------------------------------------------------------------------
 # Typed helpers
 # ---------------------------------------------------------------------------
+
 
 @jaxtyped(typechecker=beartype)
 def sq_dist_matrix(
@@ -59,6 +60,7 @@ def mean_abs_asymmetry(
 # Model fixture
 # ---------------------------------------------------------------------------
 
+
 @pytest.fixture
 def model():
     return MainTrunk(
@@ -78,6 +80,7 @@ def model():
 # ---------------------------------------------------------------------------
 # Input tensor fixtures  (all have leading B dim)
 # ---------------------------------------------------------------------------
+
 
 @pytest.fixture
 def ref_pos():
@@ -140,6 +143,7 @@ def gt_atom_distogram_mask_sparse():
 # FeaturizedBatch fixture and forward helper
 # ---------------------------------------------------------------------------
 
+
 @pytest.fixture
 def featurized_batch(
     ref_pos,
@@ -184,6 +188,7 @@ def _forward(model: MainTrunk, batch: FeaturizedBatch):
 # sinusoidal_encoding
 # ---------------------------------------------------------------------------
 
+
 def test_sinusoidal_encoding_output_shape():
     positions = repeat(torch.arange(N_RES, dtype=torch.float32), "n -> b n", b=2)
     out = sinusoidal_encoding(positions, dim=C_RES)
@@ -202,6 +207,7 @@ def test_sinusoidal_encoding_varies_across_positions():
 # TimeFourierEmbedding
 # ---------------------------------------------------------------------------
 
+
 def test_time_fourier_embedding_output_shape(model):
     out = model.time_fourier(torch.randn(N_RES))
     assert out.shape == (N_RES, C_RES)
@@ -219,6 +225,7 @@ def test_time_fourier_embedding_gradient_flows_to_freqs():
 # RelativePositionEncoding
 # ---------------------------------------------------------------------------
 
+
 def test_rel_pos_enc_output_shape(model):
     out = model.rel_pos_enc(N_RES, torch.device("cpu"))
     assert out.shape == (N_RES, N_RES, C_PAIR)
@@ -234,6 +241,7 @@ def test_rel_pos_enc_deterministic(model):
 # ---------------------------------------------------------------------------
 # ResidueDistogramHead
 # ---------------------------------------------------------------------------
+
 
 def test_residue_distogram_head_output_shape():
     head = ResidueDistogramHead(C_PAIR, n_bins=N_BINS)
@@ -252,6 +260,7 @@ def test_residue_distogram_head_output_symmetric():
 # AtomDistogramHead
 # ---------------------------------------------------------------------------
 
+
 def test_atom_distogram_head_output_shapes():
     head = AtomDistogramHead(C_ATOMPAIR, n_bins=N_BINS, atoms_per_res=ATOMS_PER_RES)
     logits, mask = head(torch.randn(N_ATOM, N_ATOM, C_ATOMPAIR))
@@ -259,7 +268,9 @@ def test_atom_distogram_head_output_shapes():
     assert mask.shape == (N_ATOM, N_ATOM)
     assert mask.dtype == torch.bool
     assert torch.isfinite(logits).all()
-    assert logits.std(dim=-1).min().item() > 0   # logits vary across bin dimension
+    assert (
+        logits[mask].std(dim=-1).min().item() > 0
+    )  # logits vary across bin dimension for local-window pairs
 
 
 def test_atom_distogram_head_mask_includes_diagonal():
@@ -277,6 +288,7 @@ def test_atom_distogram_head_mask_symmetric():
 # ---------------------------------------------------------------------------
 # MainTrunk.forward — output shapes and values
 # ---------------------------------------------------------------------------
+
 
 def test_main_trunk_r_denoised_shape_finite(model, featurized_batch):
     r_denoised, *_ = _forward(model, featurized_batch)
@@ -312,6 +324,7 @@ def test_main_trunk_atom_distogram_bins_match_ground_truth(model, featurized_bat
 
 def test_main_trunk_distogram_loss_atom_computable(model, featurized_batch):
     from architecture.losses import distogram_loss_atom
+
     _, _, _, atom_logits, *_ = _forward(model, featurized_batch)
     loss = distogram_loss_atom(
         atom_logits,
@@ -346,6 +359,7 @@ def test_main_trunk_gradient_flows_to_r_input(model, featurized_batch):
     assert r_input_g.grad is not None
     assert torch.isfinite(r_input_g.grad).all()
 
+
 # you need to add integration tests here. don't be afraid to use pytest mocks.
 
 
@@ -355,7 +369,7 @@ def test_main_trunk_gradient_flows_to_r_input(model, featurized_batch):
 
 _SM_B = 2
 _SM_N_RES = 4
-_SM_N_ATOM = 8   # 2 atoms per residue
+_SM_N_ATOM = 8  # 2 atoms per residue
 _SM_C = 6
 
 
@@ -382,19 +396,19 @@ def sm_index(sm_tok_idx) -> Int[torch.Tensor, "B N_atom"]:
 
 def test_scatter_mean_known_values_uniform():
     # B=1, 2 atoms per residue, C=1; manually verify pair-wise means
-    src = torch.tensor([[[0.], [2.], [4.], [6.]]])  # (1, 4, 1)
-    index = torch.tensor([[0, 0, 1, 1]])             # (1, 4)
+    src = torch.tensor([[[0.0], [2.0], [4.0], [6.0]]])  # (1, 4, 1)
+    index = torch.tensor([[0, 0, 1, 1]])  # (1, 4)
     out = scatter_mean(src, index, 2, 1)
-    expected = torch.tensor([[[1.], [5.]]])           # mean(0,2)=1, mean(4,6)=5
+    expected = torch.tensor([[[1.0], [5.0]]])  # mean(0,2)=1, mean(4,6)=5
     assert torch.allclose(out, expected)
 
 
 def test_scatter_mean_known_values_nonuniform():
     # B=1, residue 0 has 3 atoms, residue 1 has 2 atoms, C=1
-    src = torch.tensor([[[1.], [3.], [5.], [7.], [9.]]])  # (1, 5, 1)
-    index = torch.tensor([[0, 0, 0, 1, 1]])               # (1, 5)
+    src = torch.tensor([[[1.0], [3.0], [5.0], [7.0], [9.0]]])  # (1, 5, 1)
+    index = torch.tensor([[0, 0, 0, 1, 1]])  # (1, 5)
     out = scatter_mean(src, index, 2, 1)
-    expected = torch.tensor([[[3.], [8.]]])                # mean(1,3,5)=3, mean(7,9)=8
+    expected = torch.tensor([[[3.0], [8.0]]])  # mean(1,3,5)=3, mean(7,9)=8
     assert torch.allclose(out, expected)
 
 
@@ -402,9 +416,9 @@ def test_scatter_mean_one_atom_per_residue():
     # 1:1 atom-to-residue mapping — output must equal src exactly
     B_sm, N_sm, C_sm = 2, 4, 6
     src = torch.randn(B_sm, N_sm, C_sm)
-    base   = repeat(torch.arange(N_sm), "n -> b n", b=B_sm)
+    base = repeat(torch.arange(N_sm), "n -> b n", b=B_sm)
     offset = repeat(torch.arange(B_sm) * N_sm, "b -> b n", n=N_sm)
-    index  = base + offset   # [[0,1,2,3],[4,5,6,7]]
+    index = base + offset  # [[0,1,2,3],[4,5,6,7]]
     out = scatter_mean(src, index, B_sm * N_sm, B_sm)
     assert torch.allclose(out, src)
 
@@ -417,8 +431,8 @@ def test_scatter_mean_constant_src_returns_that_constant():
     src = torch.full((B_sm, N_src, C_sm), val)
     tok_idx = torch.repeat_interleave(torch.arange(N_tgt), atoms_per)
     tok_idx = repeat(tok_idx, "n -> b n", b=B_sm)
-    offset  = repeat(torch.arange(B_sm) * N_tgt, "b -> b n", n=N_src)
-    index   = tok_idx + offset
+    offset = repeat(torch.arange(B_sm) * N_tgt, "b -> b n", n=N_src)
+    index = tok_idx + offset
     out = scatter_mean(src, index, B_sm * N_tgt, B_sm)
     assert torch.allclose(out, torch.full((B_sm, N_tgt, C_sm), val))
 
@@ -426,16 +440,16 @@ def test_scatter_mean_constant_src_returns_that_constant():
 def test_scatter_mean_batch_items_independent():
     # Zeroing batch item 1's src must leave batch item 0's output unchanged
     B_sm, N_src, N_tgt, C_sm = 2, 8, 4, 6
-    src  = torch.randn(B_sm, N_src, C_sm)
+    src = torch.randn(B_sm, N_src, C_sm)
     src0 = src.clone()
     src0[1] = 0.0
 
     tok_base = torch.repeat_interleave(torch.arange(N_tgt), 2)  # [0,0,1,1,2,2,3,3]
-    tok_idx  = repeat(tok_base, "n -> b n", b=B_sm)
-    offset   = repeat(torch.arange(B_sm) * N_tgt, "b -> b n", n=N_src)
-    index    = tok_idx + offset
+    tok_idx = repeat(tok_base, "n -> b n", b=B_sm)
+    offset = repeat(torch.arange(B_sm) * N_tgt, "b -> b n", n=N_src)
+    index = tok_idx + offset
 
-    out_full = scatter_mean(src,  index, B_sm * N_tgt, B_sm)
+    out_full = scatter_mean(src, index, B_sm * N_tgt, B_sm)
     out_zero = scatter_mean(src0, index, B_sm * N_tgt, B_sm)
     assert torch.allclose(out_full[0], out_zero[0])
 
@@ -446,7 +460,7 @@ def test_scatter_mean_multichannel_mean_matches_per_channel():
     N_src = N_tgt * atoms_per
     src = torch.randn(B_sm, N_src, C_sm)
     tok_idx = torch.repeat_interleave(torch.arange(N_tgt), atoms_per)
-    index   = repeat(tok_idx, "n -> b n", b=B_sm)
+    index = repeat(tok_idx, "n -> b n", b=B_sm)
 
     out = scatter_mean(src, index, B_sm * N_tgt, B_sm)
 
