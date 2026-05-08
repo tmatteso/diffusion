@@ -376,3 +376,19 @@ def test_distance_rotation_invariant(r_center):
         d_orig = compute_dij(r_center)
         d_rot = compute_dij(apply_rotation(r_center, R))
     assert torch.allclose(d_orig, d_rot, atol=1e-5)
+
+
+def test_rbf_translation_invariant(rbf, r_center):
+    t = torch.randn(1, 1, 3)
+    with torch.no_grad():
+        b_orig = rbf(compute_dij(r_center))
+        b_shift = rbf(compute_dij(r_center + t))
+    assert torch.allclose(b_orig, b_shift, atol=1e-5)
+
+
+def test_rbf_rotation_invariant(rbf, r_center):
+    R = random_rotation()
+    with torch.no_grad():
+        b_orig = rbf(compute_dij(r_center))
+        b_rot = rbf(compute_dij(apply_rotation(r_center, R)))
+    assert torch.allclose(b_orig, b_rot, atol=1e-5)
