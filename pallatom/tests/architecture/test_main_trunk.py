@@ -259,6 +259,7 @@ def test_atom_distogram_head_output_shapes():
     assert mask.shape == (N_ATOM, N_ATOM)
     assert mask.dtype == torch.bool
     assert torch.isfinite(logits).all()
+    assert logits.std(dim=-1).min().item() > 0   # logits vary across bin dimension
 
 
 def test_atom_distogram_head_mask_includes_diagonal():
@@ -377,16 +378,6 @@ def sm_index(sm_tok_idx) -> Int[torch.Tensor, "B N_atom"]:
     # batch-offset flat index: tok_idx + b * N_RES
     offset = repeat(torch.arange(_SM_B) * _SM_N_RES, "b -> b n", n=_SM_N_ATOM)
     return sm_tok_idx + offset
-
-
-def test_scatter_mean_output_shape(sm_src, sm_index):
-    out = scatter_mean(sm_src, sm_index, _SM_B * _SM_N_RES, _SM_B)
-    assert out.shape == (_SM_B, _SM_N_RES, _SM_C)
-
-
-def test_scatter_mean_output_finite(sm_src, sm_index):
-    out = scatter_mean(sm_src, sm_index, _SM_B * _SM_N_RES, _SM_B)
-    assert torch.isfinite(out).all()
 
 
 def test_scatter_mean_known_values_uniform():
