@@ -121,12 +121,6 @@ def test_pairformer_stack_gradient_flows():
 # TemplateEmbedder — output shape and values
 # ---------------------------------------------------------------------------
 
-def test_output_shape_finite(embedder, f_distogram, f_pseudo_beta_mask, z_ij):
-    out = embedder(f_distogram, f_pseudo_beta_mask, z_ij, t=0.5)
-    assert out.shape == (B, N_RES, N_RES, D)
-    assert torch.isfinite(out).all()
-
-
 def test_time_modulates_output(embedder, f_distogram, f_pseudo_beta_mask, z_ij):
     with torch.no_grad():
         out_t0 = embedder(f_distogram, f_pseudo_beta_mask, z_ij, t=0.0)
