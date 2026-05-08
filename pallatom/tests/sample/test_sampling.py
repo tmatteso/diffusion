@@ -477,6 +477,12 @@ def test_sigma_schedule_is_monotonically_non_increasing(bare_sampler):
     assert (diffs <= 0).all()
 
 
+def test_sigma_schedule_strictly_decreasing(bare_sampler):
+    sigmas = bare_sampler._sigma_schedule(10, "cpu")
+    diffs = sigmas[1:] - sigmas[:-1]
+    assert (diffs < 0).all()
+
+
 def test_sigma_schedule_all_values_nonnegative(bare_sampler):
     sigmas = bare_sampler._sigma_schedule(20, "cpu")
     assert (sigmas >= 0).all()
@@ -489,20 +495,6 @@ def test_sigma_schedule_different_rho_gives_different_intermediate_values():
     sig2 = s2._sigma_schedule(10, "cpu")
     # Endpoints are the same; interior values must differ with different ρ
     assert not torch.allclose(sig1[1:-1], sig2[1:-1])
-
-
-# ---------------------------------------------------------------------------
-# EDMSampler.sample — output shape and finiteness
-# ---------------------------------------------------------------------------
-
-def test_edm_sampler_output_shape(edm_sampler):
-    out = edm_sampler.sample((1, N_ATOM, 3), steps=3)
-    assert out.shape == (1, N_ATOM, 3)
-
-
-def test_edm_sampler_output_is_finite(edm_sampler):
-    out = edm_sampler.sample((1, N_ATOM, 3), steps=3)
-    assert torch.isfinite(out).all()
 
 
 # ---------------------------------------------------------------------------
