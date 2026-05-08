@@ -1,9 +1,5 @@
 import pytest
 import torch
-from beartype import beartype
-from einops import rearrange, reduce
-from jaxtyping import Float, jaxtyped
-
 from architecture.pair_update import (
     DropoutColumnwise,
     DropoutRowwise,
@@ -13,6 +9,9 @@ from architecture.pair_update import (
     TriangleAttentionEndingNodeWithBias,
     TriangleAttentionStartingNodeWithBias,
 )
+from beartype import beartype
+from einops import einsum, rearrange, reduce
+from jaxtyping import Float, jaxtyped
 
 torch.manual_seed(42)
 
@@ -26,6 +25,7 @@ B = 2
 # Typed helpers
 # ---------------------------------------------------------------------------
 
+
 @jaxtyped(typechecker=beartype)
 def mean_abs_asymmetry(
     x: Float[torch.Tensor, "B N N C"],
@@ -33,9 +33,34 @@ def mean_abs_asymmetry(
     return reduce((x - rearrange(x, "b i j c -> b j i c")).abs(), "b i j c -> ", "mean")
 
 
+@jaxtyped(typechecker=beartype)
+def compute_dij(
+    r: Float[torch.Tensor, "B N_res 3"],
+) -> Float[torch.Tensor, "B N_res N_res"]:
+    diff = rearrange(r, "b n d -> b n 1 d") - rearrange(r, "b n d -> b 1 n d")
+    return diff.norm(dim=-1)
+
+
+@jaxtyped(typechecker=beartype)
+def random_rotation() -> Float[torch.Tensor, "3 3"]:
+    Q, _ = torch.linalg.qr(torch.randn(3, 3))
+    if Q.det() < 0:
+        Q[:, 0] = -Q[:, 0]
+    return Q
+
+
+@jaxtyped(typechecker=beartype)
+def apply_rotation(
+    r: Float[torch.Tensor, "B N_res 3"],
+    R: Float[torch.Tensor, "3 3"],
+) -> Float[torch.Tensor, "B N_res 3"]:
+    return einsum(r, R, "b n d, d e -> b n e")
+
+
 # ---------------------------------------------------------------------------
 # Model fixtures
 # ---------------------------------------------------------------------------
+
 
 @pytest.fixture
 def rbf():
@@ -66,6 +91,7 @@ def pair_update():
 # Input tensor fixtures
 # ---------------------------------------------------------------------------
 
+
 @pytest.fixture
 def z():
     return torch.randn(B, N_RES, N_RES, C)
@@ -92,6 +118,7 @@ def r_center():
 # TransformRBF
 # ---------------------------------------------------------------------------
 
+
 def test_transform_rbf_output_shape(rbf, d):
     with torch.no_grad():
         out = rbf(d)
@@ -114,6 +141,7 @@ def test_transform_rbf_symmetric_distance_gives_symmetric_output(rbf, d):
 # ---------------------------------------------------------------------------
 # TriangleAttentionStartingNodeWithBias
 # ---------------------------------------------------------------------------
+
 
 def test_tri_start_output_shape(tri_start, z, b):
     with torch.no_grad():
@@ -143,13 +171,14 @@ def test_tri_start_row_independence(tri_start, z, b):
     z_mod[:, 0] = torch.randn_like(z_mod[:, 0])
     with torch.no_grad():
         out_orig = tri_start(z, b)
-        out_mod  = tri_start(z_mod, b)
+        out_mod = tri_start(z_mod, b)
     assert torch.allclose(out_orig[:, 1:], out_mod[:, 1:], atol=1e-5)
 
 
 # ---------------------------------------------------------------------------
 # TriangleAttentionEndingNodeWithBias
 # ---------------------------------------------------------------------------
+
 
 def test_tri_end_output_shape(tri_end, z, b):
     with torch.no_grad():
@@ -179,13 +208,14 @@ def test_tri_end_col_independence(tri_end, z, b):
     z_mod[:, :, 0, :] = torch.randn_like(z_mod[:, :, 0, :])
     with torch.no_grad():
         out_orig = tri_end(z, b)
-        out_mod  = tri_end(z_mod, b)
+        out_mod = tri_end(z_mod, b)
     assert torch.allclose(out_orig[:, :, 1:, :], out_mod[:, :, 1:, :], atol=1e-5)
 
 
 # ---------------------------------------------------------------------------
 # Transition
 # ---------------------------------------------------------------------------
+
 
 def test_transition_output_shape_3d(transition, z):
     with torch.no_grad():
@@ -218,6 +248,7 @@ def test_transition_gradient_flows(transition, z):
 # DropoutRowwise
 # ---------------------------------------------------------------------------
 
+
 def test_dropout_rowwise_eval_is_identity(z):
     drop = DropoutRowwise(p=0.5)
     drop.eval()
@@ -240,13 +271,16 @@ def test_dropout_rowwise_train_zeroes_entire_rows():
     drop.train()
     out = drop(x)
     for i in range(N_RES):
-        row = out[0, i]   # shape (N_RES, C) — check first batch item
-        assert torch.allclose(row, torch.zeros_like(row)) or torch.allclose(row, torch.ones_like(row))
+        row = out[0, i]  # shape (N_RES, C) — check first batch item
+        assert torch.allclose(row, torch.zeros_like(row)) or torch.allclose(
+            row, torch.ones_like(row)
+        )
 
 
 # ---------------------------------------------------------------------------
 # DropoutColumnwise
 # ---------------------------------------------------------------------------
+
 
 def test_dropout_columnwise_eval_is_identity(z):
     drop = DropoutColumnwise(p=0.5)
@@ -269,13 +303,16 @@ def test_dropout_columnwise_train_zeroes_entire_cols():
     drop.train()
     out = drop(x)
     for j in range(N_RES):
-        col = out[0, :, j, :]   # shape (N_RES, C) — check first batch item
-        assert torch.allclose(col, torch.zeros_like(col)) or torch.allclose(col, torch.ones_like(col))
+        col = out[0, :, j, :]  # shape (N_RES, C) — check first batch item
+        assert torch.allclose(col, torch.zeros_like(col)) or torch.allclose(
+            col, torch.ones_like(col)
+        )
 
 
 # ---------------------------------------------------------------------------
 # PairUpdate
 # ---------------------------------------------------------------------------
+
 
 def test_pair_update_changes_input(pair_update, z, r_center):
     with torch.no_grad():
