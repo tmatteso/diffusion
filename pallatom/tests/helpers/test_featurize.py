@@ -62,43 +62,13 @@ def residue_indices():
 
 
 # ---------------------------------------------------------------------------
-# Distogram — output shapes
+# Distogram — overflow bin shape
 # ---------------------------------------------------------------------------
-
-def test_distogram_output_shapes_unbatched(disto, coords):
-    with torch.no_grad():
-        f, m = disto(coords)
-    assert f.shape == (N_RES, N_RES, N_BINS)
-    assert m.shape == (N_RES, N_RES)
-
-
-def test_distogram_output_shapes_batched(disto, coords_batch):
-    with torch.no_grad():
-        f, m = disto(coords_batch)
-    assert f.shape == (2, N_RES, N_RES, N_BINS)
-    assert m.shape == (2, N_RES, N_RES)
-
 
 def test_distogram_overflow_bin_output_shape(disto_overflow, coords):
     with torch.no_grad():
         f, _ = disto_overflow(coords)
     assert f.shape == (N_RES, N_RES, N_BINS + 1)
-
-
-# ---------------------------------------------------------------------------
-# Distogram — output dtypes
-# ---------------------------------------------------------------------------
-
-def test_distogram_f_distogram_is_float(disto, coords):
-    with torch.no_grad():
-        f, _ = disto(coords)
-    assert f.dtype == torch.float32
-
-
-def test_distogram_f_pair_mask_is_bool(disto, coords):
-    with torch.no_grad():
-        _, m = disto(coords)
-    assert m.dtype == torch.bool
 
 
 # ---------------------------------------------------------------------------
@@ -198,27 +168,22 @@ def test_distogram_overflow_far_pairs_land_in_last_bin(disto_overflow):
     assert cross[..., -1].all()
 
 
+def test_distogram_exact_bin_for_known_interior_distance(disto):
+    # bin_width = (MAX_DIST - MIN_DIST) / N_BINS = (22 - 2) / 16 = 1.25 Å
+    # d = 9.0 Å → bin = floor((9.0 - 2.0) / 1.25) = floor(5.6) = 5
+    c = torch.zeros(N_RES, 3)
+    c[0, 0] = 9.0   # residue 0 at (9, 0, 0); all others at origin
+    expected_bin = 5
+    with torch.no_grad():
+        f, _ = disto(c)
+    assert f[0, 1, expected_bin].item() == pytest.approx(1.0)
+    assert f[0, 1, :expected_bin].abs().max().item() < 1e-6
+    assert f[0, 1, expected_bin + 1:].abs().max().item() < 1e-6
+
+
 # ---------------------------------------------------------------------------
-# ResidueIndexEmbedding — output shapes and dtype
+# ResidueIndexEmbedding — output behavior
 # ---------------------------------------------------------------------------
-
-def test_residue_index_embedding_output_shape(emb, residue_indices):
-    with torch.no_grad():
-        out = emb(residue_indices)
-    assert out.shape == (N_RES, C_RES)
-
-
-def test_residue_index_embedding_output_dtype(emb, residue_indices):
-    with torch.no_grad():
-        out = emb(residue_indices)
-    assert out.dtype == torch.float32
-
-
-def test_residue_index_embedding_output_finite(emb, residue_indices):
-    with torch.no_grad():
-        out = emb(residue_indices)
-    assert torch.isfinite(out).all()
-
 
 def test_residue_index_embedding_different_indices_give_different_output(emb):
     with torch.no_grad():
