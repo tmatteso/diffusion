@@ -277,18 +277,6 @@ def test_dropout_columnwise_train_zeroes_entire_cols():
 # PairUpdate
 # ---------------------------------------------------------------------------
 
-def test_pair_update_output_shape(pair_update, z, r_center):
-    with torch.no_grad():
-        out = pair_update(z, r_center)
-    assert out.shape == (B, N_RES, N_RES, C)
-
-
-def test_pair_update_output_finite(pair_update, z, r_center):
-    with torch.no_grad():
-        out = pair_update(z, r_center)
-    assert torch.isfinite(out).all()
-
-
 def test_pair_update_changes_input(pair_update, z, r_center):
     with torch.no_grad():
         out = pair_update(z, r_center)
@@ -318,3 +306,20 @@ def test_pair_update_no_nan_grad_from_zero_diagonal_distance(pair_update):
     out = pair_update(torch.randn(B, N_RES, N_RES, C), r_g)
     reduce(out, "b n m c -> ", "sum").backward()
     assert torch.isfinite(r_g.grad).all()
+
+
+def test_pair_update_symmetric_input_symmetric_output(pair_update, r_center):
+    z_raw = torch.randn(B, N_RES, N_RES, C)
+    z_sym = (z_raw + z_raw.transpose(1, 2)) / 2
+    with torch.no_grad():
+        out = pair_update(z_sym, r_center)
+    assert mean_abs_asymmetry(out).item() < 1e-4
+
+
+def test_tri_start_changes_with_pair_bias(tri_start, z):
+    b1 = torch.randn(B, N_RES, N_RES, C)
+    b2 = torch.randn(B, N_RES, N_RES, C)
+    with torch.no_grad():
+        out1 = tri_start(z, b1)
+        out2 = tri_start(z, b2)
+    assert not torch.allclose(out1, out2)
