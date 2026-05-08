@@ -62,19 +62,17 @@ def spread_loader(spread_positions, all_ones_mask):
 # compute_sigma_data
 # ---------------------------------------------------------------------------
 
-def test_compute_sigma_data_returns_float(constant_positions, all_ones_mask):
-    result = compute_sigma_data(_loader(_batch(constant_positions, all_ones_mask)))
-    assert isinstance(result, float)
-
-
-def test_compute_sigma_data_positive(constant_positions, all_ones_mask):
-    assert compute_sigma_data(_loader(_batch(constant_positions, all_ones_mask))) > 0.0
-
-
 def test_compute_sigma_data_known_value(constant_positions, all_ones_mask):
     # All norms = 2.0 → RMS = 2.0
     result = compute_sigma_data(_loader(_batch(constant_positions, all_ones_mask)))
     assert math.isclose(result, 2.0, rel_tol=1e-5)
+
+
+def test_compute_sigma_data_atoms_at_origin():
+    pos = torch.zeros(2, 4, 37, 3)   # all atoms at origin: every norm = 0
+    mask = torch.ones(2, 4, 37)
+    result = compute_sigma_data(_loader(_batch(pos, mask)))
+    assert math.isclose(result, 0.0, abs_tol=1e-8)
 
 
 def test_compute_sigma_data_mask_excludes_zero_atoms():
