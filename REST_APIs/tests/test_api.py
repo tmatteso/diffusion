@@ -1,4 +1,4 @@
-"""Tests for SampleRequest validation and _protein_from_pdb_string."""
+"""Tests for SampleRequest validation."""
 
 import os
 import sys
