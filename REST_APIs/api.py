@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 from einops import rearrange
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 # ── resolve pallatom onto the path ────────────────────────────────────────────
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -40,6 +40,7 @@ _semaphore: asyncio.Semaphore
 
 
 # ── model loading ─────────────────────────────────────────────────────────────
+
 
 def _load_model(
     checkpoint_path: str,
@@ -91,13 +92,61 @@ app = FastAPI(
 
 # ── request / response schemas ────────────────────────────────────────────────
 
+_VALID_AA: frozenset[str] = frozenset("ARNDCQEGHILKMFPSTWYVX")
+
+
 class SampleRequest(BaseModel):
-    n_res: int = Field(100, gt=0, le=256, description="Number of residues to generate")
-    n_samples: int = Field(1, gt=0, le=10, description="Number of structures to generate in parallel")
-    ddim_steps: int = Field(40, gt=1, description="Number of ODE solver steps (more = higher quality)")
+    # --- target ---
+    n_res: int = Field(..., gt=0, le=512, description="Number of residues to generate")
+
+    # --- conditioning (all optional) ---
+    sequence: str | None = Field(
+        None,
+        description=(
+            "Amino-acid sequence of length n_res. "
+            "Standard 20 AAs plus 'X' for unknown. "
+            "Omit for no sequence conditioning ('X' * n_res is used internally)."
+        ),
+    )
+    structure_pdb: str | None = Field(
+        None,
+        description=(
+            "PDB string for atom-level conditioning. "
+            "Residues present in the PDB fill r_gt/atom5_mask; uncovered positions are zeroed. "
+            "Must cover ≤ n_res residues."
+        ),
+    )
+    template_pdb: str | None = Field(
+        None,
+        description=(
+            "PDB string for template-distogram conditioning. "
+            "May cover fewer than n_res residues (padded with zeros)."
+        ),
+    )
+
+    # --- sampler ---
+    n_samples: int = Field(
+        1, gt=0, le=10, description="Number of structures to generate in parallel"
+    )
+    ddim_steps: int = Field(40, gt=1, description="ODE solver steps (more = higher quality)")
     rho: float = Field(7.0, gt=0, description="Karras noise-schedule exponent")
-    S_churn: float = Field(0.0, ge=0, description="Stochasticity per step (0 = fully deterministic)")
-    S_noise: float = Field(1.003, gt=0, description="Noise scaling applied during stochastic steps")
+    S_churn: float = Field(0.0, ge=0, description="Stochasticity per step (0 = deterministic)")
+    S_noise: float = Field(1.003, gt=0, description="Noise scaling for stochastic steps")
+
+    @field_validator("sequence")
+    @classmethod
+    def sequence_valid_characters(cls, v: str | None) -> str | None:
+        if v is not None:
+            invalid = set(v) - _VALID_AA
+            if invalid:
+                raise ValueError(f"Invalid characters in sequence: {sorted(invalid)!r}")
+        return v
+
+    @model_validator(mode="after")
+    def sequence_length_matches_n_res(self) -> "SampleRequest":
+        if self.sequence is not None and len(self.sequence) != self.n_res:
+            raise ValueError(f"sequence length {len(self.sequence)} must equal n_res {self.n_res}")
+        return self
 
 
 class SampleResponse(BaseModel):
@@ -108,6 +157,7 @@ class SampleResponse(BaseModel):
 
 
 # ── synchronous sampling work (runs in a thread-pool executor) ────────────────
+
 
 def _run_sampling(req: SampleRequest) -> list[str]:
     model: MainTrunk = _state["model"]
@@ -153,9 +203,7 @@ def _run_sampling(req: SampleRequest) -> list[str]:
 
     pdb_strings: list[str] = []
     for b in range(B):
-        coords_np = rearrange(
-            coords_batch[b].cpu().numpy(), "(n a) d -> n a d", n=N_res, a=NATOM
-        )
+        coords_np = rearrange(coords_batch[b].cpu().numpy(), "(n a) d -> n a d", n=N_res, a=NATOM)
         x_37, mask_37 = atom5_to_atom37(coords_np)
         prot = Protein(
             atom_positions=x_37,
@@ -171,6 +219,7 @@ def _run_sampling(req: SampleRequest) -> list[str]:
 
 
 # ── endpoints ─────────────────────────────────────────────────────────────────
+
 
 @app.get("/health")
 async def health() -> dict:
