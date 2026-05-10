@@ -130,7 +130,7 @@ def build_AA_context(
     batch_size: int,
     device: str,
 ) -> AllAtomContext:
-    _aa_vals = [restype_order[r] for r in aa_sequence]
+    _aa_vals = [restype_order.get(r, 20) for r in aa_sequence]
     aa_indices_i: Int[torch.Tensor, N_res] = torch.tensor(_aa_vals, dtype=torch.long, device=device)
     f_residue_idx_i: Float[torch.Tensor, "N_res c_res"] = index_embedding(residue_index.long())
 

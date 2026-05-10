@@ -1481,3 +1481,63 @@ def test_full_atoms_partial_templ_aa_indices_all_alanine(full_atoms_partial_temp
 def test_full_atoms_partial_templ_r_gt_all_finite_and_nonzero(full_atoms_partial_templ_ctx):
     assert torch.isfinite(full_atoms_partial_templ_ctx.r_gt).all()
     assert not (full_atoms_partial_templ_ctx.r_gt == 0).all()
+
+
+# ---------------------------------------------------------------------------
+# build_AA_context — 'X' residue handling
+# ---------------------------------------------------------------------------
+
+
+def test_build_aa_context_x_sequence_does_not_raise(atom_disto_fn, residue_idx_aa, aa_emb):
+    with torch.no_grad():
+        ctx = build_AA_context(
+            atom_37_coordinate_tensor=torch.zeros(N_RES_AA, 37, 3),
+            atom_37_mask=torch.zeros(N_RES_AA, 37),
+            residue_index=residue_idx_aa,
+            index_embedding=aa_emb,
+            aa_sequence="X" * N_RES_AA,
+            atom_distogram_fn=atom_disto_fn,
+            batch_size=1,
+            device="cpu",
+        )
+    assert isinstance(ctx, AllAtomContext)
+
+
+def test_build_aa_context_x_maps_to_index_20(atom_disto_fn, residue_idx_aa, aa_emb):
+    with torch.no_grad():
+        ctx = build_AA_context(
+            atom_37_coordinate_tensor=torch.zeros(N_RES_AA, 37, 3),
+            atom_37_mask=torch.zeros(N_RES_AA, 37),
+            residue_index=residue_idx_aa,
+            index_embedding=aa_emb,
+            aa_sequence="X" * N_RES_AA,
+            atom_distogram_fn=atom_disto_fn,
+            batch_size=1,
+            device="cpu",
+        )
+    assert (ctx.aa_indices == 20).all()
+
+
+def test_build_aa_context_x_is_distinct_from_alanine(atom_disto_fn, residue_idx_aa, aa_emb):
+    with torch.no_grad():
+        ctx_x = build_AA_context(
+            atom_37_coordinate_tensor=torch.zeros(N_RES_AA, 37, 3),
+            atom_37_mask=torch.zeros(N_RES_AA, 37),
+            residue_index=residue_idx_aa,
+            index_embedding=aa_emb,
+            aa_sequence="X" * N_RES_AA,
+            atom_distogram_fn=atom_disto_fn,
+            batch_size=1,
+            device="cpu",
+        )
+        ctx_a = build_AA_context(
+            atom_37_coordinate_tensor=torch.zeros(N_RES_AA, 37, 3),
+            atom_37_mask=torch.zeros(N_RES_AA, 37),
+            residue_index=residue_idx_aa,
+            index_embedding=aa_emb,
+            aa_sequence="A" * N_RES_AA,
+            atom_distogram_fn=atom_disto_fn,
+            batch_size=1,
+            device="cpu",
+        )
+    assert not torch.equal(ctx_x.aa_indices, ctx_a.aa_indices)
