@@ -10,6 +10,7 @@ from helpers.featurize import (
     FeaturizedBatch,
     ProteinBatch,
     ResidueIndexEmbedding,
+    apply_conditioning_dropout,
     featurize_batch,
 )
 from train.train_config import TrainConfig
@@ -368,7 +369,7 @@ def test_featurize_batch_returns_featurized_batch_instance(featurized_batch):
 
 
 def test_featurize_batch_rejects_wrong_atom_positions_rank():
-    with pytest.raises(Exception):
+    with pytest.raises((TypeError, Exception)):
         ProteinBatch(
             atom_positions=torch.randn(B, N_RES, 37),  # missing last dim
             atom_mask=torch.ones(B, N_RES, 37),
@@ -379,10 +380,71 @@ def test_featurize_batch_rejects_wrong_atom_positions_rank():
 
 def test_featurize_batch_rejects_wrong_atom_count():
     # atom_positions second-to-last dim must be exactly 37.
-    with pytest.raises(Exception):
+    with pytest.raises((TypeError, Exception)):
         ProteinBatch(
             atom_positions=torch.randn(B, N_RES, 36, 3),
             atom_mask=torch.ones(B, N_RES, 37),
             residue_index=torch.arange(N_RES).float().unsqueeze(0).expand(B, -1).clone(),
             seq=[AA_SEQ, AA_SEQ],
         )
+
+
+# ---------------------------------------------------------------------------
+# apply_conditioning_dropout
+# ---------------------------------------------------------------------------
+
+
+def test_conditioning_dropout_p1_distogram_zeroes_all(featurized_batch):
+    out = apply_conditioning_dropout(
+        featurized_batch, p_distogram=1.0, p_atom=0.0, p_seq=0.0, device="cpu"
+    )
+    # All valid residues should have their rows/cols zeroed
+    assert out.gt_res_distogram.sum() == 0
+    assert out.f_pseudo_beta_mask.sum() == 0
+
+
+def test_conditioning_dropout_p1_atom_zeroes_all(featurized_batch):
+    out = apply_conditioning_dropout(
+        featurized_batch, p_distogram=0.0, p_atom=1.0, p_seq=0.0, device="cpu"
+    )
+    assert not out.atom5_mask.any()
+
+
+def test_conditioning_dropout_p1_seq_sets_all_to_mask_token(featurized_batch):
+    out = apply_conditioning_dropout(
+        featurized_batch, p_distogram=0.0, p_atom=0.0, p_seq=1.0, device="cpu"
+    )
+    valid = featurized_batch.residue_mask
+    assert (out.aa_indices[valid] == 20).all()
+
+
+def test_conditioning_dropout_p0_is_noop(featurized_batch):
+    out = apply_conditioning_dropout(
+        featurized_batch, p_distogram=0.0, p_atom=0.0, p_seq=0.0, device="cpu"
+    )
+    assert torch.equal(out.gt_res_distogram, featurized_batch.gt_res_distogram)
+    assert torch.equal(out.atom5_mask, featurized_batch.atom5_mask)
+    assert torch.equal(out.aa_indices, featurized_batch.aa_indices)
+
+
+def test_conditioning_dropout_distogram_symmetric(featurized_batch):
+    torch.manual_seed(0)
+    out = apply_conditioning_dropout(
+        featurized_batch, p_distogram=0.5, p_atom=0.0, p_seq=0.0, device="cpu"
+    )
+    # If row i is zeroed, column i must also be zeroed (and vice versa)
+    row_sums = out.gt_res_distogram.sum(dim=(2, 3))  # (B, N_res)
+    col_sums = out.gt_res_distogram.sum(dim=(1, 3))  # (B, N_res)
+    assert torch.equal(row_sums == 0, col_sums == 0)
+
+
+def test_conditioning_dropout_respects_residue_mask(featurized_batch):
+    # Padding residues (residue_mask=False) must not be changed
+    batch_with_padding = dataclasses.replace(
+        featurized_batch,
+        residue_mask=torch.zeros_like(featurized_batch.residue_mask, dtype=torch.bool),
+    )
+    out = apply_conditioning_dropout(
+        batch_with_padding, p_distogram=1.0, p_atom=1.0, p_seq=1.0, device="cpu"
+    )
+    assert torch.equal(out.aa_indices, batch_with_padding.aa_indices)
