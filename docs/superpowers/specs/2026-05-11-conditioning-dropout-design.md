@@ -50,7 +50,11 @@ class ConditioningDropoutConfig:
 
 ### Model change
 
-The sequence embedding table is widened from 20 → 21 entries. Index 20 is the mask token for dropped sequence residues. The new row is randomly initialized like any other embedding row.
+`"X"` is appended to `restypes` in `pallatom/helpers/atom_utils.py` (after `"V"` at position 19), making it position 20. Because `restype_order` is built from `restypes` via `enumerate`, `restype_order["X"]` automatically equals 20 and `restype_num` becomes 21. The existing `.get(r, 20)` fallbacks in `featurize.py` and `sampling.py` already handle unknown characters — adding `"X"` explicitly promotes it from a silent fallback to a first-class mask token.
+
+The sequence embedding table in `MainTrunk` is widened from 20 → 21 entries to accommodate index 20. The new row is randomly initialized like any other embedding row.
+
+The sequence prediction head output dimension stays at 20 (`n_amino`). The mask token is an input-side embedding only — the model is never asked to predict `"X"` as an output.
 
 ## Per-Signal Masking Logic
 
