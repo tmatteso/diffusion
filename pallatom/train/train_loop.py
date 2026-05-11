@@ -28,6 +28,11 @@ from train.train_config import TrainConfig
 log = structlog.get_logger()
 
 
+def _mask_seq_target(aa_indices: torch.Tensor) -> torch.Tensor:
+    """Replace mask-token index 20 with -100 so CE loss ignores dropped positions."""
+    return aa_indices.masked_fill(aa_indices == 20, -100)
+
+
 def _to_protein_batch(batch: dict) -> ProteinBatch:
     """Convert a DataLoader dict batch to a ProteinBatch dataclass."""
     return ProteinBatch(
@@ -87,7 +92,7 @@ def evaluate(
         ).mean()
         CE_loss: Float[torch.Tensor, ""] = F.cross_entropy(
             rearrange(f_seq_logits, "b n c -> (b n) c"),
-            rearrange(featurized_batch.aa_indices, "b n -> (b n)"),
+            rearrange(_mask_seq_target(featurized_batch.aa_indices), "b n -> (b n)"),
         )
 
         gt_res_bin_idx: Int[torch.Tensor, "B N_res N_res"] = (
@@ -121,7 +126,7 @@ def evaluate(
                 intermediate_denoised_coord, featurized_batch.r_gt, featurized_batch.atom5_mask
             ) + lp.alpha_0 * F.cross_entropy(
                 rearrange(intermediate_pred_aa_logit_stack[k_idx], "b n c -> (b n) c"),
-                rearrange(featurized_batch.aa_indices, "b n -> (b n)"),
+                rearrange(_mask_seq_target(featurized_batch.aa_indices), "b n -> (b n)"),
             )
             intermediate_med_loss = intermediate_med_loss + gamma_K_minus_k * k_loss
         intermediate_med_loss = (intermediate_med_loss / max(K_unit, 1)).mean()
@@ -205,7 +210,7 @@ def evaluate_ddp(
         ).mean()
         CE_loss: Float[torch.Tensor, ""] = F.cross_entropy(
             rearrange(f_seq_logits, "b n c -> (b n) c"),
-            rearrange(featurized_batch.aa_indices, "b n -> (b n)"),
+            rearrange(_mask_seq_target(featurized_batch.aa_indices), "b n -> (b n)"),
         )
 
         gt_res_bin_idx: Int[torch.Tensor, "B N_res N_res"] = (
@@ -238,7 +243,7 @@ def evaluate_ddp(
                 intermediate_denoised_coord, featurized_batch.r_gt, featurized_batch.atom5_mask
             ) + lp.alpha_0 * F.cross_entropy(
                 rearrange(intermediate_pred_aa_logit_stack[k_idx], "b n c -> (b n) c"),
-                rearrange(featurized_batch.aa_indices, "b n -> (b n)"),
+                rearrange(_mask_seq_target(featurized_batch.aa_indices), "b n -> (b n)"),
             )
             intermediate_med_loss = intermediate_med_loss + gamma_K_minus_k * k_loss
         intermediate_med_loss = (intermediate_med_loss / max(K_unit, 1)).mean()
@@ -351,7 +356,7 @@ def train(
                     intermediate_denoised_coord, featurized_batch.r_gt, featurized_batch.atom5_mask
                 ) + lp.alpha_0 * F.cross_entropy(
                     rearrange(intermediate_pred_aa_logit_stack[k_idx], "b n c -> (b n) c"),
-                    rearrange(featurized_batch.aa_indices, "b n -> (b n)"),
+                    rearrange(_mask_seq_target(featurized_batch.aa_indices), "b n -> (b n)"),
                 )
                 intermediate_med_loss = intermediate_med_loss + gamma_K_minus_k * k_loss
             intermediate_med_loss = (intermediate_med_loss / max(K_unit, 1)).mean()
@@ -381,7 +386,7 @@ def train(
             )
             CE_loss: Float[torch.Tensor, ""] = F.cross_entropy(
                 rearrange(f_seq_logits, "b n c -> (b n) c"),
-                rearrange(featurized_batch.aa_indices, "b n -> (b n)"),
+                rearrange(_mask_seq_target(featurized_batch.aa_indices), "b n -> (b n)"),
             )
 
             total_loss: Float[torch.Tensor, ""] = (
@@ -565,7 +570,7 @@ def train_ddp(
                     intermediate_denoised_coord, featurized_batch.r_gt, featurized_batch.atom5_mask
                 ) + lp.alpha_0 * F.cross_entropy(
                     rearrange(intermediate_pred_aa_logit_stack[k_idx], "b n c -> (b n) c"),
-                    rearrange(featurized_batch.aa_indices, "b n -> (b n)"),
+                    rearrange(_mask_seq_target(featurized_batch.aa_indices), "b n -> (b n)"),
                 )
                 intermediate_med_loss = intermediate_med_loss + gamma_K_minus_k * k_loss
             intermediate_med_loss = (intermediate_med_loss / max(K_unit, 1)).mean()
@@ -595,7 +600,7 @@ def train_ddp(
             )
             CE_loss: Float[torch.Tensor, ""] = F.cross_entropy(
                 rearrange(f_seq_logits, "b n c -> (b n) c"),
-                rearrange(featurized_batch.aa_indices, "b n -> (b n)"),
+                rearrange(_mask_seq_target(featurized_batch.aa_indices), "b n -> (b n)"),
             )
 
             total_loss: Float[torch.Tensor, ""] = (
