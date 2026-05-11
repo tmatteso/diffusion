@@ -4,7 +4,6 @@ from unittest.mock import MagicMock
 import numpy as np
 import pytest
 import torch
-import torch.nn as nn
 from einops import rearrange, reduce
 from helpers.atom_utils import Protein, to_pdb
 from helpers.featurize import Distogram, FeaturizedBatch
@@ -89,12 +88,7 @@ def coords5() -> np.ndarray:
 
 
 @pytest.fixture
-def index_embedding() -> nn.Embedding:
-    return nn.Embedding(256, 32)
-
-
-@pytest.fixture
-def context(index_embedding, atom_disto_fn, templ_disto) -> FeaturizedBatch:
+def context(atom_disto_fn, templ_disto) -> FeaturizedBatch:
     with torch.no_grad():
         return build_sampling_context(
             atom_positions=torch.zeros(N_RES, 37, 3),
@@ -102,9 +96,9 @@ def context(index_embedding, atom_disto_fn, templ_disto) -> FeaturizedBatch:
             residue_index=torch.arange(N_RES, dtype=torch.float),
             seq="A" * N_RES,
             pdb_files=[],
-            index_embedding=index_embedding,
             atom_distogram_fn=atom_disto_fn,
             templ_distogram_fn=templ_disto,
+            c_res=32,
         )
 
 
@@ -143,9 +137,9 @@ def context_c_res_64(atom_disto_fn, templ_disto) -> FeaturizedBatch:
             residue_index=torch.arange(N_RES, dtype=torch.float),
             seq="A" * N_RES,
             pdb_files=[],
-            index_embedding=nn.Embedding(256, 64),
             atom_distogram_fn=atom_disto_fn,
             templ_distogram_fn=templ_disto,
+            c_res=64,
         )
 
 
@@ -369,7 +363,6 @@ def test_build_sampling_context_placeholder_scalars(context):
 
 
 def test_build_sampling_context_n_atom_scales_linearly_with_n_res():
-    emb = nn.Embedding(256, 32)
     a_fn = Distogram(n_bins=22, min_dist=2.0, max_dist=22.0)
     t_fn = Distogram(n_bins=38, min_dist=3.25, max_dist=50.75, overflow_bin=True)
     with torch.no_grad():
@@ -379,9 +372,9 @@ def test_build_sampling_context_n_atom_scales_linearly_with_n_res():
             torch.arange(N_RES, dtype=torch.float),
             "A" * N_RES,
             [],
-            emb,
             a_fn,
             t_fn,
+            c_res=32,
         )
         large = build_sampling_context(
             torch.zeros(N_RES * 2, 37, 3),
@@ -389,9 +382,9 @@ def test_build_sampling_context_n_atom_scales_linearly_with_n_res():
             torch.arange(N_RES * 2, dtype=torch.float),
             "A" * (N_RES * 2),
             [],
-            emb,
             a_fn,
             t_fn,
+            c_res=32,
         )
     assert large.ref_pos.shape[1] == 2 * small.ref_pos.shape[1]
     assert large.tok_idx.shape[1] == 2 * small.tok_idx.shape[1]
@@ -408,9 +401,9 @@ def test_build_sampling_context_custom_n_templ_bins():
             torch.arange(N_RES, dtype=torch.float),
             "A" * N_RES,
             [],
-            nn.Embedding(256, 32),
             a_fn,
             t_fn,
+            c_res=32,
         )
     assert ctx.gt_res_distogram.shape == (1, N_RES, N_RES, 20)  # 19 bins + 1 overflow
 
@@ -425,9 +418,9 @@ def test_build_sampling_context_custom_n_atom_bins():
             torch.arange(N_RES, dtype=torch.float),
             "A" * N_RES,
             [],
-            nn.Embedding(256, 32),
             a_fn,
             t_fn,
+            c_res=32,
         )
     assert ctx.gt_atom_distogram_sparse.shape[3] == 10  # (B, N_atom, K, n_atom_bins)
 
@@ -815,27 +808,22 @@ def residue_idx_aa() -> torch.Tensor:
 
 
 @pytest.fixture
-def aa_emb() -> nn.Embedding:
-    return nn.Embedding(256, C_RES_AA)
-
-
-@pytest.fixture
 def atom_disto_fn() -> Distogram:
     return Distogram(n_bins=N_ATOM_BINS, min_dist=2.0, max_dist=22.0)
 
 
 @pytest.fixture
-def aa_ctx(atom37_pos, atom37_mask_all, residue_idx_aa, aa_emb, atom_disto_fn) -> AllAtomContext:
+def aa_ctx(atom37_pos, atom37_mask_all, residue_idx_aa, atom_disto_fn) -> AllAtomContext:
     with torch.no_grad():
         return build_AA_context(
             atom_37_coordinate_tensor=atom37_pos,
             atom_37_mask=atom37_mask_all,
             residue_index=residue_idx_aa,
-            index_embedding=aa_emb,
             aa_sequence=AA_SEQ_AA,
             atom_distogram_fn=atom_disto_fn,
             batch_size=2,
             device="cpu",
+            c_res=C_RES_AA,
         )
 
 
@@ -927,18 +915,18 @@ def test_build_aa_context_all_batch_slices_of_aa_indices_are_identical(aa_ctx):
 
 
 def test_build_aa_context_batch_size_controls_leading_dim(
-    atom37_pos, atom37_mask_all, residue_idx_aa, aa_emb, atom_disto_fn
+    atom37_pos, atom37_mask_all, residue_idx_aa, atom_disto_fn
 ):
     with torch.no_grad():
         ctx = build_AA_context(
             atom37_pos,
             atom37_mask_all,
             residue_idx_aa,
-            aa_emb,
             AA_SEQ_AA,
             atom_disto_fn,
             batch_size=3,
             device="cpu",
+            c_res=C_RES_AA,
         )
     assert ctx.r_gt.shape[0] == 3
     assert ctx.aa_indices.shape[0] == 3
@@ -1148,7 +1136,7 @@ def partial_atom_msk() -> torch.Tensor:
 
 
 @pytest.fixture
-def unconditional_ctx(index_embedding, atom_disto_fn, templ_disto) -> FeaturizedBatch:
+def unconditional_ctx(atom_disto_fn, templ_disto) -> FeaturizedBatch:
     """Use case 1: no sequence, no atoms, no template."""
     with torch.no_grad():
         return build_sampling_context(
@@ -1157,14 +1145,14 @@ def unconditional_ctx(index_embedding, atom_disto_fn, templ_disto) -> Featurized
             residue_index=torch.zeros(N_RES),
             seq="A" * N_RES,
             pdb_files=[],
-            index_embedding=index_embedding,
             atom_distogram_fn=atom_disto_fn,
             templ_distogram_fn=templ_disto,
+            c_res=32,
         )
 
 
 @pytest.fixture
-def seq_only_ctx(index_embedding, atom_disto_fn, templ_disto) -> FeaturizedBatch:
+def seq_only_ctx(atom_disto_fn, templ_disto) -> FeaturizedBatch:
     """Use case 2: amino-acid sequence + residue positions, no atoms, no template."""
     with torch.no_grad():
         return build_sampling_context(
@@ -1173,15 +1161,15 @@ def seq_only_ctx(index_embedding, atom_disto_fn, templ_disto) -> FeaturizedBatch
             residue_index=torch.arange(N_RES, dtype=torch.float),
             seq=SEQ_4,
             pdb_files=[],
-            index_embedding=index_embedding,
             atom_distogram_fn=atom_disto_fn,
             templ_distogram_fn=templ_disto,
+            c_res=32,
         )
 
 
 @pytest.fixture
 def seq_partial_atoms_ctx(
-    partial_atom_pos, partial_atom_msk, index_embedding, atom_disto_fn, templ_disto
+    partial_atom_pos, partial_atom_msk, atom_disto_fn, templ_disto
 ) -> FeaturizedBatch:
     """Use case 3: sequence + partial structural info (first half of residues), no template."""
     with torch.no_grad():
@@ -1191,16 +1179,14 @@ def seq_partial_atoms_ctx(
             residue_index=torch.arange(N_RES, dtype=torch.float),
             seq=SEQ_4,
             pdb_files=[],
-            index_embedding=index_embedding,
             atom_distogram_fn=atom_disto_fn,
             templ_distogram_fn=templ_disto,
+            c_res=32,
         )
 
 
 @pytest.fixture
-def partial_templ_no_seq_ctx(
-    partial_template_pdb, index_embedding, atom_disto_fn, templ_disto
-) -> FeaturizedBatch:
+def partial_templ_no_seq_ctx(partial_template_pdb, atom_disto_fn, templ_disto) -> FeaturizedBatch:
     """Use case 4: partial template (N_PARTIAL < N_RES residues), no sequence, no atoms."""
     with torch.no_grad():
         return build_sampling_context(
@@ -1209,16 +1195,14 @@ def partial_templ_no_seq_ctx(
             residue_index=torch.zeros(N_RES),
             seq="A" * N_RES,
             pdb_files=[partial_template_pdb],
-            index_embedding=index_embedding,
             atom_distogram_fn=atom_disto_fn,
             templ_distogram_fn=templ_disto,
+            c_res=32,
         )
 
 
 @pytest.fixture
-def full_templ_no_seq_ctx(
-    full_template_pdb, index_embedding, atom_disto_fn, templ_disto
-) -> FeaturizedBatch:
+def full_templ_no_seq_ctx(full_template_pdb, atom_disto_fn, templ_disto) -> FeaturizedBatch:
     """Use case 5: full template (all N_RES residues), no sequence, no atoms."""
     with torch.no_grad():
         return build_sampling_context(
@@ -1227,15 +1211,15 @@ def full_templ_no_seq_ctx(
             residue_index=torch.zeros(N_RES),
             seq="A" * N_RES,
             pdb_files=[full_template_pdb],
-            index_embedding=index_embedding,
             atom_distogram_fn=atom_disto_fn,
             templ_distogram_fn=templ_disto,
+            c_res=32,
         )
 
 
 @pytest.fixture
 def full_atoms_partial_templ_ctx(
-    partial_template_pdb, index_embedding, atom_disto_fn, templ_disto
+    partial_template_pdb, atom_disto_fn, templ_disto
 ) -> FeaturizedBatch:
     """Use case 6: all atoms present, partial template (N_PARTIAL < N_RES), no sequence."""
     with torch.no_grad():
@@ -1245,9 +1229,9 @@ def full_atoms_partial_templ_ctx(
             residue_index=torch.arange(N_RES, dtype=torch.float),
             seq="A" * N_RES,
             pdb_files=[partial_template_pdb],
-            index_embedding=index_embedding,
             atom_distogram_fn=atom_disto_fn,
             templ_distogram_fn=templ_disto,
+            c_res=32,
         )
 
 
@@ -1488,56 +1472,56 @@ def test_full_atoms_partial_templ_r_gt_all_finite_and_nonzero(full_atoms_partial
 # ---------------------------------------------------------------------------
 
 
-def test_build_aa_context_x_sequence_does_not_raise(atom_disto_fn, residue_idx_aa, aa_emb):
+def test_build_aa_context_x_sequence_does_not_raise(atom_disto_fn, residue_idx_aa):
     with torch.no_grad():
         ctx = build_AA_context(
             atom_37_coordinate_tensor=torch.zeros(N_RES_AA, 37, 3),
             atom_37_mask=torch.zeros(N_RES_AA, 37),
             residue_index=residue_idx_aa,
-            index_embedding=aa_emb,
             aa_sequence="X" * N_RES_AA,
             atom_distogram_fn=atom_disto_fn,
             batch_size=1,
             device="cpu",
+            c_res=C_RES_AA,
         )
     assert isinstance(ctx, AllAtomContext)
 
 
-def test_build_aa_context_x_maps_to_index_20(atom_disto_fn, residue_idx_aa, aa_emb):
+def test_build_aa_context_x_maps_to_index_20(atom_disto_fn, residue_idx_aa):
     with torch.no_grad():
         ctx = build_AA_context(
             atom_37_coordinate_tensor=torch.zeros(N_RES_AA, 37, 3),
             atom_37_mask=torch.zeros(N_RES_AA, 37),
             residue_index=residue_idx_aa,
-            index_embedding=aa_emb,
             aa_sequence="X" * N_RES_AA,
             atom_distogram_fn=atom_disto_fn,
             batch_size=1,
             device="cpu",
+            c_res=C_RES_AA,
         )
     assert (ctx.aa_indices == 20).all()
 
 
-def test_build_aa_context_x_is_distinct_from_alanine(atom_disto_fn, residue_idx_aa, aa_emb):
+def test_build_aa_context_x_is_distinct_from_alanine(atom_disto_fn, residue_idx_aa):
     with torch.no_grad():
         ctx_x = build_AA_context(
             atom_37_coordinate_tensor=torch.zeros(N_RES_AA, 37, 3),
             atom_37_mask=torch.zeros(N_RES_AA, 37),
             residue_index=residue_idx_aa,
-            index_embedding=aa_emb,
             aa_sequence="X" * N_RES_AA,
             atom_distogram_fn=atom_disto_fn,
             batch_size=1,
             device="cpu",
+            c_res=C_RES_AA,
         )
         ctx_a = build_AA_context(
             atom_37_coordinate_tensor=torch.zeros(N_RES_AA, 37, 3),
             atom_37_mask=torch.zeros(N_RES_AA, 37),
             residue_index=residue_idx_aa,
-            index_embedding=aa_emb,
             aa_sequence="A" * N_RES_AA,
             atom_distogram_fn=atom_disto_fn,
             batch_size=1,
             device="cpu",
+            c_res=C_RES_AA,
         )
     assert not torch.equal(ctx_x.aa_indices, ctx_a.aa_indices)

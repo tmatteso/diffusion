@@ -27,7 +27,7 @@ from helpers.atom_utils import (
     rigid_group_atom_positions,
     to_pdb,
 )
-from helpers.featurize import Distogram, FeaturizedBatch
+from helpers.featurize import Distogram, FeaturizedBatch, sinusoidal_encoding
 from jaxtyping import Bool, Float, Int, jaxtyped
 
 log = structlog.get_logger()
@@ -124,15 +124,17 @@ def build_AA_context(
     atom_37_coordinate_tensor: Float[torch.Tensor, "N_res 37 3"],
     atom_37_mask: Float[torch.Tensor, "N_res 37"],
     residue_index: Float[torch.Tensor, "N_res"],
-    index_embedding: nn.Embedding,
     aa_sequence: str,
     atom_distogram_fn: Distogram,
     batch_size: int,
     device: str,
+    c_res: int,
 ) -> AllAtomContext:
     _aa_vals = [restype_order.get(r, 20) for r in aa_sequence]
     aa_indices_i: Int[torch.Tensor, N_res] = torch.tensor(_aa_vals, dtype=torch.long, device=device)
-    f_residue_idx_i: Float[torch.Tensor, "N_res c_res"] = index_embedding(residue_index.long())
+    f_residue_idx_i: Float[torch.Tensor, "N_res c_res"] = sinusoidal_encoding(
+        residue_index.unsqueeze(0), dim=c_res
+    ).squeeze(0)
 
     atom5_pos, atom5_mask = atom37_to_atom5(
         rearrange(atom_37_coordinate_tensor, "n a d -> 1 n a d"),
@@ -255,9 +257,9 @@ def build_sampling_context(
     residue_index: Float[torch.Tensor, "N_res"],
     seq: str,
     pdb_files: list[str],
-    index_embedding: nn.Embedding,
     atom_distogram_fn: "Distogram",
     templ_distogram_fn: "Distogram",
+    c_res: int,
     batch_size: int = 1,
     device: str = "cpu",
 ) -> FeaturizedBatch:
@@ -268,12 +270,12 @@ def build_sampling_context(
     ----------
     atom_positions    : (N_res, 37, 3) reference atom coordinates in atom37 layout
     atom_mask         : (N_res, 37) float mask; 1 where atom is present
-    residue_index     : (N_res,) per-residue position index fed to index_embedding
+    residue_index     : (N_res,) per-residue position index (sinusoidal encoding applied internally)
     seq               : amino-acid sequence string of length N_res
     pdb_files         : PDB paths used as templates; empty list → unconditioned templates
-    index_embedding   : nn.Embedding mapping residue indices to c_res-dim vectors
     atom_distogram_fn : Distogram for atom-level pairwise distances
     templ_distogram_fn: Distogram for template Cβ pairwise distances
+    c_res             : residue embedding dimension
     batch_size        : B — number of parallel samples; all share the same context
     device            : torch device string
     """
@@ -287,11 +289,11 @@ def build_sampling_context(
             atom_37_coordinate_tensor=atom_positions.to(device),
             atom_37_mask=atom_mask.to(device),
             residue_index=residue_index.to(device),
-            index_embedding=index_embedding,
             aa_sequence=seq,
             atom_distogram_fn=atom_distogram_fn,
             batch_size=B,
             device=device,
+            c_res=c_res,
         )
 
     # ── TemplateContext (residue-level distogram from PDB templates) ─────────
@@ -592,9 +594,6 @@ if __name__ == "__main__":
         ).to(device)
         ckpt = torch.load(scfg.checkpoint.checkpoint_path, map_location=device)
         model.load_state_dict(ckpt["model"])
-        index_embedding = nn.Embedding(mp.max_residues, mp.c_res).to(device)
-        index_embedding.load_state_dict(ckpt["index_embedding"])
-        index_embedding.eval()
         model.eval()
         log.info("model loaded", checkpoint=scfg.checkpoint.checkpoint_path, device=device)
 
@@ -614,9 +613,9 @@ if __name__ == "__main__":
             residue_index=torch.arange(N_RES, dtype=torch.float, device=device),
             seq="A" * N_RES,
             pdb_files=[],
-            index_embedding=index_embedding,
             atom_distogram_fn=_atom_disto,
             templ_distogram_fn=_templ_disto,
+            c_res=mp.c_res,
             batch_size=B_SAMPLE,
             device=device,
         )

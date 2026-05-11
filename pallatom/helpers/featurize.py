@@ -129,17 +129,18 @@ class Distogram(nn.Module):
         return f_distogram, f_pair_mask
 
 
-class ResidueIndexEmbedding(nn.Module):
-    def __init__(self, max_residues: int = 1024, c_res: int = 256):
-        super().__init__()
-        self.embed = nn.Embedding(max_residues, c_res)
-
-    @jaxtyped(typechecker=beartype)
-    def forward(
-        self,
-        residue_indices: Int[torch.Tensor, "N_res"],
-    ) -> Float[torch.Tensor, "N_res c_res"]:
-        return self.embed(residue_indices)
+@jaxtyped(typechecker=beartype)
+def sinusoidal_encoding(
+    positions: Float[torch.Tensor, "batch N_res"], dim: int = 32
+) -> Float[torch.Tensor, "batch N_res dim"]:
+    """Sinusoidal positional encoding. positions: (batch, N_res) → (batch, N_res, dim)"""
+    half = dim // 2
+    freqs = torch.exp(
+        torch.arange(half, dtype=torch.float32) * -(math.log(10000.0) / (half - 1))
+    ).to(positions.device)
+    pos = positions.float().unsqueeze(-1)  # (batch, N_res, 1)
+    args = pos * freqs  # (batch, N_res, half)
+    return torch.cat([torch.sin(args), torch.cos(args)], dim=-1)  # (batch, N_res, dim)
 
 
 # batch = torch.load('test_dict.pt') # this is a good test batch
@@ -191,11 +192,11 @@ def featurize_batch(
     tcfg: TrainConfig,
     c_beta_distogram_fn: Distogram,
     atom_distogram_fn: Distogram,
-    index_embedding: nn.Embedding,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
 ) -> FeaturizedBatch:
     B: int = len(batch.seq)
     Natom: int = 5
+    c_res: int = tcfg.model.c_res
 
     # ── Shared noise for the whole batch ──────────────────────────────────────
     sigma_min, sigma_max = tcfg.noise.sigma_min, tcfg.noise.sigma_max
@@ -254,7 +255,9 @@ def featurize_batch(
             repeat(ala_ref_elem, "a e -> n a e", n=N_res_i), "n a e -> (n a) e"
         )
 
-        f_residue_idx_i: Float[torch.Tensor, "N_res c_res"] = index_embedding(index.long())
+        f_residue_idx_i: Float[torch.Tensor, "N_res c_res"] = sinusoidal_encoding(
+            index.unsqueeze(0), dim=c_res
+        ).squeeze(0)
 
         items.append(
             {

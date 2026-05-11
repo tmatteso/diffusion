@@ -51,7 +51,6 @@ def evaluate(
     tcfg: TrainConfig,
     distogram_res: Distogram,
     distogram_atom: Distogram,
-    index_embedding: nn.Embedding,
     device: str,
 ) -> dict[str, float]:
     """Full-dataset evaluation pass. Returns mean loss per metric."""
@@ -71,7 +70,7 @@ def evaluate(
 
     for batch in loader:
         featurized_batch = featurize_batch(
-            _to_protein_batch(batch), tcfg, distogram_res, distogram_atom, index_embedding, device
+            _to_protein_batch(batch), tcfg, distogram_res, distogram_atom, device
         )
 
         (
@@ -172,7 +171,6 @@ def evaluate_ddp(
     tcfg: TrainConfig,
     distogram_res: Distogram,
     distogram_atom: Distogram,
-    index_embedding: nn.Embedding,
     device: str,
 ) -> dict[str, float]:
     """Distributed evaluation. Each rank processes its shard; metrics are all-reduced."""
@@ -193,7 +191,7 @@ def evaluate_ddp(
 
     for batch in loader:
         featurized_batch = featurize_batch(
-            _to_protein_batch(batch), tcfg, distogram_res, distogram_atom, index_embedding, device
+            _to_protein_batch(batch), tcfg, distogram_res, distogram_atom, device
         )
 
         (
@@ -292,7 +290,6 @@ def train(
     test_loader: torch.utils.data.DataLoader,
     distogram_res: Distogram,
     distogram_atom: Distogram,
-    index_embedding: nn.Embedding,
     device: str,
 ) -> None:
     tp = tcfg.training
@@ -301,7 +298,7 @@ def train(
     ck = tcfg.checkpoint
 
     optimizer = Adam(
-        list(model.parameters()) + list(index_embedding.parameters()),
+        model.parameters(),
         lr=tp.lr,
         weight_decay=tp.weight_decay,
     )
@@ -325,7 +322,6 @@ def train(
                 tcfg,
                 distogram_res,
                 distogram_atom,
-                index_embedding,
                 device,
             )
             featurized_batch = apply_conditioning_dropout(
@@ -454,9 +450,7 @@ def train(
             )
         }
 
-        avg_val = evaluate(
-            model, test_loader, tcfg, distogram_res, distogram_atom, index_embedding, device
-        )
+        avg_val = evaluate(model, test_loader, tcfg, distogram_res, distogram_atom, device)
         model.train()
 
         log.info(
@@ -482,14 +476,11 @@ def train(
 
         if avg_val["total loss"] < best_val_loss:
             best_val_loss = avg_val["total loss"]
-            torch.save(
-                {"model": model.state_dict(), "index_embedding": index_embedding.state_dict()},
-                ck.checkpoint_path,
-            )
+            torch.save({"model": model.state_dict()}, ck.checkpoint_path)
 
         if epoch % ck.save_every == 0:
             torch.save(
-                {"model": model.state_dict(), "index_embedding": index_embedding.state_dict()},
+                {"model": model.state_dict()},
                 f"checkpoint_epoch_{epoch:03d}.pt",
             )
 
@@ -504,7 +495,6 @@ def train_ddp(
     test_loader: torch.utils.data.DataLoader,
     distogram_res: Distogram,
     distogram_atom: Distogram,
-    index_embedding: nn.Embedding,
     device: str | None = None,
 ) -> None:
     """DDP training loop. Launched via torchrun — one process per GPU."""
@@ -517,7 +507,7 @@ def train_ddp(
     ck = tcfg.checkpoint
 
     optimizer = Adam(
-        list(ddp_model.parameters()) + list(index_embedding.parameters()),
+        ddp_model.parameters(),
         lr=tp.lr,
         weight_decay=tp.weight_decay,
     )
@@ -547,7 +537,6 @@ def train_ddp(
                 tcfg,
                 distogram_res,
                 distogram_atom,
-                index_embedding,
                 device,
             )
             featurized_batch = apply_conditioning_dropout(
@@ -641,14 +630,8 @@ def train_ddp(
             optimizer.zero_grad()
             total_loss.backward()
 
-            if world_size > 1 and dist.is_initialized():
-                for param in index_embedding.parameters():
-                    if param.grad is not None:
-                        dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
-                        param.grad.div_(world_size)
-
             grad_norm: Float[torch.Tensor, ""] = nn.utils.clip_grad_norm_(
-                list(ddp_model.parameters()) + list(index_embedding.parameters()),
+                ddp_model.parameters(),
                 tp.grad_clip if tp.grad_clip is not None else float("inf"),
             )
             optimizer.step()
@@ -702,7 +685,6 @@ def train_ddp(
             tcfg,
             distogram_res,
             distogram_atom,
-            index_embedding,
             device,
         )
         ddp_model.train()
@@ -731,20 +713,11 @@ def train_ddp(
 
             if avg_val["total loss"] < best_val_loss:
                 best_val_loss = avg_val["total loss"]
-                torch.save(
-                    {
-                        "model": ddp_model.module.state_dict(),
-                        "index_embedding": index_embedding.state_dict(),
-                    },
-                    ck.checkpoint_path,
-                )
+                torch.save({"model": ddp_model.module.state_dict()}, ck.checkpoint_path)
 
             if epoch % ck.save_every == 0:
                 torch.save(
-                    {
-                        "model": ddp_model.module.state_dict(),
-                        "index_embedding": index_embedding.state_dict(),
-                    },
+                    {"model": ddp_model.module.state_dict()},
                     f"checkpoint_epoch_{epoch:03d}.pt",
                 )
 
@@ -840,12 +813,10 @@ if __name__ == "__main__":
             distogram_atom = Distogram(
                 n_bins=da.n_bins, min_dist=da.min_dist, max_dist=da.max_dist
             ).to(device)
-            index_embedding = nn.Embedding(tcfg.model.max_residues, tcfg.model.c_res).to(device)
 
             if tcfg.training.pretrained_weights is not None:
                 ckpt = torch.load(tcfg.training.pretrained_weights, map_location=device)
                 model.load_state_dict(ckpt["model"])
-                index_embedding.load_state_dict(ckpt["index_embedding"])
                 if rank == 0:
                     log.info("loaded pretrained weights", path=tcfg.training.pretrained_weights)
 
@@ -862,7 +833,6 @@ if __name__ == "__main__":
                 test_loader=val_loader,
                 distogram_res=distogram_res,
                 distogram_atom=distogram_atom,
-                index_embedding=index_embedding,
             )
         except Exception as _exc:
             log.error("fatal", error=str(_exc), traceback=_tb.format_exc())

@@ -28,22 +28,10 @@ from architecture.pair_update import PairUpdate
 from architecture.template_embedder import TemplateEmbedder
 from beartype import beartype
 from einops import rearrange
-from helpers.featurize import FeaturizedBatch
+from helpers.featurize import FeaturizedBatch, sinusoidal_encoding  # re-exported for callers
 from jaxtyping import Float, Int, jaxtyped
 
-
-@jaxtyped(typechecker=beartype)
-def sinusoidal_encoding(
-    positions: Float[torch.Tensor, "batch N_res"], dim: int = 32
-) -> Float[torch.Tensor, "batch N_res dim"]:
-    """Sinusoidal positional encoding. positions: (..., Nres,) → (..., Nres, dim)"""
-    half = dim // 2
-    freqs = torch.exp(
-        torch.arange(half, dtype=torch.float32) * -(math.log(10000.0) / (half - 1))
-    ).to(positions.device)
-    pos = positions.float().unsqueeze(-1)  # (..., Nres, 1)
-    args = pos * freqs  # (..., Nres, half)
-    return torch.cat([torch.sin(args), torch.cos(args)], dim=-1)  # (..., Nres, dim)
+__all__ = ["MainTrunk", "sinusoidal_encoding"]
 
 
 @jaxtyped(typechecker=beartype)

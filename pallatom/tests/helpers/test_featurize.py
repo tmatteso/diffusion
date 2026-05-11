@@ -2,14 +2,12 @@ import dataclasses
 
 import pytest
 import torch
-import torch.nn as nn
 from einops import rearrange, reduce
 from helpers.atom_utils import restype_num, restype_order
 from helpers.featurize import (
     Distogram,
     FeaturizedBatch,
     ProteinBatch,
-    ResidueIndexEmbedding,
     apply_conditioning_dropout,
     featurize_batch,
 )
@@ -54,11 +52,6 @@ def disto_overflow():
     return Distogram(n_bins=N_BINS, min_dist=MIN_DIST, max_dist=MAX_DIST, overflow_bin=True).eval()
 
 
-@pytest.fixture
-def emb():
-    return ResidueIndexEmbedding(max_residues=256, c_res=C_RES).eval()
-
-
 # ---------------------------------------------------------------------------
 # Fixtures — tensors
 # ---------------------------------------------------------------------------
@@ -77,11 +70,6 @@ def coords_batch():
 @pytest.fixture
 def mask():
     return torch.ones(N_RES, dtype=torch.bool)
-
-
-@pytest.fixture
-def residue_indices():
-    return torch.arange(N_RES)
 
 
 # ---------------------------------------------------------------------------
@@ -210,32 +198,6 @@ def test_distogram_exact_bin_for_known_interior_distance(disto):
 
 
 # ---------------------------------------------------------------------------
-# ResidueIndexEmbedding — output behavior
-# ---------------------------------------------------------------------------
-
-
-def test_residue_index_embedding_different_indices_give_different_output(emb):
-    with torch.no_grad():
-        out0 = emb(torch.tensor([0]))
-        out1 = emb(torch.tensor([1]))
-    assert not torch.allclose(out0, out1)
-
-
-def test_residue_index_embedding_same_index_gives_same_output(emb):
-    with torch.no_grad():
-        out_a = emb(torch.tensor([5]))
-        out_b = emb(torch.tensor([5]))
-    assert torch.equal(out_a, out_b)
-
-
-def test_residue_index_embedding_gradient_flows(emb, residue_indices):
-    out = emb(residue_indices)
-    reduce(out, "n c -> ", "sum").backward()
-    assert emb.embed.weight.grad is not None
-    assert torch.isfinite(emb.embed.weight.grad).all()
-
-
-# ---------------------------------------------------------------------------
 # featurize_batch — fixtures
 # ---------------------------------------------------------------------------
 
@@ -270,16 +232,11 @@ def atom_distogram_fn(tcfg: TrainConfig) -> Distogram:
 
 
 @pytest.fixture
-def index_embedding(tcfg: TrainConfig):
-    return nn.Embedding(tcfg.model.max_residues, tcfg.model.c_res)
-
-
-@pytest.fixture
 def featurized_batch(
-    protein_batch, tcfg, c_beta_distogram_fn, atom_distogram_fn, index_embedding
+    protein_batch, tcfg, c_beta_distogram_fn, atom_distogram_fn
 ) -> FeaturizedBatch:
     return featurize_batch(
-        protein_batch, tcfg, c_beta_distogram_fn, atom_distogram_fn, index_embedding, device="cpu"
+        protein_batch, tcfg, c_beta_distogram_fn, atom_distogram_fn, device="cpu"
     )
 
 

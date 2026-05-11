@@ -74,11 +74,6 @@ def distogram_atom() -> Distogram:
 
 
 @pytest.fixture
-def index_embedding() -> nn.Embedding:
-    return nn.Embedding(256, _C_RES)
-
-
-@pytest.fixture
 def model() -> MainTrunk:
     return MainTrunk(
         f_ref_dim=_F_REF_DIM,
@@ -277,67 +272,53 @@ def test_to_protein_batch_seq_length_matches_batch_size(mini_batch):
 # ---------------------------------------------------------------------------
 
 
-def test_evaluate_returns_dict(model, loader, tcfg, distogram_res, distogram_atom, index_embedding):
-    result = evaluate(model, loader, tcfg, distogram_res, distogram_atom, index_embedding, "cpu")
+def test_evaluate_returns_dict(model, loader, tcfg, distogram_res, distogram_atom):
+    result = evaluate(model, loader, tcfg, distogram_res, distogram_atom, "cpu")
     assert isinstance(result, dict)
 
 
-def test_evaluate_returns_expected_keys(
-    model, loader, tcfg, distogram_res, distogram_atom, index_embedding
-):
-    result = evaluate(model, loader, tcfg, distogram_res, distogram_atom, index_embedding, "cpu")
+def test_evaluate_returns_expected_keys(model, loader, tcfg, distogram_res, distogram_atom):
+    result = evaluate(model, loader, tcfg, distogram_res, distogram_atom, "cpu")
     assert set(result.keys()) == EXPECTED_EVAL_KEYS
 
 
-def test_evaluate_all_values_are_floats(
-    model, loader, tcfg, distogram_res, distogram_atom, index_embedding
-):
-    result = evaluate(model, loader, tcfg, distogram_res, distogram_atom, index_embedding, "cpu")
+def test_evaluate_all_values_are_floats(model, loader, tcfg, distogram_res, distogram_atom):
+    result = evaluate(model, loader, tcfg, distogram_res, distogram_atom, "cpu")
     for k, v in result.items():
         assert isinstance(v, float), f"'{k}' is {type(v)}, expected float"
 
 
-def test_evaluate_all_losses_finite(
-    model, loader, tcfg, distogram_res, distogram_atom, index_embedding
-):
-    result = evaluate(model, loader, tcfg, distogram_res, distogram_atom, index_embedding, "cpu")
+def test_evaluate_all_losses_finite(model, loader, tcfg, distogram_res, distogram_atom):
+    result = evaluate(model, loader, tcfg, distogram_res, distogram_atom, "cpu")
     for k, v in result.items():
         assert v == v, f"NaN in '{k}'"
         assert v != float("inf"), f"Inf in '{k}'"
 
 
-def test_evaluate_total_loss_non_negative(
-    model, loader, tcfg, distogram_res, distogram_atom, index_embedding
-):
-    result = evaluate(model, loader, tcfg, distogram_res, distogram_atom, index_embedding, "cpu")
+def test_evaluate_total_loss_non_negative(model, loader, tcfg, distogram_res, distogram_atom):
+    result = evaluate(model, loader, tcfg, distogram_res, distogram_atom, "cpu")
     assert result["total loss"] >= 0.0
 
 
-def test_evaluate_rmsd_non_negative(
-    model, loader, tcfg, distogram_res, distogram_atom, index_embedding
-):
-    result = evaluate(model, loader, tcfg, distogram_res, distogram_atom, index_embedding, "cpu")
+def test_evaluate_rmsd_non_negative(model, loader, tcfg, distogram_res, distogram_atom):
+    result = evaluate(model, loader, tcfg, distogram_res, distogram_atom, "cpu")
     assert result["RMSD"] >= 0.0
 
 
-def test_evaluate_sets_model_to_eval_mode(
-    model, loader, tcfg, distogram_res, distogram_atom, index_embedding
-):
+def test_evaluate_sets_model_to_eval_mode(model, loader, tcfg, distogram_res, distogram_atom):
     model.train()
-    evaluate(model, loader, tcfg, distogram_res, distogram_atom, index_embedding, "cpu")
+    evaluate(model, loader, tcfg, distogram_res, distogram_atom, "cpu")
     assert not model.training
 
 
-def test_evaluate_empty_loader_returns_zero_dict(
-    model, tcfg, distogram_res, distogram_atom, index_embedding
-):
+def test_evaluate_empty_loader_returns_zero_dict(model, tcfg, distogram_res, distogram_atom):
     empty = torch.utils.data.DataLoader([], batch_size=None, collate_fn=lambda x: x)
-    result = evaluate(model, empty, tcfg, distogram_res, distogram_atom, index_embedding, "cpu")
+    result = evaluate(model, empty, tcfg, distogram_res, distogram_atom, "cpu")
     assert all(v == 0.0 for v in result.values())
 
 
-def test_evaluate_uses_no_grad(model, loader, tcfg, distogram_res, distogram_atom, index_embedding):
-    evaluate(model, loader, tcfg, distogram_res, distogram_atom, index_embedding, "cpu")
+def test_evaluate_uses_no_grad(model, loader, tcfg, distogram_res, distogram_atom):
+    evaluate(model, loader, tcfg, distogram_res, distogram_atom, "cpu")
     for p in model.parameters():
         assert p.grad is None
 
@@ -347,98 +328,81 @@ def test_evaluate_uses_no_grad(model, loader, tcfg, distogram_res, distogram_ato
 # ---------------------------------------------------------------------------
 
 
-def test_train_returns_none(model, loader, tcfg, distogram_res, distogram_atom, index_embedding):
-    assert (
-        train(model, tcfg, loader, loader, distogram_res, distogram_atom, index_embedding, "cpu")
-        is None
-    )
+def test_train_returns_none(model, loader, tcfg, distogram_res, distogram_atom):
+    assert train(model, tcfg, loader, loader, distogram_res, distogram_atom, "cpu") is None
 
 
-def test_train_saves_best_checkpoint(
-    model, loader, tcfg, distogram_res, distogram_atom, index_embedding
-):
-    train(model, tcfg, loader, loader, distogram_res, distogram_atom, index_embedding, "cpu")
+def test_train_saves_best_checkpoint(model, loader, tcfg, distogram_res, distogram_atom):
+    train(model, tcfg, loader, loader, distogram_res, distogram_atom, "cpu")
     assert os.path.exists(tcfg.checkpoint.checkpoint_path)
 
 
-def test_train_checkpoint_is_valid_state_dict(
-    model, loader, tcfg, distogram_res, distogram_atom, index_embedding
-):
-    train(model, tcfg, loader, loader, distogram_res, distogram_atom, index_embedding, "cpu")
+def test_train_checkpoint_is_valid_state_dict(model, loader, tcfg, distogram_res, distogram_atom):
+    train(model, tcfg, loader, loader, distogram_res, distogram_atom, "cpu")
     ckpt = torch.load(tcfg.checkpoint.checkpoint_path, weights_only=True)
     assert isinstance(ckpt, dict)
-    assert "model" in ckpt and "index_embedding" in ckpt
+    assert "model" in ckpt
 
 
-def test_train_updates_model_parameters(
-    model, loader, tcfg, distogram_res, distogram_atom, index_embedding
-):
+def test_train_updates_model_parameters(model, loader, tcfg, distogram_res, distogram_atom):
     params_before = [p.clone().detach() for p in model.parameters()]
-    train(model, tcfg, loader, loader, distogram_res, distogram_atom, index_embedding, "cpu")
+    train(model, tcfg, loader, loader, distogram_res, distogram_atom, "cpu")
     params_after = list(model.parameters())
     assert any(not torch.equal(b, a) for b, a in zip(params_before, params_after, strict=False))
 
 
-def test_train_model_in_train_mode_after(
-    model, loader, tcfg, distogram_res, distogram_atom, index_embedding
-):
+def test_train_model_in_train_mode_after(model, loader, tcfg, distogram_res, distogram_atom):
     model.eval()
-    train(model, tcfg, loader, loader, distogram_res, distogram_atom, index_embedding, "cpu")
+    train(model, tcfg, loader, loader, distogram_res, distogram_atom, "cpu")
     assert model.training
 
 
 def test_train_runs_all_epochs(
-    model, loader, tcfg_multi, distogram_res, distogram_atom, index_embedding, monkeypatch
+    model, loader, tcfg_multi, distogram_res, distogram_atom, monkeypatch
 ):
     losses: list[float] = []
     _real_evaluate = evaluate
 
-    def _patched_evaluate(m, ldr, cfg, dr, da, emb, dev):
-        result = _real_evaluate(m, ldr, cfg, dr, da, emb, dev)
+    def _patched_evaluate(m, ldr, cfg, dr, da, dev):
+        result = _real_evaluate(m, ldr, cfg, dr, da, dev)
         losses.append(result["total loss"])
         return result
 
     monkeypatch.setattr("train.train_loop.evaluate", _patched_evaluate)
-    train(model, tcfg_multi, loader, loader, distogram_res, distogram_atom, index_embedding, "cpu")
+    train(model, tcfg_multi, loader, loader, distogram_res, distogram_atom, "cpu")
 
     assert len(losses) == 3
     assert all(v == v and v != float("inf") for v in losses)
 
 
-def test_train_no_grad_clip_runs(
-    model, loader, tcfg_no_clip, distogram_res, distogram_atom, index_embedding
-):
-    result = train(
-        model, tcfg_no_clip, loader, loader, distogram_res, distogram_atom, index_embedding, "cpu"
-    )
+def test_train_no_grad_clip_runs(model, loader, tcfg_no_clip, distogram_res, distogram_atom):
+    result = train(model, tcfg_no_clip, loader, loader, distogram_res, distogram_atom, "cpu")
     assert result is None
 
 
 def test_train_no_grad_clip_saves_checkpoint(
-    model, loader, tcfg_no_clip, distogram_res, distogram_atom, index_embedding
+    model, loader, tcfg_no_clip, distogram_res, distogram_atom
 ):
-    train(
-        model, tcfg_no_clip, loader, loader, distogram_res, distogram_atom, index_embedding, "cpu"
-    )
+    train(model, tcfg_no_clip, loader, loader, distogram_res, distogram_atom, "cpu")
     assert os.path.exists(tcfg_no_clip.checkpoint.checkpoint_path)
 
 
 def test_train_save_every_creates_epoch_checkpoint(
-    model, loader, tcfg_save, distogram_res, distogram_atom, index_embedding, tmp_path, monkeypatch
+    model, loader, tcfg_save, distogram_res, distogram_atom, tmp_path, monkeypatch
 ):
     monkeypatch.chdir(tmp_path)
-    train(model, tcfg_save, loader, loader, distogram_res, distogram_atom, index_embedding, "cpu")
+    train(model, tcfg_save, loader, loader, distogram_res, distogram_atom, "cpu")
     assert os.path.exists(tmp_path / "checkpoint_epoch_001.pt")
 
 
 def test_train_save_every_checkpoint_is_valid_state_dict(
-    model, loader, tcfg_save, distogram_res, distogram_atom, index_embedding, tmp_path, monkeypatch
+    model, loader, tcfg_save, distogram_res, distogram_atom, tmp_path, monkeypatch
 ):
     monkeypatch.chdir(tmp_path)
-    train(model, tcfg_save, loader, loader, distogram_res, distogram_atom, index_embedding, "cpu")
+    train(model, tcfg_save, loader, loader, distogram_res, distogram_atom, "cpu")
     ckpt = torch.load(tmp_path / "checkpoint_epoch_001.pt", weights_only=True)
     assert isinstance(ckpt, dict)
-    assert "model" in ckpt and "index_embedding" in ckpt
+    assert "model" in ckpt
 
 
 # ---------------------------------------------------------------------------
@@ -447,20 +411,20 @@ def test_train_save_every_checkpoint_is_valid_state_dict(
 
 
 def test_evaluate_multi_batch_returns_expected_keys(
-    model, mini_batch, tcfg, distogram_res, distogram_atom, index_embedding
+    model, mini_batch, tcfg, distogram_res, distogram_atom
 ):
     loader2 = torch.utils.data.DataLoader(
         [mini_batch, mini_batch], batch_size=None, collate_fn=lambda x: x
     )
-    result = evaluate(model, loader2, tcfg, distogram_res, distogram_atom, index_embedding, "cpu")
+    result = evaluate(model, loader2, tcfg, distogram_res, distogram_atom, "cpu")
     assert set(result.keys()) == EXPECTED_EVAL_KEYS
 
 
 def test_evaluate_multi_batch_n_batches_counted(
-    model, mini_batch, tcfg, distogram_res, distogram_atom, index_embedding
+    model, mini_batch, tcfg, distogram_res, distogram_atom
 ):
     loader3 = torch.utils.data.DataLoader([mini_batch] * 3, batch_size=None, collate_fn=lambda x: x)
-    result = evaluate(model, loader3, tcfg, distogram_res, distogram_atom, index_embedding, "cpu")
+    result = evaluate(model, loader3, tcfg, distogram_res, distogram_atom, "cpu")
     for k, v in result.items():
         assert v == v and v != float("inf"), f"bad value for '{k}'"
 
@@ -527,111 +491,105 @@ def test_file_log_processor_truncates_existing_file(tmp_path):
 
 
 def test_train_calls_wandb_log_when_enabled(
-    model, loader, tcfg_wandb, distogram_res, distogram_atom, index_embedding, monkeypatch
+    model, loader, tcfg_wandb, distogram_res, distogram_atom, monkeypatch
 ):
     logged: list = []
     monkeypatch.setattr(
         "train.train_loop.wandb.log", lambda data, step: logged.append((data, step))
     )
-    train(model, tcfg_wandb, loader, loader, distogram_res, distogram_atom, index_embedding, "cpu")
+    train(model, tcfg_wandb, loader, loader, distogram_res, distogram_atom, "cpu")
     assert len(logged) == 1
 
 
 def test_train_wandb_log_not_called_when_disabled(
-    model, loader, tcfg, distogram_res, distogram_atom, index_embedding, monkeypatch
+    model, loader, tcfg, distogram_res, distogram_atom, monkeypatch
 ):
     mock_log = MagicMock()
     monkeypatch.setattr("train.train_loop.wandb.log", mock_log)
-    train(model, tcfg, loader, loader, distogram_res, distogram_atom, index_embedding, "cpu")
+    train(model, tcfg, loader, loader, distogram_res, distogram_atom, "cpu")
     mock_log.assert_not_called()
 
 
 def test_train_wandb_log_payload_has_epoch_key(
-    model, loader, tcfg_wandb, distogram_res, distogram_atom, index_embedding, monkeypatch
+    model, loader, tcfg_wandb, distogram_res, distogram_atom, monkeypatch
 ):
     payloads: list[dict] = []
     monkeypatch.setattr("train.train_loop.wandb.log", lambda data, step: payloads.append(data))
-    train(model, tcfg_wandb, loader, loader, distogram_res, distogram_atom, index_embedding, "cpu")
+    train(model, tcfg_wandb, loader, loader, distogram_res, distogram_atom, "cpu")
     assert "epoch" in payloads[0]
     assert payloads[0]["epoch"] == 1
 
 
 def test_train_wandb_log_payload_has_train_keys(
-    model, loader, tcfg_wandb, distogram_res, distogram_atom, index_embedding, monkeypatch
+    model, loader, tcfg_wandb, distogram_res, distogram_atom, monkeypatch
 ):
     payloads: list[dict] = []
     monkeypatch.setattr("train.train_loop.wandb.log", lambda data, step: payloads.append(data))
-    train(model, tcfg_wandb, loader, loader, distogram_res, distogram_atom, index_embedding, "cpu")
+    train(model, tcfg_wandb, loader, loader, distogram_res, distogram_atom, "cpu")
     assert any(k.startswith("train/") for k in payloads[0])
 
 
 def test_train_wandb_log_payload_has_val_keys(
-    model, loader, tcfg_wandb, distogram_res, distogram_atom, index_embedding, monkeypatch
+    model, loader, tcfg_wandb, distogram_res, distogram_atom, monkeypatch
 ):
     payloads: list[dict] = []
     monkeypatch.setattr("train.train_loop.wandb.log", lambda data, step: payloads.append(data))
-    train(model, tcfg_wandb, loader, loader, distogram_res, distogram_atom, index_embedding, "cpu")
+    train(model, tcfg_wandb, loader, loader, distogram_res, distogram_atom, "cpu")
     assert any(k.startswith("val/") for k in payloads[0])
 
 
 def test_train_wandb_log_step_is_positive(
-    model, loader, tcfg_wandb, distogram_res, distogram_atom, index_embedding, monkeypatch
+    model, loader, tcfg_wandb, distogram_res, distogram_atom, monkeypatch
 ):
     steps: list[int] = []
     monkeypatch.setattr("train.train_loop.wandb.log", lambda data, step: steps.append(step))
-    train(model, tcfg_wandb, loader, loader, distogram_res, distogram_atom, index_embedding, "cpu")
+    train(model, tcfg_wandb, loader, loader, distogram_res, distogram_atom, "cpu")
     assert steps[0] >= 1
 
 
 def test_train_wandb_log_called_once_per_epoch(
-    model, loader, tcfg_wandb_3ep, distogram_res, distogram_atom, index_embedding, monkeypatch
+    model, loader, tcfg_wandb_3ep, distogram_res, distogram_atom, monkeypatch
 ):
     logged: list = []
     monkeypatch.setattr("train.train_loop.wandb.log", lambda data, step: logged.append(data))
-    train(
-        model, tcfg_wandb_3ep, loader, loader, distogram_res, distogram_atom, index_embedding, "cpu"
-    )
+    train(model, tcfg_wandb_3ep, loader, loader, distogram_res, distogram_atom, "cpu")
     assert len(logged) == 3
 
 
 def test_train_wandb_log_epoch_increments(
-    model, loader, tcfg_wandb_3ep, distogram_res, distogram_atom, index_embedding, monkeypatch
+    model, loader, tcfg_wandb_3ep, distogram_res, distogram_atom, monkeypatch
 ):
     payloads: list[dict] = []
     monkeypatch.setattr("train.train_loop.wandb.log", lambda data, step: payloads.append(data))
-    train(
-        model, tcfg_wandb_3ep, loader, loader, distogram_res, distogram_atom, index_embedding, "cpu"
-    )
+    train(model, tcfg_wandb_3ep, loader, loader, distogram_res, distogram_atom, "cpu")
     epochs = [p["epoch"] for p in payloads]
     assert epochs == [1, 2, 3]
 
 
 def test_train_wandb_log_train_total_loss_is_float(
-    model, loader, tcfg_wandb, distogram_res, distogram_atom, index_embedding, monkeypatch
+    model, loader, tcfg_wandb, distogram_res, distogram_atom, monkeypatch
 ):
     payloads: list[dict] = []
     monkeypatch.setattr("train.train_loop.wandb.log", lambda data, step: payloads.append(data))
-    train(model, tcfg_wandb, loader, loader, distogram_res, distogram_atom, index_embedding, "cpu")
+    train(model, tcfg_wandb, loader, loader, distogram_res, distogram_atom, "cpu")
     assert isinstance(payloads[0]["train/total loss"], float)
 
 
 def test_train_wandb_log_val_total_loss_is_float(
-    model, loader, tcfg_wandb, distogram_res, distogram_atom, index_embedding, monkeypatch
+    model, loader, tcfg_wandb, distogram_res, distogram_atom, monkeypatch
 ):
     payloads: list[dict] = []
     monkeypatch.setattr("train.train_loop.wandb.log", lambda data, step: payloads.append(data))
-    train(model, tcfg_wandb, loader, loader, distogram_res, distogram_atom, index_embedding, "cpu")
+    train(model, tcfg_wandb, loader, loader, distogram_res, distogram_atom, "cpu")
     assert isinstance(payloads[0]["val/total loss"], float)
 
 
 def test_train_wandb_log_steps_increase_across_epochs(
-    model, loader, tcfg_wandb_3ep, distogram_res, distogram_atom, index_embedding, monkeypatch
+    model, loader, tcfg_wandb_3ep, distogram_res, distogram_atom, monkeypatch
 ):
     steps: list[int] = []
     monkeypatch.setattr("train.train_loop.wandb.log", lambda data, step: steps.append(step))
-    train(
-        model, tcfg_wandb_3ep, loader, loader, distogram_res, distogram_atom, index_embedding, "cpu"
-    )
+    train(model, tcfg_wandb_3ep, loader, loader, distogram_res, distogram_atom, "cpu")
     assert steps == sorted(steps)
     assert len(set(steps)) == 3
 
@@ -641,96 +599,66 @@ def test_train_wandb_log_steps_increase_across_epochs(
 # ---------------------------------------------------------------------------
 
 
-def test_evaluate_ddp_returns_dict(
-    model, loader, tcfg, distogram_res, distogram_atom, index_embedding
-):
-    result = evaluate_ddp(
-        0, 1, model, loader, tcfg, distogram_res, distogram_atom, index_embedding, "cpu"
-    )
+def test_evaluate_ddp_returns_dict(model, loader, tcfg, distogram_res, distogram_atom):
+    result = evaluate_ddp(0, 1, model, loader, tcfg, distogram_res, distogram_atom, "cpu")
     assert isinstance(result, dict)
 
 
-def test_evaluate_ddp_returns_expected_keys(
-    model, loader, tcfg, distogram_res, distogram_atom, index_embedding
-):
-    result = evaluate_ddp(
-        0, 1, model, loader, tcfg, distogram_res, distogram_atom, index_embedding, "cpu"
-    )
+def test_evaluate_ddp_returns_expected_keys(model, loader, tcfg, distogram_res, distogram_atom):
+    result = evaluate_ddp(0, 1, model, loader, tcfg, distogram_res, distogram_atom, "cpu")
     assert set(result.keys()) == EXPECTED_EVAL_KEYS
 
 
-def test_evaluate_ddp_all_values_are_floats(
-    model, loader, tcfg, distogram_res, distogram_atom, index_embedding
-):
-    result = evaluate_ddp(
-        0, 1, model, loader, tcfg, distogram_res, distogram_atom, index_embedding, "cpu"
-    )
+def test_evaluate_ddp_all_values_are_floats(model, loader, tcfg, distogram_res, distogram_atom):
+    result = evaluate_ddp(0, 1, model, loader, tcfg, distogram_res, distogram_atom, "cpu")
     for k, v in result.items():
         assert isinstance(v, float), f"'{k}' is {type(v)}, expected float"
 
 
-def test_evaluate_ddp_all_losses_finite(
-    model, loader, tcfg, distogram_res, distogram_atom, index_embedding
-):
-    result = evaluate_ddp(
-        0, 1, model, loader, tcfg, distogram_res, distogram_atom, index_embedding, "cpu"
-    )
+def test_evaluate_ddp_all_losses_finite(model, loader, tcfg, distogram_res, distogram_atom):
+    result = evaluate_ddp(0, 1, model, loader, tcfg, distogram_res, distogram_atom, "cpu")
     for k, v in result.items():
         assert v == v, f"NaN in '{k}'"
         assert v != float("inf"), f"Inf in '{k}'"
 
 
-def test_evaluate_ddp_total_loss_non_negative(
-    model, loader, tcfg, distogram_res, distogram_atom, index_embedding
-):
-    result = evaluate_ddp(
-        0, 1, model, loader, tcfg, distogram_res, distogram_atom, index_embedding, "cpu"
-    )
+def test_evaluate_ddp_total_loss_non_negative(model, loader, tcfg, distogram_res, distogram_atom):
+    result = evaluate_ddp(0, 1, model, loader, tcfg, distogram_res, distogram_atom, "cpu")
     assert result["total loss"] >= 0.0
 
 
-def test_evaluate_ddp_rmsd_non_negative(
-    model, loader, tcfg, distogram_res, distogram_atom, index_embedding
-):
-    result = evaluate_ddp(
-        0, 1, model, loader, tcfg, distogram_res, distogram_atom, index_embedding, "cpu"
-    )
+def test_evaluate_ddp_rmsd_non_negative(model, loader, tcfg, distogram_res, distogram_atom):
+    result = evaluate_ddp(0, 1, model, loader, tcfg, distogram_res, distogram_atom, "cpu")
     assert result["RMSD"] >= 0.0
 
 
-def test_evaluate_ddp_sets_model_to_eval_mode(
-    model, loader, tcfg, distogram_res, distogram_atom, index_embedding
-):
+def test_evaluate_ddp_sets_model_to_eval_mode(model, loader, tcfg, distogram_res, distogram_atom):
     model.train()
-    evaluate_ddp(0, 1, model, loader, tcfg, distogram_res, distogram_atom, index_embedding, "cpu")
+    evaluate_ddp(0, 1, model, loader, tcfg, distogram_res, distogram_atom, "cpu")
     assert not model.training
 
 
-def test_evaluate_ddp_empty_loader_returns_zero_dict(
-    model, tcfg, distogram_res, distogram_atom, index_embedding
-):
+def test_evaluate_ddp_empty_loader_returns_zero_dict(model, tcfg, distogram_res, distogram_atom):
     empty = torch.utils.data.DataLoader([], batch_size=None, collate_fn=lambda x: x)
-    result = evaluate_ddp(
-        0, 1, model, empty, tcfg, distogram_res, distogram_atom, index_embedding, "cpu"
-    )
+    result = evaluate_ddp(0, 1, model, empty, tcfg, distogram_res, distogram_atom, "cpu")
     assert all(v == 0.0 for v in result.values())
 
 
 def test_evaluate_ddp_calls_all_reduce_once_when_world_size_gt_1(
-    model, loader, tcfg, distogram_res, distogram_atom, index_embedding, monkeypatch
+    model, loader, tcfg, distogram_res, distogram_atom, monkeypatch
 ):
     calls = []
     monkeypatch.setattr(dist_module, "all_reduce", lambda t, op=None: calls.append(1))
-    evaluate_ddp(0, 2, model, loader, tcfg, distogram_res, distogram_atom, index_embedding, "cpu")
+    evaluate_ddp(0, 2, model, loader, tcfg, distogram_res, distogram_atom, "cpu")
     assert len(calls) == 1
 
 
 def test_evaluate_ddp_skips_all_reduce_when_world_size_is_1(
-    model, loader, tcfg, distogram_res, distogram_atom, index_embedding, monkeypatch
+    model, loader, tcfg, distogram_res, distogram_atom, monkeypatch
 ):
     calls = []
     monkeypatch.setattr(dist_module, "all_reduce", lambda t, op=None: calls.append(1))
-    evaluate_ddp(0, 1, model, loader, tcfg, distogram_res, distogram_atom, index_embedding, "cpu")
+    evaluate_ddp(0, 1, model, loader, tcfg, distogram_res, distogram_atom, "cpu")
     assert len(calls) == 0
 
 
@@ -781,9 +709,7 @@ def patch_ddp(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_train_ddp_returns_none(
-    model, ddp_loader, tcfg, distogram_res, distogram_atom, index_embedding, patch_ddp
-):
+def test_train_ddp_returns_none(model, ddp_loader, tcfg, distogram_res, distogram_atom, patch_ddp):
     result = train_ddp(
         0,
         0,
@@ -794,14 +720,13 @@ def test_train_ddp_returns_none(
         ddp_loader,
         distogram_res,
         distogram_atom,
-        index_embedding,
         device="cpu",
     )
     assert result is None
 
 
 def test_train_ddp_rank0_saves_checkpoint(
-    model, ddp_loader, tcfg, distogram_res, distogram_atom, index_embedding, patch_ddp
+    model, ddp_loader, tcfg, distogram_res, distogram_atom, patch_ddp
 ):
     train_ddp(
         0,
@@ -813,14 +738,13 @@ def test_train_ddp_rank0_saves_checkpoint(
         ddp_loader,
         distogram_res,
         distogram_atom,
-        index_embedding,
         device="cpu",
     )
     assert os.path.exists(tcfg.checkpoint.checkpoint_path)
 
 
 def test_train_ddp_checkpoint_has_correct_keys(
-    model, ddp_loader, tcfg, distogram_res, distogram_atom, index_embedding, patch_ddp
+    model, ddp_loader, tcfg, distogram_res, distogram_atom, patch_ddp
 ):
     train_ddp(
         0,
@@ -832,15 +756,14 @@ def test_train_ddp_checkpoint_has_correct_keys(
         ddp_loader,
         distogram_res,
         distogram_atom,
-        index_embedding,
         device="cpu",
     )
     ckpt = torch.load(tcfg.checkpoint.checkpoint_path, weights_only=True)
-    assert "model" in ckpt and "index_embedding" in ckpt
+    assert "model" in ckpt
 
 
 def test_train_ddp_rank1_does_not_save_checkpoint(
-    model, ddp_loader, tcfg, distogram_res, distogram_atom, index_embedding, patch_ddp
+    model, ddp_loader, tcfg, distogram_res, distogram_atom, patch_ddp
 ):
     train_ddp(
         1,
@@ -852,14 +775,13 @@ def test_train_ddp_rank1_does_not_save_checkpoint(
         ddp_loader,
         distogram_res,
         distogram_atom,
-        index_embedding,
         device="cpu",
     )
     assert not os.path.exists(tcfg.checkpoint.checkpoint_path)
 
 
 def test_train_ddp_calls_set_epoch_each_epoch(
-    model, ddp_loader, tcfg_multi, distogram_res, distogram_atom, index_embedding, patch_ddp
+    model, ddp_loader, tcfg_multi, distogram_res, distogram_atom, patch_ddp
 ):
     train_ddp(
         0,
@@ -871,14 +793,13 @@ def test_train_ddp_calls_set_epoch_each_epoch(
         ddp_loader,
         distogram_res,
         distogram_atom,
-        index_embedding,
         device="cpu",
     )
     assert ddp_loader.sampler.set_epoch_calls == [1, 2, 3]
 
 
 def test_train_ddp_updates_model_parameters(
-    model, ddp_loader, tcfg, distogram_res, distogram_atom, index_embedding, patch_ddp
+    model, ddp_loader, tcfg, distogram_res, distogram_atom, patch_ddp
 ):
     params_before = [p.clone().detach() for p in model.parameters()]
     train_ddp(
@@ -891,7 +812,6 @@ def test_train_ddp_updates_model_parameters(
         ddp_loader,
         distogram_res,
         distogram_atom,
-        index_embedding,
         device="cpu",
     )
     changed = (
@@ -901,7 +821,7 @@ def test_train_ddp_updates_model_parameters(
 
 
 def test_train_ddp_wandb_not_called_when_disabled(
-    model, ddp_loader, tcfg, distogram_res, distogram_atom, index_embedding, patch_ddp, monkeypatch
+    model, ddp_loader, tcfg, distogram_res, distogram_atom, patch_ddp, monkeypatch
 ):
     mock_log = MagicMock()
     monkeypatch.setattr("train.train_loop.wandb.log", mock_log)
@@ -915,7 +835,6 @@ def test_train_ddp_wandb_not_called_when_disabled(
         ddp_loader,
         distogram_res,
         distogram_atom,
-        index_embedding,
         device="cpu",
     )
     mock_log.assert_not_called()
@@ -927,7 +846,6 @@ def test_train_ddp_wandb_called_when_rank0_and_enabled(
     tcfg_wandb,
     distogram_res,
     distogram_atom,
-    index_embedding,
     patch_ddp,
     monkeypatch,
 ):
@@ -943,7 +861,6 @@ def test_train_ddp_wandb_called_when_rank0_and_enabled(
         ddp_loader,
         distogram_res,
         distogram_atom,
-        index_embedding,
         device="cpu",
     )
     assert len(logged) == 1
@@ -955,7 +872,6 @@ def test_train_ddp_wandb_not_called_when_rank_nonzero(
     tcfg_wandb,
     distogram_res,
     distogram_atom,
-    index_embedding,
     patch_ddp,
     monkeypatch,
 ):
@@ -971,21 +887,18 @@ def test_train_ddp_wandb_not_called_when_rank_nonzero(
         ddp_loader,
         distogram_res,
         distogram_atom,
-        index_embedding,
         device="cpu",
     )
     mock_log.assert_not_called()
 
 
 def test_evaluate_ddp_world_size1_matches_evaluate(
-    model, loader, tcfg, distogram_res, distogram_atom, index_embedding
+    model, loader, tcfg, distogram_res, distogram_atom
 ):
     torch.manual_seed(42)
-    r1 = evaluate(model, loader, tcfg, distogram_res, distogram_atom, index_embedding, "cpu")
+    r1 = evaluate(model, loader, tcfg, distogram_res, distogram_atom, "cpu")
     torch.manual_seed(42)
-    r2 = evaluate_ddp(
-        0, 1, model, loader, tcfg, distogram_res, distogram_atom, index_embedding, "cpu"
-    )
+    r2 = evaluate_ddp(0, 1, model, loader, tcfg, distogram_res, distogram_atom, "cpu")
     for k in r1:
         assert (
             abs(r1[k] - r2[k]) < 1e-5
@@ -998,11 +911,11 @@ def test_evaluate_ddp_world_size1_matches_evaluate(
 
 
 def test_training_step_with_full_dropout_produces_finite_outputs(
-    model, loader, tcfg, distogram_res, distogram_atom, index_embedding
+    model, loader, tcfg, distogram_res, distogram_atom
 ):
     batch = next(iter(loader))
     featurized = featurize_batch(
-        _to_protein_batch(batch), tcfg, distogram_res, distogram_atom, index_embedding, device="cpu"
+        _to_protein_batch(batch), tcfg, distogram_res, distogram_atom, device="cpu"
     )
     featurized = apply_conditioning_dropout(
         featurized,
@@ -1018,9 +931,7 @@ def test_training_step_with_full_dropout_produces_finite_outputs(
 
 
 def test_evaluate_loop_unchanged_by_dropout_config(
-    model, loader, tcfg, distogram_res, distogram_atom, index_embedding
+    model, loader, tcfg, distogram_res, distogram_atom
 ):
-    result = evaluate(
-        model, loader, tcfg, distogram_res, distogram_atom, index_embedding, device="cpu"
-    )
+    result = evaluate(model, loader, tcfg, distogram_res, distogram_atom, device="cpu")
     assert all(isinstance(v, float) for v in result.values())
