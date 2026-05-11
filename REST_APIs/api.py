@@ -19,6 +19,7 @@ sys.path.insert(0, os.path.join(_HERE, "..", "pallatom"))
 
 from architecture.main_trunk import MainTrunk  # noqa: E402
 from helpers.atom_utils import Protein, to_pdb  # noqa: E402
+from helpers.featurize import Distogram  # noqa: E402
 from sample.sampling import (  # noqa: E402
     NATOM,
     EDMPrecond,
@@ -47,7 +48,7 @@ def _load_model(
     mp: ModelParams,
     noise: NoiseScheduleParams,
     device: str,
-) -> tuple[MainTrunk, nn.Embedding]:
+) -> MainTrunk:
     model = MainTrunk(
         f_ref_dim=mp.f_ref_dim,
         n_bins=mp.n_bins,
@@ -60,11 +61,8 @@ def _load_model(
     ).to(device)
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=True)
     model.load_state_dict(ckpt["model"])
-    index_embedding = nn.Embedding(mp.max_residues, mp.c_res).to(device)
-    index_embedding.load_state_dict(ckpt["index_embedding"])
     model.eval()
-    index_embedding.eval()
-    return model, index_embedding
+    return model
 
 
 @asynccontextmanager
@@ -77,8 +75,18 @@ async def lifespan(app: FastAPI):
 
     mp = ModelParams()
     noise = NoiseScheduleParams()
-    model, index_embedding = _load_model(CHECKPOINT_PATH, mp, noise, DEVICE)
-    _state.update(model=model, index_embedding=index_embedding, mp=mp, noise=noise)
+    model = _load_model(CHECKPOINT_PATH, mp, noise, DEVICE)
+    atom_disto = Distogram(n_bins=22, min_dist=2.0, max_dist=22.0).to(DEVICE)
+    templ_disto = Distogram(
+        n_bins=mp.n_bins - 1, min_dist=3.25, max_dist=50.75, overflow_bin=True
+    ).to(DEVICE)
+    _state.update(
+        model=model,
+        mp=mp,
+        noise=noise,
+        atom_disto=atom_disto,
+        templ_disto=templ_disto,
+    )
     yield
     _state.clear()
 
