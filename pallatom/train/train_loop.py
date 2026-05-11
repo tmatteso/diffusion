@@ -17,7 +17,7 @@ from beartype import beartype
 from einops import rearrange
 from helpers.alignment import kabsch_align
 from helpers.data import make_ddp_data_loaders
-from helpers.featurize import Distogram, ProteinBatch, featurize_batch
+from helpers.featurize import Distogram, ProteinBatch, apply_conditioning_dropout, featurize_batch
 from jaxtyping import Float, Int, jaxtyped
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import Adam
@@ -328,6 +328,13 @@ def train(
                 index_embedding,
                 device,
             )
+            featurized_batch = apply_conditioning_dropout(
+                featurized_batch,
+                p_distogram=tcfg.conditioning_dropout.p_distogram,
+                p_atom=tcfg.conditioning_dropout.p_atom,
+                p_seq=tcfg.conditioning_dropout.p_seq,
+                device=device,
+            )
 
             (
                 r_denoised,
@@ -542,6 +549,13 @@ def train_ddp(
                 distogram_atom,
                 index_embedding,
                 device,
+            )
+            featurized_batch = apply_conditioning_dropout(
+                featurized_batch,
+                p_distogram=tcfg.conditioning_dropout.p_distogram,
+                p_atom=tcfg.conditioning_dropout.p_atom,
+                p_seq=tcfg.conditioning_dropout.p_seq,
+                device=device,
             )
 
             (
