@@ -19,6 +19,8 @@ from helpers.featurize import Distogram  # noqa: E402
 from pydantic import ValidationError  # noqa: E402
 from train.train_config import ModelParams, NoiseScheduleParams  # noqa: E402
 
+from REST_APIs.api import SampleRequest, _run_sampling  # noqa: E402
+
 # ---------------------------------------------------------------------------
 # SampleRequest validation
 # ---------------------------------------------------------------------------
@@ -103,7 +105,6 @@ def test_sample_request_defaults():
 # ---------------------------------------------------------------------------
 
 N_RES_TEST = 4
-N_ATOM_TEST = N_RES_TEST * 5  # NATOM = 5
 
 
 def _make_trunk_mock():
@@ -156,16 +157,11 @@ def _make_pdb_string(n_res: int) -> str:
 
 
 def _run(req_kwargs: dict) -> list[str]:
-    from REST_APIs.api import SampleRequest, _run_sampling
-
     req_kwargs.setdefault("ddim_steps", 2)
     req = SampleRequest(**req_kwargs)
     mock_state = _make_mock_state()
     with patch("REST_APIs.api._state", mock_state):
         return _run_sampling(req)
-
-
-# --- use case 1: unconditional ---
 
 
 def test_run_sampling_unconditional_returns_pdb_strings():
@@ -180,9 +176,6 @@ def test_run_sampling_unconditional_n_samples_controls_output_count():
     assert len(result) == 3
 
 
-# --- use case 2: sequence only ---
-
-
 def test_run_sampling_sequence_only_returns_pdb_strings():
     result = _run({"n_res": N_RES_TEST, "sequence": "ACDE"})
     assert len(result) == 1
@@ -193,9 +186,6 @@ def test_run_sampling_sequence_with_x_returns_pdb_strings():
     result = _run({"n_res": N_RES_TEST, "sequence": "AXXE"})
     assert len(result) == 1
     assert "ATOM" in result[0]
-
-
-# --- use case 3: sequence + partial atoms ---
 
 
 def test_run_sampling_seq_partial_atoms_returns_pdb_strings():
@@ -211,9 +201,6 @@ def test_run_sampling_seq_partial_atoms_returns_pdb_strings():
     assert "ATOM" in result[0]
 
 
-# --- use case 4: partial template only ---
-
-
 def test_run_sampling_partial_template_returns_pdb_strings():
     partial_pdb = _make_pdb_string(N_RES_TEST // 2)
     result = _run({"n_res": N_RES_TEST, "template_pdb": partial_pdb})
@@ -221,17 +208,11 @@ def test_run_sampling_partial_template_returns_pdb_strings():
     assert "ATOM" in result[0]
 
 
-# --- use case 5: full template ---
-
-
 def test_run_sampling_full_template_returns_pdb_strings():
     full_pdb = _make_pdb_string(N_RES_TEST)
     result = _run({"n_res": N_RES_TEST, "template_pdb": full_pdb})
     assert len(result) == 1
     assert "ATOM" in result[0]
-
-
-# --- use case 6: all atoms + partial template ---
 
 
 def test_run_sampling_full_atoms_partial_template_returns_pdb_strings():
@@ -248,21 +229,10 @@ def test_run_sampling_full_atoms_partial_template_returns_pdb_strings():
     assert "ATOM" in result[0]
 
 
-# --- structure_pdb validation ---
-
-
 def test_run_sampling_structure_pdb_too_many_residues_raises():
     oversized_pdb = _make_pdb_string(N_RES_TEST + 2)
-    from REST_APIs.api import SampleRequest, _run_sampling
-
-    req = SampleRequest(n_res=N_RES_TEST, structure_pdb=oversized_pdb)
-    mock_state = _make_mock_state()
-    with patch("REST_APIs.api._state", mock_state):
-        with pytest.raises(ValueError, match="structure_pdb has"):
-            _run_sampling(req)
-
-
-# --- residue_index from PDB is non-contiguous ---
+    with pytest.raises(ValueError, match="structure_pdb has"):
+        _run({"n_res": N_RES_TEST, "structure_pdb": oversized_pdb})
 
 
 def test_run_sampling_non_contiguous_residue_index_does_not_raise():
@@ -281,9 +251,7 @@ def test_run_sampling_non_contiguous_residue_index_does_not_raise():
     pdb_str = to_pdb(prot)
     result = _run({"n_res": N_RES_TEST, "structure_pdb": pdb_str})
     assert len(result) == 1
-
-
-# --- template tempfile is always cleaned up ---
+    assert "ATOM" in result[0]
 
 
 def test_run_sampling_tempfile_deleted_after_sampling():
