@@ -101,9 +101,10 @@ restypes = [
     "W",
     "Y",
     "V",
+    "X",  # mask token: unknown / conditioning-dropout placeholder
 ]
 restype_order = {restype: i for i, restype in enumerate(restypes)}
-restype_num = len(restypes)  # := 20.
+restype_num = len(restypes)  # := 21.
 
 restype_1to3 = {
     "A": "ALA",

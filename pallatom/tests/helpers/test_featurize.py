@@ -1,10 +1,17 @@
 import dataclasses
+
 import pytest
 import torch
 import torch.nn as nn
 from einops import rearrange, reduce
-
-from helpers.featurize import Distogram, FeaturizedBatch, ProteinBatch, ResidueIndexEmbedding, featurize_batch
+from helpers.atom_utils import restype_num, restype_order
+from helpers.featurize import (
+    Distogram,
+    FeaturizedBatch,
+    ProteinBatch,
+    ResidueIndexEmbedding,
+    featurize_batch,
+)
 from train.train_config import TrainConfig
 
 torch.manual_seed(42)
@@ -15,12 +22,26 @@ N_BINS = 16
 C_RES = 32
 MIN_DIST = 2.0
 MAX_DIST = 22.0
-AA_SEQ = "ACDEFGHIKLMN"   # length N_RES
+AA_SEQ = "ACDEFGHIKLMN"  # length N_RES
+
+
+# ---------------------------------------------------------------------------
+# restype order and count — X as mask token
+# ---------------------------------------------------------------------------
+
+
+def test_restype_order_x_is_20():
+    assert restype_order["X"] == 20
+
+
+def test_restype_num_is_21():
+    assert restype_num == 21
 
 
 # ---------------------------------------------------------------------------
 # Fixtures — models
 # ---------------------------------------------------------------------------
+
 
 @pytest.fixture
 def disto():
@@ -40,6 +61,7 @@ def emb():
 # ---------------------------------------------------------------------------
 # Fixtures — tensors
 # ---------------------------------------------------------------------------
+
 
 @pytest.fixture
 def coords():
@@ -65,6 +87,7 @@ def residue_indices():
 # Distogram — overflow bin shape
 # ---------------------------------------------------------------------------
 
+
 def test_distogram_overflow_bin_output_shape(disto_overflow, coords):
     with torch.no_grad():
         f, _ = disto_overflow(coords)
@@ -74,6 +97,7 @@ def test_distogram_overflow_bin_output_shape(disto_overflow, coords):
 # ---------------------------------------------------------------------------
 # Distogram — one-hot property
 # ---------------------------------------------------------------------------
+
 
 def test_distogram_one_hot_sums_to_one(disto, coords):
     with torch.no_grad():
@@ -92,6 +116,7 @@ def test_distogram_overflow_one_hot_sums_to_one(disto_overflow, coords):
 # ---------------------------------------------------------------------------
 # Distogram — pair mask
 # ---------------------------------------------------------------------------
+
 
 def test_distogram_mask_none_gives_all_true_within_range(disto, coords):
     # Without a coords_mask, every pair within max_dist should be unmasked.
@@ -118,7 +143,7 @@ def test_distogram_overflow_mask_ignores_distance_cutoff(disto_overflow):
     # With overflow_bin=True the mask does NOT apply a distance cutoff —
     # pairs are valid as long as both atoms have valid coords.
     c = torch.zeros(N_RES, 3)
-    c[0] = 1000.0   # very far from all others
+    c[0] = 1000.0  # very far from all others
     with torch.no_grad():
         _, m = disto_overflow(c)
     assert m.all()
@@ -127,7 +152,7 @@ def test_distogram_overflow_mask_ignores_distance_cutoff(disto_overflow):
 def test_distogram_no_overflow_masks_distant_pairs(disto):
     # Without overflow_bin, pairs beyond max_dist are masked out.
     c = torch.zeros(N_RES, 3)
-    c[0] = MAX_DIST * 2   # residue 0 far from residue 1..N-1
+    c[0] = MAX_DIST * 2  # residue 0 far from residue 1..N-1
     with torch.no_grad():
         _, m = disto(c)
     # Pair (0, 1..N-1) should be masked
@@ -137,6 +162,7 @@ def test_distogram_no_overflow_masks_distant_pairs(disto):
 # ---------------------------------------------------------------------------
 # Distogram — symmetry
 # ---------------------------------------------------------------------------
+
 
 def test_distogram_is_symmetric(disto, coords):
     with torch.no_grad():
@@ -149,6 +175,7 @@ def test_distogram_is_symmetric(disto, coords):
 # Distogram — bin correctness
 # ---------------------------------------------------------------------------
 
+
 def test_distogram_close_pairs_land_in_first_bin(disto):
     # All coords at origin → all distances are 0 → all pairs in bin 0.
     c = torch.zeros(N_RES, 3)
@@ -160,11 +187,11 @@ def test_distogram_close_pairs_land_in_first_bin(disto):
 def test_distogram_overflow_far_pairs_land_in_last_bin(disto_overflow):
     # Two groups of atoms separated by >> max_dist.
     c = torch.zeros(N_RES, 3)
-    c[N_RES // 2:] = MAX_DIST * 10
+    c[N_RES // 2 :] = MAX_DIST * 10
     with torch.no_grad():
         f, _ = disto_overflow(c)
     # Cross-group pairs must occupy the overflow bin (last bin).
-    cross = f[:N_RES // 2, N_RES // 2:, :]
+    cross = f[: N_RES // 2, N_RES // 2 :, :]
     assert cross[..., -1].all()
 
 
@@ -172,18 +199,19 @@ def test_distogram_exact_bin_for_known_interior_distance(disto):
     # bin_width = (MAX_DIST - MIN_DIST) / N_BINS = (22 - 2) / 16 = 1.25 Å
     # d = 9.0 Å → bin = floor((9.0 - 2.0) / 1.25) = floor(5.6) = 5
     c = torch.zeros(N_RES, 3)
-    c[0, 0] = 9.0   # residue 0 at (9, 0, 0); all others at origin
+    c[0, 0] = 9.0  # residue 0 at (9, 0, 0); all others at origin
     expected_bin = 5
     with torch.no_grad():
         f, _ = disto(c)
     assert f[0, 1, expected_bin].item() == pytest.approx(1.0)
     assert f[0, 1, :expected_bin].abs().max().item() < 1e-6
-    assert f[0, 1, expected_bin + 1:].abs().max().item() < 1e-6
+    assert f[0, 1, expected_bin + 1 :].abs().max().item() < 1e-6
 
 
 # ---------------------------------------------------------------------------
 # ResidueIndexEmbedding — output behavior
 # ---------------------------------------------------------------------------
+
 
 def test_residue_index_embedding_different_indices_give_different_output(emb):
     with torch.no_grad():
@@ -210,6 +238,7 @@ def test_residue_index_embedding_gradient_flows(emb, residue_indices):
 # featurize_batch — fixtures
 # ---------------------------------------------------------------------------
 
+
 @pytest.fixture
 def protein_batch() -> ProteinBatch:
     return ProteinBatch(
@@ -228,7 +257,9 @@ def tcfg() -> TrainConfig:
 @pytest.fixture
 def c_beta_distogram_fn(tcfg: TrainConfig) -> Distogram:
     dr = tcfg.distogram_res
-    return Distogram(n_bins=dr.n_bins, min_dist=dr.min_dist, max_dist=dr.max_dist, overflow_bin=True).eval()
+    return Distogram(
+        n_bins=dr.n_bins, min_dist=dr.min_dist, max_dist=dr.max_dist, overflow_bin=True
+    ).eval()
 
 
 @pytest.fixture
@@ -243,8 +274,12 @@ def index_embedding(tcfg: TrainConfig):
 
 
 @pytest.fixture
-def featurized_batch(protein_batch, tcfg, c_beta_distogram_fn, atom_distogram_fn, index_embedding) -> FeaturizedBatch:
-    return featurize_batch(protein_batch, tcfg, c_beta_distogram_fn, atom_distogram_fn, index_embedding, device="cpu")
+def featurized_batch(
+    protein_batch, tcfg, c_beta_distogram_fn, atom_distogram_fn, index_embedding
+) -> FeaturizedBatch:
+    return featurize_batch(
+        protein_batch, tcfg, c_beta_distogram_fn, atom_distogram_fn, index_embedding, device="cpu"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -252,7 +287,7 @@ def featurized_batch(protein_batch, tcfg, c_beta_distogram_fn, atom_distogram_fn
 # Batched layout for B=2, N_RES=12:  tensors are (B, N_RES, *) or (B, N_ATOM, *)
 # ---------------------------------------------------------------------------
 
-N_ATOM = N_RES * 5   # 5 atoms per residue, no separators
+N_ATOM = N_RES * 5  # 5 atoms per residue, no separators
 
 
 def test_featurize_batch_ref_pos_shape(featurized_batch):
@@ -291,6 +326,7 @@ def test_featurize_batch_center_uid_shape(featurized_batch):
 # featurize_batch — output values
 # ---------------------------------------------------------------------------
 
+
 def test_featurize_batch_all_tensor_fields_finite(featurized_batch):
     for field in dataclasses.fields(featurized_batch):
         val = getattr(featurized_batch, field.name)
@@ -317,7 +353,7 @@ def test_featurize_batch_tok_idx_maps_atoms_to_residues(featurized_batch):
 
 
 def test_featurize_batch_center_uid_points_to_ca(featurized_batch):
-    expected = torch.arange(N_RES) * 5 + 1   # (N_RES,)
+    expected = torch.arange(N_RES) * 5 + 1  # (N_RES,)
     for b in range(B):
         assert torch.equal(featurized_batch.center_uid[b], expected)
 
@@ -330,10 +366,11 @@ def test_featurize_batch_returns_featurized_batch_instance(featurized_batch):
 # featurize_batch — ProteinBatch type enforcement
 # ---------------------------------------------------------------------------
 
+
 def test_featurize_batch_rejects_wrong_atom_positions_rank():
     with pytest.raises(Exception):
         ProteinBatch(
-            atom_positions=torch.randn(B, N_RES, 37),   # missing last dim
+            atom_positions=torch.randn(B, N_RES, 37),  # missing last dim
             atom_mask=torch.ones(B, N_RES, 37),
             residue_index=torch.arange(N_RES).float().unsqueeze(0).expand(B, -1).clone(),
             seq=[AA_SEQ, AA_SEQ],
