@@ -3,6 +3,7 @@
 import asyncio
 import os
 import sys
+import tempfile  # noqa: F401
 from contextlib import asynccontextmanager
 from functools import partial
 
@@ -18,7 +19,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(_HERE, "..", "pallatom"))
 
 from architecture.main_trunk import MainTrunk  # noqa: E402
-from helpers.atom_utils import Protein, to_pdb  # noqa: E402
+from helpers.atom_utils import Protein, protein_from_pdb, to_pdb  # noqa: E402,F401
 from helpers.featurize import Distogram  # noqa: E402
 from sample.sampling import (  # noqa: E402
     NATOM,
