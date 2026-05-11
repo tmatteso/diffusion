@@ -1,3 +1,5 @@
+import dataclasses
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -358,6 +360,18 @@ def test_main_trunk_gradient_flows_to_r_input(model, featurized_batch):
     reduce(r_denoised, "b n d -> ", "sum").backward()
     assert r_input_g.grad is not None
     assert torch.isfinite(r_input_g.grad).all()
+
+
+def test_main_trunk_forward_with_mask_token_aa_indices(model, featurized_batch):
+    # aa_indices containing 20 (mask token "X") must not raise IndexError
+    masked_batch = dataclasses.replace(
+        featurized_batch,
+        aa_indices=torch.full((B, N_RES), 20, dtype=torch.long),
+    )
+    with torch.no_grad():
+        r_denoised, *_ = model(masked_batch)
+    assert r_denoised.shape == (B, N_ATOM, 3)
+    assert torch.isfinite(r_denoised).all()
 
 
 # you need to add integration tests here. don't be afraid to use pytest mocks.
