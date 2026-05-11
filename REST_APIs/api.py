@@ -3,7 +3,7 @@
 import asyncio
 import os
 import sys
-import tempfile  # noqa: F401
+import tempfile
 from contextlib import asynccontextmanager
 from functools import partial
 
@@ -19,7 +19,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(_HERE, "..", "pallatom"))
 
 from architecture.main_trunk import MainTrunk  # noqa: E402
-from helpers.atom_utils import Protein, protein_from_pdb, to_pdb  # noqa: E402,F401
+from helpers.atom_utils import Protein, protein_from_pdb, to_pdb  # noqa: E402
 from helpers.featurize import Distogram  # noqa: E402
 from sample.sampling import (  # noqa: E402
     NATOM,
@@ -77,6 +77,10 @@ async def lifespan(app: FastAPI):
     mp = ModelParams()
     noise = NoiseScheduleParams()
     model = _load_model(CHECKPOINT_PATH, mp, noise, DEVICE)
+    ckpt = torch.load(CHECKPOINT_PATH, map_location=DEVICE, weights_only=True)
+    index_embedding = nn.Embedding(mp.max_residues, mp.c_res).to(DEVICE)
+    index_embedding.load_state_dict(ckpt["index_embedding"])
+    index_embedding.eval()
     atom_disto = Distogram(n_bins=22, min_dist=2.0, max_dist=22.0).to(DEVICE)
     templ_disto = Distogram(
         n_bins=mp.n_bins - 1, min_dist=3.25, max_dist=50.75, overflow_bin=True
@@ -85,6 +89,7 @@ async def lifespan(app: FastAPI):
         model=model,
         mp=mp,
         noise=noise,
+        index_embedding=index_embedding,
         atom_disto=atom_disto,
         templ_disto=templ_disto,
     )
@@ -168,23 +173,82 @@ class SampleResponse(BaseModel):
 # ── synchronous sampling work (runs in a thread-pool executor) ────────────────
 
 
+def _protein_from_pdb_string(pdb_string: str):
+    """Write pdb_string to a temp file, parse it, delete the temp file."""
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".pdb", delete=False) as f:
+        f.write(pdb_string)
+        path = f.name
+    try:
+        return protein_from_pdb(path)
+    finally:
+        os.unlink(path)
+
+
 def _run_sampling(req: SampleRequest) -> list[str]:
     model: MainTrunk = _state["model"]
-    index_embedding: nn.Embedding = _state["index_embedding"]
-    mp: ModelParams = _state["mp"]
     noise: NoiseScheduleParams = _state["noise"]
+    index_embedding: nn.Embedding = _state["index_embedding"]
+    atom_disto: Distogram = _state["atom_disto"]
+    templ_disto: Distogram = _state["templ_disto"]
 
     N_res = req.n_res
-    N_atom = N_res * NATOM
     B = req.n_samples
+    N_atom = N_res * NATOM
 
-    context = build_sampling_context(
-        N_res,
-        index_embedding,
-        batch_size=B,
-        n_templ_bins=mp.n_bins,
-        device=DEVICE,
-    )
+    # ── atom-level conditioning ───────────────────────────────────────────────
+    if req.structure_pdb is not None:
+        prot = _protein_from_pdb_string(req.structure_pdb)
+        n_pdb: int = prot.atom_positions.shape[0]
+        if n_pdb > N_res:
+            raise ValueError(
+                f"structure_pdb has {n_pdb} residues but n_res={N_res}; "
+                "structure_pdb must cover ≤ n_res residues"
+            )
+        atom_positions = torch.zeros(N_res, 37, 3)
+        atom_mask = torch.zeros(N_res, 37)
+        atom_positions[:n_pdb] = torch.tensor(prot.atom_positions, dtype=torch.float32)
+        atom_mask[:n_pdb] = torch.tensor(prot.atom_mask, dtype=torch.float32)
+        pdb_idx = torch.tensor(prot.residue_index, dtype=torch.float32)
+        if n_pdb < N_res:
+            last = int(pdb_idx[-1].item()) if n_pdb > 0 else -1
+            tail = torch.arange(last + 1, last + 1 + (N_res - n_pdb), dtype=torch.float32)
+            residue_index = torch.cat([pdb_idx, tail])
+        else:
+            residue_index = pdb_idx
+    else:
+        atom_positions = torch.zeros(N_res, 37, 3)
+        atom_mask = torch.zeros(N_res, 37)
+        residue_index = torch.arange(N_res, dtype=torch.float32)
+
+    # ── sequence ─────────────────────────────────────────────────────────────
+    seq: str = req.sequence if req.sequence is not None else "X" * N_res
+
+    # ── template-distogram conditioning ──────────────────────────────────────
+    pdb_files: list[str] = []
+    tmp_path: str | None = None
+    try:
+        if req.template_pdb is not None:
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".pdb", delete=False) as f:
+                f.write(req.template_pdb)
+                tmp_path = f.name
+            pdb_files = [tmp_path]
+
+        context = build_sampling_context(
+            atom_positions=atom_positions,
+            atom_mask=atom_mask,
+            residue_index=residue_index,
+            seq=seq,
+            pdb_files=pdb_files,
+            index_embedding=index_embedding,
+            atom_distogram_fn=atom_disto,
+            templ_distogram_fn=templ_disto,
+            batch_size=B,
+            device=DEVICE,
+        )
+    finally:
+        if tmp_path is not None:
+            os.unlink(tmp_path)
+
     edm_precond = EDMPrecond(
         model,
         context,
@@ -214,7 +278,7 @@ def _run_sampling(req: SampleRequest) -> list[str]:
     for b in range(B):
         coords_np = rearrange(coords_batch[b].cpu().numpy(), "(n a) d -> n a d", n=N_res, a=NATOM)
         x_37, mask_37 = atom5_to_atom37(coords_np)
-        prot = Protein(
+        prot_out = Protein(
             atom_positions=x_37,
             atom_mask=mask_37,
             residue_index=np.arange(N_res, dtype=np.int32),
@@ -222,7 +286,7 @@ def _run_sampling(req: SampleRequest) -> list[str]:
             chain_index=np.zeros(N_res, dtype=np.int32),
             b_factors=np.ones((N_res, 37), dtype=np.float32),
         )
-        pdb_strings.append(to_pdb(prot))
+        pdb_strings.append(to_pdb(prot_out))
 
     return pdb_strings
 
