@@ -1,9 +1,9 @@
 import pytest
 from pydantic import ValidationError
-
 from train.train_config import (
     AtomDistogramParams,
     CheckpointParams,
+    ConditioningDropoutConfig,
     LoaderConfig,
     LoggingParams,
     LossParams,
@@ -14,10 +14,10 @@ from train.train_config import (
     TrainingParams,
 )
 
-
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+
 
 @pytest.fixture
 def training() -> TrainingParams:
@@ -66,15 +66,15 @@ def loader() -> LoaderConfig:
 
 @pytest.fixture
 def cfg(
-    training:      TrainingParams,
-    model:         ModelParams,
-    noise:         NoiseScheduleParams,
+    training: TrainingParams,
+    model: ModelParams,
+    noise: NoiseScheduleParams,
     distogram_res: ResidueDistogramParams,
     distogram_atom: AtomDistogramParams,
-    loss:          LossParams,
-    checkpoint:    CheckpointParams,
-    logging_:      LoggingParams,
-    loader:        LoaderConfig,
+    loss: LossParams,
+    checkpoint: CheckpointParams,
+    logging_: LoggingParams,
+    loader: LoaderConfig,
 ) -> TrainConfig:
     return TrainConfig(
         training=training,
@@ -93,20 +93,21 @@ def cfg(
 # TrainConfig — construction and sub-model types
 # ---------------------------------------------------------------------------
 
+
 def test_train_config_default_constructs():
     assert isinstance(TrainConfig(), TrainConfig)
 
 
 def test_train_config_sub_models_are_correct_types(cfg: TrainConfig):
-    assert isinstance(cfg.training,      TrainingParams)
-    assert isinstance(cfg.model,         ModelParams)
-    assert isinstance(cfg.noise,         NoiseScheduleParams)
+    assert isinstance(cfg.training, TrainingParams)
+    assert isinstance(cfg.model, ModelParams)
+    assert isinstance(cfg.noise, NoiseScheduleParams)
     assert isinstance(cfg.distogram_res, ResidueDistogramParams)
     assert isinstance(cfg.distogram_atom, AtomDistogramParams)
-    assert isinstance(cfg.loss,          LossParams)
-    assert isinstance(cfg.checkpoint,    CheckpointParams)
-    assert isinstance(cfg.logging,       LoggingParams)
-    assert isinstance(cfg.loader,        LoaderConfig)
+    assert isinstance(cfg.loss, LossParams)
+    assert isinstance(cfg.checkpoint, CheckpointParams)
+    assert isinstance(cfg.logging, LoggingParams)
+    assert isinstance(cfg.loader, LoaderConfig)
 
 
 def test_train_config_accepts_nested_overrides():
@@ -119,24 +120,26 @@ def test_train_config_accepts_nested_overrides():
 # TrainConfig — immutability
 # ---------------------------------------------------------------------------
 
+
 def test_train_config_is_frozen(cfg: TrainConfig):
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError):
         cfg.training = TrainingParams()  # type: ignore[misc]
 
 
 def test_training_params_is_frozen(training: TrainingParams):
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError):
         training.lr = 1e-2  # type: ignore[misc]
 
 
 def test_model_params_is_frozen(model: ModelParams):
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError):
         model.c_res = 512  # type: ignore[misc]
 
 
 # ---------------------------------------------------------------------------
 # TrainConfig — serialization round-trip
 # ---------------------------------------------------------------------------
+
 
 def test_train_config_model_dump_is_dict(cfg: TrainConfig):
     assert isinstance(cfg.model_dump(), dict)
@@ -156,6 +159,7 @@ def test_train_config_round_trips_custom_values():
 # ---------------------------------------------------------------------------
 # TrainingParams — defaults and field constraints
 # ---------------------------------------------------------------------------
+
 
 def test_training_default_values(training: TrainingParams):
     assert training.num_epochs == 50
@@ -191,14 +195,15 @@ def test_training_accepts_positive_grad_clip():
 # ModelParams — defaults and field constraints
 # ---------------------------------------------------------------------------
 
+
 def test_model_default_values(model: ModelParams):
-    assert model.f_ref_dim  == 35
-    assert model.n_bins     == 39
-    assert model.c_atom     == 16
-    assert model.c_pair     == 16
-    assert model.c_res      == 32
+    assert model.f_ref_dim == 35
+    assert model.n_bins == 39
+    assert model.c_atom == 16
+    assert model.c_pair == 16
+    assert model.c_res == 32
     assert model.c_atompair == 2
-    assert model.K_unit     == 3
+    assert model.K_unit == 3
 
 
 def test_model_rejects_zero_c_res():
@@ -215,12 +220,13 @@ def test_model_rejects_zero_k_unit():
 # NoiseScheduleParams — defaults, field constraints, cross-field validator
 # ---------------------------------------------------------------------------
 
+
 def test_noise_default_values(noise: NoiseScheduleParams):
     assert noise.sigma_data == pytest.approx(19.2368)
-    assert noise.sigma_max  == pytest.approx(42.3689)
-    assert noise.sigma_min  == pytest.approx(3.807123)
-    assert noise.P_mean     == pytest.approx(2.5416)
-    assert noise.P_std      == pytest.approx(1.2048)
+    assert noise.sigma_max == pytest.approx(42.3689)
+    assert noise.sigma_min == pytest.approx(3.807123)
+    assert noise.P_mean == pytest.approx(2.5416)
+    assert noise.P_std == pytest.approx(1.2048)
 
 
 def test_noise_sigma_min_lt_sigma_max(noise: NoiseScheduleParams):
@@ -251,10 +257,11 @@ def test_noise_rejects_sigma_min_greater_than_sigma_max():
 # ResidueDistogramParams — defaults, field constraints, cross-field validator
 # ---------------------------------------------------------------------------
 
+
 def test_residue_distogram_default_values(distogram_res: ResidueDistogramParams):
-    assert distogram_res.min_dist    == pytest.approx(3.25)
-    assert distogram_res.max_dist    == pytest.approx(50.75)
-    assert distogram_res.n_bins      == 38
+    assert distogram_res.min_dist == pytest.approx(3.25)
+    assert distogram_res.max_dist == pytest.approx(50.75)
+    assert distogram_res.n_bins == 38
     assert distogram_res.tok_emb_dim == 32
 
 
@@ -285,10 +292,11 @@ def test_residue_distogram_accepts_zero_min_dist():
 # AtomDistogramParams — defaults
 # ---------------------------------------------------------------------------
 
+
 def test_atom_distogram_default_values(distogram_atom: AtomDistogramParams):
     assert distogram_atom.min_dist == pytest.approx(0.0)
     assert distogram_atom.max_dist == pytest.approx(10.0)
-    assert distogram_atom.n_bins   == 22
+    assert distogram_atom.n_bins == 22
 
 
 def test_atom_distogram_min_dist_lt_max_dist(distogram_atom: AtomDistogramParams):
@@ -299,11 +307,12 @@ def test_atom_distogram_min_dist_lt_max_dist(distogram_atom: AtomDistogramParams
 # LossParams — defaults and field constraints
 # ---------------------------------------------------------------------------
 
+
 def test_loss_default_values(loss: LossParams):
-    assert loss.lam                == pytest.approx(1.0)
-    assert loss.alpha_0            == pytest.approx(0.25)
-    assert loss.alpha_1            == pytest.approx(1.0)
-    assert loss.gamma              == pytest.approx(0.99)
+    assert loss.lam == pytest.approx(1.0)
+    assert loss.alpha_0 == pytest.approx(0.25)
+    assert loss.alpha_1 == pytest.approx(1.0)
+    assert loss.gamma == pytest.approx(0.99)
     assert loss.smooth_lddt_cutoff == 15
 
 
@@ -336,6 +345,7 @@ def test_loss_rejects_nonpositive_smooth_lddt_cutoff():
 # CheckpointParams — defaults and field constraints
 # ---------------------------------------------------------------------------
 
+
 def test_checkpoint_default_values(checkpoint: CheckpointParams):
     assert checkpoint.checkpoint_path == "pallatom_best_best.pt"
     assert checkpoint.save_every == 1
@@ -354,9 +364,10 @@ def test_checkpoint_rejects_negative_save_every():
 # LoggingParams — defaults and field constraints
 # ---------------------------------------------------------------------------
 
+
 def test_logging_default_values(logging_: LoggingParams):
-    assert logging_.log_interval  == 1
-    assert logging_.use_wandb     is True
+    assert logging_.log_interval == 1
+    assert logging_.use_wandb is True
     assert logging_.wandb_project == "pallatom-training"
 
 
@@ -375,9 +386,10 @@ def test_logging_accepts_wandb_enabled():
 # LoaderConfig — defaults and field constraints
 # ---------------------------------------------------------------------------
 
+
 def test_loader_default_values(loader: LoaderConfig):
     assert loader.max_seq_length == 128
-    assert loader.batch_size     == 2
+    assert loader.batch_size == 2
 
 
 def test_loader_rejects_zero_batch_size():
@@ -388,3 +400,43 @@ def test_loader_rejects_zero_batch_size():
 def test_loader_rejects_zero_max_seq_length():
     with pytest.raises(ValidationError):
         LoaderConfig(max_seq_length=0)
+
+
+# ---------------------------------------------------------------------------
+# ConditioningDropoutConfig — defaults, field constraints
+# ---------------------------------------------------------------------------
+
+
+def test_conditioning_dropout_config_defaults():
+    cfg = ConditioningDropoutConfig()
+    assert cfg.p_distogram == 0.15
+    assert cfg.p_atom == 0.15
+    assert cfg.p_seq == 0.15
+
+
+def test_conditioning_dropout_config_custom_values():
+    cfg = ConditioningDropoutConfig(p_distogram=0.3, p_atom=0.1, p_seq=0.2)
+    assert cfg.p_distogram == 0.3
+    assert cfg.p_atom == 0.1
+    assert cfg.p_seq == 0.2
+
+
+def test_conditioning_dropout_config_rejects_negative():
+    with pytest.raises(ValidationError):
+        ConditioningDropoutConfig(p_distogram=-0.1)
+
+
+def test_conditioning_dropout_config_rejects_above_one():
+    with pytest.raises(ValidationError):
+        ConditioningDropoutConfig(p_seq=1.1)
+
+
+def test_train_config_has_conditioning_dropout():
+    cfg = TrainConfig()
+    assert hasattr(cfg, "conditioning_dropout")
+    assert isinstance(cfg.conditioning_dropout, ConditioningDropoutConfig)
+
+
+def test_train_config_conditioning_dropout_defaults():
+    cfg = TrainConfig()
+    assert cfg.conditioning_dropout.p_distogram == 0.15
