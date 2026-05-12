@@ -9,7 +9,6 @@ from functools import partial
 
 import numpy as np
 import torch
-import torch.nn as nn
 from einops import rearrange
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -50,6 +49,7 @@ def _load_model(
     noise: NoiseScheduleParams,
     device: str,
 ) -> MainTrunk:
+    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=True)
     model = MainTrunk(
         f_ref_dim=mp.f_ref_dim,
         n_bins=mp.n_bins,
@@ -60,7 +60,6 @@ def _load_model(
         K_unit=mp.K_unit,
         sigma_data=noise.sigma_data,
     ).to(device)
-    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=True)
     model.load_state_dict(ckpt["model"])
     model.eval()
     return model
@@ -77,10 +76,6 @@ async def lifespan(app: FastAPI):
     mp = ModelParams()
     noise = NoiseScheduleParams()
     model = _load_model(CHECKPOINT_PATH, mp, noise, DEVICE)
-    ckpt = torch.load(CHECKPOINT_PATH, map_location=DEVICE, weights_only=True)
-    index_embedding = nn.Embedding(mp.max_residues, mp.c_res).to(DEVICE)
-    index_embedding.load_state_dict(ckpt["index_embedding"])
-    index_embedding.eval()
     atom_disto = Distogram(n_bins=22, min_dist=2.0, max_dist=22.0).to(DEVICE)
     templ_disto = Distogram(
         n_bins=mp.n_bins - 1, min_dist=3.25, max_dist=50.75, overflow_bin=True
@@ -89,7 +84,6 @@ async def lifespan(app: FastAPI):
         model=model,
         mp=mp,
         noise=noise,
-        index_embedding=index_embedding,
         atom_disto=atom_disto,
         templ_disto=templ_disto,
     )
@@ -186,8 +180,8 @@ def _protein_from_pdb_string(pdb_string: str):
 
 def _run_sampling(req: SampleRequest) -> list[str]:
     model: MainTrunk = _state["model"]
+    mp: ModelParams = _state["mp"]
     noise: NoiseScheduleParams = _state["noise"]
-    index_embedding: nn.Embedding = _state["index_embedding"]
     atom_disto: Distogram = _state["atom_disto"]
     templ_disto: Distogram = _state["templ_disto"]
 
@@ -239,9 +233,9 @@ def _run_sampling(req: SampleRequest) -> list[str]:
             residue_index=residue_index,
             seq=seq,
             pdb_files=pdb_files,
-            index_embedding=index_embedding,
             atom_distogram_fn=atom_disto,
             templ_distogram_fn=templ_disto,
+            c_res=mp.c_res,
             batch_size=B,
             device=DEVICE,
         )
