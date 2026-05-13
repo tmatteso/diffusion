@@ -166,7 +166,6 @@ reportUnboundVariable = "none" # let's come back to this
 reportRedeclaration = "none" # let's come back to this
 reportOptionalMemberAccess = "none" # let's come back to this
 reportOptionalOperand = "none" # let's come back to this
-reportOptionalSubscript = "none" # let's come back to this
 
 [tool.pytest.ini_options]
 testpaths = ["tests", "pallatom/tests"]
