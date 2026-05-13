@@ -1,7 +1,11 @@
+"""Pydantic configuration models for training, noise schedule, and model hyperparameters."""
+
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class TrainingParams(BaseModel):
+    """Optimizer and training loop hyperparameters."""
+
     model_config = ConfigDict(frozen=True)
 
     num_epochs: int = 50
@@ -12,6 +16,8 @@ class TrainingParams(BaseModel):
 
 
 class ModelParams(BaseModel):
+    """Architecture channel dimensions and capacity parameters."""
+
     model_config = ConfigDict(frozen=True)
 
     f_ref_dim: int = Field(35, gt=0)  # 5 atoms × 7 features
@@ -25,6 +31,8 @@ class ModelParams(BaseModel):
 
 
 class NoiseScheduleParams(BaseModel):
+    """EDM diffusion noise schedule params (sigma bounds, data scale, and sampling distribution)."""
+
     model_config = ConfigDict(frozen=True)
 
     sigma_data: float = Field(19.2368, gt=0)
@@ -35,12 +43,15 @@ class NoiseScheduleParams(BaseModel):
 
     @model_validator(mode="after")
     def sigma_min_lt_max(self) -> "NoiseScheduleParams":
+        """Validate that sigma_min is strictly less than sigma_max."""
         if self.sigma_min >= self.sigma_max:
             raise ValueError(f"sigma_min ({self.sigma_min}) must be < sigma_max ({self.sigma_max})")
         return self
 
 
 class ResidueDistogramParams(BaseModel):
+    """Binning configuration for the residue-level Cβ distance distogram."""
+
     model_config = ConfigDict(frozen=True)
 
     min_dist: float = Field(3.25, ge=0)
@@ -50,18 +61,23 @@ class ResidueDistogramParams(BaseModel):
 
     @model_validator(mode="after")
     def min_lt_max(self) -> "ResidueDistogramParams":
+        """Validate that min_dist is strictly less than max_dist."""
         if self.min_dist >= self.max_dist:
             raise ValueError(f"min_dist ({self.min_dist}) must be < max_dist ({self.max_dist})")
         return self
 
 
 class AtomDistogramParams(ResidueDistogramParams):
+    """Binning configuration for the sparse atom-pair distance distogram."""
+
     min_dist: float = Field(0.0, ge=0)
     max_dist: float = Field(10.0, gt=0)
     n_bins: int = Field(22, gt=0)
 
 
 class LossParams(BaseModel):
+    """Weights and thresholds for the composite training loss."""
+
     model_config = ConfigDict(frozen=True)
 
     # polar residues get weight 2.0, others 1.0 in the basic L0 loss
@@ -76,6 +92,8 @@ class LossParams(BaseModel):
 
 
 class CheckpointParams(BaseModel):
+    """Checkpoint file path and save frequency."""
+
     model_config = ConfigDict(frozen=True)
 
     checkpoint_path: str = "pallatom_best_best.pt"
@@ -83,6 +101,8 @@ class CheckpointParams(BaseModel):
 
 
 class LoggingParams(BaseModel):
+    """Logging frequency and W&B project configuration."""
+
     model_config = ConfigDict(frozen=True)
 
     log_interval: int = Field(1, ge=1)
@@ -91,6 +111,8 @@ class LoggingParams(BaseModel):
 
 
 class LoaderConfig(BaseModel):
+    """DataLoader sequence length cap and batch size."""
+
     model_config = ConfigDict(frozen=True)
 
     max_seq_length: int = Field(128, gt=0)  # was 256
@@ -102,6 +124,8 @@ TestLoaderConfig = LoaderConfig
 
 
 class ConditioningDropoutConfig(BaseModel):
+    """Per-conditioning-signal dropout probabilities used during training."""
+
     model_config = ConfigDict(frozen=True)
 
     p_distogram: float = Field(0.15, ge=0.0, le=1.0)
@@ -110,6 +134,8 @@ class ConditioningDropoutConfig(BaseModel):
 
 
 class TrainConfig(BaseModel):
+    """Top-level frozen config aggregating all training sub-configs."""
+
     model_config = ConfigDict(frozen=True)
 
     training: TrainingParams = Field(default_factory=TrainingParams)

@@ -1,20 +1,22 @@
-import torch.nn as nn
+"""Template embedder for encoding structural template information."""
+
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
-from einops import rearrange, repeat
-from einops import einsum
 from architecture.atom_transformers import LinearNoBias
 from architecture.pairformer_stack import PairformerStack
-from jaxtyping import Float, jaxtyped
 from beartype import beartype
+from einops import einsum, rearrange, repeat
+from jaxtyping import Float, jaxtyped
 
 # ---------------------------------------------------------------------------
 # TemplateEmbedder — Algorithm 3
 # ---------------------------------------------------------------------------
 
+
 class TemplateEmbedder(nn.Module):
-    """
-    Parameters
+    """Parameters
+
     ----------
     n_bins   : number of distogram bins  (f_distogram last dim)
     c_z      : trunk pair embedding dim  (z_ij last dim)
@@ -26,38 +28,38 @@ class TemplateEmbedder(nn.Module):
 
     def __init__(
         self,
-        n_bins:   int,
-        c_z:      int,
-        c:        int = 64,
-        d:        int = 128,
+        n_bins: int,
+        c_z: int,
+        c: int = 64,
+        d: int = 128,
         n_blocks: int = 2,
-        n_heads:  int = 4,
-    ):
+        n_heads: int = 4,
+    ) -> None:
         super().__init__()
 
         # Step 4 projections
         # a_ij dim = n_bins + 1 (b_mask) + 1 (b_time)
         a_dim = n_bins + 1 + 1
-        self.norm_z   = nn.LayerNorm(c_z)
-        self.proj_z   = LinearNoBias(c_z,   c)   # LinearNoBias(LayerNorm(z_ij))
-        self.proj_a   = LinearNoBias(a_dim, c)   # LinearNoBias(a_ij)
+        self.norm_z = nn.LayerNorm(c_z)
+        self.proj_z = LinearNoBias(c_z, c)  # LinearNoBias(LayerNorm(z_ij))
+        self.proj_a = LinearNoBias(a_dim, c)  # LinearNoBias(a_ij)
 
         # Step 5
         self.pairformer = PairformerStack(c, n_blocks, n_heads)
 
         # Step 6
-        self.norm_v   = nn.LayerNorm(c)
+        self.norm_v = nn.LayerNorm(c)
         self.proj_out = LinearNoBias(c, d)
 
     @jaxtyped(typechecker=beartype)
     def forward(
         self,
-        f_distogram:        Float[torch.Tensor, "B N_res N_res n_bins"],
+        f_distogram: Float[torch.Tensor, "B N_res N_res n_bins"],
         f_pseudo_beta_mask: Float[torch.Tensor, "B N_res"],
-        z_ij:               Float[torch.Tensor, "B N_res N_res c_z"],
-        t:                  float,       # scalar in [0, 1)
-    ) -> Float[torch.Tensor,"B N_res N_res d"]:
-
+        z_ij: Float[torch.Tensor, "B N_res N_res c_z"],
+        t: float,  # scalar in [0, 1)
+    ) -> Float[torch.Tensor, "B N_res N_res d"]:
+        """Embed template distogram and pair features into time-conditioned pair representation."""
         N = f_pseudo_beta_mask.size(1)
 
         # ------------------------------------------------------------------
@@ -78,12 +80,16 @@ class TemplateEmbedder(nn.Module):
         # ------------------------------------------------------------------
         # Step 3: a_ij = concat(f_distogram, b_mask, b_time)
         # ------------------------------------------------------------------
-        a_ij: Float[torch.Tensor, "B N_res N_res a_dim"] = torch.cat([f_distogram, b_mask, b_time], dim=-1)
+        a_ij: Float[torch.Tensor, "B N_res N_res a_dim"] = torch.cat(
+            [f_distogram, b_mask, b_time], dim=-1
+        )
 
         # ------------------------------------------------------------------
         # Step 4: v_ij = LinearNoBias(LayerNorm(z_ij)) + LinearNoBias(a_ij)
         # ------------------------------------------------------------------
-        v_ij: Float[torch.Tensor, "B N_res N_res c"] = self.proj_z(self.norm_z(z_ij)) + self.proj_a(a_ij)
+        v_ij: Float[torch.Tensor, "B N_res N_res c"] = self.proj_z(self.norm_z(z_ij)) + self.proj_a(
+            a_ij
+        )
 
         # ------------------------------------------------------------------
         # Step 5: v_ij = PairformerStack(v_ij, N_block)

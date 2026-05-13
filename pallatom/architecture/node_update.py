@@ -1,14 +1,15 @@
+"""Node update modules for single-representation refinement."""
+
 import math
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from architecture.atom_transformers import LinearNoBias
+from architecture.pair_update import DropoutRowwise, Transition
 from beartype import beartype
 from einops import einsum, rearrange
 from jaxtyping import Float, jaxtyped
-
-from architecture.atom_transformers import LinearNoBias
-from architecture.pair_update import DropoutRowwise, Transition
 
 # ---------------------------------------------------------------------------
 # AttentionPairBias
@@ -20,9 +21,9 @@ from architecture.pair_update import DropoutRowwise, Transition
 # With β_ij = 0 the pair bias is purely additive (no learned gating).
 # ---------------------------------------------------------------------------
 
+
 class AttentionPairBias(nn.Module):
-    """
-    Self-attention on node embeddings s_i biased by pair embeddings z_ij.
+    """Self-attention on node embeddings s_i biased by pair embeddings z_ij.
 
     Parameters
     ----------
@@ -31,30 +32,30 @@ class AttentionPairBias(nn.Module):
     n_heads : number of attention heads (default 8 per Algorithm 6)
     """
 
-    def __init__(self, c: int, c_pair: int, n_heads: int = 8):
+    def __init__(self, c: int, c_pair: int, n_heads: int = 8) -> None:
         super().__init__()
         assert c % n_heads == 0, "c must be divisible by n_heads"
-        self.n_heads  = n_heads
+        self.n_heads = n_heads
         self.head_dim = c // n_heads
 
-        self.norm_s  = nn.LayerNorm(c)
-        self.norm_t  = nn.LayerNorm(c)
-        self.norm_z  = nn.LayerNorm(c_pair)
+        self.norm_s = nn.LayerNorm(c)
+        self.norm_t = nn.LayerNorm(c)
+        self.norm_z = nn.LayerNorm(c_pair)
 
         # Time conditioning: project t_i → query bias
-        self.proj_t  = LinearNoBias(c, c)
+        self.proj_t = LinearNoBias(c, c)
 
         # QKV projections (no bias, as throughout AF3)
-        self.to_q    = LinearNoBias(c, c)
-        self.to_k    = LinearNoBias(c, c)
-        self.to_v    = LinearNoBias(c, c)
+        self.to_q = LinearNoBias(c, c)
+        self.to_k = LinearNoBias(c, c)
+        self.to_v = LinearNoBias(c, c)
 
         # Pair → per-head scalar bias  (β_ij = 0 means purely additive, no extra gate)
         self.to_bias = LinearNoBias(c_pair, n_heads)
 
         # Gating on output (standard in AF3 attention)
-        self.to_g    = nn.Linear(c, c)           # gating (bias allowed)
-        self.to_out  = LinearNoBias(c, c)
+        self.to_g = nn.Linear(c, c)  # gating (bias allowed)
+        self.to_out = LinearNoBias(c, c)
 
     @jaxtyped(typechecker=beartype)
     def forward(
@@ -63,22 +64,32 @@ class AttentionPairBias(nn.Module):
         t: Float[torch.Tensor, "B N_res c_res"],
         z: Float[torch.Tensor, "B N_res N_res c_pair"],
     ) -> Float[torch.Tensor, "B N_res c_res"]:
-
+        """Compute time-conditioned pair-biased attention over residue single embeddings."""
         H, D = self.n_heads, self.head_dim
 
         # Inject time conditioning into queries
         sn: Float[torch.Tensor, "B N_res c_res"] = self.norm_s(s) + self.proj_t(self.norm_t(t))
 
-        Q: Float[torch.Tensor, "B N_res n_heads head_dim"] = rearrange(self.to_q(sn), "b n (h d) -> b n h d", h=H)
-        K: Float[torch.Tensor, "B N_res n_heads head_dim"] = rearrange(self.to_k(sn), "b n (h d) -> b n h d", h=H)
-        V: Float[torch.Tensor, "B N_res n_heads head_dim"] = rearrange(self.to_v(sn), "b n (h d) -> b n h d", h=H)
+        Q: Float[torch.Tensor, "B N_res n_heads head_dim"] = rearrange(
+            self.to_q(sn), "b n (h d) -> b n h d", h=H
+        )
+        K: Float[torch.Tensor, "B N_res n_heads head_dim"] = rearrange(
+            self.to_k(sn), "b n (h d) -> b n h d", h=H
+        )
+        V: Float[torch.Tensor, "B N_res n_heads head_dim"] = rearrange(
+            self.to_v(sn), "b n (h d) -> b n h d", h=H
+        )
         G: Float[torch.Tensor, "B N_res c_res"] = torch.sigmoid(self.to_g(sn))
 
         # Attention logits: (B, h, N_q, N_k)
-        attn: Float[torch.Tensor, "B n_heads N_res N_res"] = einsum(Q, K, "b n_q h d, b n_k h d -> b h n_q n_k") / math.sqrt(D)
+        attn: Float[torch.Tensor, "B n_heads N_res N_res"] = einsum(
+            Q, K, "b n_q h d, b n_k h d -> b h n_q n_k"
+        ) / math.sqrt(D)
 
         # Additive pair bias: (B, N_res, N_res, n_heads) → (B, h, N_q, N_k)
-        bias: Float[torch.Tensor, "B n_heads N_res N_res"] = rearrange(self.to_bias(self.norm_z(z)), "b n_q n_k h -> b h n_q n_k")
+        bias: Float[torch.Tensor, "B n_heads N_res N_res"] = rearrange(
+            self.to_bias(self.norm_z(z)), "b n_q n_k h -> b h n_q n_k"
+        )
         attn: Float[torch.Tensor, "B n_heads N_res N_res"] = F.softmax(attn + bias, dim=-1)
 
         # Weighted sum → (B, N_res, c_res)
@@ -94,9 +105,10 @@ class AttentionPairBias(nn.Module):
 # NodeUpdate — Algorithm 6
 # ---------------------------------------------------------------------------
 
+
 class NodeUpdate(nn.Module):
-    """
-    Parameters
+    """Parameters
+
     ----------
     c       : single embedding dim  (default 256)
     c_pair  : pair   embedding dim
@@ -106,19 +118,19 @@ class NodeUpdate(nn.Module):
 
     def __init__(
         self,
-        c:       int   = 256,
-        c_pair:  int   = 128,
-        n_heads: int   = 8,
+        c: int = 256,
+        c_pair: int = 128,
+        n_heads: int = 8,
         dropout: float = 0.25,
-    ):
+    ) -> None:
         super().__init__()
 
         # Step 1
         self.attn_pair_bias = AttentionPairBias(c, c_pair, n_heads)
-        self.dropout_row    = DropoutRowwise(dropout)
+        self.dropout_row = DropoutRowwise(dropout)
 
         # Step 2
-        self.transition     = Transition(c)
+        self.transition = Transition(c)
 
     @jaxtyped(typechecker=beartype)
     def forward(
@@ -127,7 +139,7 @@ class NodeUpdate(nn.Module):
         t: Float[torch.Tensor, "B N_res c_res"],
         z: Float[torch.Tensor, "B N_res N_res c_pair"],
     ) -> Float[torch.Tensor, "B N_res c_res"]:
-
+        """Apply pair-biased attention and transition to update the residue single embedding."""
         # ------------------------------------------------------------------
         # Step 1: s_i += DropoutRowwise_0.25(AttentionPairBias(s, t, z, β=0, N_head=8))
         # ------------------------------------------------------------------
@@ -142,6 +154,4 @@ class NodeUpdate(nn.Module):
         # ------------------------------------------------------------------
         # Step 2: s_i += Transition(s_i)
         # ------------------------------------------------------------------
-        s = s + self.transition(s)
-
-        return s
+        return s + self.transition(s)

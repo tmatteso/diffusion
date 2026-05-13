@@ -1,20 +1,22 @@
+"""Tests for the main trunk forward pass."""
+
 import dataclasses
 
 import pytest
 import torch
 import torch.nn.functional as F
+from architecture.losses import distogram_loss_atom
 from architecture.main_trunk import (
     AtomDistogramHead,
     MainTrunk,
     ResidueDistogramHead,
     TimeFourierEmbedding,
     scatter_mean,
-    sinusoidal_encoding,
 )
 from beartype import beartype
 from einops import einsum, rearrange, reduce, repeat
-from helpers.featurize import FeaturizedBatch
-from jaxtyping import Float, Int, jaxtyped
+from helpers.featurize import FeaturizedBatch, sinusoidal_encoding
+from jaxtyping import Bool, Float, Int, jaxtyped
 
 torch.manual_seed(42)
 
@@ -46,6 +48,7 @@ F_REF_DIM = ATOMS_PER_RES * (
 def sq_dist_matrix(
     x: Float[torch.Tensor, "N D"],
 ) -> Float[torch.Tensor, "N N"]:
+    """Compute pairwise squared Euclidean distances between N row-vectors."""
     diff = rearrange(x, "n d -> n 1 d") - rearrange(x, "n d -> 1 n d")
     return einsum(diff, diff, "n m d, n m d -> n m")
 
@@ -54,6 +57,7 @@ def sq_dist_matrix(
 def mean_abs_asymmetry(
     x: Float[torch.Tensor, "B N N D"],
 ) -> Float[torch.Tensor, ""]:
+    """Return mean absolute difference between x[b,i,j] and x[b,j,i] — measures non-symmetry."""
     diff = x - rearrange(x, "b i j d -> b j i d")
     return reduce(diff.abs(), "b i j d -> ", "mean")
 
@@ -64,7 +68,8 @@ def mean_abs_asymmetry(
 
 
 @pytest.fixture
-def model():
+def model() -> MainTrunk:
+    """Provide a small MainTrunk instance in eval mode."""
     return MainTrunk(
         f_ref_dim=F_REF_DIM,
         n_bins=N_BINS,
@@ -85,59 +90,70 @@ def model():
 
 
 @pytest.fixture
-def ref_pos():
+def ref_pos() -> Float[torch.Tensor, "B N_atom 3"]:
+    """Provide random reference atom positions (B, N_ATOM, 3)."""
     return torch.randn(B, N_ATOM, 3)
 
 
 @pytest.fixture
-def ref_element():
+def ref_element() -> Float[torch.Tensor, "B N_atom E"]:
+    """Provide random one-hot element features (B, N_ATOM, E)."""
     return F.one_hot(torch.randint(0, E, (B, N_ATOM)), num_classes=E).float()
 
 
 @pytest.fixture
-def ref_space_uid():
+def ref_space_uid() -> Int[torch.Tensor, "B N_atom"]:
+    """Provide all-zero chain/space UIDs (B, N_ATOM) for a single-chain input."""
     return torch.zeros(B, N_ATOM, dtype=torch.long)
 
 
 @pytest.fixture
-def f_distogram():
+def f_distogram() -> Float[torch.Tensor, "B N_res N_res N_bins"]:
+    """One-hot template distogram [B, N_RES, N_RES, N_BINS] with random bin assignments."""
     return F.one_hot(torch.randint(0, N_BINS, (B, N_RES, N_RES)), num_classes=N_BINS).float()
 
 
 @pytest.fixture
-def f_pseudo_beta_mask():
+def f_pseudo_beta_mask() -> Float[torch.Tensor, "B N_res"]:
+    """All-ones pseudo-β mask [B, N_RES] — every residue has a valid pseudo-β position."""
     return torch.ones(B, N_RES)
 
 
 @pytest.fixture
-def f_residue_idx():
+def f_residue_idx() -> Float[torch.Tensor, "B N_res C_res"]:
+    """Pre-projected sinusoidal residue index encoding [B, N_RES, C_RES]."""
     return torch.randn(B, N_RES, C_RES)
 
 
 @pytest.fixture
-def r_input():
+def r_input() -> Float[torch.Tensor, "B N_atom 3"]:
+    """Noisy atom positions [B, N_ATOM, 3] fed to the trunk as the diffusion denoising input."""
     return torch.randn(B, N_ATOM, 3)
 
 
 @pytest.fixture
-def tok_idx():
+def tok_idx() -> Int[torch.Tensor, "B N_atom"]:
+    """Residue index for each atom [B, N_ATOM] — ATOMS_PER_RES atoms map to same residue."""
     single = torch.repeat_interleave(torch.arange(N_RES), ATOMS_PER_RES)
     return single.unsqueeze(0).expand(B, -1).contiguous()
 
 
 @pytest.fixture
-def center_uid():
+def center_uid() -> Int[torch.Tensor, "B N_res"]:
+    """Index of center atom of each residue [B, N_RES], used to extract per-residue positions."""
     single = torch.arange(0, N_ATOM, ATOMS_PER_RES)
     return single.unsqueeze(0).expand(B, -1).contiguous()
 
 
 @pytest.fixture
-def gt_atom_distogram_sparse():
+def gt_atom_distogram_sparse() -> Float[torch.Tensor, "B N_atom K_sparse N_atom_bins"]:
+    """Random ground-truth sparse atom distogram targets [B, N_ATOM, K_SPARSE, N_ATOM_BINS]."""
     return torch.randn(B, N_ATOM, K_SPARSE, N_ATOM_BINS)
 
 
 @pytest.fixture
-def gt_atom_distogram_mask_sparse():
+def gt_atom_distogram_mask_sparse() -> Bool[torch.Tensor, "B N_atom K_sparse"]:
+    """All-True validity mask [B, N_ATOM, K_SPARSE] for sparse atom distogram — no padding slots."""
     return torch.ones(B, N_ATOM, K_SPARSE, dtype=torch.bool)
 
 
@@ -148,18 +164,19 @@ def gt_atom_distogram_mask_sparse():
 
 @pytest.fixture
 def featurized_batch(
-    ref_pos,
-    ref_element,
-    ref_space_uid,
-    f_distogram,
-    f_pseudo_beta_mask,
-    f_residue_idx,
-    r_input,
-    tok_idx,
-    center_uid,
-    gt_atom_distogram_sparse,
-    gt_atom_distogram_mask_sparse,
+    ref_pos: Float[torch.Tensor, "B N_atom 3"],
+    ref_element: Float[torch.Tensor, "B N_atom E"],
+    ref_space_uid: Int[torch.Tensor, "B N_atom"],
+    f_distogram: Float[torch.Tensor, "B N_res N_res N_bins"],
+    f_pseudo_beta_mask: Float[torch.Tensor, "B N_res"],
+    f_residue_idx: Float[torch.Tensor, "B N_res C_res"],
+    r_input: Float[torch.Tensor, "B N_atom 3"],
+    tok_idx: Int[torch.Tensor, "B N_atom"],
+    center_uid: Int[torch.Tensor, "B N_res"],
+    gt_atom_distogram_sparse: Float[torch.Tensor, "B N_atom K_sparse N_atom_bins"],
+    gt_atom_distogram_mask_sparse: Bool[torch.Tensor, "B N_atom K_sparse"],
 ) -> FeaturizedBatch:
+    """Assemble a complete FeaturizedBatch from all input fixtures for end-to-end trunk tests."""
     return FeaturizedBatch(
         ref_pos=ref_pos,
         ref_element=ref_element,
@@ -192,6 +209,7 @@ def _forward(model: MainTrunk, batch: FeaturizedBatch):
 
 
 def test_sinusoidal_encoding_output_shape():
+    """sinusoidal_encoding returns [B, N_res, dim] with all finite values."""
     positions = repeat(torch.arange(N_RES, dtype=torch.float32), "n -> b n", b=2)
     out = sinusoidal_encoding(positions, dim=C_RES)
     assert out.shape == (2, N_RES, C_RES)
@@ -199,6 +217,7 @@ def test_sinusoidal_encoding_output_shape():
 
 
 def test_sinusoidal_encoding_varies_across_positions():
+    """Every residue position maps to a distinct encoding — no two rows are identical."""
     positions = repeat(torch.arange(N_RES, dtype=torch.float32), "n -> 1 n")
     enc = rearrange(sinusoidal_encoding(positions, dim=C_RES), "1 n d -> n d")
     off_diag = sq_dist_matrix(enc) + torch.eye(N_RES) * 1e10
@@ -210,13 +229,15 @@ def test_sinusoidal_encoding_varies_across_positions():
 # ---------------------------------------------------------------------------
 
 
-def test_time_fourier_embedding_output_shape(model):
+def test_time_fourier_embedding_output_shape(model: MainTrunk):
+    """TimeFourierEmbedding maps a length-N noise level to [N, C_res] with all finite values."""
     out = model.time_fourier(torch.randn(N_RES))
     assert out.shape == (N_RES, C_RES)
     assert torch.isfinite(out).all()
 
 
 def test_time_fourier_embedding_gradient_flows_to_freqs():
+    """Learned frequency parameters receive gradients during backprop through Fourier embedding."""
     emb = TimeFourierEmbedding(C_RES)
     reduce(emb(torch.randn(N_RES)), "n d -> ", "sum").backward()
     assert emb.freqs.grad is not None
@@ -228,13 +249,15 @@ def test_time_fourier_embedding_gradient_flows_to_freqs():
 # ---------------------------------------------------------------------------
 
 
-def test_rel_pos_enc_output_shape(model):
+def test_rel_pos_enc_output_shape(model: MainTrunk):
+    """RelativePositionEncoding returns an [N_res, N_res, C_pair] tensor with all finite values."""
     out = model.rel_pos_enc(N_RES, torch.device("cpu"))
     assert out.shape == (N_RES, N_RES, C_PAIR)
     assert torch.isfinite(out).all()
 
 
-def test_rel_pos_enc_deterministic(model):
+def test_rel_pos_enc_deterministic(model: MainTrunk):
+    """RelativePositionEncoding is purely positional — calls with same N_res return same out."""
     out1 = model.rel_pos_enc(N_RES, torch.device("cpu"))
     out2 = model.rel_pos_enc(N_RES, torch.device("cpu"))
     assert torch.allclose(out1, out2)
@@ -246,6 +269,7 @@ def test_rel_pos_enc_deterministic(model):
 
 
 def test_residue_distogram_head_output_shape():
+    """ResidueDistogramHead maps [B, N_res, N_res, C_pair] to finite [B, N_res, N_res, N_bins]."""
     head = ResidueDistogramHead(C_PAIR, n_bins=N_BINS)
     logits = head(torch.randn(B, N_RES, N_RES, C_PAIR))
     assert logits.shape == (B, N_RES, N_RES, N_BINS)
@@ -253,6 +277,7 @@ def test_residue_distogram_head_output_shape():
 
 
 def test_residue_distogram_head_output_symmetric():
+    """The head symmetrises the pair embedding before projection so logits[i,j] == logits[j,i]."""
     head = ResidueDistogramHead(C_PAIR, n_bins=N_BINS)
     logits = head(torch.randn(B, N_RES, N_RES, C_PAIR))
     assert mean_abs_asymmetry(logits).item() < 1e-5
@@ -264,6 +289,7 @@ def test_residue_distogram_head_output_symmetric():
 
 
 def test_atom_distogram_head_output_shapes():
+    """AtomDistogramHead returns finite logits [N_atom, N_atom, N_bins] and local-window mask."""
     head = AtomDistogramHead(C_ATOMPAIR, n_bins=N_BINS, atoms_per_res=ATOMS_PER_RES)
     logits, mask = head(torch.randn(N_ATOM, N_ATOM, C_ATOMPAIR))
     assert logits.shape == (N_ATOM, N_ATOM, N_BINS)
@@ -276,12 +302,14 @@ def test_atom_distogram_head_output_shapes():
 
 
 def test_atom_distogram_head_mask_includes_diagonal():
+    """The local-window mask is True on the diagonal — every atom is within its own window."""
     head = AtomDistogramHead(C_ATOMPAIR, n_bins=N_BINS, atoms_per_res=ATOMS_PER_RES)
     _, mask = head(torch.randn(N_ATOM, N_ATOM, C_ATOMPAIR))
     assert mask.diagonal().all()
 
 
 def test_atom_distogram_head_mask_symmetric():
+    """If atom i is within the window of atom j, atom j must also be within the window of atom i."""
     head = AtomDistogramHead(C_ATOMPAIR, n_bins=N_BINS, atoms_per_res=ATOMS_PER_RES)
     _, mask = head(torch.randn(N_ATOM, N_ATOM, C_ATOMPAIR))
     assert torch.equal(mask, rearrange(mask, "i j -> j i"))
@@ -292,25 +320,33 @@ def test_atom_distogram_head_mask_symmetric():
 # ---------------------------------------------------------------------------
 
 
-def test_main_trunk_r_denoised_shape_finite(model, featurized_batch):
+def test_main_trunk_r_denoised_shape_finite(model: MainTrunk, featurized_batch: FeaturizedBatch):
+    """The main trunk returns denoised atom coordinates [B, N_atom, 3] with no NaN or Inf."""
     r_denoised, *_ = _forward(model, featurized_batch)
     assert r_denoised.shape == (B, N_ATOM, 3)
     assert torch.isfinite(r_denoised).all()
 
 
-def test_main_trunk_seq_logits_shape_finite(model, featurized_batch):
+def test_main_trunk_seq_logits_shape_finite(model: MainTrunk, featurized_batch: FeaturizedBatch):
+    """The sequence prediction head returns [B, N_res, 20] amino-acid logits with no NaN or Inf."""
     _, f_seq_logits, *_ = _forward(model, featurized_batch)
     assert f_seq_logits.shape == (B, N_RES, 20)
     assert torch.isfinite(f_seq_logits).all()
 
 
-def test_main_trunk_residue_distogram_shape_finite(model, featurized_batch):
+def test_main_trunk_residue_distogram_shape_finite(
+    model: MainTrunk, featurized_batch: FeaturizedBatch
+):
+    """The residue distogram head returns [B, N_res, N_res, N_bins] logits with no NaN or Inf."""
     _, _, res_logits, *_ = _forward(model, featurized_batch)
     assert res_logits.shape == (B, N_RES, N_RES, N_BINS)
     assert torch.isfinite(res_logits).all()
 
 
-def test_main_trunk_atom_distogram_shape_finite(model, featurized_batch):
+def test_main_trunk_atom_distogram_shape_finite(
+    model: MainTrunk, featurized_batch: FeaturizedBatch
+):
+    """Atom distogram output shape is [B, N_ATOM, ..., N_ATOM_BINS]."""
     _, _, _, atom_logits, *_ = _forward(model, featurized_batch)
     assert atom_logits.ndim == 4
     assert atom_logits.shape[0] == B
@@ -319,14 +355,18 @@ def test_main_trunk_atom_distogram_shape_finite(model, featurized_batch):
     assert torch.isfinite(atom_logits).all()
 
 
-def test_main_trunk_atom_distogram_bins_match_ground_truth(model, featurized_batch):
+def test_main_trunk_atom_distogram_bins_match_ground_truth(
+    model: MainTrunk, featurized_batch: FeaturizedBatch
+):
+    """Number of predicted atom distance bins matches bin count in ground-truth sparse tensor."""
     _, _, _, atom_logits, *_ = _forward(model, featurized_batch)
     assert atom_logits.shape[-1] == featurized_batch.gt_atom_distogram_sparse.shape[-1]
 
 
-def test_main_trunk_distogram_loss_atom_computable(model, featurized_batch):
-    from architecture.losses import distogram_loss_atom
-
+def test_main_trunk_distogram_loss_atom_computable(
+    model: MainTrunk, featurized_batch: FeaturizedBatch
+):
+    """Atom distogram logits from trunk passed directly to distogram_loss_atom without errors."""
     _, _, _, atom_logits, *_ = _forward(model, featurized_batch)
     loss = distogram_loss_atom(
         atom_logits,
@@ -337,20 +377,25 @@ def test_main_trunk_distogram_loss_atom_computable(model, featurized_batch):
     assert torch.isfinite(loss)
 
 
-def test_main_trunk_intermediate_stack_lengths(model, featurized_batch):
+def test_main_trunk_intermediate_stack_lengths(model: MainTrunk, featurized_batch: FeaturizedBatch):
+    """The intermediate coordinate and amino-acid stacks each contain exactly K_unit entries."""
     _, _, _, _, coord_stack, aa_stack = _forward(model, featurized_batch)
     assert len(coord_stack) == K_UNIT
     assert len(aa_stack) == K_UNIT
 
 
-def test_main_trunk_intermediate_coords_shape_finite(model, featurized_batch):
+def test_main_trunk_intermediate_coords_shape_finite(
+    model: MainTrunk, featurized_batch: FeaturizedBatch
+):
+    """Every intermediate denoised coordinate tensor in stack has shape [B, N_atom, 3]."""
     _, _, _, _, coord_stack, _ = _forward(model, featurized_batch)
     for r in coord_stack:
         assert r.shape == (B, N_ATOM, 3)
         assert torch.isfinite(r).all()
 
 
-def test_main_trunk_gradient_flows_to_r_input(model, featurized_batch):
+def test_main_trunk_gradient_flows_to_r_input(model: MainTrunk, featurized_batch: FeaturizedBatch):
+    """The denoised output is differentiable with respect to the noisy input positions r_input."""
     r_input_g = torch.randn(B, N_ATOM, 3, requires_grad=True)
     batch_g = FeaturizedBatch(
         **{k: v for k, v in featurized_batch.__dict__.items() if k != "r_input"},
@@ -362,7 +407,10 @@ def test_main_trunk_gradient_flows_to_r_input(model, featurized_batch):
     assert torch.isfinite(r_input_g.grad).all()
 
 
-def test_main_trunk_forward_with_mask_token_aa_indices(model, featurized_batch):
+def test_main_trunk_forward_with_mask_token_aa_indices(
+    model: MainTrunk, featurized_batch: FeaturizedBatch
+):
+    """aa_indices of 20 (mask token 'X') must not raise an IndexError during the forward pass."""
     # aa_indices containing 20 (mask token "X") must not raise IndexError
     masked_batch = dataclasses.replace(
         featurized_batch,
@@ -389,6 +437,7 @@ _SM_C = 6
 
 @pytest.fixture
 def sm_src() -> Float[torch.Tensor, "B N_atom C"]:
+    """Sequential source feature tensor with known values for deterministic scatter tests."""
     return torch.arange(_SM_B * _SM_N_ATOM * _SM_C, dtype=torch.float32).reshape(
         _SM_B, _SM_N_ATOM, _SM_C
     )
@@ -396,19 +445,22 @@ def sm_src() -> Float[torch.Tensor, "B N_atom C"]:
 
 @pytest.fixture
 def sm_tok_idx() -> Int[torch.Tensor, "B N_atom"]:
+    """Token index [_SM_B, _SM_N_ATOM] assigns 2 consecutive atoms to each of _SM_N_RES residues."""
     # 2 atoms per residue: [0, 0, 1, 1, 2, 2, 3, 3]
     single = torch.repeat_interleave(torch.arange(_SM_N_RES), 2)
     return repeat(single, "n -> b n", b=_SM_B)
 
 
 @pytest.fixture
-def sm_index(sm_tok_idx) -> Int[torch.Tensor, "B N_atom"]:
+def sm_index(sm_tok_idx: Int[torch.Tensor, "B N_atom"]) -> Int[torch.Tensor, "B N_atom"]:
+    """Flat scatter index [_SM_B, _SM_N_ATOM] = tok_idx + b * N_RES, unique across batch dim."""
     # batch-offset flat index: tok_idx + b * N_RES
     offset = repeat(torch.arange(_SM_B) * _SM_N_RES, "b -> b n", n=_SM_N_ATOM)
     return sm_tok_idx + offset
 
 
 def test_scatter_mean_known_values_uniform():
+    """With two atoms per residue, scatter_mean produces mean of each pair."""
     # B=1, 2 atoms per residue, C=1; manually verify pair-wise means
     src = torch.tensor([[[0.0], [2.0], [4.0], [6.0]]])  # (1, 4, 1)
     index = torch.tensor([[0, 0, 1, 1]])  # (1, 4)
@@ -418,6 +470,7 @@ def test_scatter_mean_known_values_uniform():
 
 
 def test_scatter_mean_known_values_nonuniform():
+    """scatter_mean handles variable group sizes: residue 0 gets 3 atoms and residue 1 gets 2."""
     # B=1, residue 0 has 3 atoms, residue 1 has 2 atoms, C=1
     src = torch.tensor([[[1.0], [3.0], [5.0], [7.0], [9.0]]])  # (1, 5, 1)
     index = torch.tensor([[0, 0, 0, 1, 1]])  # (1, 5)
@@ -427,6 +480,7 @@ def test_scatter_mean_known_values_nonuniform():
 
 
 def test_scatter_mean_one_atom_per_residue():
+    """When each residue has exactly one atom, scatter_mean is identity over the atom dimension."""
     # 1:1 atom-to-residue mapping — output must equal src exactly
     B_sm, N_sm, C_sm = 2, 4, 6
     src = torch.randn(B_sm, N_sm, C_sm)
@@ -438,6 +492,7 @@ def test_scatter_mean_one_atom_per_residue():
 
 
 def test_scatter_mean_constant_src_returns_that_constant():
+    """Averaging constant val across any number of atoms in residue still returns that constant."""
     # Every atom in every residue holds the same value; mean must equal it
     B_sm, N_tgt, atoms_per, C_sm = 2, 2, 3, 4
     N_src = N_tgt * atoms_per
@@ -452,6 +507,7 @@ def test_scatter_mean_constant_src_returns_that_constant():
 
 
 def test_scatter_mean_batch_items_independent():
+    """Zeroing one item's source features must not affect scatter_mean output for other items."""
     # Zeroing batch item 1's src must leave batch item 0's output unchanged
     B_sm, N_src, N_tgt, C_sm = 2, 8, 4, 6
     src = torch.randn(B_sm, N_src, C_sm)
@@ -469,6 +525,7 @@ def test_scatter_mean_batch_items_independent():
 
 
 def test_scatter_mean_multichannel_mean_matches_per_channel():
+    """scatter_mean agrees with reference reshape+reduce mean across all C channels."""
     # Verify that scatter_mean is equivalent to running per-channel means manually
     B_sm, N_tgt, atoms_per, C_sm = 1, 3, 4, 5
     N_src = N_tgt * atoms_per

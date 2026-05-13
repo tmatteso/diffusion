@@ -1,4 +1,7 @@
+"""Utility dataclasses and functions for atom-level coordinate data."""
+
 import dataclasses
+from collections.abc import Mapping
 
 import numpy as np
 import torch
@@ -346,7 +349,7 @@ rigid_group_atom_positions = {
 }
 
 
-def make_np_example(coords_dict):
+def make_np_example(coords_dict: Mapping[str, np.ndarray]) -> dict[str, np.ndarray]:
     """Make a dictionary of non-batched numpy protein features."""
     bb_atom_types = ["N", "CA", "C", "O"]
     bb_idx = [i for i, atom_type in enumerate(atom_types) if atom_type in bb_atom_types]
@@ -365,26 +368,24 @@ def make_np_example(coords_dict):
     atom_mask[..., bb_idx] = 1
     atom_mask[nan_pos] = 0
 
-    batch = {
+    return {
         "atom_positions": atom_positions,
         "atom_mask": atom_mask,
         "residue_index": np.arange(num_res),
     }
-    return batch
 
 
-def make_fixed_size(np_example, max_seq_length=500):
+def make_fixed_size(np_example: Mapping[str, np.ndarray], max_seq_length: int = 500) -> None:
     """Pad features to fixed sequence length, i.e. currently axis=0."""
     for k, v in np_example.items():
         pad = max_seq_length - v.shape[0]
         if pad > 0:
-            v = np.pad(v, ((0, pad),) + ((0, 0),) * (len(v.shape) - 1))
+            np_example[k] = np.pad(v, ((0, pad),) + ((0, 0),) * (len(v.shape) - 1))
         elif pad < 0:
-            v = v[:max_seq_length]
-        np_example[k] = v
+            np_example[k] = v[:max_seq_length]
 
 
-def center_positions(np_example):
+def center_positions(np_example: Mapping[str, np.ndarray]) -> None:
     """Center 'atom_positions' on CA center of mass."""
     atom_positions = np_example["atom_positions"]  # N, 37, 3
     atom_mask = np_example["atom_mask"]  # N, 37
@@ -508,7 +509,7 @@ def protein_from_pdb(pdb_path: str) -> "Protein":
     )
 
 
-def _chain_end(atom_index, end_resname, chain_name, residue_index) -> str:
+def _chain_end(atom_index: int, end_resname: str, chain_name: str, residue_index: int) -> str:
     chain_end = "TER"
     return f"{chain_end:<6}{atom_index:>5}      {end_resname:>3} {chain_name:>1}{residue_index:>4}"
 
@@ -546,7 +547,7 @@ def to_pdb(prot: Protein) -> str:
         "X",
     ]
 
-    def res_1to3(r):
+    def res_1to3(r: int) -> str:
         return restype_1to3.get(restypes[r], "UNK")
 
     pdb_lines = []
@@ -629,10 +630,9 @@ def atom37_to_atom5(
     atom37_positions: Float[torch.Tensor, "B N_res 37 3"],
     atom37_mask: Float[torch.Tensor, "B N_res 37"],
 ) -> tuple[Float[torch.Tensor, "B N_res 5 3"], Float[torch.Tensor, "B N_res 5"]]:
-    """
-    Extract the 5 backbone+Cβ atoms from atom37 representation.
+    """Extract the 5 backbone+Cβ atoms from atom37 representation.
 
-    Returns
+    Returns:
     -------
     atom5_positions : (B, N_res, 5, 3)
     atom5_mask      : (B, N_res, 5)
@@ -651,8 +651,7 @@ def pseudo_cb(
     ca: Float[torch.Tensor, "... 3"],
     c: Float[torch.Tensor, "... 3"],
 ) -> Float[torch.Tensor, "... 3"]:
-    """
-    Compute a virtual Cβ from backbone geometry (Gly-safe).
+    """Compute a virtual Cβ from backbone geometry (Gly-safe).
 
     Uses the standard ideal-geometry recipe:
       b = Cα - N        (N→Cα bond vector)
@@ -683,8 +682,7 @@ def get_cb_coords(
     atom5_mask: Float[torch.Tensor, "B N_res 5"],
     fill_pseudo: bool = True,
 ) -> tuple[Float[torch.Tensor, "B N_res 3"], Bool[torch.Tensor, "B N_res"]]:
-    """
-    Extract Cβ (slot 4) from atom5, replacing missing Cβ (Gly) with pseudo-Cβ.
+    """Extract Cβ (slot 4) from atom5, replacing missing Cβ (Gly) with pseudo-Cβ.
 
     Parameters
     ----------
@@ -692,7 +690,7 @@ def get_cb_coords(
     atom5_mask      : (B, N_res, 5)  — 1 where atom is present
     fill_pseudo     : if True, compute pseudo-Cβ wherever Cβ is absent
 
-    Returns
+    Returns:
     -------
     cb               : (B, N_res, 3)  — real Cβ where available, pseudo-Cβ otherwise
     pseudo_beta_mask : (B, N_res)     — True where real Cβ present, False where pseudo-Cβ was used
@@ -721,7 +719,7 @@ def atom37_to_cb(
 ) -> tuple[Float[torch.Tensor, "B N_res 3"], Bool[torch.Tensor, "B N_res"]]:
     """Full pipeline: atom37 → atom5 → Cβ / pseudo-Cβ.
 
-    Returns
+    Returns:
     -------
     cb               : (B, N_res, 3)  — real Cβ where available, pseudo-Cβ otherwise
     pseudo_beta_mask : (B, N_res)     — True where real Cβ present, False where pseudo-Cβ was used

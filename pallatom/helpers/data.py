@@ -1,19 +1,18 @@
+"""Dataset and data loading utilities for protein structure files."""
+
 import io
 import json
+from pathlib import Path
+
 import torch
 import torch.utils.data
-from pathlib import Path
-from typing import Optional
-
+from helpers.atom_utils import center_positions, make_fixed_size, make_np_example
 from torch.utils.data.distributed import DistributedSampler
-
-from helpers.atom_utils import make_fixed_size, make_np_example, center_positions
 from train.train_config import TrainConfig
 
 
 class ProteinDataset(torch.utils.data.Dataset):
-    """
-    Lazy-loading Dataset backed by a JSONL file.
+    """Lazy-loading Dataset backed by a JSONL file.
 
     Scans the file once at construction to build a name→byte-offset index
     (only offsets are kept in RAM, not the protein data).  Each __getitem__
@@ -35,13 +34,13 @@ class ProteinDataset(torch.utils.data.Dataset):
 
     def __init__(
         self,
-        jsonl_path:     str | Path,
-        names:          list[str],
+        jsonl_path: str | Path,
+        names: list[str],
         max_seq_length: int = 256,
     ) -> None:
-        self.jsonl_path     = Path(jsonl_path)
+        self.jsonl_path = Path(jsonl_path)
         self.max_seq_length = max_seq_length
-        self._file: Optional[io.BufferedReader] = None
+        self._file: io.BufferedReader | None = None
 
         name_set = set(names)
         offsets: list[int] = []
@@ -59,23 +58,27 @@ class ProteinDataset(torch.utils.data.Dataset):
 
     def _open(self) -> None:
         if self._file is None:
-            self._file = open(self.jsonl_path, "rb")
+            self._file = open(self.jsonl_path, "rb")  # noqa: SIM115
 
     def __getstate__(self) -> dict:
+        """Return picklable state with the open file handle set to None."""
         state = self.__dict__.copy()
         state["_file"] = None
         return state
 
     def __del__(self) -> None:
+        """Close the underlying file handle on deletion."""
         if self._file is not None:
             self._file.close()
 
     # ------------------------------------------------------------------
 
     def __len__(self) -> int:
+        """Return the number of entries in the dataset."""
         return len(self._offsets)
 
     def __getitem__(self, idx: int) -> dict:
+        """Return the parsed JSON entry at the given index."""
         self._open()
         self._file.seek(self._offsets[idx])  # type: ignore[union-attr]
         entry = json.loads(self._file.readline())  # type: ignore[union-attr]
@@ -90,19 +93,17 @@ class ProteinDataset(torch.utils.data.Dataset):
 
 
 def make_data_loaders(
-    cfg:         TrainConfig,
-    jsonl_path:  str | Path,
+    cfg: TrainConfig,
+    jsonl_path: str | Path,
     splits_path: str | Path,
     num_workers: int = 0,
-    debug_run: bool = True
+    debug_run: bool = True,
 ) -> tuple[
     torch.utils.data.DataLoader,
     torch.utils.data.DataLoader,
     torch.utils.data.DataLoader,
 ]:
-    """
-    Build train, validation, and test DataLoaders from a JSONL file and a
-    splits JSON.
+    """Build train, validation, and test DataLoaders from a JSONL file and a splits JSON.
 
     Args:
         cfg:         TrainConfig — batch_size and max_seq_length are read from
@@ -111,6 +112,7 @@ def make_data_loaders(
         splits_path: Path to a JSON file with keys "train", "validation", and
                      "test", each a list of entry names.
         num_workers: DataLoader worker processes (0 = main process only).
+        debug_run:   If True, restrict each split to 252 samples for fast iteration.
 
     Returns:
         (train_loader, val_loader, test_loader)
@@ -119,15 +121,18 @@ def make_data_loaders(
         splits: dict[str, list[str]] = json.load(f)
 
     train_set = ProteinDataset(
-        jsonl_path, splits["train"],
+        jsonl_path,
+        splits["train"],
         max_seq_length=cfg.train_loader.max_seq_length,
     )
     val_set = ProteinDataset(
-        jsonl_path, splits["validation"],
+        jsonl_path,
+        splits["validation"],
         max_seq_length=cfg.test_loader.max_seq_length,
     )
     test_set = ProteinDataset(
-        jsonl_path, splits["test"],
+        jsonl_path,
+        splits["test"],
         max_seq_length=cfg.test_loader.max_seq_length,
     )
 
@@ -183,11 +188,11 @@ def make_data_loaders(
 
 
 def make_ddp_data_loaders(
-    cfg:         TrainConfig,
-    jsonl_path:  str | Path,
+    cfg: TrainConfig,
+    jsonl_path: str | Path,
     splits_path: str | Path,
-    rank:        int,
-    world_size:  int,
+    rank: int,
+    world_size: int,
     num_workers: int = 0,
 ) -> tuple[
     torch.utils.data.DataLoader,
@@ -198,24 +203,67 @@ def make_ddp_data_loaders(
     with open(splits_path) as f:
         splits: dict[str, list[str]] = json.load(f)
 
-    train_set = ProteinDataset(jsonl_path, splits["train"],      max_seq_length=cfg.train_loader.max_seq_length)
-    val_set   = ProteinDataset(jsonl_path, splits["validation"], max_seq_length=cfg.test_loader.max_seq_length)
-    test_set  = ProteinDataset(jsonl_path, splits["test"],       max_seq_length=cfg.test_loader.max_seq_length)
+    train_set = ProteinDataset(
+        jsonl_path, splits["train"], max_seq_length=cfg.train_loader.max_seq_length
+    )
+    val_set = ProteinDataset(
+        jsonl_path, splits["validation"], max_seq_length=cfg.test_loader.max_seq_length
+    )
+    test_set = ProteinDataset(
+        jsonl_path, splits["test"], max_seq_length=cfg.test_loader.max_seq_length
+    )
 
     train_sampler = DistributedSampler(train_set, num_replicas=world_size, rank=rank, shuffle=True)
-    val_sampler   = DistributedSampler(val_set,   num_replicas=world_size, rank=rank, shuffle=False)
-    test_sampler  = DistributedSampler(test_set,  num_replicas=world_size, rank=rank, shuffle=False)
+    val_sampler = DistributedSampler(val_set, num_replicas=world_size, rank=rank, shuffle=False)
+    test_sampler = DistributedSampler(test_set, num_replicas=world_size, rank=rank, shuffle=False)
 
     train_loader = torch.utils.data.DataLoader(
-        train_set, batch_size=cfg.train_loader.batch_size,
-        sampler=train_sampler, num_workers=num_workers, pin_memory=True,
+        train_set,
+        batch_size=cfg.train_loader.batch_size,
+        sampler=train_sampler,
+        num_workers=num_workers,
+        pin_memory=True,
     )
     val_loader = torch.utils.data.DataLoader(
-        val_set, batch_size=cfg.test_loader.batch_size,
-        sampler=val_sampler, num_workers=num_workers, pin_memory=True,
+        val_set,
+        batch_size=cfg.test_loader.batch_size,
+        sampler=val_sampler,
+        num_workers=num_workers,
+        pin_memory=True,
     )
     test_loader = torch.utils.data.DataLoader(
-        test_set, batch_size=cfg.test_loader.batch_size,
-        sampler=test_sampler, num_workers=num_workers, pin_memory=True,
+        test_set,
+        batch_size=cfg.test_loader.batch_size,
+        sampler=test_sampler,
+        num_workers=num_workers,
+        pin_memory=True,
     )
     return train_loader, val_loader, test_loader
+
+
+class _FileLogProcessor:
+    """Structlog processor that appends JSON lines to a file, then passes the event dict through.
+
+    Opens the log file with line-buffering (buffering=1) on construction so each line is flushed
+    to disk immediately — critical for long runs where buffered writes could be lost on a crash.
+
+    Context manager (__enter__ / __exit__): closes the file when the with-block ends. Use via
+    contextlib.ExitStack so the file is closed even if the caller raises.
+
+    Structlog processor (__call__): serializes the event dict to JSON and appends it, then
+    returns the dict unchanged so downstream processors (e.g. ConsoleRenderer) still run.
+    Insert before ConsoleRenderer so the raw dict reaches disk before it is colorized.
+    """
+
+    def __init__(self, path: str) -> None:
+        self._f = open(path, "w", buffering=1)  # noqa: SIM115
+
+    def __enter__(self) -> "_FileLogProcessor":
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self._f.close()
+
+    def __call__(self, _logger: object, _method: str, event_dict: dict) -> dict:
+        self._f.write(json.dumps(event_dict) + "\n")
+        return event_dict

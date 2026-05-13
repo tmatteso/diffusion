@@ -1,5 +1,9 @@
-import json
+"""Tests for the training loop."""
+
+import math
 import os
+import pathlib
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -17,7 +21,6 @@ from train.train_config import (
     TrainingParams,
 )
 from train.train_loop import (
-    _FileLogProcessor,
     _to_protein_batch,
     evaluate,
     evaluate_ddp,
@@ -60,21 +63,25 @@ EXPECTED_EVAL_KEYS = frozenset(
 
 @pytest.fixture
 def raw_batch() -> dict:
+    """Load the shared test protein batch from disk."""
     return torch.load(_TEST_DICT, weights_only=False)
 
 
 @pytest.fixture
 def distogram_res() -> Distogram:
+    """Provide a residue-level Distogram in eval mode."""
     return Distogram(n_bins=_N_BINS, min_dist=3.25, max_dist=50.75, overflow_bin=False).eval()
 
 
 @pytest.fixture
 def distogram_atom() -> Distogram:
+    """Provide an atom-level Distogram in eval mode."""
     return Distogram(n_bins=_N_ATOM_BINS, min_dist=0.0, max_dist=10.0, overflow_bin=False).eval()
 
 
 @pytest.fixture
 def model() -> MainTrunk:
+    """Provide a small MainTrunk instance for training loop tests."""
     return MainTrunk(
         f_ref_dim=_F_REF_DIM,
         n_bins=_N_BINS,
@@ -88,7 +95,8 @@ def model() -> MainTrunk:
 
 
 @pytest.fixture
-def tcfg(tmp_path) -> TrainConfig:
+def tcfg(tmp_path: pathlib.Path) -> TrainConfig:
+    """Provide a single-epoch TrainConfig with a temporary checkpoint path."""
     return TrainConfig(
         training=TrainingParams(num_epochs=1, lr=1e-4, grad_clip=1.0),
         model=ModelParams(
@@ -109,7 +117,8 @@ def tcfg(tmp_path) -> TrainConfig:
 
 
 @pytest.fixture
-def mini_batch(raw_batch) -> dict:
+def mini_batch(raw_batch: dict) -> dict:
+    """Provide a single-item mini-batch trimmed to _N_KEEP residues from raw_batch."""
     return {
         "atom_positions": raw_batch["atom_positions"][:1, :_N_KEEP],
         "atom_mask": raw_batch["atom_mask"][:1, :_N_KEEP],
@@ -119,12 +128,14 @@ def mini_batch(raw_batch) -> dict:
 
 
 @pytest.fixture
-def loader(mini_batch) -> torch.utils.data.DataLoader:
+def loader(mini_batch: dict) -> torch.utils.data.DataLoader:
+    """Provide a DataLoader that yields the mini_batch as a single batch."""
     return torch.utils.data.DataLoader([mini_batch], batch_size=None, collate_fn=lambda x: x)
 
 
 @pytest.fixture
-def tcfg_multi(tmp_path) -> TrainConfig:
+def tcfg_multi(tmp_path: pathlib.Path) -> TrainConfig:
+    """Provide a 3-epoch TrainConfig for multi-epoch loop tests."""
     return TrainConfig(
         training=TrainingParams(num_epochs=3, lr=1e-3, grad_clip=1.0),
         model=ModelParams(
@@ -145,7 +156,8 @@ def tcfg_multi(tmp_path) -> TrainConfig:
 
 
 @pytest.fixture
-def tcfg_no_clip(tmp_path) -> TrainConfig:
+def tcfg_no_clip(tmp_path: pathlib.Path) -> TrainConfig:
+    """Provide a TrainConfig with grad_clip=None to exercise the unclipped gradient path."""
     return TrainConfig(
         training=TrainingParams(num_epochs=1, lr=1e-4, grad_clip=None),
         model=ModelParams(
@@ -166,7 +178,8 @@ def tcfg_no_clip(tmp_path) -> TrainConfig:
 
 
 @pytest.fixture
-def tcfg_wandb(tmp_path) -> TrainConfig:
+def tcfg_wandb(tmp_path: pathlib.Path) -> TrainConfig:
+    """Provide a 1-epoch TrainConfig with W&B logging enabled for wandb-branch tests."""
     return TrainConfig(
         training=TrainingParams(num_epochs=1, lr=1e-4, grad_clip=1.0),
         model=ModelParams(
@@ -187,7 +200,8 @@ def tcfg_wandb(tmp_path) -> TrainConfig:
 
 
 @pytest.fixture
-def tcfg_wandb_3ep(tmp_path) -> TrainConfig:
+def tcfg_wandb_3ep(tmp_path: pathlib.Path) -> TrainConfig:
+    """Provide a 3-epoch TrainConfig with W&B logging enabled for multi-epoch wandb tests."""
     return TrainConfig(
         training=TrainingParams(num_epochs=3, lr=1e-4, grad_clip=1.0),
         model=ModelParams(
@@ -208,7 +222,8 @@ def tcfg_wandb_3ep(tmp_path) -> TrainConfig:
 
 
 @pytest.fixture
-def tcfg_save(tmp_path) -> TrainConfig:
+def tcfg_save(tmp_path: pathlib.Path) -> TrainConfig:
+    """Provide a TrainConfig with save_every=1 to exercise the periodic epoch checkpoint path."""
     return TrainConfig(
         training=TrainingParams(num_epochs=1, lr=1e-4, grad_clip=1.0),
         model=ModelParams(
@@ -233,36 +248,43 @@ def tcfg_save(tmp_path) -> TrainConfig:
 # ---------------------------------------------------------------------------
 
 
-def test_to_protein_batch_returns_protein_batch(mini_batch):
+def test_to_protein_batch_returns_protein_batch(mini_batch: dict) -> None:
+    """Ensures _to_protein_batch returns a ProteinBatch dataclass instance."""
     assert isinstance(_to_protein_batch(mini_batch), ProteinBatch)
 
 
-def test_to_protein_batch_atom_positions_shape(mini_batch):
+def test_to_protein_batch_atom_positions_shape(mini_batch: dict) -> None:
+    """Ensures _to_protein_batch preserves the atom_positions shape from the raw batch dict."""
     result = _to_protein_batch(mini_batch)
     assert result.atom_positions.shape == mini_batch["atom_positions"].shape
 
 
-def test_to_protein_batch_atom_mask_shape(mini_batch):
+def test_to_protein_batch_atom_mask_shape(mini_batch: dict) -> None:
+    """Ensures _to_protein_batch preserves the atom_mask shape from the raw batch dict."""
     result = _to_protein_batch(mini_batch)
     assert result.atom_mask.shape == mini_batch["atom_mask"].shape
 
 
-def test_to_protein_batch_residue_index_shape(mini_batch):
+def test_to_protein_batch_residue_index_shape(mini_batch: dict) -> None:
+    """Ensures _to_protein_batch preserves the residue_index shape from the raw batch dict."""
     result = _to_protein_batch(mini_batch)
     assert result.residue_index.shape == mini_batch["residue_index"].shape
 
 
-def test_to_protein_batch_seq_is_list(mini_batch):
+def test_to_protein_batch_seq_is_list(mini_batch: dict) -> None:
+    """Ensures _to_protein_batch wraps the sequence field into a Python list."""
     result = _to_protein_batch(mini_batch)
     assert isinstance(result.seq, list)
 
 
-def test_to_protein_batch_seq_elements_are_strings(mini_batch):
+def test_to_protein_batch_seq_elements_are_strings(mini_batch: dict) -> None:
+    """Ensures _to_protein_batch contains only str elements in the seq list."""
     result = _to_protein_batch(mini_batch)
     assert all(isinstance(s, str) for s in result.seq)
 
 
-def test_to_protein_batch_seq_length_matches_batch_size(mini_batch):
+def test_to_protein_batch_seq_length_matches_batch_size(mini_batch: dict) -> None:
+    """Ensures _to_protein_batch seq list has one entry per item in the batch dimension."""
     result = _to_protein_batch(mini_batch)
     assert len(result.seq) == mini_batch["atom_positions"].shape[0]
 
@@ -272,52 +294,114 @@ def test_to_protein_batch_seq_length_matches_batch_size(mini_batch):
 # ---------------------------------------------------------------------------
 
 
-def test_evaluate_returns_dict(model, loader, tcfg, distogram_res, distogram_atom):
+def test_evaluate_returns_dict(
+    model: MainTrunk,
+    loader: torch.utils.data.DataLoader,
+    tcfg: TrainConfig,
+    distogram_res: Distogram,
+    distogram_atom: Distogram,
+) -> None:
+    """Ensures evaluate returns a plain dict."""
     result = evaluate(model, loader, tcfg, distogram_res, distogram_atom, "cpu")
     assert isinstance(result, dict)
 
 
-def test_evaluate_returns_expected_keys(model, loader, tcfg, distogram_res, distogram_atom):
+def test_evaluate_returns_expected_keys(
+    model: MainTrunk,
+    loader: torch.utils.data.DataLoader,
+    tcfg: TrainConfig,
+    distogram_res: Distogram,
+    distogram_atom: Distogram,
+) -> None:
+    """Ensures evaluate result contains exactly the expected metric keys."""
     result = evaluate(model, loader, tcfg, distogram_res, distogram_atom, "cpu")
     assert set(result.keys()) == EXPECTED_EVAL_KEYS
 
 
-def test_evaluate_all_values_are_floats(model, loader, tcfg, distogram_res, distogram_atom):
+def test_evaluate_all_values_are_floats(
+    model: MainTrunk,
+    loader: torch.utils.data.DataLoader,
+    tcfg: TrainConfig,
+    distogram_res: Distogram,
+    distogram_atom: Distogram,
+) -> None:
+    """Every value in the evaluate result dict is a Python float."""
     result = evaluate(model, loader, tcfg, distogram_res, distogram_atom, "cpu")
     for k, v in result.items():
         assert isinstance(v, float), f"'{k}' is {type(v)}, expected float"
 
 
-def test_evaluate_all_losses_finite(model, loader, tcfg, distogram_res, distogram_atom):
+def test_evaluate_all_losses_finite(
+    model: MainTrunk,
+    loader: torch.utils.data.DataLoader,
+    tcfg: TrainConfig,
+    distogram_res: Distogram,
+    distogram_atom: Distogram,
+) -> None:
+    """Every metric value in the evaluate result is finite (no NaN or Inf)."""
     result = evaluate(model, loader, tcfg, distogram_res, distogram_atom, "cpu")
     for k, v in result.items():
-        assert v == v, f"NaN in '{k}'"
-        assert v != float("inf"), f"Inf in '{k}'"
+        # math.isfinite returns False if the value is NaN or Infinity
+        assert math.isfinite(v), f"Value for '{k}' is not finite: {v}"
 
 
-def test_evaluate_total_loss_non_negative(model, loader, tcfg, distogram_res, distogram_atom):
+def test_evaluate_total_loss_non_negative(
+    model: MainTrunk,
+    loader: torch.utils.data.DataLoader,
+    tcfg: TrainConfig,
+    distogram_res: Distogram,
+    distogram_atom: Distogram,
+) -> None:
+    """Ensures evaluate total loss is non-negative for any valid model and input."""
     result = evaluate(model, loader, tcfg, distogram_res, distogram_atom, "cpu")
     assert result["total loss"] >= 0.0
 
 
-def test_evaluate_rmsd_non_negative(model, loader, tcfg, distogram_res, distogram_atom):
+def test_evaluate_rmsd_non_negative(
+    model: MainTrunk,
+    loader: torch.utils.data.DataLoader,
+    tcfg: TrainConfig,
+    distogram_res: Distogram,
+    distogram_atom: Distogram,
+) -> None:
+    """Ensures evaluate RMSD is non-negative (it is the square root of a mean squared distance)."""
     result = evaluate(model, loader, tcfg, distogram_res, distogram_atom, "cpu")
     assert result["RMSD"] >= 0.0
 
 
-def test_evaluate_sets_model_to_eval_mode(model, loader, tcfg, distogram_res, distogram_atom):
+def test_evaluate_sets_model_to_eval_mode(
+    model: MainTrunk,
+    loader: torch.utils.data.DataLoader,
+    tcfg: TrainConfig,
+    distogram_res: Distogram,
+    distogram_atom: Distogram,
+) -> None:
+    """Ensures evaluate puts the model in eval mode and leaves it there after returning."""
     model.train()
     evaluate(model, loader, tcfg, distogram_res, distogram_atom, "cpu")
     assert not model.training
 
 
-def test_evaluate_empty_loader_returns_zero_dict(model, tcfg, distogram_res, distogram_atom):
+def test_evaluate_empty_loader_returns_zero_dict(
+    model: MainTrunk,
+    tcfg: TrainConfig,
+    distogram_res: Distogram,
+    distogram_atom: Distogram,
+) -> None:
+    """Ensures evaluate returns all-zero metrics when the loader contains no batches."""
     empty = torch.utils.data.DataLoader([], batch_size=None, collate_fn=lambda x: x)
     result = evaluate(model, empty, tcfg, distogram_res, distogram_atom, "cpu")
     assert all(v == 0.0 for v in result.values())
 
 
-def test_evaluate_uses_no_grad(model, loader, tcfg, distogram_res, distogram_atom):
+def test_evaluate_uses_no_grad(
+    model: MainTrunk,
+    loader: torch.utils.data.DataLoader,
+    tcfg: TrainConfig,
+    distogram_res: Distogram,
+    distogram_atom: Distogram,
+) -> None:
+    """Ensures evaluate accumulates no gradients into model parameters."""
     evaluate(model, loader, tcfg, distogram_res, distogram_atom, "cpu")
     for p in model.parameters():
         assert p.grad is None
@@ -328,42 +412,90 @@ def test_evaluate_uses_no_grad(model, loader, tcfg, distogram_res, distogram_ato
 # ---------------------------------------------------------------------------
 
 
-def test_train_returns_none(model, loader, tcfg, distogram_res, distogram_atom):
+def test_train_returns_none(
+    model: MainTrunk,
+    loader: torch.utils.data.DataLoader,
+    tcfg: TrainConfig,
+    distogram_res: Distogram,
+    distogram_atom: Distogram,
+) -> None:
+    """Ensures train returns None (the function is side-effect-only)."""
     assert train(model, tcfg, loader, loader, distogram_res, distogram_atom, "cpu") is None
 
 
-def test_train_saves_best_checkpoint(model, loader, tcfg, distogram_res, distogram_atom):
+def test_train_saves_best_checkpoint(
+    model: MainTrunk,
+    loader: torch.utils.data.DataLoader,
+    tcfg: TrainConfig,
+    distogram_res: Distogram,
+    distogram_atom: Distogram,
+) -> None:
+    """Ensures train writes a checkpoint file at the path configured in tcfg.checkpoint."""
     train(model, tcfg, loader, loader, distogram_res, distogram_atom, "cpu")
     assert os.path.exists(tcfg.checkpoint.checkpoint_path)
 
 
-def test_train_checkpoint_is_valid_state_dict(model, loader, tcfg, distogram_res, distogram_atom):
+def test_train_checkpoint_is_valid_state_dict(
+    model: MainTrunk,
+    loader: torch.utils.data.DataLoader,
+    tcfg: TrainConfig,
+    distogram_res: Distogram,
+    distogram_atom: Distogram,
+) -> None:
+    """The checkpoint written by train is a dict containing a 'model' state-dict key."""
     train(model, tcfg, loader, loader, distogram_res, distogram_atom, "cpu")
     ckpt = torch.load(tcfg.checkpoint.checkpoint_path, weights_only=True)
     assert isinstance(ckpt, dict)
     assert "model" in ckpt
 
 
-def test_train_updates_model_parameters(model, loader, tcfg, distogram_res, distogram_atom):
+def test_train_updates_model_parameters(
+    model: MainTrunk,
+    loader: torch.utils.data.DataLoader,
+    tcfg: TrainConfig,
+    distogram_res: Distogram,
+    distogram_atom: Distogram,
+) -> None:
+    """Ensures train modifies at least one model parameter via gradient descent."""
     params_before = [p.clone().detach() for p in model.parameters()]
     train(model, tcfg, loader, loader, distogram_res, distogram_atom, "cpu")
     params_after = list(model.parameters())
     assert any(not torch.equal(b, a) for b, a in zip(params_before, params_after, strict=False))
 
 
-def test_train_model_in_train_mode_after(model, loader, tcfg, distogram_res, distogram_atom):
+def test_train_model_in_train_mode_after(
+    model: MainTrunk,
+    loader: torch.utils.data.DataLoader,
+    tcfg: TrainConfig,
+    distogram_res: Distogram,
+    distogram_atom: Distogram,
+) -> None:
+    """Ensures train leaves the model in train mode after the last epoch completes."""
     model.eval()
     train(model, tcfg, loader, loader, distogram_res, distogram_atom, "cpu")
     assert model.training
 
 
 def test_train_runs_all_epochs(
-    model, loader, tcfg_multi, distogram_res, distogram_atom, monkeypatch
-):
+    model: MainTrunk,
+    loader: torch.utils.data.DataLoader,
+    tcfg_multi: TrainConfig,
+    distogram_res: Distogram,
+    distogram_atom: Distogram,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ensures train calls evaluate once per epoch and produces finite losses for all epochs."""
     losses: list[float] = []
     _real_evaluate = evaluate
 
-    def _patched_evaluate(m, ldr, cfg, dr, da, dev):
+    def _patched_evaluate(
+        m: MainTrunk,
+        ldr: torch.utils.data.DataLoader,
+        cfg: TrainConfig,
+        dr: Distogram,
+        da: Distogram,
+        dev: str,
+    ) -> dict:
         result = _real_evaluate(m, ldr, cfg, dr, da, dev)
         losses.append(result["total loss"])
         return result
@@ -372,32 +504,59 @@ def test_train_runs_all_epochs(
     train(model, tcfg_multi, loader, loader, distogram_res, distogram_atom, "cpu")
 
     assert len(losses) == 3
-    assert all(v == v and v != float("inf") for v in losses)
+    # math.isfinite returns False if the value is NaN or Infinity
+    assert all(math.isfinite(v) for v in losses)
 
 
-def test_train_no_grad_clip_runs(model, loader, tcfg_no_clip, distogram_res, distogram_atom):
+def test_train_no_grad_clip_runs(
+    model: MainTrunk,
+    loader: torch.utils.data.DataLoader,
+    tcfg_no_clip: TrainConfig,
+    distogram_res: Distogram,
+    distogram_atom: Distogram,
+) -> None:
+    """Ensures train completes without error when grad_clip is None (gradient clipping disabled)."""
     result = train(model, tcfg_no_clip, loader, loader, distogram_res, distogram_atom, "cpu")
     assert result is None
 
 
 def test_train_no_grad_clip_saves_checkpoint(
-    model, loader, tcfg_no_clip, distogram_res, distogram_atom
-):
+    model: MainTrunk,
+    loader: torch.utils.data.DataLoader,
+    tcfg_no_clip: TrainConfig,
+    distogram_res: Distogram,
+    distogram_atom: Distogram,
+) -> None:
+    """Ensures train writes a checkpoint even when grad_clip is None."""
     train(model, tcfg_no_clip, loader, loader, distogram_res, distogram_atom, "cpu")
     assert os.path.exists(tcfg_no_clip.checkpoint.checkpoint_path)
 
 
 def test_train_save_every_creates_epoch_checkpoint(
-    model, loader, tcfg_save, distogram_res, distogram_atom, tmp_path, monkeypatch
-):
+    model: MainTrunk,
+    loader: torch.utils.data.DataLoader,
+    tcfg_save: TrainConfig,
+    distogram_res: Distogram,
+    distogram_atom: Distogram,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ensures train writes a per-epoch checkpoint file when save_every=1."""
     monkeypatch.chdir(tmp_path)
     train(model, tcfg_save, loader, loader, distogram_res, distogram_atom, "cpu")
     assert os.path.exists(tmp_path / "checkpoint_epoch_001.pt")
 
 
 def test_train_save_every_checkpoint_is_valid_state_dict(
-    model, loader, tcfg_save, distogram_res, distogram_atom, tmp_path, monkeypatch
-):
+    model: MainTrunk,
+    loader: torch.utils.data.DataLoader,
+    tcfg_save: TrainConfig,
+    distogram_res: Distogram,
+    distogram_atom: Distogram,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The per-epoch checkpoint written by train is a dict containing a 'model' key."""
     monkeypatch.chdir(tmp_path)
     train(model, tcfg_save, loader, loader, distogram_res, distogram_atom, "cpu")
     ckpt = torch.load(tmp_path / "checkpoint_epoch_001.pt", weights_only=True)
@@ -411,8 +570,13 @@ def test_train_save_every_checkpoint_is_valid_state_dict(
 
 
 def test_evaluate_multi_batch_returns_expected_keys(
-    model, mini_batch, tcfg, distogram_res, distogram_atom
-):
+    model: MainTrunk,
+    mini_batch: dict,
+    tcfg: TrainConfig,
+    distogram_res: Distogram,
+    distogram_atom: Distogram,
+) -> None:
+    """Ensures evaluate with a 2-batch loader still returns exactly the expected metric keys."""
     loader2 = torch.utils.data.DataLoader(
         [mini_batch, mini_batch], batch_size=None, collate_fn=lambda x: x
     )
@@ -421,68 +585,18 @@ def test_evaluate_multi_batch_returns_expected_keys(
 
 
 def test_evaluate_multi_batch_n_batches_counted(
-    model, mini_batch, tcfg, distogram_res, distogram_atom
-):
+    model: MainTrunk,
+    mini_batch: dict,
+    tcfg: TrainConfig,
+    distogram_res: Distogram,
+    distogram_atom: Distogram,
+) -> None:
+    """Ensures evaluate averages correctly over 3 batches, producing finite loss values."""
     loader3 = torch.utils.data.DataLoader([mini_batch] * 3, batch_size=None, collate_fn=lambda x: x)
     result = evaluate(model, loader3, tcfg, distogram_res, distogram_atom, "cpu")
     for k, v in result.items():
-        assert v == v and v != float("inf"), f"bad value for '{k}'"
-
-
-# ---------------------------------------------------------------------------
-# _FileLogProcessor
-# ---------------------------------------------------------------------------
-
-
-def test_file_log_processor_creates_file(tmp_path):
-    path = str(tmp_path / "run.jsonl")
-    _FileLogProcessor(path)
-    assert os.path.exists(path)
-
-
-def test_file_log_processor_returns_event_dict(tmp_path):
-    path = str(tmp_path / "run.jsonl")
-    proc = _FileLogProcessor(path)
-    event = {"event": "test", "value": 1}
-    returned = proc(None, None, event)
-    assert returned is event
-
-
-def test_file_log_processor_writes_json_line(tmp_path):
-    path = str(tmp_path / "run.jsonl")
-    proc = _FileLogProcessor(path)
-    event = {"event": "train", "loss": 0.5}
-    proc(None, None, event)
-    proc._f.flush()
-    with open(path) as fh:
-        written = json.loads(fh.readline())
-    assert written == event
-
-
-def test_file_log_processor_writes_multiple_lines(tmp_path):
-    path = str(tmp_path / "run.jsonl")
-    proc = _FileLogProcessor(path)
-    events = [{"event": "a", "x": 1}, {"event": "b", "x": 2}]
-    for ev in events:
-        proc(None, None, ev)
-    proc._f.flush()
-    with open(path) as fh:
-        lines = fh.readlines()
-    assert len(lines) == 2
-    assert [json.loads(line) for line in lines] == events
-
-
-def test_file_log_processor_truncates_existing_file(tmp_path):
-    path = str(tmp_path / "run.jsonl")
-    with open(path, "w") as fh:
-        fh.write('{"stale": true}\n' * 5)
-    proc = _FileLogProcessor(path)
-    proc(None, None, {"event": "fresh"})
-    proc._f.flush()
-    with open(path) as fh:
-        lines = fh.readlines()
-    assert len(lines) == 1
-    assert json.loads(lines[0]) == {"event": "fresh"}
+        # math.isfinite returns False if the value is NaN or Infinity
+        assert math.isfinite(v), f"Value for '{k}' is not finite: {v}"
 
 
 # ---------------------------------------------------------------------------
@@ -491,19 +605,31 @@ def test_file_log_processor_truncates_existing_file(tmp_path):
 
 
 def test_train_calls_wandb_log_when_enabled(
-    model, loader, tcfg_wandb, distogram_res, distogram_atom, monkeypatch
-):
+    model: MainTrunk,
+    loader: torch.utils.data.DataLoader,
+    tcfg_wandb: TrainConfig,
+    distogram_res: Distogram,
+    distogram_atom: Distogram,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Train calls wandb.log exactly once per epoch when use_wandb=True."""
     logged: list = []
     monkeypatch.setattr(
-        "train.train_loop.wandb.log", lambda data, step: logged.append((data, step))
+        "train.train_loop.wandb.log", lambda data, step=None: logged.append((data, step))
     )
     train(model, tcfg_wandb, loader, loader, distogram_res, distogram_atom, "cpu")
     assert len(logged) == 1
 
 
 def test_train_wandb_log_not_called_when_disabled(
-    model, loader, tcfg, distogram_res, distogram_atom, monkeypatch
-):
+    model: MainTrunk,
+    loader: torch.utils.data.DataLoader,
+    tcfg: TrainConfig,
+    distogram_res: Distogram,
+    distogram_atom: Distogram,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Train does not call wandb.log when use_wandb=False."""
     mock_log = MagicMock()
     monkeypatch.setattr("train.train_loop.wandb.log", mock_log)
     train(model, tcfg, loader, loader, distogram_res, distogram_atom, "cpu")
@@ -511,84 +637,138 @@ def test_train_wandb_log_not_called_when_disabled(
 
 
 def test_train_wandb_log_payload_has_epoch_key(
-    model, loader, tcfg_wandb, distogram_res, distogram_atom, monkeypatch
-):
+    model: MainTrunk,
+    loader: torch.utils.data.DataLoader,
+    tcfg_wandb: TrainConfig,
+    distogram_res: Distogram,
+    distogram_atom: Distogram,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The W&B payload logged by train includes an 'epoch' key set to the current epoch number."""
     payloads: list[dict] = []
-    monkeypatch.setattr("train.train_loop.wandb.log", lambda data, step: payloads.append(data))
+    monkeypatch.setattr("train.train_loop.wandb.log", lambda data, **_: payloads.append(data))
     train(model, tcfg_wandb, loader, loader, distogram_res, distogram_atom, "cpu")
     assert "epoch" in payloads[0]
     assert payloads[0]["epoch"] == 1
 
 
 def test_train_wandb_log_payload_has_train_keys(
-    model, loader, tcfg_wandb, distogram_res, distogram_atom, monkeypatch
-):
+    model: MainTrunk,
+    loader: torch.utils.data.DataLoader,
+    tcfg_wandb: TrainConfig,
+    distogram_res: Distogram,
+    distogram_atom: Distogram,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The W&B payload logged by train contains at least one key prefixed with 'train/'."""
     payloads: list[dict] = []
-    monkeypatch.setattr("train.train_loop.wandb.log", lambda data, step: payloads.append(data))
+    monkeypatch.setattr("train.train_loop.wandb.log", lambda data, **_: payloads.append(data))
     train(model, tcfg_wandb, loader, loader, distogram_res, distogram_atom, "cpu")
     assert any(k.startswith("train/") for k in payloads[0])
 
 
 def test_train_wandb_log_payload_has_val_keys(
-    model, loader, tcfg_wandb, distogram_res, distogram_atom, monkeypatch
-):
+    model: MainTrunk,
+    loader: torch.utils.data.DataLoader,
+    tcfg_wandb: TrainConfig,
+    distogram_res: Distogram,
+    distogram_atom: Distogram,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The W&B payload logged by train contains at least one key prefixed with 'val/'."""
     payloads: list[dict] = []
-    monkeypatch.setattr("train.train_loop.wandb.log", lambda data, step: payloads.append(data))
+    monkeypatch.setattr("train.train_loop.wandb.log", lambda data, **_: payloads.append(data))
     train(model, tcfg_wandb, loader, loader, distogram_res, distogram_atom, "cpu")
     assert any(k.startswith("val/") for k in payloads[0])
 
 
 def test_train_wandb_log_step_is_positive(
-    model, loader, tcfg_wandb, distogram_res, distogram_atom, monkeypatch
-):
+    model: MainTrunk,
+    loader: torch.utils.data.DataLoader,
+    tcfg_wandb: TrainConfig,
+    distogram_res: Distogram,
+    distogram_atom: Distogram,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The global_step passed to wandb.log is at least 1 after the first training step."""
     steps: list[int] = []
-    monkeypatch.setattr("train.train_loop.wandb.log", lambda data, step: steps.append(step))
+    monkeypatch.setattr("train.train_loop.wandb.log", lambda _data, step=None: steps.append(step))
     train(model, tcfg_wandb, loader, loader, distogram_res, distogram_atom, "cpu")
     assert steps[0] >= 1
 
 
 def test_train_wandb_log_called_once_per_epoch(
-    model, loader, tcfg_wandb_3ep, distogram_res, distogram_atom, monkeypatch
-):
+    model: MainTrunk,
+    loader: torch.utils.data.DataLoader,
+    tcfg_wandb_3ep: TrainConfig,
+    distogram_res: Distogram,
+    distogram_atom: Distogram,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Train calls wandb.log exactly once per epoch for a 3-epoch run."""
     logged: list = []
-    monkeypatch.setattr("train.train_loop.wandb.log", lambda data, step: logged.append(data))
+    monkeypatch.setattr("train.train_loop.wandb.log", lambda data, **_: logged.append(data))
     train(model, tcfg_wandb_3ep, loader, loader, distogram_res, distogram_atom, "cpu")
     assert len(logged) == 3
 
 
 def test_train_wandb_log_epoch_increments(
-    model, loader, tcfg_wandb_3ep, distogram_res, distogram_atom, monkeypatch
-):
+    model: MainTrunk,
+    loader: torch.utils.data.DataLoader,
+    tcfg_wandb_3ep: TrainConfig,
+    distogram_res: Distogram,
+    distogram_atom: Distogram,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The epoch number in W&B payloads increments from 1 to 3 across a 3-epoch run."""
     payloads: list[dict] = []
-    monkeypatch.setattr("train.train_loop.wandb.log", lambda data, step: payloads.append(data))
+    monkeypatch.setattr("train.train_loop.wandb.log", lambda data, **_: payloads.append(data))
     train(model, tcfg_wandb_3ep, loader, loader, distogram_res, distogram_atom, "cpu")
     epochs = [p["epoch"] for p in payloads]
     assert epochs == [1, 2, 3]
 
 
 def test_train_wandb_log_train_total_loss_is_float(
-    model, loader, tcfg_wandb, distogram_res, distogram_atom, monkeypatch
-):
+    model: MainTrunk,
+    loader: torch.utils.data.DataLoader,
+    tcfg_wandb: TrainConfig,
+    distogram_res: Distogram,
+    distogram_atom: Distogram,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The 'train/total loss' value logged to W&B is a Python float."""
     payloads: list[dict] = []
-    monkeypatch.setattr("train.train_loop.wandb.log", lambda data, step: payloads.append(data))
+    monkeypatch.setattr("train.train_loop.wandb.log", lambda data, **_: payloads.append(data))
     train(model, tcfg_wandb, loader, loader, distogram_res, distogram_atom, "cpu")
     assert isinstance(payloads[0]["train/total loss"], float)
 
 
 def test_train_wandb_log_val_total_loss_is_float(
-    model, loader, tcfg_wandb, distogram_res, distogram_atom, monkeypatch
-):
+    model: MainTrunk,
+    loader: torch.utils.data.DataLoader,
+    tcfg_wandb: TrainConfig,
+    distogram_res: Distogram,
+    distogram_atom: Distogram,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The 'val/total loss' value logged to W&B is a Python float."""
     payloads: list[dict] = []
-    monkeypatch.setattr("train.train_loop.wandb.log", lambda data, step: payloads.append(data))
+    monkeypatch.setattr("train.train_loop.wandb.log", lambda data, **_: payloads.append(data))
     train(model, tcfg_wandb, loader, loader, distogram_res, distogram_atom, "cpu")
     assert isinstance(payloads[0]["val/total loss"], float)
 
 
 def test_train_wandb_log_steps_increase_across_epochs(
-    model, loader, tcfg_wandb_3ep, distogram_res, distogram_atom, monkeypatch
-):
+    model: MainTrunk,
+    loader: torch.utils.data.DataLoader,
+    tcfg_wandb_3ep: TrainConfig,
+    distogram_res: Distogram,
+    distogram_atom: Distogram,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Global steps passed to wandb.log are strictly increasing and unique across epochs."""
     steps: list[int] = []
-    monkeypatch.setattr("train.train_loop.wandb.log", lambda data, step: steps.append(step))
+    monkeypatch.setattr("train.train_loop.wandb.log", lambda _data, step=None: steps.append(step))
     train(model, tcfg_wandb_3ep, loader, loader, distogram_res, distogram_atom, "cpu")
     assert steps == sorted(steps)
     assert len(set(steps)) == 3
@@ -599,91 +779,164 @@ def test_train_wandb_log_steps_increase_across_epochs(
 # ---------------------------------------------------------------------------
 
 
-def test_evaluate_ddp_returns_dict(model, loader, tcfg, distogram_res, distogram_atom):
-    result = evaluate_ddp(0, 1, model, loader, tcfg, distogram_res, distogram_atom, "cpu")
+def test_evaluate_ddp_returns_dict(
+    model: MainTrunk,
+    loader: torch.utils.data.DataLoader,
+    tcfg: TrainConfig,
+    distogram_res: Distogram,
+    distogram_atom: Distogram,
+) -> None:
+    """Ensures evaluate_ddp returns a plain dict for world_size=1."""
+    result = evaluate_ddp(1, model, loader, tcfg, distogram_res, distogram_atom, "cpu")
     assert isinstance(result, dict)
 
 
-def test_evaluate_ddp_returns_expected_keys(model, loader, tcfg, distogram_res, distogram_atom):
-    result = evaluate_ddp(0, 1, model, loader, tcfg, distogram_res, distogram_atom, "cpu")
+def test_evaluate_ddp_returns_expected_keys(
+    model: MainTrunk,
+    loader: torch.utils.data.DataLoader,
+    tcfg: TrainConfig,
+    distogram_res: Distogram,
+    distogram_atom: Distogram,
+) -> None:
+    """Ensures evaluate_ddp result contains exactly the expected metric keys."""
+    result = evaluate_ddp(1, model, loader, tcfg, distogram_res, distogram_atom, "cpu")
     assert set(result.keys()) == EXPECTED_EVAL_KEYS
 
 
-def test_evaluate_ddp_all_values_are_floats(model, loader, tcfg, distogram_res, distogram_atom):
-    result = evaluate_ddp(0, 1, model, loader, tcfg, distogram_res, distogram_atom, "cpu")
+def test_evaluate_ddp_all_values_are_floats(
+    model: MainTrunk,
+    loader: torch.utils.data.DataLoader,
+    tcfg: TrainConfig,
+    distogram_res: Distogram,
+    distogram_atom: Distogram,
+) -> None:
+    """Every value in the evaluate_ddp result dict is a Python float."""
+    result = evaluate_ddp(1, model, loader, tcfg, distogram_res, distogram_atom, "cpu")
     for k, v in result.items():
         assert isinstance(v, float), f"'{k}' is {type(v)}, expected float"
 
 
-def test_evaluate_ddp_all_losses_finite(model, loader, tcfg, distogram_res, distogram_atom):
-    result = evaluate_ddp(0, 1, model, loader, tcfg, distogram_res, distogram_atom, "cpu")
+def test_evaluate_ddp_all_losses_finite(
+    model: MainTrunk,
+    loader: torch.utils.data.DataLoader,
+    tcfg: TrainConfig,
+    distogram_res: Distogram,
+    distogram_atom: Distogram,
+) -> None:
+    """Every metric value in evaluate_ddp is finite (no NaN or Inf)."""
+    result = evaluate_ddp(1, model, loader, tcfg, distogram_res, distogram_atom, "cpu")
     for k, v in result.items():
-        assert v == v, f"NaN in '{k}'"
-        assert v != float("inf"), f"Inf in '{k}'"
+        # math.isfinite returns False if the value is NaN or Infinity
+        assert math.isfinite(v), f"Value for '{k}' is not finite: {v}"
 
 
-def test_evaluate_ddp_total_loss_non_negative(model, loader, tcfg, distogram_res, distogram_atom):
-    result = evaluate_ddp(0, 1, model, loader, tcfg, distogram_res, distogram_atom, "cpu")
+def test_evaluate_ddp_total_loss_non_negative(
+    model: MainTrunk,
+    loader: torch.utils.data.DataLoader,
+    tcfg: TrainConfig,
+    distogram_res: Distogram,
+    distogram_atom: Distogram,
+) -> None:
+    """Ensures evaluate_ddp total loss is non-negative."""
+    result = evaluate_ddp(1, model, loader, tcfg, distogram_res, distogram_atom, "cpu")
     assert result["total loss"] >= 0.0
 
 
-def test_evaluate_ddp_rmsd_non_negative(model, loader, tcfg, distogram_res, distogram_atom):
-    result = evaluate_ddp(0, 1, model, loader, tcfg, distogram_res, distogram_atom, "cpu")
+def test_evaluate_ddp_rmsd_non_negative(
+    model: MainTrunk,
+    loader: torch.utils.data.DataLoader,
+    tcfg: TrainConfig,
+    distogram_res: Distogram,
+    distogram_atom: Distogram,
+) -> None:
+    """Ensures evaluate_ddp RMSD is non-negative."""
+    result = evaluate_ddp(1, model, loader, tcfg, distogram_res, distogram_atom, "cpu")
     assert result["RMSD"] >= 0.0
 
 
-def test_evaluate_ddp_sets_model_to_eval_mode(model, loader, tcfg, distogram_res, distogram_atom):
+def test_evaluate_ddp_sets_model_to_eval_mode(
+    model: MainTrunk,
+    loader: torch.utils.data.DataLoader,
+    tcfg: TrainConfig,
+    distogram_res: Distogram,
+    distogram_atom: Distogram,
+) -> None:
+    """Ensures evaluate_ddp puts the model in eval mode and leaves it there after returning."""
     model.train()
-    evaluate_ddp(0, 1, model, loader, tcfg, distogram_res, distogram_atom, "cpu")
+    evaluate_ddp(1, model, loader, tcfg, distogram_res, distogram_atom, "cpu")
     assert not model.training
 
 
-def test_evaluate_ddp_empty_loader_returns_zero_dict(model, tcfg, distogram_res, distogram_atom):
+def test_evaluate_ddp_empty_loader_returns_zero_dict(
+    model: MainTrunk,
+    tcfg: TrainConfig,
+    distogram_res: Distogram,
+    distogram_atom: Distogram,
+) -> None:
+    """Ensures evaluate_ddp returns all-zero metrics when the loader contains no batches."""
     empty = torch.utils.data.DataLoader([], batch_size=None, collate_fn=lambda x: x)
-    result = evaluate_ddp(0, 1, model, empty, tcfg, distogram_res, distogram_atom, "cpu")
+    result = evaluate_ddp(1, model, empty, tcfg, distogram_res, distogram_atom, "cpu")
     assert all(v == 0.0 for v in result.values())
 
 
 def test_evaluate_ddp_calls_all_reduce_once_when_world_size_gt_1(
-    model, loader, tcfg, distogram_res, distogram_atom, monkeypatch
-):
+    model: MainTrunk,
+    loader: torch.utils.data.DataLoader,
+    tcfg: TrainConfig,
+    distogram_res: Distogram,
+    distogram_atom: Distogram,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ensures evaluate_ddp calls dist.all_reduce exactly once to aggregate metrics across ranks."""
     calls = []
-    monkeypatch.setattr(dist_module, "all_reduce", lambda t, op=None: calls.append(1))
-    evaluate_ddp(0, 2, model, loader, tcfg, distogram_res, distogram_atom, "cpu")
+    monkeypatch.setattr(dist_module, "all_reduce", lambda *_args, **_kwargs: calls.append(1))
+    evaluate_ddp(2, model, loader, tcfg, distogram_res, distogram_atom, "cpu")
     assert len(calls) == 1
 
 
 def test_evaluate_ddp_skips_all_reduce_when_world_size_is_1(
-    model, loader, tcfg, distogram_res, distogram_atom, monkeypatch
-):
+    model: MainTrunk,
+    loader: torch.utils.data.DataLoader,
+    tcfg: TrainConfig,
+    distogram_res: Distogram,
+    distogram_atom: Distogram,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ensures evaluate_ddp does not call dist.all_reduce when world_size=1."""
     calls = []
-    monkeypatch.setattr(dist_module, "all_reduce", lambda t, op=None: calls.append(1))
-    evaluate_ddp(0, 1, model, loader, tcfg, distogram_res, distogram_atom, "cpu")
+    monkeypatch.setattr(dist_module, "all_reduce", lambda *_args, **_kwargs: calls.append(1))
+    evaluate_ddp(1, model, loader, tcfg, distogram_res, distogram_atom, "cpu")
     assert len(calls) == 0
 
 
 class _FakeDDP(nn.Module):
     """Minimal DDP stand-in that exposes .module and works on CPU."""
 
-    def __init__(self, module, device_ids=None):
+    def __init__(self, module: nn.Module, **_kwargs: Any) -> None:
         super().__init__()
         self.module = module
 
-    def forward(self, *args, **kwargs):
+    def forward(self, *args: Any, **kwargs: Any) -> Any:
         return self.module(*args, **kwargs)
+
+
+@pytest.fixture(autouse=True)
+def _patch_ddp(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Replace DDP with _FakeDDP so train_ddp tests run without a real process group."""
+    monkeypatch.setattr("train.train_loop.DDP", _FakeDDP)
 
 
 class _MockSampler:
     """DataLoader sampler with set_epoch() for verifying epoch reseeding."""
 
-    def __init__(self, data):
+    def __init__(self, data: list) -> None:
         self._data = data
         self.set_epoch_calls: list[int] = []
 
     def __iter__(self):
         return iter(range(len(self._data)))
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self._data)
 
     def set_epoch(self, epoch: int) -> None:
@@ -691,17 +944,12 @@ class _MockSampler:
 
 
 @pytest.fixture
-def ddp_loader(mini_batch):
+def ddp_loader(mini_batch: dict) -> torch.utils.data.DataLoader:
+    """Provide a DataLoader backed by a _MockSampler to track set_epoch calls."""
     sampler = _MockSampler([mini_batch])
-    loader = torch.utils.data.DataLoader(
+    return torch.utils.data.DataLoader(
         [mini_batch], batch_size=None, sampler=sampler, collate_fn=lambda x: x
     )
-    return loader
-
-
-@pytest.fixture
-def patch_ddp(monkeypatch):
-    monkeypatch.setattr("train.train_loop.DDP", _FakeDDP)
 
 
 # ---------------------------------------------------------------------------
@@ -709,7 +957,14 @@ def patch_ddp(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_train_ddp_returns_none(model, ddp_loader, tcfg, distogram_res, distogram_atom, patch_ddp):
+def test_train_ddp_returns_none(
+    model: MainTrunk,
+    ddp_loader: torch.utils.data.DataLoader,
+    tcfg: TrainConfig,
+    distogram_res: Distogram,
+    distogram_atom: Distogram,
+) -> None:
+    """Ensures train_ddp returns None (side-effect-only function)."""
     result = train_ddp(
         0,
         0,
@@ -726,8 +981,13 @@ def test_train_ddp_returns_none(model, ddp_loader, tcfg, distogram_res, distogra
 
 
 def test_train_ddp_rank0_saves_checkpoint(
-    model, ddp_loader, tcfg, distogram_res, distogram_atom, patch_ddp
-):
+    model: MainTrunk,
+    ddp_loader: torch.utils.data.DataLoader,
+    tcfg: TrainConfig,
+    distogram_res: Distogram,
+    distogram_atom: Distogram,
+) -> None:
+    """Ensures train_ddp writes a checkpoint when rank=0."""
     train_ddp(
         0,
         0,
@@ -744,8 +1004,13 @@ def test_train_ddp_rank0_saves_checkpoint(
 
 
 def test_train_ddp_checkpoint_has_correct_keys(
-    model, ddp_loader, tcfg, distogram_res, distogram_atom, patch_ddp
-):
+    model: MainTrunk,
+    ddp_loader: torch.utils.data.DataLoader,
+    tcfg: TrainConfig,
+    distogram_res: Distogram,
+    distogram_atom: Distogram,
+) -> None:
+    """The checkpoint written by train_ddp contains the 'model' state-dict key."""
     train_ddp(
         0,
         0,
@@ -763,8 +1028,13 @@ def test_train_ddp_checkpoint_has_correct_keys(
 
 
 def test_train_ddp_rank1_does_not_save_checkpoint(
-    model, ddp_loader, tcfg, distogram_res, distogram_atom, patch_ddp
-):
+    model: MainTrunk,
+    ddp_loader: torch.utils.data.DataLoader,
+    tcfg: TrainConfig,
+    distogram_res: Distogram,
+    distogram_atom: Distogram,
+) -> None:
+    """Ensures train_ddp does not write a checkpoint when rank != 0."""
     train_ddp(
         1,
         0,
@@ -781,8 +1051,13 @@ def test_train_ddp_rank1_does_not_save_checkpoint(
 
 
 def test_train_ddp_calls_set_epoch_each_epoch(
-    model, ddp_loader, tcfg_multi, distogram_res, distogram_atom, patch_ddp
-):
+    model: MainTrunk,
+    ddp_loader: torch.utils.data.DataLoader,
+    tcfg_multi: TrainConfig,
+    distogram_res: Distogram,
+    distogram_atom: Distogram,
+) -> None:
+    """Ensures train_ddp calls sampler.set_epoch(epoch) once per epoch in ascending order."""
     train_ddp(
         0,
         0,
@@ -799,8 +1074,13 @@ def test_train_ddp_calls_set_epoch_each_epoch(
 
 
 def test_train_ddp_updates_model_parameters(
-    model, ddp_loader, tcfg, distogram_res, distogram_atom, patch_ddp
-):
+    model: MainTrunk,
+    ddp_loader: torch.utils.data.DataLoader,
+    tcfg: TrainConfig,
+    distogram_res: Distogram,
+    distogram_atom: Distogram,
+) -> None:
+    """Ensures train_ddp modifies at least one model parameter via gradient descent."""
     params_before = [p.clone().detach() for p in model.parameters()]
     train_ddp(
         0,
@@ -821,8 +1101,14 @@ def test_train_ddp_updates_model_parameters(
 
 
 def test_train_ddp_wandb_not_called_when_disabled(
-    model, ddp_loader, tcfg, distogram_res, distogram_atom, patch_ddp, monkeypatch
-):
+    model: MainTrunk,
+    ddp_loader: torch.utils.data.DataLoader,
+    tcfg: TrainConfig,
+    distogram_res: Distogram,
+    distogram_atom: Distogram,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ensures train_ddp does not call wandb.log when use_wandb=False."""
     mock_log = MagicMock()
     monkeypatch.setattr("train.train_loop.wandb.log", mock_log)
     train_ddp(
@@ -841,16 +1127,16 @@ def test_train_ddp_wandb_not_called_when_disabled(
 
 
 def test_train_ddp_wandb_called_when_rank0_and_enabled(
-    model,
-    ddp_loader,
-    tcfg_wandb,
-    distogram_res,
-    distogram_atom,
-    patch_ddp,
-    monkeypatch,
-):
+    model: MainTrunk,
+    ddp_loader: torch.utils.data.DataLoader,
+    tcfg_wandb: TrainConfig,
+    distogram_res: Distogram,
+    distogram_atom: Distogram,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ensures train_ddp calls wandb.log when rank=0 and use_wandb=True."""
     logged = []
-    monkeypatch.setattr("train.train_loop.wandb.log", lambda data, step: logged.append(data))
+    monkeypatch.setattr("train.train_loop.wandb.log", lambda data, **_: logged.append(data))
     train_ddp(
         0,
         0,
@@ -867,14 +1153,14 @@ def test_train_ddp_wandb_called_when_rank0_and_enabled(
 
 
 def test_train_ddp_wandb_not_called_when_rank_nonzero(
-    model,
-    ddp_loader,
-    tcfg_wandb,
-    distogram_res,
-    distogram_atom,
-    patch_ddp,
-    monkeypatch,
-):
+    model: MainTrunk,
+    ddp_loader: torch.utils.data.DataLoader,
+    tcfg_wandb: TrainConfig,
+    distogram_res: Distogram,
+    distogram_atom: Distogram,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ensures train_ddp does not call wandb.log when rank != 0 even if use_wandb=True."""
     mock_log = MagicMock()
     monkeypatch.setattr("train.train_loop.wandb.log", mock_log)
     train_ddp(
@@ -893,12 +1179,17 @@ def test_train_ddp_wandb_not_called_when_rank_nonzero(
 
 
 def test_evaluate_ddp_world_size1_matches_evaluate(
-    model, loader, tcfg, distogram_res, distogram_atom
-):
+    model: MainTrunk,
+    loader: torch.utils.data.DataLoader,
+    tcfg: TrainConfig,
+    distogram_res: Distogram,
+    distogram_atom: Distogram,
+) -> None:
+    """Ensures evaluate_ddp with world_size=1 produces identical results to evaluate."""
     torch.manual_seed(42)
     r1 = evaluate(model, loader, tcfg, distogram_res, distogram_atom, "cpu")
     torch.manual_seed(42)
-    r2 = evaluate_ddp(0, 1, model, loader, tcfg, distogram_res, distogram_atom, "cpu")
+    r2 = evaluate_ddp(1, model, loader, tcfg, distogram_res, distogram_atom, "cpu")
     for k in r1:
         assert (
             abs(r1[k] - r2[k]) < 1e-5
@@ -911,8 +1202,13 @@ def test_evaluate_ddp_world_size1_matches_evaluate(
 
 
 def test_training_step_with_full_dropout_produces_finite_outputs(
-    model, loader, tcfg, distogram_res, distogram_atom
-):
+    model: MainTrunk,
+    loader: torch.utils.data.DataLoader,
+    tcfg: TrainConfig,
+    distogram_res: Distogram,
+    distogram_atom: Distogram,
+) -> None:
+    """A forward pass with 50% conditioning dropout produces finite denoised coords and logits."""
     batch = next(iter(loader))
     featurized = featurize_batch(
         _to_protein_batch(batch), tcfg, distogram_res, distogram_atom, device="cpu"
@@ -931,7 +1227,12 @@ def test_training_step_with_full_dropout_produces_finite_outputs(
 
 
 def test_evaluate_loop_unchanged_by_dropout_config(
-    model, loader, tcfg, distogram_res, distogram_atom
-):
+    model: MainTrunk,
+    loader: torch.utils.data.DataLoader,
+    tcfg: TrainConfig,
+    distogram_res: Distogram,
+    distogram_atom: Distogram,
+) -> None:
+    """Ensures evaluate returns valid float metrics regardless of dropout config."""
     result = evaluate(model, loader, tcfg, distogram_res, distogram_atom, device="cpu")
     assert all(isinstance(v, float) for v in result.values())

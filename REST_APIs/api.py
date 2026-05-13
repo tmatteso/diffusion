@@ -4,13 +4,16 @@ import asyncio
 import os
 import sys
 import tempfile
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from functools import partial
 
 import numpy as np
 import torch
 from einops import rearrange
 from fastapi import FastAPI, HTTPException
+from jaxtyping import Float
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 # ── resolve pallatom onto the path ────────────────────────────────────────────
@@ -36,8 +39,18 @@ CHECKPOINT_PATH: str = os.environ.get(
 )
 DEVICE: str = "cuda" if torch.cuda.is_available() else "cpu"
 
-_state: dict = {}
-_semaphore: asyncio.Semaphore
+
+@dataclass(frozen=True)
+class _AppState:
+    semaphore: asyncio.Semaphore
+    model: MainTrunk
+    mp: ModelParams
+    noise: NoiseScheduleParams
+    atom_disto: Distogram
+    templ_disto: Distogram
+
+
+_loaded: _AppState | None = None
 
 
 # ── model loading ─────────────────────────────────────────────────────────────
@@ -66,10 +79,8 @@ def _load_model(
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
-    global _semaphore
-    _semaphore = asyncio.Semaphore(1)
-
+async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
+    """Manage application startup and teardown: initialise the semaphore and load the model."""
     if not os.path.exists(CHECKPOINT_PATH):
         raise RuntimeError(f"Checkpoint not found: {CHECKPOINT_PATH}")
 
@@ -81,6 +92,7 @@ async def lifespan(app: FastAPI):
         n_bins=mp.n_bins - 1, min_dist=3.25, max_dist=50.75, overflow_bin=True
     ).to(DEVICE)
     _state.update(
+        semaphore=asyncio.Semaphore(1),
         model=model,
         mp=mp,
         noise=noise,
@@ -104,6 +116,8 @@ _VALID_AA: frozenset[str] = frozenset("ARNDCQEGHILKMFPSTWYVX")
 
 
 class SampleRequest(BaseModel):
+    """Request body for the /sample endpoint."""
+
     # --- target ---
     n_res: int = Field(..., gt=0, le=512, description="Number of residues to generate")
 
@@ -144,6 +158,7 @@ class SampleRequest(BaseModel):
     @field_validator("sequence")
     @classmethod
     def sequence_valid_characters(cls, v: str | None) -> str | None:
+        """Reject sequences containing characters outside the standard amino acid alphabet."""
         if v is not None:
             invalid = set(v) - _VALID_AA
             if invalid:
@@ -152,12 +167,15 @@ class SampleRequest(BaseModel):
 
     @model_validator(mode="after")
     def sequence_length_matches_n_res(self) -> "SampleRequest":
+        """Ensure sequence length equals n_res when a sequence is provided."""
         if self.sequence is not None and len(self.sequence) != self.n_res:
             raise ValueError(f"sequence length {len(self.sequence)} must equal n_res {self.n_res}")
         return self
 
 
 class SampleResponse(BaseModel):
+    """Response body returned by the /sample endpoint."""
+
     pdb_strings: list[str]
     n_res: int
     n_samples: int
@@ -167,7 +185,7 @@ class SampleResponse(BaseModel):
 # ── synchronous sampling work (runs in a thread-pool executor) ────────────────
 
 
-def _protein_from_pdb_string(pdb_string: str):
+def _protein_from_pdb_string(pdb_string: str) -> Protein:
     """Write pdb_string to a temp file, parse it, delete the temp file."""
     with tempfile.NamedTemporaryFile(mode="w", suffix=".pdb", delete=False) as f:
         f.write(pdb_string)
@@ -176,6 +194,30 @@ def _protein_from_pdb_string(pdb_string: str):
         return protein_from_pdb(path)
     finally:
         os.unlink(path)
+
+
+def coords_to_pdb_strings(
+    coords_batch: Float[torch.Tensor, "B N_atom 3"],
+    seq_logits: Float[torch.Tensor, "B N_res n_amino"],
+    N_res: int,
+) -> list[str]:
+    """Convert a batch of atom coordinates and sequence logits to PDB-format strings."""
+    B = coords_batch.shape[0]
+    pdb_strings: list[str] = []
+    for b in range(B):
+        coords_np = rearrange(coords_batch[b].cpu().numpy(), "(n a) d -> n a d", n=N_res, a=NATOM)
+        x_37, mask_37 = atom5_to_atom37(coords_np)
+        aatype = seq_logits[b].argmax(dim=-1).cpu().numpy().astype(np.int32)
+        prot_out = Protein(
+            atom_positions=x_37,
+            atom_mask=mask_37,
+            residue_index=np.arange(N_res, dtype=np.int32),
+            aatype=aatype,
+            chain_index=np.zeros(N_res, dtype=np.int32),
+            b_factors=np.ones((N_res, 37), dtype=np.float32),
+        )
+        pdb_strings.append(to_pdb(prot_out))
+    return pdb_strings
 
 
 def _run_sampling(req: SampleRequest) -> list[str]:
@@ -262,27 +304,13 @@ def _run_sampling(req: SampleRequest) -> list[str]:
         S_noise=req.S_noise,
     )
 
-    coords_batch = edm_sampler.sample(
+    coords_batch, seq_logit_batch = edm_sampler.sample(
         shape=(B, N_atom, 3),
         steps=req.ddim_steps,
         device=DEVICE,
     )
 
-    pdb_strings: list[str] = []
-    for b in range(B):
-        coords_np = rearrange(coords_batch[b].cpu().numpy(), "(n a) d -> n a d", n=N_res, a=NATOM)
-        x_37, mask_37 = atom5_to_atom37(coords_np)
-        prot_out = Protein(
-            atom_positions=x_37,
-            atom_mask=mask_37,
-            residue_index=np.arange(N_res, dtype=np.int32),
-            aatype=np.zeros(N_res, dtype=np.int32),
-            chain_index=np.zeros(N_res, dtype=np.int32),
-            b_factors=np.ones((N_res, 37), dtype=np.float32),
-        )
-        pdb_strings.append(to_pdb(prot_out))
-
-    return pdb_strings
+    return coords_to_pdb_strings(coords_batch, seq_logits, N_res)
 
 
 # ── endpoints ─────────────────────────────────────────────────────────────────
@@ -290,18 +318,18 @@ def _run_sampling(req: SampleRequest) -> list[str]:
 
 @app.get("/health")
 async def health() -> dict:
+    """Return service health status, compute device, and whether a model is loaded."""
     return {"status": "ok", "device": DEVICE, "model_loaded": bool(_state)}
 
 
 @app.post("/sample", response_model=SampleResponse)
 async def sample(request: SampleRequest) -> SampleResponse:
-    """
-    Generate unconditional protein backbone structures.
+    """Generate unconditional protein backbone structures.
 
     Returns one PDB string per requested sample.
     Requests are serialised (one sampling job runs at a time).
     """
-    async with _semaphore:
+    async with _state["semaphore"]:
         loop = asyncio.get_event_loop()
         try:
             pdb_strings = await loop.run_in_executor(None, partial(_run_sampling, request))

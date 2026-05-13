@@ -1,3 +1,8 @@
+"""Training loop implementation for the diffusion model."""
+
+import argparse
+import contextlib
+import math
 import os
 
 import structlog
@@ -16,7 +21,7 @@ from architecture.main_trunk import MainTrunk
 from beartype import beartype
 from einops import rearrange
 from helpers.alignment import kabsch_align
-from helpers.data import make_ddp_data_loaders
+from helpers.data import _FileLogProcessor, make_ddp_data_loaders
 from helpers.featurize import Distogram, ProteinBatch, apply_conditioning_dropout, featurize_batch
 from jaxtyping import Float, Int, jaxtyped
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -47,7 +52,7 @@ def _to_protein_batch(batch: dict) -> ProteinBatch:
 @jaxtyped(typechecker=beartype)
 def evaluate(
     model: MainTrunk,
-    loader,
+    loader: torch.utils.data.DataLoader,
     tcfg: TrainConfig,
     distogram_res: Distogram,
     distogram_atom: Distogram,
@@ -164,10 +169,9 @@ def evaluate(
 
 @torch.no_grad()
 def evaluate_ddp(
-    rank: int,
     world_size: int,
     model: nn.Module,
-    loader,
+    loader: torch.utils.data.DataLoader,
     tcfg: TrainConfig,
     distogram_res: Distogram,
     distogram_atom: Distogram,
@@ -282,6 +286,182 @@ def evaluate_ddp(
     return {k: totals[i].item() / max(n_batches, 1) for i, k in enumerate(metric_names)}
 
 
+def train_step(
+    batch: dict,
+    model: nn.Module,
+    tcfg: TrainConfig,
+    distogram_res: Distogram,
+    distogram_atom: Distogram,
+    optimizer: Adam,
+    device: str,
+) -> tuple[dict[str, float], float]:
+    """Process one training batch: featurize, forward, compute losses, backward, step.
+
+    Returns step-level metrics (scalar floats, same keys as epoch averages) and the
+    gradient norm after clipping.
+    """
+    lp = tcfg.loss
+    tp = tcfg.training
+
+    featurized_batch = featurize_batch(
+        _to_protein_batch(batch), tcfg, distogram_res, distogram_atom, device
+    )
+    featurized_batch = apply_conditioning_dropout(
+        featurized_batch,
+        p_distogram=tcfg.conditioning_dropout.p_distogram,
+        p_atom=tcfg.conditioning_dropout.p_atom,
+        p_seq=tcfg.conditioning_dropout.p_seq,
+        device=device,
+    )
+
+    (
+        r_denoised,
+        f_seq_logits,
+        residue_distogram_logits,
+        atom_distogram_logits,
+        intermediate_denoised_coord_stack,
+        intermediate_pred_aa_logit_stack,
+    ) = model(featurized_batch)
+    r_denoised: Float[torch.Tensor, "B N_atom 3"]
+    f_seq_logits: Float[torch.Tensor, "B N_res n_amino"]
+    residue_distogram_logits: Float[torch.Tensor, "B N_res N_res n_bins"]
+    atom_distogram_logits: Float[torch.Tensor, "B N_atom K n_atom_bins"]
+
+    Kabsch_aligned_MSE_loss: Float[torch.Tensor, ""] = atom_loss(
+        r_denoised, featurized_batch.r_gt, featurized_batch.atom5_mask
+    ).mean()
+
+    K_unit = len(intermediate_denoised_coord_stack)
+    intermediate_med_loss: Float[torch.Tensor, ""] = torch.tensor(0.0, device=device)
+    for k_idx, intermediate_denoised_coord in enumerate(intermediate_denoised_coord_stack):
+        intermediate_denoised_coord: Float[torch.Tensor, "B N_atom 3"]
+        gamma_K_minus_k: float = lp.gamma ** (K_unit - k_idx - 1)
+        k_loss: Float[torch.Tensor, ""] = lp.lam * atom_loss(
+            intermediate_denoised_coord, featurized_batch.r_gt, featurized_batch.atom5_mask
+        ) + lp.alpha_0 * F.cross_entropy(
+            rearrange(intermediate_pred_aa_logit_stack[k_idx], "b n c -> (b n) c"),
+            rearrange(_mask_seq_target(featurized_batch.aa_indices), "b n -> (b n)"),
+        )
+        intermediate_med_loss = intermediate_med_loss + gamma_K_minus_k * k_loss
+    intermediate_med_loss = (intermediate_med_loss / max(K_unit, 1)).mean()
+
+    gt_res_bin_idx: Int[torch.Tensor, "B N_res N_res"] = featurized_batch.gt_res_distogram.argmax(
+        dim=-1
+    ).clamp(0, residue_distogram_logits.size(-1) - 1)
+    residue_distogram_loss: Float[torch.Tensor, ""] = distogram_loss_residue(
+        residue_distogram_logits,
+        gt_res_bin_idx,
+        featurized_batch.residue_mask,
+    ).mean()
+
+    atom_distogram_loss: Float[torch.Tensor, ""] = distogram_loss_atom(
+        atom_distogram_logits,
+        featurized_batch.gt_atom_distogram_sparse,
+        featurized_batch.gt_atom_distogram_mask_sparse,
+    ).mean()
+
+    lddt_loss: Float[torch.Tensor, ""] = smooth_lddt_loss(
+        r_denoised,
+        featurized_batch.r_gt,
+        featurized_batch.atom5_mask,
+        cutoff=float(lp.smooth_lddt_cutoff),
+    )
+    CE_loss: Float[torch.Tensor, ""] = F.cross_entropy(
+        rearrange(f_seq_logits, "b n c -> (b n) c"),
+        rearrange(_mask_seq_target(featurized_batch.aa_indices), "b n -> (b n)"),
+    )
+
+    total_loss: Float[torch.Tensor, ""] = (
+        lp.lam * Kabsch_aligned_MSE_loss
+        + lp.alpha_0 * CE_loss
+        + lp.alpha_1 * lddt_loss
+        + lp.alpha_2 * residue_distogram_loss
+        + lp.alpha_3 * atom_distogram_loss
+        + lp.alpha_4 * intermediate_med_loss
+    )
+
+    optimizer.zero_grad()
+    total_loss.backward()
+
+    grad_norm: float = float(
+        nn.utils.clip_grad_norm_(
+            model.parameters(),
+            tp.grad_clip if tp.grad_clip is not None else float("inf"),
+        )
+    )
+    optimizer.step()
+
+    return {
+        "total loss": total_loss.item(),
+        "Kabsch aligned MSE loss": Kabsch_aligned_MSE_loss.item(),
+        "Cross Entropy loss": CE_loss.item(),
+        "smooth lddt": lddt_loss.item(),
+        "Residue Distogram loss": residue_distogram_loss.item(),
+        "Atom Distogram loss": atom_distogram_loss.item(),
+        "Intermediate loss": intermediate_med_loss.item(),
+    }, grad_norm
+
+
+def log_epoch(
+    epoch: int,
+    global_step: int,
+    avg_train: dict[str, float],
+    avg_val: dict[str, float],
+    model: nn.Module,
+    tcfg: TrainConfig,
+    best_val_loss: float,
+    *,
+    do_log: bool = True,
+) -> float:
+    """Log metrics and save checkpoints for one completed epoch.
+
+    Writes structlog entries for train and val splits, optionally pushes to W&B, saves
+    the best-validation checkpoint, and saves a periodic epoch checkpoint when
+    ``tcfg.checkpoint.save_every`` divides ``epoch``.  Handles both plain ``nn.Module``
+    and DDP-wrapped models (accesses ``.module`` when present).  Pass ``do_log=False``
+    on non-rank-0 workers to skip all I/O.
+
+    Returns the (possibly updated) best validation loss.
+    """
+    if not do_log:
+        return best_val_loss
+
+    ck = tcfg.checkpoint
+    lg = tcfg.logging
+
+    log.info(
+        "train",
+        epoch=epoch,
+        **{k.replace(" ", "_"): round(v, 6) for k, v in avg_train.items()},
+    )
+    log.info(
+        "val",
+        epoch=epoch,
+        **{k.replace(" ", "_"): round(v, 6) for k, v in avg_val.items()},
+    )
+
+    if lg.use_wandb:
+        wandb.log(
+            {
+                "epoch": epoch,
+                **{f"train/{k}": v for k, v in avg_train.items()},
+                **{f"val/{k}": v for k, v in avg_val.items()},
+            },
+            step=global_step,
+        )
+
+    state_dict = model.module.state_dict() if hasattr(model, "module") else model.state_dict()
+
+    if avg_val["total loss"] < best_val_loss:
+        best_val_loss = avg_val["total loss"]
+        torch.save({"model": state_dict}, ck.checkpoint_path)
+
+    if epoch % ck.save_every == 0:
+        torch.save({"model": state_dict}, f"checkpoint_epoch_{epoch:03d}.pt")
+
+    return best_val_loss
+
+
 @jaxtyped(typechecker=beartype)
 def train(
     model: MainTrunk,
@@ -292,16 +472,42 @@ def train(
     distogram_atom: Distogram,
     device: str,
 ) -> None:
-    tp = tcfg.training
-    lp = tcfg.loss
-    lg = tcfg.logging
-    ck = tcfg.checkpoint
+    """Single-GPU training loop for the MainTrunk diffusion model.
 
-    optimizer = Adam(
-        model.parameters(),
-        lr=tp.lr,
-        weight_decay=tp.weight_decay,
-    )
+    Runs a standard train/eval loop for ``tcfg.training.num_epochs`` epochs.
+    Each training step featurizes a raw protein batch with a freshly sampled noise
+    level σ, applies per-modality conditioning dropout for classifier-free guidance,
+    forwards through the model, and back-propagates a weighted sum of seven losses:
+
+    - **MSE** (Kabsch-aligned coordinate error)
+    - **Cross-entropy** (sequence prediction)
+    - **Smooth lDDT** (local distance difference test)
+    - **Residue distogram** (Cβ pairwise distances)
+    - **Atom distogram** (sparse local atom-pair distances)
+    - **Intermediate coordinate loss** (auxiliary loss over each decoder unit,
+      weighted by γ^(K−k) to emphasise later units)
+    - **Intermediate sequence loss** (auxiliary CE over each decoder unit)
+
+    After each epoch the model is evaluated on ``test_loader`` via :func:`evaluate`,
+    metrics are logged with structlog (and optionally W&B), and the best-validation
+    checkpoint is saved.  Periodic epoch checkpoints are also written if
+    ``tcfg.checkpoint.save_every`` is set.
+
+    Args:
+        model: MainTrunk to train; must already be on ``device``.
+        tcfg: Training configuration supplying optimizer hyper-parameters, loss
+            weights, conditioning-dropout probabilities, logging, and checkpoint
+            settings.
+        train_loader: DataLoader yielding raw protein batches for training.
+        test_loader: DataLoader yielding raw protein batches for evaluation.
+        distogram_res: Callable producing Cβ residue-level distograms.
+        distogram_atom: Callable producing atom-level distograms.
+        device: PyTorch device string (e.g. ``"cuda:0"`` or ``"cpu"``).
+    """
+    tp = tcfg.training
+    lg = tcfg.logging
+
+    optimizer = Adam(model.parameters(), lr=tp.lr, weight_decay=tp.weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=tp.num_epochs, eta_min=tp.lr * 0.01)
 
     best_val_loss = float("inf")
@@ -309,180 +515,43 @@ def train(
 
     for epoch in range(1, tp.num_epochs + 1):
         model.train()
-        epoch_total_loss = epoch_MSE = epoch_CE = epoch_smooth_lddt = epoch_res_dist = (
-            epoch_atom_dist
-        ) = epoch_intermediate_loss = 0.0
+        epoch_metrics: dict[str, float] = dict.fromkeys(
+            [
+                "total loss",
+                "Kabsch aligned MSE loss",
+                "Cross Entropy loss",
+                "smooth lddt",
+                "Residue Distogram loss",
+                "Atom Distogram loss",
+                "Intermediate loss",
+            ],
+            0.0,
+        )
         n_batches = 0
 
         pbar = tqdm(train_loader, desc=f"Epoch {epoch:03d}/{tp.num_epochs}", leave=False)
 
         for batch in pbar:
-            featurized_batch = featurize_batch(
-                _to_protein_batch(batch),
-                tcfg,
-                distogram_res,
-                distogram_atom,
-                device,
+            step_metrics, grad_norm = train_step(
+                batch, model, tcfg, distogram_res, distogram_atom, optimizer, device
             )
-            featurized_batch = apply_conditioning_dropout(
-                featurized_batch,
-                p_distogram=tcfg.conditioning_dropout.p_distogram,
-                p_atom=tcfg.conditioning_dropout.p_atom,
-                p_seq=tcfg.conditioning_dropout.p_seq,
-                device=device,
-            )
-
-            (
-                r_denoised,
-                f_seq_logits,
-                residue_distogram_logits,
-                atom_distogram_logits,
-                intermediate_denoised_coord_stack,
-                intermediate_pred_aa_logit_stack,
-            ) = model(featurized_batch)
-            r_denoised: Float[torch.Tensor, "B N_atom 3"]
-            f_seq_logits: Float[torch.Tensor, "B N_res n_amino"]
-            residue_distogram_logits: Float[torch.Tensor, "B N_res N_res n_bins"]
-            atom_distogram_logits: Float[torch.Tensor, "B N_atom K n_atom_bins"]
-
-            Kabsch_aligned_MSE_loss: Float[torch.Tensor, ""] = atom_loss(
-                r_denoised, featurized_batch.r_gt, featurized_batch.atom5_mask
-            ).mean()
-
-            K_unit = len(intermediate_denoised_coord_stack)
-            intermediate_med_loss: Float[torch.Tensor, ""] = torch.tensor(0.0, device=device)
-
-            for k_idx, intermediate_denoised_coord in enumerate(intermediate_denoised_coord_stack):
-                intermediate_denoised_coord: Float[torch.Tensor, "B N_atom 3"]
-                gamma_K_minus_k: float = lp.gamma ** (K_unit - k_idx - 1)
-                k_loss: Float[torch.Tensor, ""] = lp.lam * atom_loss(
-                    intermediate_denoised_coord, featurized_batch.r_gt, featurized_batch.atom5_mask
-                ) + lp.alpha_0 * F.cross_entropy(
-                    rearrange(intermediate_pred_aa_logit_stack[k_idx], "b n c -> (b n) c"),
-                    rearrange(_mask_seq_target(featurized_batch.aa_indices), "b n -> (b n)"),
-                )
-                intermediate_med_loss = intermediate_med_loss + gamma_K_minus_k * k_loss
-            intermediate_med_loss = (intermediate_med_loss / max(K_unit, 1)).mean()
-
-            gt_res_bin_idx: Int[torch.Tensor, "B N_res N_res"] = (
-                featurized_batch.gt_res_distogram.argmax(dim=-1).clamp(
-                    0, residue_distogram_logits.size(-1) - 1
-                )
-            )
-            residue_distogram_loss: Float[torch.Tensor, ""] = distogram_loss_residue(
-                residue_distogram_logits,
-                gt_res_bin_idx,
-                featurized_batch.residue_mask,
-            ).mean()
-
-            atom_distogram_loss: Float[torch.Tensor, ""] = distogram_loss_atom(
-                atom_distogram_logits,
-                featurized_batch.gt_atom_distogram_sparse,
-                featurized_batch.gt_atom_distogram_mask_sparse,
-            ).mean()
-
-            lddt_loss: Float[torch.Tensor, ""] = smooth_lddt_loss(
-                r_denoised,
-                featurized_batch.r_gt,
-                featurized_batch.atom5_mask,
-                cutoff=float(lp.smooth_lddt_cutoff),
-            )
-            CE_loss: Float[torch.Tensor, ""] = F.cross_entropy(
-                rearrange(f_seq_logits, "b n c -> (b n) c"),
-                rearrange(_mask_seq_target(featurized_batch.aa_indices), "b n -> (b n)"),
-            )
-
-            total_loss: Float[torch.Tensor, ""] = (
-                lp.lam * Kabsch_aligned_MSE_loss
-                + lp.alpha_0 * CE_loss
-                + lp.alpha_1 * lddt_loss
-                + lp.alpha_2 * residue_distogram_loss
-                + lp.alpha_3 * atom_distogram_loss
-                + lp.alpha_4 * intermediate_med_loss
-            )
-
-            optimizer.zero_grad()
-            total_loss.backward()
-
-            grad_norm: Float[torch.Tensor, ""] = nn.utils.clip_grad_norm_(
-                model.parameters(),
-                tp.grad_clip if tp.grad_clip is not None else float("inf"),
-            )
-            optimizer.step()
-
-            epoch_total_loss += total_loss.item()
-            epoch_MSE += Kabsch_aligned_MSE_loss.item()
-            epoch_CE += CE_loss.item()
-            epoch_smooth_lddt += lddt_loss.item()
-            epoch_res_dist += residue_distogram_loss.item()
-            epoch_atom_dist += atom_distogram_loss.item()
-            epoch_intermediate_loss += intermediate_med_loss.item()
+            for k in epoch_metrics:
+                epoch_metrics[k] += step_metrics[k]
             n_batches += 1
             global_step += 1
 
             if global_step % lg.log_interval == 0:
-                pbar.set_postfix(loss=f"{total_loss.item():.4f}", gnorm=f"{grad_norm:.3f}")
+                pbar.set_postfix(loss=f"{step_metrics['total loss']:.4f}", gnorm=f"{grad_norm:.3f}")
 
         scheduler.step()
 
-        avg_train = {
-            k: v / n_batches
-            for k, v in zip(
-                [
-                    "total loss",
-                    "Kabsch aligned MSE loss",
-                    "Cross Entropy loss",
-                    "smooth lddt",
-                    "Residue Distogram loss",
-                    "Atom Distogram loss",
-                    "Intermediate loss",
-                ],
-                [
-                    epoch_total_loss,
-                    epoch_MSE,
-                    epoch_CE,
-                    epoch_smooth_lddt,
-                    epoch_res_dist,
-                    epoch_atom_dist,
-                    epoch_intermediate_loss,
-                ],
-                strict=False,
-            )
-        }
-
+        avg_train = {k: v / n_batches for k, v in epoch_metrics.items()}
         avg_val = evaluate(model, test_loader, tcfg, distogram_res, distogram_atom, device)
         model.train()
 
-        log.info(
-            "train",
-            epoch=epoch,
-            **{k.replace(" ", "_"): round(v, 6) for k, v in avg_train.items()},
+        best_val_loss = log_epoch(
+            epoch, global_step, avg_train, avg_val, model, tcfg, best_val_loss
         )
-        log.info(
-            "val",
-            epoch=epoch,
-            **{k.replace(" ", "_"): round(v, 6) for k, v in avg_val.items()},
-        )
-
-        if lg.use_wandb:
-            wandb.log(
-                {
-                    "epoch": epoch,
-                    **{f"train/{k}": v for k, v in avg_train.items()},
-                    **{f"val/{k}": v for k, v in avg_val.items()},
-                },
-                step=global_step,
-            )
-
-        if avg_val["total loss"] < best_val_loss:
-            best_val_loss = avg_val["total loss"]
-            torch.save({"model": model.state_dict()}, ck.checkpoint_path)
-
-        if epoch % ck.save_every == 0:
-            torch.save(
-                {"model": model.state_dict()},
-                f"checkpoint_epoch_{epoch:03d}.pt",
-            )
 
 
 def train_ddp(
@@ -502,15 +571,9 @@ def train_ddp(
     ddp_model = DDP(model, device_ids=[local_rank])
 
     tp = tcfg.training
-    lp = tcfg.loss
     lg = tcfg.logging
-    ck = tcfg.checkpoint
 
-    optimizer = Adam(
-        ddp_model.parameters(),
-        lr=tp.lr,
-        weight_decay=tp.weight_decay,
-    )
+    optimizer = Adam(ddp_model.parameters(), lr=tp.lr, weight_decay=tp.weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=tp.num_epochs, eta_min=tp.lr * 0.01)
 
     best_val_loss = float("inf")
@@ -519,9 +582,18 @@ def train_ddp(
     for epoch in range(1, tp.num_epochs + 1):
         ddp_model.train()
         train_loader.sampler.set_epoch(epoch)
-        epoch_total_loss = epoch_MSE = epoch_CE = epoch_smooth_lddt = epoch_res_dist = (
-            epoch_atom_dist
-        ) = epoch_intermediate_loss = 0.0
+        epoch_metrics: dict[str, float] = dict.fromkeys(
+            [
+                "total loss",
+                "Kabsch aligned MSE loss",
+                "Cross Entropy loss",
+                "smooth lddt",
+                "Residue Distogram loss",
+                "Atom Distogram loss",
+                "Intermediate loss",
+            ],
+            0.0,
+        )
         n_batches = 0
 
         pbar = tqdm(
@@ -532,213 +604,42 @@ def train_ddp(
         )
 
         for batch in pbar:
-            featurized_batch = featurize_batch(
-                _to_protein_batch(batch),
-                tcfg,
-                distogram_res,
-                distogram_atom,
-                device,
+            step_metrics, grad_norm = train_step(
+                batch, ddp_model, tcfg, distogram_res, distogram_atom, optimizer, device
             )
-            featurized_batch = apply_conditioning_dropout(
-                featurized_batch,
-                p_distogram=tcfg.conditioning_dropout.p_distogram,
-                p_atom=tcfg.conditioning_dropout.p_atom,
-                p_seq=tcfg.conditioning_dropout.p_seq,
-                device=device,
-            )
-
-            (
-                r_denoised,
-                f_seq_logits,
-                residue_distogram_logits,
-                atom_distogram_logits,
-                intermediate_denoised_coord_stack,
-                intermediate_pred_aa_logit_stack,
-            ) = ddp_model(featurized_batch)
-            r_denoised: Float[torch.Tensor, "B N_atom 3"]
-            f_seq_logits: Float[torch.Tensor, "B N_res n_amino"]
-            residue_distogram_logits: Float[torch.Tensor, "B N_res N_res n_bins"]
-            atom_distogram_logits: Float[torch.Tensor, "B N_atom K n_atom_bins"]
-
-            Kabsch_aligned_MSE_loss: Float[torch.Tensor, ""] = atom_loss(
-                r_denoised, featurized_batch.r_gt, featurized_batch.atom5_mask
-            ).mean()
-
-            K_unit = len(intermediate_denoised_coord_stack)
-            intermediate_med_loss: Float[torch.Tensor, ""] = torch.tensor(0.0, device=device)
-            for k_idx, intermediate_denoised_coord in enumerate(intermediate_denoised_coord_stack):
-                intermediate_denoised_coord: Float[torch.Tensor, "B N_atom 3"]
-                gamma_K_minus_k: float = lp.gamma ** (K_unit - k_idx - 1)
-                k_loss: Float[torch.Tensor, ""] = lp.lam * atom_loss(
-                    intermediate_denoised_coord, featurized_batch.r_gt, featurized_batch.atom5_mask
-                ) + lp.alpha_0 * F.cross_entropy(
-                    rearrange(intermediate_pred_aa_logit_stack[k_idx], "b n c -> (b n) c"),
-                    rearrange(_mask_seq_target(featurized_batch.aa_indices), "b n -> (b n)"),
-                )
-                intermediate_med_loss = intermediate_med_loss + gamma_K_minus_k * k_loss
-            intermediate_med_loss = (intermediate_med_loss / max(K_unit, 1)).mean()
-
-            gt_res_bin_idx: Int[torch.Tensor, "B N_res N_res"] = (
-                featurized_batch.gt_res_distogram.argmax(dim=-1).clamp(
-                    0, residue_distogram_logits.size(-1) - 1
-                )
-            )
-            residue_distogram_loss: Float[torch.Tensor, ""] = distogram_loss_residue(
-                residue_distogram_logits,
-                gt_res_bin_idx,
-                featurized_batch.residue_mask,
-            ).mean()
-
-            atom_distogram_loss: Float[torch.Tensor, ""] = distogram_loss_atom(
-                atom_distogram_logits,
-                featurized_batch.gt_atom_distogram_sparse,
-                featurized_batch.gt_atom_distogram_mask_sparse,
-            ).mean()
-
-            lddt_loss: Float[torch.Tensor, ""] = smooth_lddt_loss(
-                r_denoised,
-                featurized_batch.r_gt,
-                featurized_batch.atom5_mask,
-                cutoff=float(lp.smooth_lddt_cutoff),
-            )
-            CE_loss: Float[torch.Tensor, ""] = F.cross_entropy(
-                rearrange(f_seq_logits, "b n c -> (b n) c"),
-                rearrange(_mask_seq_target(featurized_batch.aa_indices), "b n -> (b n)"),
-            )
-
-            total_loss: Float[torch.Tensor, ""] = (
-                lp.lam * Kabsch_aligned_MSE_loss
-                + lp.alpha_0 * CE_loss
-                + lp.alpha_1 * lddt_loss
-                + lp.alpha_2 * residue_distogram_loss
-                + lp.alpha_3 * atom_distogram_loss
-                + lp.alpha_4 * intermediate_med_loss
-            )
-
-            if rank == 0 and torch.isnan(total_loss):
-                components = {
-                    "mse": Kabsch_aligned_MSE_loss,
-                    "ce": CE_loss,
-                    "lddt": lddt_loss,
-                    "res_dist": residue_distogram_loss,
-                    "atom_dist": atom_distogram_loss,
-                    "inter": intermediate_med_loss,
-                }
-                nan_keys = [k for k, v in components.items() if torch.isnan(v)]
+            if rank == 0 and math.isnan(step_metrics["total loss"]):
+                nan_keys = [k for k, v in step_metrics.items() if math.isnan(v)]
                 log.warning("nan_loss", step=global_step, nan_components=nan_keys)
-
-            optimizer.zero_grad()
-            total_loss.backward()
-
-            grad_norm: Float[torch.Tensor, ""] = nn.utils.clip_grad_norm_(
-                ddp_model.parameters(),
-                tp.grad_clip if tp.grad_clip is not None else float("inf"),
-            )
-            optimizer.step()
-
-            epoch_total_loss += total_loss.item()
-            epoch_MSE += Kabsch_aligned_MSE_loss.item()
-            epoch_CE += CE_loss.item()
-            epoch_smooth_lddt += lddt_loss.item()
-            epoch_res_dist += residue_distogram_loss.item()
-            epoch_atom_dist += atom_distogram_loss.item()
-            epoch_intermediate_loss += intermediate_med_loss.item()
+            for k in epoch_metrics:
+                epoch_metrics[k] += step_metrics[k]
             n_batches += 1
             global_step += 1
 
             if rank == 0 and global_step % lg.log_interval == 0:
-                pbar.set_postfix(loss=f"{total_loss.item():.4f}", gnorm=f"{grad_norm:.3f}")
+                pbar.set_postfix(loss=f"{step_metrics['total loss']:.4f}", gnorm=f"{grad_norm:.3f}")
 
         scheduler.step()
 
-        avg_train = {
-            k: v / n_batches
-            for k, v in zip(
-                [
-                    "total loss",
-                    "Kabsch aligned MSE loss",
-                    "Cross Entropy loss",
-                    "smooth lddt",
-                    "Residue Distogram loss",
-                    "Atom Distogram loss",
-                    "Intermediate loss",
-                ],
-                [
-                    epoch_total_loss,
-                    epoch_MSE,
-                    epoch_CE,
-                    epoch_smooth_lddt,
-                    epoch_res_dist,
-                    epoch_atom_dist,
-                    epoch_intermediate_loss,
-                ],
-                strict=False,
-            )
-        }
-
+        avg_train = {k: v / n_batches for k, v in epoch_metrics.items()}
         _eff_world_size = world_size if dist.is_initialized() else 1
         avg_val = evaluate_ddp(
-            rank,
-            _eff_world_size,
-            ddp_model,
-            test_loader,
-            tcfg,
-            distogram_res,
-            distogram_atom,
-            device,
+            _eff_world_size, ddp_model, test_loader, tcfg, distogram_res, distogram_atom, device
         )
         ddp_model.train()
 
-        if rank == 0:
-            log.info(
-                "train",
-                epoch=epoch,
-                **{k.replace(" ", "_"): round(v, 6) for k, v in avg_train.items()},
-            )
-            log.info(
-                "val",
-                epoch=epoch,
-                **{k.replace(" ", "_"): round(v, 6) for k, v in avg_val.items()},
-            )
-
-            if lg.use_wandb:
-                wandb.log(
-                    {
-                        "epoch": epoch,
-                        **{f"train/{k}": v for k, v in avg_train.items()},
-                        **{f"val/{k}": v for k, v in avg_val.items()},
-                    },
-                    step=global_step,
-                )
-
-            if avg_val["total loss"] < best_val_loss:
-                best_val_loss = avg_val["total loss"]
-                torch.save({"model": ddp_model.module.state_dict()}, ck.checkpoint_path)
-
-            if epoch % ck.save_every == 0:
-                torch.save(
-                    {"model": ddp_model.module.state_dict()},
-                    f"checkpoint_epoch_{epoch:03d}.pt",
-                )
-
-
-class _FileLogProcessor:
-    """Structlog processor that appends JSON lines to a file, then passes the event dict through."""
-
-    def __init__(self, path: str) -> None:
-        import json as _json
-
-        self._f = open(path, "w", buffering=1)  # line-buffered
-        self._json = _json
-
-    def __call__(self, logger, method, event_dict):
-        self._f.write(self._json.dumps(event_dict) + "\n")
-        return event_dict
+        best_val_loss = log_epoch(
+            epoch,
+            global_step,
+            avg_train,
+            avg_val,
+            ddp_model,
+            tcfg,
+            best_val_loss,
+            do_log=(rank == 0),
+        )
 
 
 if __name__ == "__main__":
-    import argparse
-
     parser = argparse.ArgumentParser(description="Train PallAtom (DDP)")
     parser.add_argument("--data", required=True, help="path to proteins.jsonl")
     parser.add_argument("--splits", required=True, help="path to splits.json")
@@ -762,80 +663,80 @@ if __name__ == "__main__":
             structlog.stdlib.add_log_level,
             structlog.processors.StackInfoRenderer(),
         ]
-        if args.log_file and rank == 0:
-            _processors.append(_FileLogProcessor(args.log_file))
         if rank == 0:
             _processors.append(structlog.dev.ConsoleRenderer())
 
-        structlog.configure(
-            processors=_processors,
-            wrapper_class=structlog.make_filtering_bound_logger(20),
-            context_class=dict,
-            logger_factory=structlog.PrintLoggerFactory(),
-        )
+        with contextlib.ExitStack() as _stack:
+            if args.log_file and rank == 0:
+                _processors.insert(-1, _stack.enter_context(_FileLogProcessor(args.log_file)))
 
-        import traceback as _tb
-
-        try:
-            if args.config is not None:
-                with open(args.config) as _f:
-                    tcfg = TrainConfig.model_validate_json(_f.read())
-            else:
-                tcfg = TrainConfig()
-
-            train_loader, val_loader, _ = make_ddp_data_loaders(
-                tcfg,
-                args.data,
-                args.splits,
-                rank=rank,
-                world_size=world_size,
-                num_workers=args.num_workers,
+            structlog.configure(
+                processors=_processors,
+                wrapper_class=structlog.make_filtering_bound_logger(20),
+                context_class=dict,
+                logger_factory=structlog.PrintLoggerFactory(),
             )
 
-            mp = tcfg.model
-            model = MainTrunk(
-                f_ref_dim=mp.f_ref_dim,
-                n_bins=mp.n_bins,
-                n_atom_bins=tcfg.distogram_atom.n_bins,
-                c_atom=mp.c_atom,
-                c_pair=mp.c_pair,
-                c_res=mp.c_res,
-                c_atompair=mp.c_atompair,
-                K_unit=mp.K_unit,
-                sigma_data=tcfg.noise.sigma_data,
-            ).to(device)
+            try:
+                if args.config is not None:
+                    with open(args.config) as _f:
+                        tcfg = TrainConfig.model_validate_json(_f.read())
+                else:
+                    tcfg = TrainConfig()
 
-            dr = tcfg.distogram_res
-            da = tcfg.distogram_atom
-            distogram_res = Distogram(
-                n_bins=dr.n_bins, min_dist=dr.min_dist, max_dist=dr.max_dist, overflow_bin=True
-            ).to(device)
-            distogram_atom = Distogram(
-                n_bins=da.n_bins, min_dist=da.min_dist, max_dist=da.max_dist
-            ).to(device)
+                train_loader, val_loader, _ = make_ddp_data_loaders(
+                    tcfg,
+                    args.data,
+                    args.splits,
+                    rank=rank,
+                    world_size=world_size,
+                    num_workers=args.num_workers,
+                )
 
-            if tcfg.training.pretrained_weights is not None:
-                ckpt = torch.load(tcfg.training.pretrained_weights, map_location=device)
-                model.load_state_dict(ckpt["model"])
-                if rank == 0:
-                    log.info("loaded pretrained weights", path=tcfg.training.pretrained_weights)
+                mp = tcfg.model
+                model = MainTrunk(
+                    f_ref_dim=mp.f_ref_dim,
+                    n_bins=mp.n_bins,
+                    n_atom_bins=tcfg.distogram_atom.n_bins,
+                    c_atom=mp.c_atom,
+                    c_pair=mp.c_pair,
+                    c_res=mp.c_res,
+                    c_atompair=mp.c_atompair,
+                    K_unit=mp.K_unit,
+                    sigma_data=tcfg.noise.sigma_data,
+                ).to(device)
 
-            if rank == 0 and tcfg.logging.use_wandb:
-                wandb.init(project=tcfg.logging.wandb_project, config=tcfg.model_dump())
+                dr = tcfg.distogram_res
+                da = tcfg.distogram_atom
+                distogram_res = Distogram(
+                    n_bins=dr.n_bins, min_dist=dr.min_dist, max_dist=dr.max_dist, overflow_bin=True
+                ).to(device)
+                distogram_atom = Distogram(
+                    n_bins=da.n_bins, min_dist=da.min_dist, max_dist=da.max_dist
+                ).to(device)
 
-            train_ddp(
-                rank=rank,
-                local_rank=local_rank,
-                world_size=world_size,
-                model=model,
-                tcfg=tcfg,
-                train_loader=train_loader,
-                test_loader=val_loader,
-                distogram_res=distogram_res,
-                distogram_atom=distogram_atom,
-            )
-        except Exception as _exc:
-            log.error("fatal", error=str(_exc), traceback=_tb.format_exc())
-            raise SystemExit(1) from _exc
+                if tcfg.training.pretrained_weights is not None:
+                    ckpt = torch.load(tcfg.training.pretrained_weights, map_location=device)
+                    model.load_state_dict(ckpt["model"])
+                    if rank == 0:
+                        log.info("loaded pretrained weights", path=tcfg.training.pretrained_weights)
+
+                if rank == 0 and tcfg.logging.use_wandb:
+                    wandb.init(project=tcfg.logging.wandb_project, config=tcfg.model_dump())
+
+                train_ddp(
+                    rank=rank,
+                    local_rank=local_rank,
+                    world_size=world_size,
+                    model=model,
+                    tcfg=tcfg,
+                    train_loader=train_loader,
+                    test_loader=val_loader,
+                    distogram_res=distogram_res,
+                    distogram_atom=distogram_atom,
+                )
+            except Exception as _exc:
+                log.error("fatal", error=str(_exc), traceback=traceback.format_exc())
+                raise SystemExit(1) from _exc
     finally:
         dist.destroy_process_group()

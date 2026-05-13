@@ -1,6 +1,7 @@
 {
   // Python settings
   "python.defaultInterpreterPath": "/opt/venv/bin/python",
+  "python.languageServer": "Pylance",
 
   // Ruff linter configuration
   "[python]": {

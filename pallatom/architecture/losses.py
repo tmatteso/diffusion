@@ -1,26 +1,24 @@
+"""Loss functions for diffusion model training."""
+
 import torch
 import torch.nn.functional as F
-from typing import Optional
-
 from beartype import beartype
 from einops import einsum, rearrange
-from jaxtyping import Bool, Float, Int, jaxtyped
-
 from helpers.alignment import kabsch_align
-
+from jaxtyping import Bool, Float, Int, jaxtyped
 
 # ---------------------------------------------------------------------------
 # atom_loss  (Algorithm 2 structure term)
 # ---------------------------------------------------------------------------
 
+
 @jaxtyped(typechecker=beartype)
 def atom_loss(
     r_denoised: Float[torch.Tensor, "... N_res 3"],
-    r_gt:       Float[torch.Tensor, "... N_res 3"],
-    mask:       Optional[Bool[torch.Tensor, "... N_res"]] = None,
+    r_gt: Float[torch.Tensor, "... N_res 3"],
+    mask: Bool[torch.Tensor, "... N_res"] | None = None,
 ) -> Float[torch.Tensor, "..."]:
-    """
-    Kabsch-aligned atom-coordinate MSE loss.
+    """Kabsch-aligned atom-coordinate MSE loss.
 
     Rigidly aligns the ground-truth structure onto the denoised structure
     (i.e. the *prediction* is held fixed; the GT is rotated/translated to
@@ -46,7 +44,7 @@ def atom_loss(
         • Gradients flow through r_denoised (r_aligned is treated as a
           constant frame — the GT is being moved, not the prediction).
     """
-    weights: Optional[Float[torch.Tensor, "... N_res"]] = mask.float() if mask is not None else None
+    weights: Float[torch.Tensor, "... N_res"] | None = mask.float() if mask is not None else None
 
     # Align GT → denoised  (mobile=r_gt, target=r_denoised).
     # Detach so gradients flow only through r_denoised, not through the SVD.
@@ -59,8 +57,8 @@ def atom_loss(
 
     if mask is not None:
         m: Float[torch.Tensor, "... N_res"] = mask.float()
-        L_eff: Float[torch.Tensor, "..."] = m.sum(dim=-1).clamp(min=1)
-        loss: Float[torch.Tensor, "..."] = einsum(sq, m, "... l, ... l -> ...") / (3.0 * L_eff)
+        L_eff: Float[torch.Tensor, ...] = m.sum(dim=-1).clamp(min=1)
+        loss: Float[torch.Tensor, ...] = einsum(sq, m, "... l, ... l -> ...") / (3.0 * L_eff)
     else:
         L = r_denoised.shape[-2]
         loss = sq.sum(dim=-1) / (3.0 * L)
@@ -84,18 +82,18 @@ def atom_loss(
 # Intermediate supervision loss with decoder-block weight decay  (L_med)
 # ---------------------------------------------------------------------------
 
+
 @jaxtyped(typechecker=beartype)
 def med_loss_per_block(
     r_denoised_k: Float[torch.Tensor, "... N_res 3"],
-    r_gt:         Float[torch.Tensor, "... N_res 3"],
-    logits_aa_k:  Float[torch.Tensor, "... N_res n_amino"],
-    aa_gt:        Int[torch.Tensor, "... N_res"],
-    lam:          float,
-    alpha_0:      float,
-    mask:         Optional[Bool[torch.Tensor, "... N_res"]] = None,
+    r_gt: Float[torch.Tensor, "... N_res 3"],
+    logits_aa_k: Float[torch.Tensor, "... N_res n_amino"],
+    aa_gt: Int[torch.Tensor, "... N_res"],
+    lam: float,
+    alpha_0: float,
+    mask: Bool[torch.Tensor, "... N_res"] | None = None,
 ) -> Float[torch.Tensor, "..."]:
-    """
-    Per-decoder-block intermediate loss  L^k_med.
+    """Per-decoder-block intermediate loss  L^k_med.
 
         L^k_med = λ(t) · ||r̄^denoised_(k) − r̄^aligned||² / 3L
                 + α₀ · CE(â_(k), a⁰)
@@ -116,20 +114,22 @@ def med_loss_per_block(
         (...,) per-batch loss for block k.
     """
     # Structure term: Kabsch-aligned MSE
-    struct: Float[torch.Tensor, "..."] = atom_loss(r_denoised_k, r_gt, mask=mask)
+    struct: Float[torch.Tensor, ...] = atom_loss(r_denoised_k, r_gt, mask=mask)
 
     # Sequence term: cross-entropy via log-softmax + einsum over vocab
     n_amino = logits_aa_k.shape[-1]
     log_p: Float[torch.Tensor, "... N_res n_amino"] = F.log_softmax(logits_aa_k, dim=-1)
-    aa_gt_oh: Float[torch.Tensor, "... N_res n_amino"] = F.one_hot(aa_gt.long(), num_classes=n_amino).float()
+    aa_gt_oh: Float[torch.Tensor, "... N_res n_amino"] = F.one_hot(
+        aa_gt.long(), num_classes=n_amino
+    ).float()
     ce_per_res: Float[torch.Tensor, "... N_res"] = -einsum(
         aa_gt_oh, log_p, "... l c, ... l c -> ... l"
     )
 
     if mask is not None:
         m: Float[torch.Tensor, "... N_res"] = mask.float()
-        L_eff: Float[torch.Tensor, "..."] = m.sum(dim=-1).clamp(min=1)
-        seq: Float[torch.Tensor, "..."] = einsum(ce_per_res, m, "... l, ... l -> ...") / L_eff
+        L_eff: Float[torch.Tensor, ...] = m.sum(dim=-1).clamp(min=1)
+        seq: Float[torch.Tensor, ...] = einsum(ce_per_res, m, "... l, ... l -> ...") / L_eff
     else:
         seq = ce_per_res.mean(dim=-1)
 
@@ -138,17 +138,15 @@ def med_loss_per_block(
 
 def med_loss(
     r_denoised_blocks: list,
-    r_gt:              Float[torch.Tensor, "... N_res 3"],
-    logits_aa_blocks:  list,
-    aa_gt:             Int[torch.Tensor, "... N_res"],
-    lam:               float,
-    alpha_0:           float,
-    gamma:             float = 0.99,
-    mask:              Optional[Bool[torch.Tensor, "... N_res"]] = None,
+    r_gt: Float[torch.Tensor, "... N_res 3"],
+    logits_aa_blocks: list,
+    aa_gt: Int[torch.Tensor, "... N_res"],
+    lam: float,
+    alpha_0: float,
+    gamma: float = 0.99,
+    mask: Bool[torch.Tensor, "... N_res"] | None = None,
 ) -> Float[torch.Tensor, ""]:
-    """
-    Full intermediate supervision loss averaged over K decoder blocks with
-    exponential weight decay that up-weights later blocks:
+    """Intermediate loss over K decoder blocks with exp weight decay to upweight later blocks.
 
         L_med = (1/K) · Σ_{k=1}^{K} γ^(K−k) · L^k_med
 
@@ -180,40 +178,44 @@ def med_loss(
         )
 
     total = None
-    for k_idx, (r_k, logits_k) in enumerate(zip(r_denoised_blocks, logits_aa_blocks)):
-        k = k_idx + 1                       # 1-indexed block number
-        w = gamma ** (K - k)                # γ^(K−k)
-        lk: Float[torch.Tensor, "..."] = med_loss_per_block(r_k, r_gt, logits_k, aa_gt, lam, alpha_0, mask=mask)
+    for k_idx, (r_k, logits_k) in enumerate(zip(r_denoised_blocks, logits_aa_blocks, strict=True)):
+        k = k_idx + 1  # 1-indexed block number
+        w = gamma ** (K - k)  # γ^(K−k)
+        lk: Float[torch.Tensor, ...] = med_loss_per_block(
+            r_k, r_gt, logits_k, aa_gt, lam, alpha_0, mask=mask
+        )
         total = w * lk if total is None else total + w * lk
 
-    return total.mean() / K                 # scalar
+    return total.mean() / K  # scalar
 
 
 # ---------------------------------------------------------------------------
 # Smooth lDDT loss
 # ---------------------------------------------------------------------------
 
+
 @jaxtyped(typechecker=beartype)
 def _pairwise_dist(
     x: Float[torch.Tensor, "... N_atom 3"],
 ) -> Float[torch.Tensor, "... N_atom N_atom"]:
     """||x_i − x_j|| for all pairs via einsum — numerically stable."""
-    diff: Float[torch.Tensor, "... N_atom N_atom 3"] = (
-        rearrange(x, "... n d -> ... n 1 d") - rearrange(x, "... n d -> ... 1 n d")
+    diff: Float[torch.Tensor, "... N_atom N_atom 3"] = rearrange(
+        x, "... n d -> ... n 1 d"
+    ) - rearrange(x, "... n d -> ... 1 n d")
+    sq: Float[torch.Tensor, "... N_atom N_atom"] = einsum(
+        diff, diff, "... n m d, ... n m d -> ... n m"
     )
-    sq: Float[torch.Tensor, "... N_atom N_atom"] = einsum(diff, diff, "... n m d, ... n m d -> ... n m")
     return torch.sqrt(sq + 1e-8)
 
 
 @jaxtyped(typechecker=beartype)
 def smooth_lddt_loss(
-    r_pred:  Float[torch.Tensor, "... N_atom 3"],
-    r_true:  Float[torch.Tensor, "... N_atom 3"],
-    mask:    Optional[Bool[torch.Tensor, "... N_atom"]] = None,
-    cutoff:  float = 15.0,
+    r_pred: Float[torch.Tensor, "... N_atom 3"],
+    r_true: Float[torch.Tensor, "... N_atom 3"],
+    mask: Bool[torch.Tensor, "... N_atom"] | None = None,
+    cutoff: float = 15.0,
 ) -> Float[torch.Tensor, ""]:
-    """
-    Smooth lDDT loss — Algorithm 8 (simplified AF3 version for all-atom design).
+    """Smooth lDDT loss — Algorithm 8 (simplified AF3 version for all-atom design).
 
     Exact algorithm:
 
@@ -258,20 +260,24 @@ def smooth_lddt_loss(
 
     # Local-neighbourhood mask c_lm  (l ≠ m, d_GT < cutoff)
     N_atom = r_pred.shape[-2]
-    not_diag: Bool[torch.Tensor, "N_atom N_atom"] = ~torch.eye(N_atom, device=r_pred.device, dtype=torch.bool)
+    not_diag: Bool[torch.Tensor, "N_atom N_atom"] = ~torch.eye(
+        N_atom, device=r_pred.device, dtype=torch.bool
+    )
     c: Bool[torch.Tensor, "... N_atom N_atom"] = (dr_true < cutoff) & not_diag
 
     if mask is not None:
         m: Float[torch.Tensor, "... N_atom"] = mask.float()
-        pair_valid: Bool[torch.Tensor, "... N_atom N_atom"] = einsum(m, m, "... n, ... m -> ... n m").bool()
+        pair_valid: Bool[torch.Tensor, "... N_atom N_atom"] = einsum(
+            m, m, "... n, ... m -> ... n m"
+        ).bool()
         c = c & pair_valid
 
     c_f: Float[torch.Tensor, "... N_atom N_atom"] = c.float()
 
     # lddt = Σ(c·ε) / Σ(c)
-    numer: Float[torch.Tensor, "..."] = einsum(c_f, epsilon, "... n m, ... n m -> ...")
-    denom: Float[torch.Tensor, "..."] = c_f.sum(dim=(-2, -1)).clamp(min=1)
-    lddt: Float[torch.Tensor, "..."] = numer / denom
+    numer: Float[torch.Tensor, ...] = einsum(c_f, epsilon, "... n m, ... n m -> ...")
+    denom: Float[torch.Tensor, ...] = c_f.sum(dim=(-2, -1)).clamp(min=1)
+    lddt: Float[torch.Tensor, ...] = numer / denom
 
     return (1.0 - lddt).mean()
 
@@ -280,14 +286,14 @@ def smooth_lddt_loss(
 # Distogram losses
 # ---------------------------------------------------------------------------
 
+
 @jaxtyped(typechecker=beartype)
 def distogram_loss_residue(
-    p:    Float[torch.Tensor, "... N_res N_res n_bins"],
-    y:    torch.Tensor,
-    mask: Optional[Bool[torch.Tensor, "... N_res"]] = None,
+    p: Float[torch.Tensor, "... N_res N_res n_bins"],
+    y: torch.Tensor,
+    mask: Bool[torch.Tensor, "... N_res"] | None = None,
 ) -> Float[torch.Tensor, "..."]:
-    """
-    Residue-level distogram cross-entropy loss  (L_dist_res).
+    """Residue-level distogram cross-entropy loss  (L_dist_res).
 
     Supervises predicted inter-residue distance bin probabilities against
     one-hot encoded ground-truth distance bins:
@@ -307,18 +313,18 @@ def distogram_loss_residue(
 
     if y.dim() == p.dim():
         # one-hot targets: CE = -Σ_b y^b · log p^b
-        ce: Float[torch.Tensor, "... N_res N_res"] = -einsum(y.float(), log_p, "... l m b, ... l m b -> ... l m")
+        ce: Float[torch.Tensor, "... N_res N_res"] = -einsum(
+            y.float(), log_p, "... l m b, ... l m b -> ... l m"
+        )
     else:
         # integer class indices → gather along bin dim
         ce = -log_p.gather(-1, y.long().unsqueeze(-1)).squeeze(-1)
 
     if mask is not None:
         m: Float[torch.Tensor, "... N_res"] = mask.float()
-        pair_mask: Float[torch.Tensor, "... N_res N_res"] = einsum(
-            m, m, "... l, ... m -> ... l m"
-        )
-        L_eff: Float[torch.Tensor, "..."] = pair_mask.sum(dim=(-2, -1)).clamp(min=1)
-        loss: Float[torch.Tensor, "..."] = einsum(ce, pair_mask, "... l m, ... l m -> ...") / L_eff
+        pair_mask: Float[torch.Tensor, "... N_res N_res"] = einsum(m, m, "... l, ... m -> ... l m")
+        L_eff: Float[torch.Tensor, ...] = pair_mask.sum(dim=(-2, -1)).clamp(min=1)
+        loss: Float[torch.Tensor, ...] = einsum(ce, pair_mask, "... l m, ... l m -> ...") / L_eff
     else:
         L = p.shape[-2]
         loss = ce.sum(dim=(-2, -1)) / (L * L)
@@ -328,12 +334,11 @@ def distogram_loss_residue(
 
 @jaxtyped(typechecker=beartype)
 def distogram_loss_atom(
-    q:          Float[torch.Tensor, "... N_atom K n_bins"],
-    y:          torch.Tensor,
-    local_mask: Optional[Bool[torch.Tensor, "... N_atom K"]] = None,
+    q: Float[torch.Tensor, "... N_atom K n_bins"],
+    y: torch.Tensor,
+    local_mask: Bool[torch.Tensor, "... N_atom K"] | None = None,
 ) -> Float[torch.Tensor, "..."]:
-    """
-    Atomic-level local distogram cross-entropy loss  (L_dist_atom).
+    """Atomic-level local distogram cross-entropy loss  (L_dist_atom).
 
     Supervises predicted local inter-atom distance bin probabilities against
     one-hot encoded ground-truth bins within a local attention window:
@@ -353,15 +358,17 @@ def distogram_loss_atom(
 
     if y.dim() == q.dim():
         # one-hot targets: CE = -Σ_b y^b · log q^b
-        ce: Float[torch.Tensor, "... N_atom K"] = -einsum(y.float(), log_q, "... n m b, ... n m b -> ... n m")
+        ce: Float[torch.Tensor, "... N_atom K"] = -einsum(
+            y.float(), log_q, "... n m b, ... n m b -> ... n m"
+        )
     else:
         # integer class indices → gather along bin dim
         ce = -log_q.gather(-1, y.long().unsqueeze(-1)).squeeze(-1)
 
     if local_mask is not None:
         m: Float[torch.Tensor, "... N_atom K"] = local_mask.float()
-        NM: Float[torch.Tensor, "..."] = m.sum(dim=(-2, -1)).clamp(min=1)
-        loss: Float[torch.Tensor, "..."] = einsum(ce, m, "... n m, ... n m -> ...") / NM
+        NM: Float[torch.Tensor, ...] = m.sum(dim=(-2, -1)).clamp(min=1)
+        loss: Float[torch.Tensor, ...] = einsum(ce, m, "... n m, ... n m -> ...") / NM
     else:
         N_at = q.shape[-2]
         loss = ce.sum(dim=(-2, -1)) / (N_at * N_at)

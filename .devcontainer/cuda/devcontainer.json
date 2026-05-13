@@ -22,10 +22,12 @@
     "vscode": {
       "extensions": [
         "ms-python.python",
+        "ms-python.vscode-pylance",
         "ms-azuretools.vscode-docker"
       ],
       "settings": {
         "python.defaultInterpreterPath": "/opt/venv/bin/python",
+        "python.languageServer": "Pylance",
         "python.terminal.activateEnvironment": true
       }
     }
