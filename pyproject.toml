@@ -67,6 +67,7 @@ dev = [
     "ipykernel>=6.0.0",
     "ipywidgets>=8.0.0",
     "jupyter>=1.0.0",
+    "pyright>=1.1.409",
 ]
 
 [tool.black]
@@ -76,6 +77,7 @@ target-version = ["py310"]
 [tool.ruff]
 line-length = 100
 target-version = "py310"
+extend-exclude = ["*.ipynb"]
 
 [tool.ruff.lint]
 select = [
@@ -86,15 +88,85 @@ select = [
     "B",   # flake8-bugbear
     "C4",  # flake8-comprehensions
     "UP",  # pyupgrade
+    "PL",   # pylint — semantic checks, forces dataclasses/objects
+    "D",    # pydocstyle — Google docstring convention
+    "N",    # pep8-naming — Google follows PEP8 naming
+    "ANN",  # flake8-annotations — enforce type hints on public APIs
+    "RET",  # flake8-return — return statement consistency
+    "SIM",  # flake8-simplify
+    "ARG",  # flake8-unused-arguments
 ]
-ignore = ["F722", "F821"]  # jaxtyping shape DSL triggers false positives on both rules
+ignore = [
+    "F722", "F821", "UP037", # jaxtyping shape strings are runtime-parsed, not forward refs
+    "ANN101", "ANN102",      # self/cls don't need annotations
+    "D107",                  # __init__ docstring — use class docstring instead
+    "PLR2004",               # magic values - common in ML constants.
+    "PLR0913",               # forces 5 arg or less for each function, not always a good idea
+    "PLR0402",               # would eliminate standard import pattern torch.nn as nn
+    "N812",                  # would eliminate standard import pattern torch.nn.functional as F
+    "N817",                  # would eliminate standard import pattern DistributedDataParallel DDP
+    "N802",                  # lowercase function names, not always best in ML code
+    "N803",                  # lowercase argument names, not always best in ML code
+    "N806",                  # lowercase variable names, not always best in ML code
+]
+
+
+[tool.ruff.lint.per-file-ignores]
+"pallatom/tests/**/*.py" = ["ANN"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"        # auto-ignores rules that conflict with Google style
 
 [tool.ruff.lint.isort]
 known-first-party = ["diffusion"]
 
 [tool.pyright]
-reportInvalidTypeForm = "none"
-reportIndexIssue = "none"
+extraPaths = ["pallatom"]
+typeCheckingMode = "basic"           # baseline: enables ~30 fundamental checks
+reportInvalidTypeForm = "none" # allows shape strings for jaxtyping compatibility.
+reportIndexIssue = "none" # allows complex pytorch tensor indexing patterns.
+reportConstantRedefinition = "none" # come back to this
+# "error" # Final enforcement — error if a Final variable is reassigned
+
+# No Any
+# reportUnknownVariableType = "warning" # does not play well with jaxtyping
+# reportUnknownParameterType = "warning" # contamination from untyped libraries
+# reportUnknownMemberType = "warning" # contamination from untyped libraries
+reportUnnecessaryTypeIgnoreComment = "none" # come back to this
+# "warning" # aren't ignoring type errors without a specific reason.
+
+strictParameterNoneValue = "warning" # prevents accessing attributes that might not exist at runtime.
+reportUninitializedInstanceVariable = "warning" # class attributes are initialized in __init__.
+reportUnnecessaryCast = "warning" # enfirces pytorch cast() calls are actually doing work.
+
+# Enforce variance safety (e.g., dict vs Mapping)
+reportIncompatibleMethodOverride = "warning"
+reportIncompatibleVariableOverride = "warning"
+
+# Ensures that if you use a generic like dict[], the inner types are also validated
+# This is key for catching things like dict[str, Any] which bypasses variance checks
+reportUnknownArgumentType = "none" #come back to this "warning"
+reportUnknownLambdaType = "none" # come back to this "warning"
+
+# Google Style / Strictness: prevent mixing positional and keyword-only args
+# in ways that break covariance in callbacks.
+reportCallInDefaultInitializer = "warning"
+
+# Google style: all public APIs must be fully annotated.
+# reportMissingParameterType = "warning" # let's come back to this one
+# reportMissingTypeArgument = "warning" # let's come back to this one
+# Google style: don't reach into private members from outside their class/module.
+# reportPrivateUsage = "warning" # let's come back to this one
+reportPrivateImportUsage = "none"   # let's come back to this one
+reportAttributeAccessIssue = "none" # let's come back to this
+reportArgumentType = "none" # let's come back to this
+reportCallIssue = "none" # let's come back to this
+reportUndefinedVariable = "none" # let's come back to this
+reportUnboundVariable = "none" # let's come back to this
+reportRedeclaration = "none" # let's come back to this
+reportOptionalMemberAccess = "none" # let's come back to this
+reportOptionalOperand = "none" # let's come back to this
+reportOptionalSubscript = "none" # let's come back to this
 
 [tool.pytest.ini_options]
 testpaths = ["tests", "pallatom/tests"]

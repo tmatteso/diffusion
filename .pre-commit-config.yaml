@@ -13,6 +13,21 @@ repos:
 
   - repo: local
     hooks:
+      - id: pyright
+        name: pyright
+        entry: pyright pallatom REST_APIs
+        language: system
+        types: [python]
+        pass_filenames: false
+
+  - repo: local
+    hooks:
+      - id: enforce-einops
+        name: enforce einops over raw tensor ops
+        language: python
+        types: [python]
+        entry: python scripts/check_einops.py
+
       - id: pytest
         name: pytest
         entry: pytest

@@ -1,30 +1,31 @@
+"""Script to compute and cache EDM noise schedule data parameters."""
+
 import argparse
+
 import numpy as np
 import torch
 from einops import rearrange, reduce
-
 from helpers.data import make_data_loaders
 from train.train_config import TrainConfig
 
 
-def compute_sigma_data(train_loader) -> float:
+def compute_sigma_data(train_loader: torch.utils.data.DataLoader) -> float:
     """RMS displacement of valid atom positions from the CA centroid."""
     sum_sq = 0.0
-    count  = 0
+    count = 0
 
     for batch in train_loader:
         atom_positions: torch.Tensor = batch["atom_positions"]  # (B, N_res, 37, 3)
-        atom_mask:      torch.Tensor = batch["atom_mask"]        # (B, N_res, 37)
-        sq = reduce(atom_positions ** 2, "b n a d -> b n a", "sum")
+        atom_mask: torch.Tensor = batch["atom_mask"]  # (B, N_res, 37)
+        sq = reduce(atom_positions**2, "b n a d -> b n a", "sum")
         sum_sq += reduce(sq * atom_mask, "b n a -> ", "sum").item()
-        count  += atom_mask.sum().item()
+        count += atom_mask.sum().item()
 
     return (sum_sq / count) ** 0.5
 
 
-def compute_edm_noise_params(train_loader) -> dict:
-    """
-    Fit sigma_max, sigma_min, P_mean, P_std from the training coordinate distribution.
+def compute_edm_noise_params(train_loader: torch.utils.data.DataLoader) -> dict:
+    """Fit sigma_max, sigma_min, P_mean, P_std from the training coordinate distribution.
 
     - sigma_max : 99th-percentile per-atom distance from the CA centroid
     - sigma_min : max(1st-percentile pairwise CA distance, 2e-3)
@@ -32,25 +33,24 @@ def compute_edm_noise_params(train_loader) -> dict:
     - P_std     : half-width of that interval (±1 std spans the full range)
     """
     dists_from_center: list[torch.Tensor] = []
-    pairwise_dists:    list[torch.Tensor] = []
+    pairwise_dists: list[torch.Tensor] = []
 
     for batch in train_loader:
         atom_positions: torch.Tensor = batch["atom_positions"]  # (B, N_res, 37, 3)
-        atom_mask:      torch.Tensor = batch["atom_mask"]        # (B, N_res, 37)
-        dist  = atom_positions.norm(dim=-1)  # (B, N_res, 37)
+        atom_mask: torch.Tensor = batch["atom_mask"]  # (B, N_res, 37)
+        dist = atom_positions.norm(dim=-1)  # (B, N_res, 37)
         valid = atom_mask.bool()
         dists_from_center.append(dist[valid].cpu().float())
 
         for b in range(atom_positions.shape[0]):
-            ca_b     = atom_positions[b, :, 1, :]  # (N_res, 3)
-            cam_b    = atom_mask[b, :, 1].bool()    # (N_res,)
-            ca_valid = ca_b[cam_b]                  # (M, 3)
+            ca_b = atom_positions[b, :, 1, :]  # (N_res, 3)
+            cam_b = atom_mask[b, :, 1].bool()  # (N_res,)
+            ca_valid = ca_b[cam_b]  # (M, 3)
             if ca_valid.shape[0] > 1:
-                diff = (
-                    rearrange(ca_valid, "m d -> m 1 d")
-                    - rearrange(ca_valid, "m d -> 1 m d")
+                diff = rearrange(ca_valid, "m d -> m 1 d") - rearrange(
+                    ca_valid, "m d -> 1 m d"
                 )  # (M, M, 3)
-                d    = diff.norm(dim=-1)  # (M, M)
+                d = diff.norm(dim=-1)  # (M, M)
                 mask = torch.triu(torch.ones_like(d, dtype=torch.bool), diagonal=1)
                 triu_vals = d[mask].cpu().float()
                 # cap per-protein to avoid exceeding torch.quantile's ~16M element limit
@@ -58,7 +58,7 @@ def compute_edm_noise_params(train_loader) -> dict:
                     triu_vals = triu_vals[torch.randperm(triu_vals.shape[0])[:1000]]
                 pairwise_dists.append(triu_vals)
 
-    all_dists    = torch.cat(dists_from_center)
+    all_dists = torch.cat(dists_from_center)
     all_pairwise = torch.cat(pairwise_dists)
 
     # torch.quantile fails above ~16.7 M elements; subsample if needed
@@ -73,17 +73,19 @@ def compute_edm_noise_params(train_loader) -> dict:
 
     log_min = np.log(sigma_min)
     log_max = np.log(sigma_max)
-    P_mean  = (log_min + log_max) / 2.0
-    P_std   = (log_max - log_min) / 2.0
+    P_mean = (log_min + log_max) / 2.0
+    P_std = (log_max - log_min) / 2.0
 
-    return dict(sigma_max=sigma_max, sigma_min=sigma_min, P_mean=P_mean, P_std=P_std)
+    return {"sigma_max": sigma_max, "sigma_min": sigma_min, "P_mean": P_mean, "P_std": P_std}
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Compute EDM noise parameters from training data")
-    parser.add_argument("--data",        required=True, help="path to proteins.jsonl")
-    parser.add_argument("--splits",      required=True, help="path to splits.json")
-    parser.add_argument("--config",      default=None,  help="path to TrainConfig JSON (omit for defaults)")
+    parser.add_argument("--data", required=True, help="path to proteins.jsonl")
+    parser.add_argument("--splits", required=True, help="path to splits.json")
+    parser.add_argument(
+        "--config", default=None, help="path to TrainConfig JSON (omit for defaults)"
+    )
     parser.add_argument("--num_workers", type=int, default=0)
     args = parser.parse_args()
 

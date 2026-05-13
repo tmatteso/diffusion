@@ -10,6 +10,7 @@ checkpoint_*
 # logs 
 pallatom/train/*logs.jsonl
 # repo specific ignores
+dino_3d/
 pallatom/data/
 train_datasets/
 eval_datasets/
