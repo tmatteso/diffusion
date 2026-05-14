@@ -171,13 +171,15 @@ def med_loss(
         ValueError: if the two block lists have different lengths.
     """
     K = len(r_denoised_blocks)
+    if K == 0:
+        raise ValueError("r_denoised_blocks must be non-empty.")
     if len(logits_aa_blocks) != K:
         raise ValueError(
             f"r_denoised_blocks has {K} entries but "
             f"logits_aa_blocks has {len(logits_aa_blocks)}."
         )
 
-    total = None
+    total: torch.Tensor | None = None
     for k_idx, (r_k, logits_k) in enumerate(zip(r_denoised_blocks, logits_aa_blocks, strict=True)):
         k = k_idx + 1  # 1-indexed block number
         w = gamma ** (K - k)  # γ^(K−k)
@@ -186,6 +188,7 @@ def med_loss(
         )
         total = w * lk if total is None else total + w * lk
 
+    assert total is not None
     return total.mean() / K  # scalar
 
 
