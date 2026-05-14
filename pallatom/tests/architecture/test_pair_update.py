@@ -454,6 +454,7 @@ def test_pair_update_no_nan_grad_from_zero_diagonal_distance(
     r_g = torch.randn(B, N_RES, 3, requires_grad=True)
     out = pair_update(torch.randn(B, N_RES, N_RES, C), r_g)
     reduce(out, "b n m c -> ", "sum").backward()
+    assert r_g.grad is not None
     assert torch.isfinite(r_g.grad).all()
 
 

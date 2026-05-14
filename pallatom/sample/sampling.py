@@ -164,6 +164,7 @@ def build_AA_context(
         residue masks, sequence indices, sinusoidal residue encodings, and sparse
         atom-pair distogram labels.
     """
+    N_res: int = atom_37_coordinate_tensor.shape[0]
     _aa_vals = [restype_order.get(r, 20) for r in aa_sequence]
     aa_indices_i: Int[torch.Tensor, N_res] = torch.tensor(_aa_vals, dtype=torch.long, device=device)
     f_residue_idx_i: Float[torch.Tensor, "N_res c_res"] = sinusoidal_encoding(
@@ -176,8 +177,6 @@ def build_AA_context(
     )
     atom5_pos = rearrange(atom5_pos, "1 n a d -> n a d")  # (N_res_i, 5, 3)
     atom5_mask = rearrange(atom5_mask, "1 n a -> n a")  # (N_res_i, 5)
-
-    N_res: int = atom_37_coordinate_tensor.shape[0]
     residue_mask_i: Bool[torch.Tensor, N_res] = atom5_mask.any(dim=-1)
     packed_flat_pos_i: Float[torch.Tensor, "N_atom 3"] = rearrange(atom5_pos, "n a d -> (n a) d")
     packed_atom_mask_i: Bool[torch.Tensor, N_atom] = repeat(residue_mask_i, "n -> (n a)", a=NATOM)
@@ -506,7 +505,7 @@ class EDMSampler:
         device: torch.device | str = "cpu",
     ) -> tuple[Float[torch.Tensor, "B N_atom 3"], Float[torch.Tensor, "B N_res n_amino"]]:
         """Run the Heun ODE sampler and return (denoised_coords, seq_logits) from the final step."""
-        sigmas: Float[torch.Tensor, S] = self._sigma_schedule(steps, device)
+        sigmas: Float[torch.Tensor, "S"] = self._sigma_schedule(steps, device)
 
         # pure noise initialised at σ_max — independent per batch item
         z: Float[torch.Tensor, "B N_atom 3"] = torch.randn(shape, device=device) * sigmas[0]

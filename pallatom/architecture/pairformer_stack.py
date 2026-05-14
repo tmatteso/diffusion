@@ -132,5 +132,5 @@ class PairformerStack(nn.Module):
     ) -> Float[torch.Tensor, "B N_res N_res c"]:
         """Pass pair embeddings through all Pairformer blocks sequentially."""
         for block in self.blocks:
-            v: Float[torch.Tensor, "B N_res N_res c"] = block(v)
+            v = block(v)
         return v

@@ -3,7 +3,7 @@
 import math
 import os
 import pathlib
-from typing import Any
+from typing import Any, cast
 from unittest.mock import MagicMock
 
 import pytest
@@ -30,8 +30,6 @@ from train.train_loop import (
 
 torch.manual_seed(42)
 
-_TEST_DICT = os.path.join(os.path.dirname(__file__), "..", "..", "test_dict.pt")
-
 _N_KEEP = 16
 _C_RES = 32
 _C_ATOM = 32
@@ -56,15 +54,20 @@ EXPECTED_EVAL_KEYS = frozenset(
 )
 
 
+class _ListDataset(torch.utils.data.Dataset[dict]):
+    def __init__(self, items: list[dict]) -> None:
+        self._items = items
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    def __getitem__(self, idx: int) -> dict:
+        return self._items[idx]
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
-
-
-@pytest.fixture
-def raw_batch() -> dict:
-    """Load the shared test protein batch from disk."""
-    return torch.load(_TEST_DICT, weights_only=False)
 
 
 @pytest.fixture
@@ -117,20 +120,22 @@ def tcfg(tmp_path: pathlib.Path) -> TrainConfig:
 
 
 @pytest.fixture
-def mini_batch(raw_batch: dict) -> dict:
-    """Provide a single-item mini-batch trimmed to _N_KEEP residues from raw_batch."""
+def mini_batch() -> dict:
+    """Provide a single-item mini-batch of random tensors with _N_KEEP residues."""
     return {
-        "atom_positions": raw_batch["atom_positions"][:1, :_N_KEEP],
-        "atom_mask": raw_batch["atom_mask"][:1, :_N_KEEP],
-        "residue_index": raw_batch["residue_index"][:1, :_N_KEEP],
-        "seq": [raw_batch["seq"][0][:_N_KEEP]],
+        "atom_positions": torch.randn(1, _N_KEEP, 37, 3),
+        "atom_mask": torch.ones(1, _N_KEEP, 37),
+        "residue_index": torch.arange(_N_KEEP, dtype=torch.float32).unsqueeze(0),
+        "seq": [("ACDEFGHIKLMNPQRSTVWY" * (_N_KEEP // 20 + 1))[:_N_KEEP]],
     }
 
 
 @pytest.fixture
 def loader(mini_batch: dict) -> torch.utils.data.DataLoader:
     """Provide a DataLoader that yields the mini_batch as a single batch."""
-    return torch.utils.data.DataLoader([mini_batch], batch_size=None, collate_fn=lambda x: x)
+    return torch.utils.data.DataLoader(
+        _ListDataset([mini_batch]), batch_size=None, collate_fn=lambda x: x
+    )
 
 
 @pytest.fixture
@@ -389,7 +394,7 @@ def test_evaluate_empty_loader_returns_zero_dict(
     distogram_atom: Distogram,
 ) -> None:
     """Ensures evaluate returns all-zero metrics when the loader contains no batches."""
-    empty = torch.utils.data.DataLoader([], batch_size=None, collate_fn=lambda x: x)
+    empty = torch.utils.data.DataLoader(_ListDataset([]), batch_size=None, collate_fn=lambda x: x)
     result = evaluate(model, empty, tcfg, distogram_res, distogram_atom, "cpu")
     assert all(v == 0.0 for v in result.values())
 
@@ -578,7 +583,7 @@ def test_evaluate_multi_batch_returns_expected_keys(
 ) -> None:
     """Ensures evaluate with a 2-batch loader still returns exactly the expected metric keys."""
     loader2 = torch.utils.data.DataLoader(
-        [mini_batch, mini_batch], batch_size=None, collate_fn=lambda x: x
+        _ListDataset([mini_batch] + [mini_batch]), batch_size=None, collate_fn=lambda x: x
     )
     result = evaluate(model, loader2, tcfg, distogram_res, distogram_atom, "cpu")
     assert set(result.keys()) == EXPECTED_EVAL_KEYS
@@ -592,7 +597,9 @@ def test_evaluate_multi_batch_n_batches_counted(
     distogram_atom: Distogram,
 ) -> None:
     """Ensures evaluate averages correctly over 3 batches, producing finite loss values."""
-    loader3 = torch.utils.data.DataLoader([mini_batch] * 3, batch_size=None, collate_fn=lambda x: x)
+    loader3 = torch.utils.data.DataLoader(
+        _ListDataset([mini_batch] * 3), batch_size=None, collate_fn=lambda x: x
+    )
     result = evaluate(model, loader3, tcfg, distogram_res, distogram_atom, "cpu")
     for k, v in result.items():
         # math.isfinite returns False if the value is NaN or Infinity
@@ -692,7 +699,12 @@ def test_train_wandb_log_step_is_positive(
 ) -> None:
     """The global_step passed to wandb.log is at least 1 after the first training step."""
     steps: list[int] = []
-    monkeypatch.setattr("train.train_loop.wandb.log", lambda _data, step=None: steps.append(step))
+
+    def _log(_data: object, step: int | None = None) -> None:
+        assert step is not None
+        steps.append(step)
+
+    monkeypatch.setattr("train.train_loop.wandb.log", _log)
     train(model, tcfg_wandb, loader, loader, distogram_res, distogram_atom, "cpu")
     assert steps[0] >= 1
 
@@ -768,7 +780,12 @@ def test_train_wandb_log_steps_increase_across_epochs(
 ) -> None:
     """Global steps passed to wandb.log are strictly increasing and unique across epochs."""
     steps: list[int] = []
-    monkeypatch.setattr("train.train_loop.wandb.log", lambda _data, step=None: steps.append(step))
+
+    def _capture_step(_data: object, step: int | None = None) -> None:
+        assert step is not None
+        steps.append(step)
+
+    monkeypatch.setattr("train.train_loop.wandb.log", _capture_step)
     train(model, tcfg_wandb_3ep, loader, loader, distogram_res, distogram_atom, "cpu")
     assert steps == sorted(steps)
     assert len(set(steps)) == 3
@@ -874,7 +891,7 @@ def test_evaluate_ddp_empty_loader_returns_zero_dict(
     distogram_atom: Distogram,
 ) -> None:
     """Ensures evaluate_ddp returns all-zero metrics when the loader contains no batches."""
-    empty = torch.utils.data.DataLoader([], batch_size=None, collate_fn=lambda x: x)
+    empty = torch.utils.data.DataLoader(_ListDataset([]), batch_size=None, collate_fn=lambda x: x)
     result = evaluate_ddp(1, model, empty, tcfg, distogram_res, distogram_atom, "cpu")
     assert all(v == 0.0 for v in result.values())
 
@@ -948,7 +965,7 @@ def ddp_loader(mini_batch: dict) -> torch.utils.data.DataLoader:
     """Provide a DataLoader backed by a _MockSampler to track set_epoch calls."""
     sampler = _MockSampler([mini_batch])
     return torch.utils.data.DataLoader(
-        [mini_batch], batch_size=None, sampler=sampler, collate_fn=lambda x: x
+        _ListDataset([mini_batch]), batch_size=None, sampler=sampler, collate_fn=lambda x: x
     )
 
 
@@ -1070,7 +1087,7 @@ def test_train_ddp_calls_set_epoch_each_epoch(
         distogram_atom,
         device="cpu",
     )
-    assert ddp_loader.sampler.set_epoch_calls == [1, 2, 3]
+    assert cast(_MockSampler, ddp_loader.sampler).set_epoch_calls == [1, 2, 3]
 
 
 def test_train_ddp_updates_model_parameters(

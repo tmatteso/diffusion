@@ -49,7 +49,7 @@ def scatter_mean(
     C: int = src.size(-1)
     device = src.device
 
-    flat_index: Int[torch.Tensor, BN_src] = rearrange(index, "b n -> (b n)")
+    flat_index: Int[torch.Tensor, "BN_src"] = rearrange(index, "b n -> (b n)")
     flat_src: Float[torch.Tensor, "BN_src C"] = rearrange(src, "b n c -> (b n) c")
 
     sum_flat: Float[torch.Tensor, "BN_target C"] = torch.zeros(num_segments, C, device=device)

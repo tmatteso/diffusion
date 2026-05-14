@@ -264,6 +264,6 @@ class _FileLogProcessor:
     def __exit__(self, *_: object) -> None:
         self._f.close()
 
-    def __call__(self, _logger: object, _method: str, event_dict: dict) -> dict:
+    def __call__(self, _logger: object, _method: str | None, event_dict: dict) -> dict:
         self._f.write(json.dumps(event_dict) + "\n")
         return event_dict

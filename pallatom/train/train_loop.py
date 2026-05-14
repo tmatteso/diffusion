@@ -4,6 +4,8 @@ import argparse
 import contextlib
 import math
 import os
+import traceback
+from typing import cast
 
 import structlog
 import torch
@@ -27,6 +29,7 @@ from jaxtyping import Float, Int, jaxtyped
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import Adam
 from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 from train.train_config import TrainConfig
 
@@ -450,7 +453,8 @@ def log_epoch(
             step=global_step,
         )
 
-    state_dict = model.module.state_dict() if hasattr(model, "module") else model.state_dict()
+    inner: nn.Module = model.module if isinstance(model, DDP) else model
+    state_dict = inner.state_dict()
 
     if avg_val["total loss"] < best_val_loss:
         best_val_loss = avg_val["total loss"]
@@ -581,7 +585,7 @@ def train_ddp(
 
     for epoch in range(1, tp.num_epochs + 1):
         ddp_model.train()
-        train_loader.sampler.set_epoch(epoch)
+        cast(DistributedSampler, train_loader.sampler).set_epoch(epoch)
         epoch_metrics: dict[str, float] = dict.fromkeys(
             [
                 "total loss",

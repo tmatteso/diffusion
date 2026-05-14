@@ -12,7 +12,7 @@ from functools import partial
 import numpy as np
 import torch
 from einops import rearrange
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from jaxtyping import Float
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -48,9 +48,6 @@ class _AppState:
     noise: NoiseScheduleParams
     atom_disto: Distogram
     templ_disto: Distogram
-
-
-_loaded: _AppState | None = None
 
 
 # ── model loading ─────────────────────────────────────────────────────────────
@@ -91,7 +88,7 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
     templ_disto = Distogram(
         n_bins=mp.n_bins - 1, min_dist=3.25, max_dist=50.75, overflow_bin=True
     ).to(DEVICE)
-    _state.update(
+    _app.state.loaded = _AppState(
         semaphore=asyncio.Semaphore(1),
         model=model,
         mp=mp,
@@ -100,7 +97,7 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
         templ_disto=templ_disto,
     )
     yield
-    _state.clear()
+    _app.state.loaded = None
 
 
 app = FastAPI(
@@ -123,7 +120,7 @@ class SampleRequest(BaseModel):
 
     # --- conditioning (all optional) ---
     sequence: str | None = Field(
-        None,
+        default=None,
         description=(
             "Amino-acid sequence of length n_res. "
             "Standard 20 AAs plus 'X' for unknown. "
@@ -131,7 +128,7 @@ class SampleRequest(BaseModel):
         ),
     )
     structure_pdb: str | None = Field(
-        None,
+        default=None,
         description=(
             "PDB string for atom-level conditioning. "
             "Residues present in the PDB fill r_gt/atom5_mask; uncovered positions are zeroed. "
@@ -139,7 +136,7 @@ class SampleRequest(BaseModel):
         ),
     )
     template_pdb: str | None = Field(
-        None,
+        default=None,
         description=(
             "PDB string for template-distogram conditioning. "
             "May cover fewer than n_res residues (padded with zeros)."
@@ -148,12 +145,16 @@ class SampleRequest(BaseModel):
 
     # --- sampler ---
     n_samples: int = Field(
-        1, gt=0, le=10, description="Number of structures to generate in parallel"
+        default=1, gt=0, le=10, description="Number of structures to generate in parallel"
     )
-    ddim_steps: int = Field(40, gt=1, description="ODE solver steps (more = higher quality)")
-    rho: float = Field(7.0, gt=0, description="Karras noise-schedule exponent")
-    S_churn: float = Field(0.0, ge=0, description="Stochasticity per step (0 = deterministic)")
-    S_noise: float = Field(1.003, gt=0, description="Noise scaling for stochastic steps")
+    ddim_steps: int = Field(
+        default=40, gt=1, description="ODE solver steps (more = higher quality)"
+    )
+    rho: float = Field(default=7.0, gt=0, description="Karras noise-schedule exponent")
+    S_churn: float = Field(
+        default=0.0, ge=0, description="Stochasticity per step (0 = deterministic)"
+    )
+    S_noise: float = Field(default=1.003, gt=0, description="Noise scaling for stochastic steps")
 
     @field_validator("sequence")
     @classmethod
@@ -220,12 +221,12 @@ def coords_to_pdb_strings(
     return pdb_strings
 
 
-def _run_sampling(req: SampleRequest) -> list[str]:
-    model: MainTrunk = _state["model"]
-    mp: ModelParams = _state["mp"]
-    noise: NoiseScheduleParams = _state["noise"]
-    atom_disto: Distogram = _state["atom_disto"]
-    templ_disto: Distogram = _state["templ_disto"]
+def _run_sampling(req: SampleRequest, state: _AppState) -> list[str]:
+    model: MainTrunk = state.model
+    mp: ModelParams = state.mp
+    noise: NoiseScheduleParams = state.noise
+    atom_disto: Distogram = state.atom_disto
+    templ_disto: Distogram = state.templ_disto
 
     N_res = req.n_res
     B = req.n_samples
@@ -310,35 +311,39 @@ def _run_sampling(req: SampleRequest) -> list[str]:
         device=DEVICE,
     )
 
-    return coords_to_pdb_strings(coords_batch, seq_logits, N_res)
+    return coords_to_pdb_strings(coords_batch, seq_logit_batch, N_res)
 
 
 # ── endpoints ─────────────────────────────────────────────────────────────────
 
 
 @app.get("/health")
-async def health() -> dict:
+async def health(request: Request) -> dict:
     """Return service health status, compute device, and whether a model is loaded."""
-    return {"status": "ok", "device": DEVICE, "model_loaded": bool(_state)}
+    state: _AppState | None = request.app.state.loaded
+    return {"status": "ok", "device": DEVICE, "model_loaded": bool(state)}
 
 
 @app.post("/sample", response_model=SampleResponse)
-async def sample(request: SampleRequest) -> SampleResponse:
+async def sample(request: Request, req: SampleRequest) -> SampleResponse:
     """Generate unconditional protein backbone structures.
 
     Returns one PDB string per requested sample.
     Requests are serialised (one sampling job runs at a time).
     """
-    async with _state["semaphore"]:
+    state: _AppState | None = request.app.state.loaded
+    if state is None:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+    async with state.semaphore:
         loop = asyncio.get_event_loop()
         try:
-            pdb_strings = await loop.run_in_executor(None, partial(_run_sampling, request))
+            pdb_strings = await loop.run_in_executor(None, partial(_run_sampling, req, state))
         except Exception as exc:
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     return SampleResponse(
         pdb_strings=pdb_strings,
-        n_res=request.n_res,
-        n_samples=request.n_samples,
+        n_res=req.n_res,
+        n_samples=req.n_samples,
         device=DEVICE,
     )

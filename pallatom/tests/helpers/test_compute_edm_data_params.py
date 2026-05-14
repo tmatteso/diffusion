@@ -6,6 +6,7 @@ import pytest
 import torch
 from helpers.compute_edm_data_params import compute_edm_noise_params, compute_sigma_data
 from jaxtyping import Float
+from torch.utils.data import DataLoader, Dataset
 
 torch.manual_seed(42)
 
@@ -22,8 +23,19 @@ def _batch(atom_positions: torch.Tensor, atom_mask: torch.Tensor) -> dict:
     return {"atom_positions": atom_positions, "atom_mask": atom_mask}
 
 
-def _loader(*batches: dict) -> list[dict]:
-    return list(batches)
+class _BatchDataset(Dataset):
+    def __init__(self, batches: list[dict]) -> None:
+        self._batches = batches
+
+    def __len__(self) -> int:
+        return len(self._batches)
+
+    def __getitem__(self, idx: int) -> dict:
+        return self._batches[idx]
+
+
+def _loader(*batches: dict) -> DataLoader:
+    return DataLoader(_BatchDataset(list(batches)), batch_size=1, collate_fn=lambda x: x[0])
 
 
 # ---------------------------------------------------------------------------
@@ -58,8 +70,8 @@ def spread_positions() -> Float[torch.Tensor, "B N_res 37 3"]:
 def spread_loader(
     spread_positions: Float[torch.Tensor, "B N_res 37 3"],
     all_ones_mask: Float[torch.Tensor, "B N_res 37"],
-) -> list[dict]:
-    """Provide a single-batch DataLoader-like list using the spread_positions fixture."""
+) -> DataLoader:
+    """Provide a single-batch DataLoader using the spread_positions fixture."""
     return _loader(_batch(spread_positions, all_ones_mask))
 
 
@@ -110,7 +122,7 @@ def test_compute_sigma_data_multi_batch_matches_single():
     pos = torch.randn(4, 4, 37, 3)
     mask = torch.ones(4, 4, 37)
     single = compute_sigma_data(_loader(_batch(pos, mask)))
-    split = compute_sigma_data([_batch(pos[:2], mask[:2]), _batch(pos[2:], mask[2:])])
+    split = compute_sigma_data(_loader(_batch(pos[:2], mask[:2]), _batch(pos[2:], mask[2:])))
     assert math.isclose(single, split, rel_tol=1e-5)
 
 
@@ -134,46 +146,46 @@ def test_compute_sigma_data_weighted_by_mask_count():
 # ---------------------------------------------------------------------------
 
 
-def test_compute_edm_noise_params_returns_dict(spread_loader: list[dict]) -> None:
+def test_compute_edm_noise_params_returns_dict(spread_loader: DataLoader) -> None:
     """compute_edm_noise_params returns a plain dict for downstream consumption."""
     assert isinstance(compute_edm_noise_params(spread_loader), dict)
 
 
-def test_compute_edm_noise_params_has_required_keys(spread_loader: list[dict]) -> None:
+def test_compute_edm_noise_params_has_required_keys(spread_loader: DataLoader) -> None:
     """compute_edm_noise_params output includes all four noise schedule keys."""
     params = compute_edm_noise_params(spread_loader)
     assert {"sigma_max", "sigma_min", "P_mean", "P_std"} <= params.keys()
 
 
-def test_compute_edm_noise_params_sigma_max_positive(spread_loader: list[dict]) -> None:
+def test_compute_edm_noise_params_sigma_max_positive(spread_loader: DataLoader) -> None:
     """sigma_max is strictly positive for a non-degenerate dataset."""
     assert compute_edm_noise_params(spread_loader)["sigma_max"] > 0.0
 
 
-def test_compute_edm_noise_params_sigma_min_ge_floor(spread_loader: list[dict]) -> None:
+def test_compute_edm_noise_params_sigma_min_ge_floor(spread_loader: DataLoader) -> None:
     """sigma_min is always at least 2e-3, the hard floor imposed to avoid underflow."""
     assert compute_edm_noise_params(spread_loader)["sigma_min"] >= 2e-3
 
 
-def test_compute_edm_noise_params_sigma_max_gt_sigma_min(spread_loader: list[dict]) -> None:
+def test_compute_edm_noise_params_sigma_max_gt_sigma_min(spread_loader: DataLoader) -> None:
     """sigma_max exceeds sigma_min so the log-uniform noise distribution is well-defined."""
     params = compute_edm_noise_params(spread_loader)
     assert params["sigma_max"] > params["sigma_min"]
 
 
-def test_compute_edm_noise_params_P_std_positive(spread_loader: list[dict]) -> None:
+def test_compute_edm_noise_params_P_std_positive(spread_loader: DataLoader) -> None:
     """P_std is strictly positive, ensuring the log-normal noise sampler has non-zero width."""
     assert compute_edm_noise_params(spread_loader)["P_std"] > 0.0
 
 
-def test_compute_edm_noise_params_P_mean_formula(spread_loader: list[dict]) -> None:
+def test_compute_edm_noise_params_P_mean_formula(spread_loader: DataLoader) -> None:
     """P_mean equals the midpoint of (log sigma_min, log sigma_max) as specified by EDM."""
     params = compute_edm_noise_params(spread_loader)
     expected = (math.log(params["sigma_min"]) + math.log(params["sigma_max"])) / 2.0
     assert math.isclose(params["P_mean"], expected, rel_tol=1e-5)
 
 
-def test_compute_edm_noise_params_P_std_formula(spread_loader: list[dict]) -> None:
+def test_compute_edm_noise_params_P_std_formula(spread_loader: DataLoader) -> None:
     """P_std equals half the log-range (log sigma_max − log sigma_min) / 2 as specified by EDM."""
     params = compute_edm_noise_params(spread_loader)
     expected = (math.log(params["sigma_max"]) - math.log(params["sigma_min"])) / 2.0
@@ -214,6 +226,6 @@ def test_compute_edm_noise_params_multi_batch_consistent():
     pos = torch.randn(4, N_RES, 37, 3).abs() + 0.5  # keep norms positive
     mask = torch.ones(4, N_RES, 37)
     single = compute_edm_noise_params(_loader(_batch(pos, mask)))
-    split = compute_edm_noise_params([_batch(pos[:2], mask[:2]), _batch(pos[2:], mask[2:])])
+    split = compute_edm_noise_params(_loader(_batch(pos[:2], mask[:2]), _batch(pos[2:], mask[2:])))
     for key in ("sigma_max", "sigma_min", "P_mean", "P_std"):
         assert math.isclose(single[key], split[key], rel_tol=1e-4), key

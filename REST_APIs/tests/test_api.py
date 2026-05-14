@@ -2,15 +2,15 @@
 
 import os
 import sys
-from typing import Any
 
 # Ensure pallatom is importable (api.py does this at module level too)
 _REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.join(_REPO, "pallatom"))
 
+import asyncio  # noqa: E402
 import glob  # noqa: E402
 import tempfile as _tf  # noqa: E402
-from unittest.mock import MagicMock, patch  # noqa: E402
+from unittest.mock import MagicMock  # noqa: E402
 
 import numpy as np  # noqa: E402
 import pytest  # noqa: E402
@@ -20,7 +20,7 @@ from helpers.featurize import Distogram, FeaturizedBatch  # noqa: E402
 from pydantic import ValidationError  # noqa: E402
 from train.train_config import ModelParams, NoiseScheduleParams  # noqa: E402
 
-from REST_APIs.api import SampleRequest, _run_sampling  # noqa: E402
+from REST_APIs.api import SampleRequest, _AppState, _run_sampling  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # SampleRequest validation
@@ -135,18 +135,19 @@ def _make_trunk_mock() -> MagicMock:
     return mock
 
 
-def _make_mock_state() -> dict[str, Any]:
+def _make_mock_state() -> _AppState:
     mp = ModelParams()
     noise = NoiseScheduleParams()
-    return {
-        "model": _make_trunk_mock(),
-        "mp": mp,
-        "noise": noise,
-        "atom_disto": Distogram(n_bins=22, min_dist=2.0, max_dist=22.0),
-        "templ_disto": Distogram(
+    return _AppState(
+        semaphore=asyncio.Semaphore(1),
+        model=_make_trunk_mock(),
+        mp=mp,
+        noise=noise,
+        atom_disto=Distogram(n_bins=22, min_dist=2.0, max_dist=22.0),
+        templ_disto=Distogram(
             n_bins=mp.n_bins - 1, min_dist=3.25, max_dist=50.75, overflow_bin=True
         ),
-    }
+    )
 
 
 def _make_pdb_string(n_res: int) -> str:
@@ -169,8 +170,7 @@ def _run(req_kwargs: dict) -> list[str]:
     req_kwargs.setdefault("ddim_steps", 2)
     req = SampleRequest(**req_kwargs)
     mock_state = _make_mock_state()
-    with patch("REST_APIs.api._state", mock_state):
-        return _run_sampling(req)
+    return _run_sampling(req, mock_state)
 
 
 def test_run_sampling_unconditional_returns_pdb_strings() -> None:

@@ -314,6 +314,7 @@ def test_make_ddp_data_loaders_train_sampler_shuffle_true(
 ):
     """make_ddp_data_loaders sets shuffle=True on the train DistributedSampler."""
     train_loader, _, _ = make_ddp_data_loaders(cfg, jsonl_path, splits_path, rank=0, world_size=1)
+    assert isinstance(train_loader.sampler, DistributedSampler)
     assert train_loader.sampler.shuffle is True
 
 
@@ -322,6 +323,7 @@ def test_make_ddp_data_loaders_val_sampler_shuffle_false(
 ):
     """make_ddp_data_loaders sets shuffle=False on the validation DistributedSampler."""
     _, val_loader, _ = make_ddp_data_loaders(cfg, jsonl_path, splits_path, rank=0, world_size=1)
+    assert isinstance(val_loader.sampler, DistributedSampler)
     assert val_loader.sampler.shuffle is False
 
 
@@ -330,6 +332,7 @@ def test_make_ddp_data_loaders_test_sampler_shuffle_false(
 ):
     """make_ddp_data_loaders sets shuffle=False on the test DistributedSampler."""
     _, _, test_loader = make_ddp_data_loaders(cfg, jsonl_path, splits_path, rank=0, world_size=1)
+    assert isinstance(test_loader.sampler, DistributedSampler)
     assert test_loader.sampler.shuffle is False
 
 
@@ -338,6 +341,7 @@ def test_make_ddp_data_loaders_train_sampler_rank(
 ):
     """make_ddp_data_loaders propagates rank=0 to the train DistributedSampler."""
     train_loader, _, _ = make_ddp_data_loaders(cfg, jsonl_path, splits_path, rank=0, world_size=2)
+    assert isinstance(train_loader.sampler, DistributedSampler)
     assert train_loader.sampler.rank == 0
 
 
@@ -346,6 +350,7 @@ def test_make_ddp_data_loaders_train_sampler_world_size(
 ):
     """make_ddp_data_loaders propagates world_size=2 to the train DistributedSampler."""
     train_loader, _, _ = make_ddp_data_loaders(cfg, jsonl_path, splits_path, rank=0, world_size=2)
+    assert isinstance(train_loader.sampler, DistributedSampler)
     assert train_loader.sampler.num_replicas == 2
 
 

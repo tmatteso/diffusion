@@ -20,6 +20,8 @@ from helpers.atom_utils import (
 from jaxtyping import Bool, Float, Int, jaxtyped
 from train.train_config import TrainConfig
 
+_DEFAULT_DEVICE: str = "cuda" if torch.cuda.is_available() else "cpu"
+
 # template distogram: Pairwise distogram of pseudo Cβ are discretized into 38 bins of
 # equal width between of bin min=3.25A, bin ˚ max=50.75A, one more ˚
 # bin contains any larger distances
@@ -219,7 +221,7 @@ def featurize_single_item(
     ala_ref_elem: Float[torch.Tensor, "5 4"],
     c_res: int,
     c_beta_distogram_fn: Distogram,
-    device: str = "cuda" if torch.cuda.is_available() else "cpu",
+    device: str = _DEFAULT_DEVICE,
 ) -> FeaturizedItem:
     """Featurize a single protein from atom37 representation to model-ready tensors.
 
@@ -304,7 +306,7 @@ def featurize_batch(
     tcfg: TrainConfig,
     c_beta_distogram_fn: Distogram,
     atom_distogram_fn: Distogram,
-    device: str = "cuda" if torch.cuda.is_available() else "cpu",
+    device: str = _DEFAULT_DEVICE,
 ) -> FeaturizedBatch:
     """Convert a raw ProteinBatch into a FeaturizedBatch ready for model input.
 
@@ -389,10 +391,10 @@ def featurize_batch(
     )
 
     # tok_idx and center_uid are identical for all items (same N_res after padding).
-    _tok_single: Int[torch.Tensor, N_atom] = torch.arange(
+    _tok_single: Int[torch.Tensor, "N_atom"] = torch.arange(
         N_res_total, dtype=torch.long, device=device
     ).repeat_interleave(Natom)
-    _center_single: Int[torch.Tensor, N_res] = (
+    _center_single: Int[torch.Tensor, "N_res"] = (
         torch.arange(N_res_total, dtype=torch.long, device=device) * Natom + 1
     )  # should always be the alpha carbon
     tok_idx: Int[torch.Tensor, "B N_atom"] = _tok_single.unsqueeze(0).expand(B, -1).contiguous()

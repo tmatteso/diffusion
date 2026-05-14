@@ -135,7 +135,7 @@ reportConstantRedefinition = "none" # come back to this
 reportUnnecessaryTypeIgnoreComment = "none" # come back to this
 # "warning" # aren't ignoring type errors without a specific reason.
 
-strictParameterNoneValue = "warning" # prevents accessing attributes that might not exist at runtime.
+strictParameterNoneValue = true # prevents accessing attributes that might not exist at runtime.
 reportUninitializedInstanceVariable = "warning" # class attributes are initialized in __init__.
 reportUnnecessaryCast = "warning" # enfirces pytorch cast() calls are actually doing work.
 
@@ -154,16 +154,9 @@ reportCallInDefaultInitializer = "warning"
 
 # Google style: all public APIs must be fully annotated.
 # reportMissingParameterType = "warning" # let's come back to this one
-# reportMissingTypeArgument = "warning" # let's come back to this one
+reportMissingTypeArgument = "warning" # let's come back to this one
 # Google style: don't reach into private members from outside their class/module.
-# reportPrivateUsage = "warning" # let's come back to this one
-reportPrivateImportUsage = "none"   # let's come back to this one
-reportAttributeAccessIssue = "none" # let's come back to this
-reportArgumentType = "none" # let's come back to this
-reportCallIssue = "none" # let's come back to this
-reportUndefinedVariable = "none" # let's come back to this
-reportUnboundVariable = "none" # let's come back to this
-reportRedeclaration = "none" # let's come back to this
+reportPrivateImportUsage = "none" # not sure I agree with this one
 
 [tool.pytest.ini_options]
 testpaths = ["tests", "pallatom/tests"]
