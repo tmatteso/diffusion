@@ -153,7 +153,7 @@ reportUnknownLambdaType = "none" # come back to this "warning"
 reportCallInDefaultInitializer = "warning"
 
 # Google style: all public APIs must be fully annotated.
-# reportMissingParameterType = "warning" # let's come back to this one
+reportMissingParameterType = "warning" # let's come back to this one
 reportMissingTypeArgument = "warning" # let's come back to this one
 # Google style: don't reach into private members from outside their class/module.
 reportPrivateImportUsage = "none" # not sure I agree with this one
