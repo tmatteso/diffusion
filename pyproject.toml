@@ -100,10 +100,12 @@ select = [
     "TRY",  # exception handling hygiene
     "PERF", # performance antipatterns in hot paths
     "PGH",  # pygrep-hooks — requires specific codes on type: ignore comments
+    "FBT",  # boolean trap — prefer keyword-only args or enums over bare bool params
+    "PT",   # pytest style — raises match=, one statement per raises block, parametrize format
+    "ISC",  # implicit string concatenation — catches ("foo" "bar") copy-paste bugs
 ]
 ignore = [
     "F722", "F821", "UP037", # jaxtyping shape strings are runtime-parsed, not forward refs
-    "ANN101", "ANN102",      # self/cls don't need annotations
     "D107",                  # __init__ docstring — use class docstring instead
     "PLR2004",               # magic values — common in ML constants
     "PLR0913",               # forces 5 arg or less for each function, not always a good idea
@@ -114,6 +116,7 @@ ignore = [
     "N803",                  # lowercase argument names, not always best in ML code
     "N806",                  # lowercase variable names, not always best in ML code
     "TRY003",                # long exception messages are fine in ML code
+    "FBT003",                # boolean literals at call sites are unavoidable in ML code
 ]
 
 
@@ -128,6 +131,7 @@ known-first-party = ["diffusion"]
 
 [tool.pyright]
 extraPaths = ["pallatom"]
+pythonVersion = "3.10"
 typeCheckingMode = "basic"           # baseline: enables ~30 fundamental checks
 reportInvalidTypeForm = "none" # allows shape strings for jaxtyping compatibility.
 reportIndexIssue = "none" # allows complex pytorch tensor indexing patterns.
@@ -163,6 +167,7 @@ reportMissingTypeArgument = "error"
 reportPrivateImportUsage = "none" # not sure I agree with this one
 
 reportDeprecated = "warning"   # catches deprecated PyTorch/CUDA API usage early
+reportReturnType = "error"     # all public functions must have explicit return type annotations
 
 
 [tool.pytest.ini_options]
