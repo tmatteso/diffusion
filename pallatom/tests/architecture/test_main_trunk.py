@@ -440,6 +440,7 @@ def _assert_submodule_grads(model: MainTrunk) -> None:
     for name, param in model.named_parameters():
         if param.grad is not None:
             buckets.setdefault(name.split(".")[0], []).append(param.grad)
+    assert buckets, "no parameters have gradients — backward was not called"
     for prefix, grads in buckets.items():
         assert any(
             torch.isfinite(g).all().item() and g.abs().max().item() > 0 for g in grads
