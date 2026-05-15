@@ -20,22 +20,31 @@ N_RES = 6
 # ---------------------------------------------------------------------------
 
 
-def _batch(atom_positions: torch.Tensor, atom_mask: torch.Tensor) -> dict:
-    return {"atom_positions": atom_positions, "atom_mask": atom_mask}
+def _batch(atom_positions: torch.Tensor, atom_mask: torch.Tensor) -> ProteinBatch:
+    """Build a minimal ProteinBatch from positions and mask."""
+    _, N_res = atom_positions.shape[:2]
+    return ProteinBatch(
+        atom_positions=atom_positions,
+        atom_mask=atom_mask,
+        residue_index=torch.arange(N_res, dtype=torch.float32)
+        .unsqueeze(0)
+        .expand(atom_positions.shape[0], -1),
+        seq=["A" * N_res],
+    )
 
 
-class _BatchDataset(Dataset):
-    def __init__(self, batches: list[dict]) -> None:
+class _BatchDataset(Dataset[ProteinBatch]):
+    def __init__(self, batches: list[ProteinBatch]) -> None:
         self._batches = batches
 
     def __len__(self) -> int:
         return len(self._batches)
 
-    def __getitem__(self, idx: int) -> dict:
+    def __getitem__(self, idx: int) -> ProteinBatch:
         return self._batches[idx]
 
 
-def _loader(*batches: dict) -> DataLoader:
+def _loader(*batches: ProteinBatch) -> DataLoader[ProteinBatch]:
     return DataLoader(_BatchDataset(list(batches)), batch_size=1, collate_fn=lambda x: x[0])
 
 
@@ -71,7 +80,7 @@ def spread_positions() -> Float[torch.Tensor, "B N_res 37 3"]:
 def spread_loader(
     spread_positions: Float[torch.Tensor, "B N_res 37 3"],
     all_ones_mask: Float[torch.Tensor, "B N_res 37"],
-) -> DataLoader:
+) -> DataLoader[ProteinBatch]:
     """Provide a single-batch DataLoader using the spread_positions fixture."""
     return _loader(_batch(spread_positions, all_ones_mask))
 
@@ -129,12 +138,14 @@ def test_compute_sigma_data_multi_batch_matches_single():
 
 def test_compute_sigma_data_weighted_by_mask_count():
     """sigma_data with half the atoms masked should match full atoms at same positions."""
-    pos = torch.zeros(1, 4, 2, 3)  # only 2 atom slots needed
+    pos = torch.zeros(1, 4, 37, 3)
     pos[:, :, 0, 0] = 5.0  # valid atom at norm 5
     pos[:, :, 1, 0] = 5.0  # second atom also at norm 5
 
-    mask_full = torch.ones(1, 4, 2)
-    mask_half = torch.zeros(1, 4, 2)
+    mask_full = torch.zeros(1, 4, 37)
+    mask_full[:, :, 0] = 1.0
+    mask_full[:, :, 1] = 1.0
+    mask_half = torch.zeros(1, 4, 37)
     mask_half[:, :, 0] = 1.0
 
     s_full = compute_sigma_data(_loader(_batch(pos, mask_full)))
@@ -195,7 +206,7 @@ def test_compute_edm_noise_params_P_mean_formula(spread_loader: DataLoader[Prote
 
 
 def test_compute_edm_noise_params_P_std_formula(spread_loader: DataLoader[ProteinBatch]) -> None:
-    """P_std equals half the log-range (log sigma_max − log sigma_min) / 2 as specified by EDM."""
+    """P_std equals half the log-range (log sigma_max - log sigma_min) / 2 as specified by EDM."""
     params = compute_edm_noise_params(spread_loader)
     expected = (math.log(params["sigma_max"]) - math.log(params["sigma_min"])) / 2.0
     assert math.isclose(params["P_std"], expected, rel_tol=1e-5)

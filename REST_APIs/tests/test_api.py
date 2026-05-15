@@ -10,6 +10,7 @@ sys.path.insert(0, os.path.join(_REPO, "pallatom"))
 import asyncio  # noqa: E402
 import glob  # noqa: E402
 import tempfile as _tf  # noqa: E402
+from collections.abc import MutableMapping  # noqa: E402
 from unittest.mock import MagicMock  # noqa: E402
 
 import numpy as np  # noqa: E402
@@ -119,7 +120,9 @@ N_RES_TEST = 4
 def _make_trunk_mock() -> MagicMock:
     mock = MagicMock()
 
-    def _forward(batch: FeaturizedBatch) -> tuple:
+    def _forward(
+        batch: FeaturizedBatch,
+    ) -> tuple[torch.Tensor, None, None, None, list[object], list[object]]:
         B = batch.r_input.shape[0]
         N_atom = batch.r_input.shape[1]
         return (
@@ -153,22 +156,22 @@ def _make_mock_state() -> _AppState:
 def _make_pdb_string(n_res: int) -> str:
     """Produce a minimal valid PDB string with n_res alanine residues."""
     rng = np.random.RandomState(42)
-    pos = rng.randn(n_res, 37, 3).astype(np.float32)
-    mask = np.ones((n_res, 37), dtype=np.float32)
+    pos = rng.randn(n_res, 37, 3).astype(np.float64)
+    mask = np.ones((n_res, 37), dtype=np.float64)
     prot = Protein(
         atom_positions=pos,
-        aatype=np.zeros(n_res, dtype=np.int32),
+        aatype=np.zeros(n_res, dtype=np.intp),
         atom_mask=mask,
-        residue_index=np.arange(n_res, dtype=np.int32),
-        chain_index=np.zeros(n_res, dtype=np.int32),
-        b_factors=np.ones((n_res, 37), dtype=np.float32),
+        residue_index=np.arange(n_res, dtype=np.intp),
+        chain_index=np.zeros(n_res, dtype=np.intp),
+        b_factors=np.ones((n_res, 37), dtype=np.float64),
     )
     return to_pdb(prot)
 
 
-def _run(req_kwargs: dict) -> list[str]:
+def _run(req_kwargs: MutableMapping[str, object]) -> list[str]:
     req_kwargs.setdefault("ddim_steps", 2)
-    req = SampleRequest(**req_kwargs)
+    req = SampleRequest.model_validate(req_kwargs)
     mock_state = _make_mock_state()
     return _run_sampling(req, mock_state)
 
@@ -256,15 +259,15 @@ def test_run_sampling_structure_pdb_too_many_residues_raises() -> None:
 def test_run_sampling_non_contiguous_residue_index_does_not_raise() -> None:
     """PDB with non-contiguous residue numbers (gap between residues)."""
     n_res = 4
-    pos = np.zeros((n_res, 37, 3), dtype=np.float32)
-    mask = np.ones((n_res, 37), dtype=np.float32)
+    pos = np.zeros((n_res, 37, 3), dtype=np.float64)
+    mask = np.ones((n_res, 37), dtype=np.float64)
     prot = Protein(
         atom_positions=pos,
-        aatype=np.zeros(n_res, dtype=np.int32),
+        aatype=np.zeros(n_res, dtype=np.intp),
         atom_mask=mask,
-        residue_index=np.array([1, 2, 10, 11], dtype=np.int32),
-        chain_index=np.zeros(n_res, dtype=np.int32),
-        b_factors=np.ones((n_res, 37), dtype=np.float32),
+        residue_index=np.array([1, 2, 10, 11], dtype=np.intp),
+        chain_index=np.zeros(n_res, dtype=np.intp),
+        b_factors=np.ones((n_res, 37), dtype=np.float64),
     )
     pdb_str = to_pdb(prot)
     result = _run({"n_res": N_RES_TEST, "structure_pdb": pdb_str})

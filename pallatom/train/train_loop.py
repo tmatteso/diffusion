@@ -464,7 +464,7 @@ def train(
 
     Runs a standard train/eval loop for ``tcfg.training.num_epochs`` epochs.
     Each training step featurizes a raw protein batch with a freshly sampled noise
-    level σ, applies per-modality conditioning dropout for classifier-free guidance,
+    level sigmq, applies per-modality conditioning dropout for classifier-free guidance,
     forwards through the model, and back-propagates a weighted sum of seven losses:
 
     - **MSE** (Kabsch-aligned coordinate error)
@@ -473,7 +473,7 @@ def train(
     - **Residue distogram** (Cβ pairwise distances)
     - **Atom distogram** (sparse local atom-pair distances)
     - **Intermediate coordinate loss** (auxiliary loss over each decoder unit,
-      weighted by γ^(K−k) to emphasise later units)
+      weighted by gamma^(K-k) to emphasise later units)
     - **Intermediate sequence loss** (auxiliary CE over each decoder unit)
 
     After each epoch the model is evaluated on ``test_loader`` via :func:`evaluate`,
@@ -569,7 +569,7 @@ def train_ddp(
 
     for epoch in range(1, tp.num_epochs + 1):
         ddp_model.train()
-        cast(DistributedSampler, train_loader.sampler).set_epoch(epoch)
+        cast(DistributedSampler[ProteinBatch], train_loader.sampler).set_epoch(epoch)
         epoch_metrics: dict[str, float] = dict.fromkeys(
             [
                 "total loss",
@@ -724,7 +724,7 @@ if __name__ == "__main__":
                     distogram_atom=distogram_atom,
                 )
             except Exception as _exc:
-                log.error("fatal", error=str(_exc), traceback=traceback.format_exc())
+                log.exception("fatal", error=str(_exc), traceback=traceback.format_exc())
                 raise SystemExit(1) from _exc
     finally:
         dist.destroy_process_group()

@@ -130,3 +130,9 @@ sections only when there are no arguments or the meaning is completely obvious f
 
 6. **Generics need type arguments** — write `dict[str, torch.Tensor]`, not `dict`;
    `list[str]`, not `list`.
+
+7. **NEVER use `Any`, `TypedDict`, or `np.generic`** — these are absolutely forbidden, no exceptions.
+   - `Any` defeats the type checker entirely; use a concrete type, a union, or a generic instead.
+   - `TypedDict` is a crutch for untyped dicts; use a proper `@dataclass` instead.
+   - `np.generic` is too broad; use the specific NumPy scalar type (`np.float32`, `np.int64`, etc.).
+   If you are tempted to reach for any of these, stop and redesign the data structure or annotation.

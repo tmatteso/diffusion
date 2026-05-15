@@ -81,13 +81,13 @@ extend-exclude = ["*.ipynb"]
 
 [tool.ruff.lint]
 select = [
-    "E",   # pycodestyle errors
-    "W",   # pycodestyle warnings
-    "F",   # pyflakes
-    "I",   # isort
-    "B",   # flake8-bugbear
-    "C4",  # flake8-comprehensions
-    "UP",  # pyupgrade
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort
+    "B",    # flake8-bugbear
+    "C4",   # flake8-comprehensions
+    "UP",   # pyupgrade
     "PL",   # pylint — semantic checks, forces dataclasses/objects
     "D",    # pydocstyle — Google docstring convention
     "N",    # pep8-naming — Google follows PEP8 naming
@@ -95,12 +95,17 @@ select = [
     "RET",  # flake8-return — return statement consistency
     "SIM",  # flake8-simplify
     "ARG",  # flake8-unused-arguments
+    "RUF",  # ruff-specific — RUF100 flags unused noqa comments
+    "TCH",  # type-checking imports — move type-only imports under TYPE_CHECKING guard
+    "TRY",  # exception handling hygiene
+    "PERF", # performance antipatterns in hot paths
+    "PGH",  # pygrep-hooks — requires specific codes on type: ignore comments
 ]
 ignore = [
     "F722", "F821", "UP037", # jaxtyping shape strings are runtime-parsed, not forward refs
     "ANN101", "ANN102",      # self/cls don't need annotations
     "D107",                  # __init__ docstring — use class docstring instead
-    "PLR2004",               # magic values - common in ML constants.
+    "PLR2004",               # magic values — common in ML constants
     "PLR0913",               # forces 5 arg or less for each function, not always a good idea
     "PLR0402",               # would eliminate standard import pattern torch.nn as nn
     "N812",                  # would eliminate standard import pattern torch.nn.functional as F
@@ -108,6 +113,7 @@ ignore = [
     "N802",                  # lowercase function names, not always best in ML code
     "N803",                  # lowercase argument names, not always best in ML code
     "N806",                  # lowercase variable names, not always best in ML code
+    "TRY003",                # long exception messages are fine in ML code
 ]
 
 
@@ -138,8 +144,8 @@ reportUninitializedInstanceVariable = "warning" # class attributes are initializ
 reportUnnecessaryCast = "warning" # enfirces pytorch cast() calls are actually doing work.
 
 # Enforce variance safety (e.g., dict vs Mapping)
-reportIncompatibleMethodOverride = "warning"
-reportIncompatibleVariableOverride = "warning"
+reportIncompatibleMethodOverride = "error"
+reportIncompatibleVariableOverride = "error"
 
 # Ensures that if you use a generic like dict[], the inner types are also validated
 # This is key for catching things like dict[str, Any] which bypasses variance checks
@@ -148,13 +154,16 @@ reportUnknownLambdaType = "warning"
 
 # Google Style / Strictness: prevent mixing positional and keyword-only args
 # in ways that break covariance in callbacks.
-reportCallInDefaultInitializer = "warning"
+reportCallInDefaultInitializer = "error"
 
 # Google style: all public APIs must be fully annotated.
-reportMissingParameterType = "warning" # let's come back to this one
-reportMissingTypeArgument = "warning" # let's come back to this one
+reportMissingParameterType = "error"
+reportMissingTypeArgument = "error"
 # Google style: don't reach into private members from outside their class/module.
 reportPrivateImportUsage = "none" # not sure I agree with this one
+
+reportDeprecated = "warning"   # catches deprecated PyTorch/CUDA API usage early
+
 
 [tool.pytest.ini_options]
 testpaths = ["tests", "pallatom/tests"]

@@ -38,16 +38,9 @@ log = structlog.get_logger()
 ATOM5_TO_ATOM37 = [ATOM37_N, ATOM37_CA, ATOM37_C, ATOM37_O, ATOM37_CB]
 NATOM = 5  # atoms per residue
 
-# write sampling contexts and APIs for:
-# unconditional sampling -- done I believe
-# conditional sampling from amino acid sequence alone (no templates)
-# conditional sampling from amino acid sequence + partial template
-# conditional sampling from no amino acid sequence + partial template -- done I believe
-# conditional sampling from no amino acid sequence + full template
-
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 1.  EDMPrecond  —  adapts MainTrunk to the D_θ(r, σ) interface
+# 1.  EDMPrecond  —  adapts MainTrunk to the D_θ(r, sigma) interface
 #
 #  EDMSampler calls  D_cur = denoiser(r_noisy, sigma)
 #  MainTrunk.forward takes a FeaturizedBatch.
@@ -60,15 +53,15 @@ NATOM = 5  # atoms per residue
 
 
 class EDMPrecond(nn.Module):
-    """Wraps MainTrunk as an EDM-compatible denoiser D_θ(r_noisy, σ) → r_denoised.
+    """Wraps MainTrunk as an EDM-compatible denoiser D_θ(r_noisy, sigma) → r_denoised.
 
     Parameters
     ----------
     model     : trained MainTrunk
     context   : FeaturizedBatch with static fields filled in; r_input and
                 t_hat are replaced at every forward call
-    sigma_min : lower σ bound, used only to compute t_normalized
-    sigma_max : upper σ bound, used only to compute t_normalized
+    sigma_min : lower sigma bound, used only to compute t_normalized
+    sigma_max : upper sigma bound, used only to compute t_normalized
     """
 
     def __init__(
@@ -273,14 +266,14 @@ def build_template_context(
     for prot in ls_of_proteins:
         n_res: int = prot.atom_positions.shape[0]
         pad: int = max_n_res - n_res
-        pos_i = torch.tensor(prot.atom_positions, dtype=torch.float32, device=device)
-        mask_i = torch.tensor(prot.atom_mask, dtype=torch.float32, device=device)
+        pos_i = torch.tensor(prot.atom_positions, dtype=torch.float64, device=device)
+        mask_i = torch.tensor(prot.atom_mask, dtype=torch.float64, device=device)
         if pad > 0:
             pos_i = torch.cat(
-                [pos_i, torch.zeros(pad, 37, 3, dtype=torch.float32, device=device)], dim=0
+                [pos_i, torch.zeros(pad, 37, 3, dtype=torch.float64, device=device)], dim=0
             )
             mask_i = torch.cat(
-                [mask_i, torch.zeros(pad, 37, dtype=torch.float32, device=device)], dim=0
+                [mask_i, torch.zeros(pad, 37, dtype=torch.float64, device=device)], dim=0
             )
         pos_list.append(pos_i)
         mask_list.append(mask_i)
@@ -391,7 +384,7 @@ def build_sampling_context(
         pos_by_name = {name: pos for name, _, pos in rigid_group_atom_positions["ALA"]}
         return torch.tensor(
             [pos_by_name.get(name, (0.0, 0.0, 0.0)) for name in ATOM5_NAMES],
-            dtype=torch.float32,
+            dtype=torch.float64,
         )
 
     ref_pos_single: Float[torch.Tensor, "N_atom 3"] = rearrange(
@@ -424,7 +417,7 @@ def build_sampling_context(
         center_uid=tile(center_uid_single),
         gt_res_distogram=gt_res_distogram,
         f_pseudo_beta_mask=f_pseudo_beta_mask,
-        r_input=torch.zeros(B, N_atom, 3, dtype=torch.float32, device=device),
+        r_input=torch.zeros(B, N_atom, 3, dtype=torch.float64, device=device),
         r_gt=aa_ctx.r_gt,
         atom5_mask=aa_ctx.atom5_mask,
         residue_mask=aa_ctx.residue_mask,
@@ -438,7 +431,7 @@ def build_sampling_context(
 # ─────────────────────────────────────────────────────────────────────────────
 # 2.  EDM Sampler  —  deterministic Heun ODE  (Algorithm 2 in the paper)
 #
-#  ODE:  dr/dσ = (r − D_θ(r,σ)) / σ   (the "probability flow ODE")
+#  ODE:  dr/dsigma = (r - D_θ(r,sigma)) / sigma   (the "probability flow ODE")
 #  Heun = one Euler predictor + one corrector for 2nd-order accuracy.
 #
 #  Optional stochasticity: inject a small amount of noise at each step
@@ -469,7 +462,7 @@ class EDMSampler:
         rho: float = 7.0,
         S_churn: float = 0.0,
         S_tmin: float = 0.0,
-        S_tmax: float = float("inf"),
+        S_tmax: float = math.inf,
         S_noise: float = 1.003,
     ) -> None:
         self.denoiser = denoiser
@@ -487,7 +480,12 @@ class EDMSampler:
         steps: int,
         device: torch.device | str,
     ) -> Float[torch.Tensor, "S"]:  # S = steps + 1
-        """Karras σ schedule: σ_i = (σ_max^(1/ρ) + i/(N-1)·(σ_min^(1/ρ)−σ_max^(1/ρ)))^ρ."""
+        """Karras sigma schedule following the closed-form noise level sequence.
+
+        The formula is:
+
+            sigma_i = (sigma_max^(1/rho) + i/(N-1) * (sigma_min^(1/rho) - sigma_max^(1/rho)))^rho
+        """
         rho: float = self.rho
         i: Float[torch.Tensor, steps] = torch.arange(steps, device=device).float()
         t: Float[torch.Tensor, steps] = (
@@ -507,7 +505,7 @@ class EDMSampler:
         """Run the Heun ODE sampler and return (denoised_coords, seq_logits) from the final step."""
         sigmas: Float[torch.Tensor, "S"] = self._sigma_schedule(steps, device)
 
-        # pure noise initialised at σ_max — independent per batch item
+        # pure noise initialised at sigma_max — independent per batch item
         z: Float[torch.Tensor, "B N_atom 3"] = torch.randn(shape, device=device) * sigmas[0]
 
         seq_logits: Float[torch.Tensor, "B N_res n_amino"]
@@ -561,8 +559,8 @@ def atom5_to_atom37(
     mask_37: (N_res, 37).
     """
     N_res: int = coords_5.shape[0]
-    x_37: Float[torch.Tensor, "N_res 37 3"] = torch.zeros((N_res, 37, 3), dtype=torch.float32)
-    mask_37: Float[torch.Tensor, "N_res 37"] = torch.zeros((N_res, 37), dtype=torch.float32)
+    x_37: Float[torch.Tensor, "N_res 37 3"] = torch.zeros((N_res, 37, 3), dtype=torch.float64)
+    mask_37: Float[torch.Tensor, "N_res 37"] = torch.zeros((N_res, 37), dtype=torch.float64)
 
     for atom5_slot, atom37_idx in enumerate(ATOM5_TO_ATOM37):
         x_37[:, atom37_idx, :] = coords_5[:, atom5_slot, :]
@@ -690,15 +688,15 @@ if __name__ == "__main__":
             prot = Protein(
                 atom_positions=x_37.numpy(),
                 atom_mask=mask_37.numpy(),
-                residue_index=np.arange(N_RES, dtype=np.int32),
-                aatype=np.zeros(N_RES, dtype=np.int32),
-                chain_index=np.zeros(N_RES, dtype=np.int32),
-                b_factors=np.ones((N_RES, 37), dtype=np.float32),
+                residue_index=np.arange(N_RES, dtype=np.intp),
+                aatype=np.zeros(N_RES, dtype=np.intp),
+                chain_index=np.zeros(N_RES, dtype=np.intp),
+                b_factors=np.ones((N_RES, 37), dtype=np.float64),
             )
             pdb_strings.append(to_pdb(prot))
 
         _Path(scfg.output.output_path).write_text(_json.dumps(pdb_strings))
         log.info("output written", path=scfg.output.output_path, n_structures=B_SAMPLE)
     except Exception as _exc:
-        log.error("fatal", error=str(_exc), traceback=_tb.format_exc())
+        log.exception("fatal", error=str(_exc), traceback=_tb.format_exc())
         raise SystemExit(1) from _exc

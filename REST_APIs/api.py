@@ -4,7 +4,7 @@ import asyncio
 import os
 import sys
 import tempfile
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from functools import partial
@@ -208,14 +208,14 @@ def coords_to_pdb_strings(
     for b in range(B):
         coords_tensor = rearrange(coords_batch[b].cpu(), "(n a) d -> n a d", n=N_res, a=NATOM)
         x_37, mask_37 = atom5_to_atom37(coords_tensor)
-        aatype = seq_logits[b].argmax(dim=-1).cpu().numpy().astype(np.int32)
+        aatype = seq_logits[b].argmax(dim=-1).cpu().numpy().astype(np.intp)
         prot_out = Protein(
             atom_positions=x_37.numpy(),
             atom_mask=mask_37.numpy(),
-            residue_index=np.arange(N_res, dtype=np.int32),
+            residue_index=np.arange(N_res, dtype=np.intp),
             aatype=aatype,
-            chain_index=np.zeros(N_res, dtype=np.int32),
-            b_factors=np.ones((N_res, 37), dtype=np.float32),
+            chain_index=np.zeros(N_res, dtype=np.intp),
+            b_factors=np.ones((N_res, 37), dtype=np.float64),
         )
         pdb_strings.append(to_pdb(prot_out))
     return pdb_strings
@@ -318,7 +318,7 @@ def _run_sampling(req: SampleRequest, state: _AppState) -> list[str]:
 
 
 @app.get("/health")
-async def health(request: Request) -> dict:
+async def health(request: Request) -> Mapping[str, str | bool]:
     """Return service health status, compute device, and whether a model is loaded."""
     state: _AppState | None = request.app.state.loaded
     return {"status": "ok", "device": DEVICE, "model_loaded": bool(state)}

@@ -1,9 +1,10 @@
 """Utility dataclasses and functions for atom-level coordinate data."""
 
 import dataclasses
-from collections.abc import Mapping
+from collections.abc import Mapping, MutableMapping
 
 import numpy as np
+import numpy.typing as npt
 import torch
 from beartype import beartype
 from einops import rearrange
@@ -349,7 +350,9 @@ rigid_group_atom_positions = {
 }
 
 
-def make_np_example(coords_dict: Mapping[str, np.ndarray]) -> dict[str, np.ndarray]:
+def make_np_example(
+    coords_dict: Mapping[str, npt.NDArray[np.float64]],
+) -> Mapping[str, npt.NDArray[np.float64] | npt.NDArray[np.intp]]:
     """Make a dictionary of non-batched numpy protein features."""
     bb_atom_types = ["N", "CA", "C", "O"]
     bb_idx = [i for i, atom_type in enumerate(atom_types) if atom_type in bb_atom_types]
@@ -375,7 +378,10 @@ def make_np_example(coords_dict: Mapping[str, np.ndarray]) -> dict[str, np.ndarr
     }
 
 
-def make_fixed_size(np_example: Mapping[str, np.ndarray], max_seq_length: int = 500) -> None:
+def make_fixed_size(
+    np_example: Mapping[str, npt.NDArray[np.float64] | npt.NDArray[np.intp]],
+    max_seq_length: int = 500,
+) -> None:
     """Pad features to fixed sequence length, i.e. currently axis=0."""
     for k, v in np_example.items():
         pad = max_seq_length - v.shape[0]
@@ -385,7 +391,9 @@ def make_fixed_size(np_example: Mapping[str, np.ndarray], max_seq_length: int = 
             np_example[k] = v[:max_seq_length]
 
 
-def center_positions(np_example: Mapping[str, np.ndarray]) -> None:
+def center_positions(
+    np_example: Mapping[str, npt.NDArray[np.float64] | npt.NDArray[np.intp]]
+) -> None:
     """Center 'atom_positions' on CA center of mass."""
     atom_positions = np_example["atom_positions"]  # N, 37, 3
     atom_mask = np_example["atom_mask"]  # N, 37
@@ -415,27 +423,27 @@ class Protein:
 
     # Cartesian coordinates of atoms in angstroms. The atom types correspond to
     # residue_constants.atom_types, i.e. the first three are N, CA, CB.
-    atom_positions: Float[np.ndarray, "num_res num_atom_type 3"]
+    atom_positions: Float[npt.NDArray[np.float64], "num_res num_atom_type 3"]
 
     # Amino-acid type for each residue represented as an integer between 0 and
     # 20, where 20 is 'X'.
-    aatype: Int[np.ndarray, "num_res"]
+    aatype: Int[npt.NDArray[np.intp], "num_res"]
 
     # Binary float mask to indicate presence of a particular atom. 1.0 if an atom
     # is present and 0.0 if not. This should be used for loss masking.
-    atom_mask: Float[np.ndarray, "num_res num_atom_type"]
+    atom_mask: Float[npt.NDArray[np.float64], "num_res num_atom_type"]
 
     # Residue index as used in PDB. It is not necessarily continuous or 0-indexed.
-    residue_index: Int[np.ndarray, "num_res"]
+    residue_index: Int[npt.NDArray[np.intp], "num_res"]
 
     # 0-indexed number corresponding to the chain in the protein that this residue
     # belongs to.
-    chain_index: Int[np.ndarray, "num_res"]
+    chain_index: Int[npt.NDArray[np.intp], "num_res"]
 
     # B-factors, or temperature factors, of each residue (in sq. angstroms units),
     # representing the displacement of the residue from its ground truth mean
     # value.
-    b_factors: Float[np.ndarray, "num_res num_atom_type"]
+    b_factors: Float[npt.NDArray[np.float64], "num_res num_atom_type"]
 
 
 def protein_from_pdb(pdb_path: str) -> "Protein":
@@ -444,9 +452,11 @@ def protein_from_pdb(pdb_path: str) -> "Protein":
     _seen_chains: dict[str, int] = {}
 
     # key = (chain_id, resseq, icode); value = per-atom dict
-    _residue_atoms: dict[tuple, dict[str, tuple[float, float, float, float]]] = {}
-    _residue_name: dict[tuple, str] = {}
-    _residue_chain: dict[tuple, str] = {}
+    _residue_atoms: MutableMapping[
+        tuple[str, int, str], MutableMapping[str, tuple[float, float, float, float]]
+    ] = {}
+    _residue_name: MutableMapping[tuple[str, int, str], str] = {}
+    _residue_chain: MutableMapping[tuple[str, int, str], str] = {}
 
     with open(pdb_path) as _fh:
         for _line in _fh:
@@ -477,12 +487,12 @@ def protein_from_pdb(pdb_path: str) -> "Protein":
 
     _keys = sorted(_residue_atoms)
     N_res = len(_keys)
-    _atom_positions = np.zeros((N_res, 37, 3), dtype=np.float32)
-    _atom_mask = np.zeros((N_res, 37), dtype=np.float32)
-    _b_factors = np.zeros((N_res, 37), dtype=np.float32)
-    _aatype = np.zeros(N_res, dtype=np.int32)
-    _residue_index = np.zeros(N_res, dtype=np.int32)
-    _chain_index = np.zeros(N_res, dtype=np.int32)
+    _atom_positions = np.zeros((N_res, 37, 3), dtype=np.float64)
+    _atom_mask = np.zeros((N_res, 37), dtype=np.float64)
+    _b_factors = np.zeros((N_res, 37), dtype=np.float64)
+    _aatype = np.zeros(N_res, dtype=np.intp)
+    _residue_index = np.zeros(N_res, dtype=np.intp)
+    _chain_index = np.zeros(N_res, dtype=np.intp)
 
     for _i, _key in enumerate(_keys):
         _cid = _residue_chain[_key]
@@ -654,8 +664,8 @@ def pseudo_cb(
     """Compute a virtual Cβ from backbone geometry (Gly-safe).
 
     Uses the standard ideal-geometry recipe:
-      b = Cα - N        (N→Cα bond vector)
-      d = C  - Cα       (Cα→C  bond vector)
+      b = C alpha - N        (N→C alpha bond vector)
+      d = C  - C alpha       (C alpha→C  bond vector)
       Cross them, then combine with ideal tetrahedral offsets.
 
     This matches the AlphaFold2 / ESMFold convention exactly.
@@ -667,7 +677,7 @@ def pseudo_cb(
     n_vec = torch.cross(bc, dc, dim=-1)
     n_vec = n_vec / (torch.linalg.norm(n_vec, dim=-1, keepdim=True) + 1e-8)
 
-    # Ideal Cβ placement constants (Hs or N→C→Cα geometry)
+    # Ideal Cβ placement constants (Hs or N→C→C alpha geometry)
     # values from Havel (1998) / AlphaFold2 supplementary
     m = -0.58273431
     s = 0.56802827

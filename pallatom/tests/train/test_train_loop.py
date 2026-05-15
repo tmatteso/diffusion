@@ -537,7 +537,7 @@ def test_train_runs_all_epochs(
         dr: Distogram,
         da: Distogram,
         dev: str,
-    ) -> dict:
+    ) -> Mapping[str, float]:
         result = _real_evaluate(m, ldr, cfg, dr, da, dev)
         losses.append(result["total loss"])
         return result
@@ -607,7 +607,7 @@ def test_train_save_every_checkpoint_is_valid_state_dict(
 
 
 # ---------------------------------------------------------------------------
-# evaluate – multi-batch averaging
+# evaluate - multi-batch averaging
 # ---------------------------------------------------------------------------
 
 
@@ -619,9 +619,7 @@ def test_evaluate_multi_batch_returns_expected_keys(
     distogram_atom: Distogram,
 ) -> None:
     """Ensures evaluate with a 2-batch loader still returns exactly the expected metric keys."""
-    loader2 = torch.utils.data.DataLoader(
-        _ListDataset([mini_batch] + [mini_batch]), batch_size=None
-    )
+    loader2 = torch.utils.data.DataLoader(_ListDataset([mini_batch, mini_batch]), batch_size=None)
     result = evaluate(model, loader2, tcfg, distogram_res, distogram_atom, "cpu")
     assert set(result.keys()) == EXPECTED_EVAL_KEYS
 
@@ -642,7 +640,7 @@ def test_evaluate_multi_batch_n_batches_counted(
 
 
 # ---------------------------------------------------------------------------
-# train – wandb logging branch
+# train - wandb logging branch
 # ---------------------------------------------------------------------------
 
 
@@ -655,10 +653,8 @@ def test_train_calls_wandb_log_when_enabled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Train calls wandb.log exactly once per epoch when use_wandb=True."""
-    logged: list = []
-    monkeypatch.setattr(
-        "train.train_loop.wandb.log", lambda data, step=None: logged.append((data, step))
-    )
+    logged: list[dict[str, float]] = []
+    monkeypatch.setattr("train.train_loop.wandb.log", lambda data, **_: logged.append(data))
     train(model, tcfg_wandb, loader, loader, distogram_res, distogram_atom, "cpu")
     assert len(logged) == 1
 
@@ -687,7 +683,7 @@ def test_train_wandb_log_payload_has_epoch_key(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The W&B payload logged by train includes an 'epoch' key set to the current epoch number."""
-    payloads: list[dict] = []
+    payloads: list[Mapping[str, object]] = []
     monkeypatch.setattr("train.train_loop.wandb.log", lambda data, **_: payloads.append(data))
     train(model, tcfg_wandb, loader, loader, distogram_res, distogram_atom, "cpu")
     assert "epoch" in payloads[0]
@@ -703,7 +699,7 @@ def test_train_wandb_log_payload_has_train_keys(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The W&B payload logged by train contains at least one key prefixed with 'train/'."""
-    payloads: list[dict] = []
+    payloads: list[Mapping[str, object]] = []
     monkeypatch.setattr("train.train_loop.wandb.log", lambda data, **_: payloads.append(data))
     train(model, tcfg_wandb, loader, loader, distogram_res, distogram_atom, "cpu")
     assert any(k.startswith("train/") for k in payloads[0])
@@ -718,7 +714,7 @@ def test_train_wandb_log_payload_has_val_keys(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The W&B payload logged by train contains at least one key prefixed with 'val/'."""
-    payloads: list[dict] = []
+    payloads: list[Mapping[str, object]] = []
     monkeypatch.setattr("train.train_loop.wandb.log", lambda data, **_: payloads.append(data))
     train(model, tcfg_wandb, loader, loader, distogram_res, distogram_atom, "cpu")
     assert any(k.startswith("val/") for k in payloads[0])
@@ -753,7 +749,7 @@ def test_train_wandb_log_called_once_per_epoch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Train calls wandb.log exactly once per epoch for a 3-epoch run."""
-    logged: list = []
+    logged: list[dict[str, float]] = []
     monkeypatch.setattr("train.train_loop.wandb.log", lambda data, **_: logged.append(data))
     train(model, tcfg_wandb_3ep, loader, loader, distogram_res, distogram_atom, "cpu")
     assert len(logged) == 3
@@ -768,7 +764,7 @@ def test_train_wandb_log_epoch_increments(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The epoch number in W&B payloads increments from 1 to 3 across a 3-epoch run."""
-    payloads: list[dict] = []
+    payloads: list[Mapping[str, object]] = []
     monkeypatch.setattr("train.train_loop.wandb.log", lambda data, **_: payloads.append(data))
     train(model, tcfg_wandb_3ep, loader, loader, distogram_res, distogram_atom, "cpu")
     epochs = [p["epoch"] for p in payloads]
@@ -784,7 +780,7 @@ def test_train_wandb_log_train_total_loss_is_float(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The 'train/total loss' value logged to W&B is a Python float."""
-    payloads: list[dict] = []
+    payloads: list[Mapping[str, object]] = []
     monkeypatch.setattr("train.train_loop.wandb.log", lambda data, **_: payloads.append(data))
     train(model, tcfg_wandb, loader, loader, distogram_res, distogram_atom, "cpu")
     assert isinstance(payloads[0]["train/total loss"], float)
@@ -799,7 +795,7 @@ def test_train_wandb_log_val_total_loss_is_float(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The 'val/total loss' value logged to W&B is a Python float."""
-    payloads: list[dict] = []
+    payloads: list[Mapping[str, object]] = []
     monkeypatch.setattr("train.train_loop.wandb.log", lambda data, **_: payloads.append(data))
     train(model, tcfg_wandb, loader, loader, distogram_res, distogram_atom, "cpu")
     assert isinstance(payloads[0]["val/total loss"], float)
@@ -981,7 +977,7 @@ def _patch_ddp(monkeypatch: pytest.MonkeyPatch) -> None:
 class _MockSampler:
     """DataLoader sampler with set_epoch() for verifying epoch reseeding."""
 
-    def __init__(self, data: list) -> None:
+    def __init__(self, data: list[Mapping[str, torch.Tensor | list[str]]]) -> None:
         self._data = data
         self.set_epoch_calls: list[int] = []
 

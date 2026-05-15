@@ -74,7 +74,7 @@ def _make_identity_denoiser_mock() -> MagicMock:
 
 
 def _make_half_denoiser_mock() -> MagicMock:
-    """MagicMock denoiser that returns 0.5 × input (non-trivial, trajectory-dependent)."""
+    """MagicMock denoiser that returns 0.5 by input (non-trivial, trajectory-dependent)."""
     mock = MagicMock()
     mock.side_effect = lambda r, _sigma: (r * 0.5, torch.zeros(r.shape[0], 1, 20))
     return mock
@@ -88,7 +88,7 @@ def _make_half_denoiser_mock() -> MagicMock:
 @pytest.fixture
 def coords5() -> torch.Tensor:
     """Provide random atom5 coordinates (N_RES, 5, 3) with fixed seed."""
-    return torch.tensor(np.random.RandomState(1).randn(N_RES, 5, 3).astype(np.float32))
+    return torch.tensor(np.random.RandomState(1).randn(N_RES, 5, 3).astype(np.float64))
 
 
 @pytest.fixture
@@ -206,13 +206,13 @@ def test_atom5_to_atom37_mask37_shape(coords5: torch.Tensor):
 def test_atom5_to_atom37_each_slot_lands_at_correct_atom37_index():
     """Confirm that each atom5 slot maps coordinates to expected atom37 index in ATOM5_TO_ATOM37."""
     # Give each atom5 slot a unique sentinel value so placement is unambiguous.
-    coords_5 = torch.zeros((N_RES, 5, 3), dtype=torch.float32)
+    coords_5 = torch.zeros((N_RES, 5, 3), dtype=torch.float64)
     for slot in range(5):
         coords_5[:, slot, :] = float(slot + 1)
     x_37, _ = atom5_to_atom37(coords_5)
     for slot, atom37_idx in enumerate(ATOM5_TO_ATOM37):
         assert torch.allclose(
-            x_37[:, atom37_idx, :], torch.tensor(float(slot + 1))
+            x_37[:, atom37_idx, :], torch.tensor(float(slot + 1), dtype=torch.float64)
         ), f"atom5 slot {slot} → atom37 slot {atom37_idx}: wrong coords"
 
 
@@ -223,7 +223,7 @@ def test_atom5_to_atom37_unoccupied_atom37_slots_are_zero(coords5: torch.Tensor)
     for idx in range(37):
         if idx not in occupied:
             assert torch.allclose(
-                x_37[:, idx, :], torch.zeros(1)
+                x_37[:, idx, :], torch.zeros(1, dtype=torch.float64)
             ), f"atom37 slot {idx} should be zero (unoccupied)"
 
 
@@ -236,14 +236,14 @@ def test_atom5_to_atom37_mask_none_sets_occupied_slots_to_one(coords5: torch.Ten
     """When no explicit mask is given, all atom5-occupied slots in the atom37 mask must be 1."""
     _, mask_37 = atom5_to_atom37(coords5, mask_5=None)
     for atom37_idx in ATOM5_TO_ATOM37:
-        assert torch.allclose(mask_37[:, atom37_idx], torch.ones(N_RES))
+        assert torch.allclose(mask_37[:, atom37_idx], torch.ones(N_RES, dtype=torch.float64))
 
 
 def test_atom5_to_atom37_explicit_mask_placed_at_correct_atom37_positions():
     """An explicit atom5 mask must be faithfully scatter-copied into correct atom37 positions."""
     rng = np.random.RandomState(2)
-    coords_5 = torch.tensor(rng.randn(N_RES, 5, 3).astype(np.float32))
-    mask_5 = torch.tensor(rng.rand(N_RES, 5).astype(np.float32))
+    coords_5 = torch.tensor(rng.randn(N_RES, 5, 3).astype(np.float64))
+    mask_5 = torch.tensor(rng.rand(N_RES, 5).astype(np.float64))
     _, mask_37 = atom5_to_atom37(coords_5, mask_5)
     for slot, atom37_idx in enumerate(ATOM5_TO_ATOM37):
         assert torch.allclose(mask_37[:, atom37_idx], mask_5[:, slot])
@@ -251,13 +251,13 @@ def test_atom5_to_atom37_explicit_mask_placed_at_correct_atom37_positions():
 
 def test_atom5_to_atom37_unoccupied_mask_slots_are_zero():
     """Atom37 mask entries with no corresponding atom5 must remain zero when atom5 mask is ones."""
-    coords_5 = torch.ones((N_RES, 5, 3), dtype=torch.float32)
-    mask_5 = torch.ones((N_RES, 5), dtype=torch.float32)
+    coords_5 = torch.ones((N_RES, 5, 3), dtype=torch.float64)
+    mask_5 = torch.ones((N_RES, 5), dtype=torch.float64)
     _, mask_37 = atom5_to_atom37(coords_5, mask_5)
     occupied = set(ATOM5_TO_ATOM37)
     for idx in range(37):
         if idx not in occupied:
-            assert torch.allclose(mask_37[:, idx], torch.zeros(N_RES))
+            assert torch.allclose(mask_37[:, idx], torch.zeros(N_RES, dtype=torch.float64))
 
 
 # ---------------------------------------------------------------------------
@@ -268,7 +268,7 @@ def test_atom5_to_atom37_unoccupied_mask_slots_are_zero():
 def test_atom5_to_atom37_rejects_wrong_second_dimension():
     """A jaxtyping TypeCheckError must be raised when the second dimension is not 5."""
     with pytest.raises(TypeCheckError):
-        atom5_to_atom37(torch.zeros((N_RES, 4, 3), dtype=torch.float32))  # 4 ≠ 5
+        atom5_to_atom37(torch.zeros((N_RES, 4, 3), dtype=torch.float64))  # 4 ≠ 5
 
 
 def test_atom5_to_atom37_single_residue():
@@ -358,8 +358,8 @@ def test_build_sampling_context_tok_idx_maps_atoms_to_parent_residue(context: Fe
 
 
 def test_build_sampling_context_center_uid_points_to_ca_slot(context: FeaturizedBatch):
-    """center_uid must point to atom5 slot 1 (Cα) within each residue's atom block."""
-    # atom5 slot 1 is Cα; center_uid[0, i] = i * NATOM + 1
+    """center_uid must point to atom5 slot 1 (C alpha) within each residue's atom block."""
+    # atom5 slot 1 is C alpha; center_uid[0, i] = i * NATOM + 1
     expected = torch.arange(N_RES) * NATOM + 1
     assert torch.equal(context.center_uid[0], expected)
 
@@ -632,7 +632,7 @@ def test_sigma_schedule_different_rho_gives_different_intermediate_values():
     s2 = EDMSampler(_make_zero_denoiser_mock(), sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX, rho=3.0)
     sig1 = s1._sigma_schedule(10, "cpu")
     sig2 = s2._sigma_schedule(10, "cpu")
-    # Endpoints are the same; interior values must differ with different ρ
+    # Endpoints are the same; interior values must differ with different rho
     assert not torch.allclose(sig1[1:-1], sig2[1:-1])
 
 
@@ -643,7 +643,7 @@ def test_sigma_schedule_different_rho_gives_different_intermediate_values():
 
 def test_edm_sampler_identity_denoiser_z_unchanged_across_step_counts():
     """Identity denoiser, ODE drift zero, so final sample == init noise regardless of step count."""
-    # D_θ(z, σ) = z  ⟹  d = (z - z)/σ = 0  ⟹  z_next = z for every step.
+    # D_θ(z, sigma) = z  ⟹  d = (z - z)/sigma = 0  ⟹  z_next = z for every step.
     # The output equals the initial noise regardless of how many steps are run.
     # (steps=1 is excluded: _sigma_schedule divides by steps-1, causing 0/0.)
     sampler = EDMSampler(
@@ -659,8 +659,8 @@ def test_edm_sampler_identity_denoiser_z_unchanged_across_step_counts():
 
 def test_edm_sampler_zero_denoiser_output_is_zero():
     """With a zero denoiser the trajectory drives all coordinates to zero by the final step."""
-    # D_θ(z, σ) = 0  ⟹  d = z/σ  ⟹  z scales by σ_next/σ_hat each step;
-    # at the final step σ_next = 0, so the trajectory converges exactly to 0.
+    # D_θ(z, sigma) = 0  ⟹  d = z/sigma  ⟹  z scales by sigma_next/sigma_hat each step;
+    # at the final step sigma_next = 0, so the trajectory converges exactly to 0.
     sampler = EDMSampler(
         _make_zero_denoiser_mock(), sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX, S_churn=0.0
     )  # type: ignore[arg-type]
@@ -712,7 +712,7 @@ def test_edm_sampler_s_churn_produces_different_result_than_deterministic():
 
 def test_edm_sampler_heun_corrector_call_count():
     """Heun requires 2·steps: one predictor per step plus one corrector except at terminal step."""
-    # steps predictor calls + (steps - 1) corrector calls (skipped when σ_next = 0)
+    # steps predictor calls + (steps - 1) corrector calls (skipped when sigma_next = 0)
     # Total = 2·steps - 1
     counter = _make_zero_denoiser_mock()
     steps = 5
@@ -728,7 +728,7 @@ def test_edm_sampler_heun_corrector_call_count():
 
 def test_edm_sampler_step_count_changes_output_for_nontrivial_denoiser():
     """Coarser sigma grid (fewer steps) must integrate differently and yield a different output."""
-    # D_θ(z, σ) = 0.5·z: trajectory depends on the σ grid.
+    # D_θ(z, sigma) = 0.5·z: trajectory depends on the sigma grid.
     # Coarser grid (fewer steps) integrates differently → different final output.
     coarse = EDMSampler(
         _make_half_denoiser_mock(), sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX, S_churn=0.0
@@ -750,11 +750,11 @@ def test_edm_sampler_step_count_changes_output_for_nontrivial_denoiser():
 # ---------------------------------------------------------------------------
 
 
-def test_atom5_to_atom37_output_dtype_is_float32(coords5: torch.Tensor):
-    """Both the coordinate and mask outputs must be float32 to match the model's expected dtype."""
+def test_atom5_to_atom37_output_dtype_is_float64(coords5: torch.Tensor):
+    """Both the coordinate and mask outputs must be float64 to match the model's expected dtype."""
     x_37, mask_37 = atom5_to_atom37(coords5)
-    assert x_37.dtype == torch.float32
-    assert mask_37.dtype == torch.float32
+    assert x_37.dtype == torch.float64
+    assert mask_37.dtype == torch.float64
 
 
 # ---------------------------------------------------------------------------
@@ -819,7 +819,12 @@ def test_edm_precond_stores_sigma_min_and_sigma_max(edm_precond_custom_sigmas: E
 def test_edm_precond_t_normalized_formula_at_arbitrary_sigma(
     edm_precond: EDMPrecond, trunk_mock: MagicMock
 ):
-    """Log-normalised t_normalized must == (log(σ)−log(σ_min))/(log(σ_max)−log(σ_min)) for any σ."""
+    """Log-normalised t_normalized matches the expected formula for any sigma.
+
+    The formula is:
+
+        t_normalized = (log(sigma) - log(sigma_min)) / (log(sigma_max) - log(sigma_min))
+    """
     t_hat = 1.0
     edm_precond(torch.randn(1, N_ATOM, 3), t_hat=t_hat)
     batch_seen = trunk_mock.call_args.args[0]
@@ -914,7 +919,7 @@ def residue_idx_aa() -> torch.Tensor:
 
 @pytest.fixture
 def atom_disto_fn() -> Distogram:
-    """Provide a standard atom distogram function with 22 bins spanning 2–22 Å."""
+    """Provide a standard atom distogram function with 22 bins spanning 2-22 Å."""
     return Distogram(n_bins=N_ATOM_BINS, min_dist=2.0, max_dist=22.0)
 
 
@@ -1074,12 +1079,12 @@ def _make_protein(n_res: int, mask_value: float = 1.0) -> Protein:
     """Build a minimal Protein with random coordinates and a uniform atom mask."""
     rng = np.random.RandomState(42)
     return Protein(
-        atom_positions=rng.randn(n_res, 37, 3).astype(np.float32),
-        aatype=np.zeros(n_res, dtype=np.int32),
-        atom_mask=np.full((n_res, 37), mask_value, dtype=np.float32),
-        residue_index=np.arange(n_res, dtype=np.int32),
-        chain_index=np.zeros(n_res, dtype=np.int32),
-        b_factors=np.ones((n_res, 37), dtype=np.float32),
+        atom_positions=rng.randn(n_res, 37, 3).astype(np.float64),
+        aatype=np.zeros(n_res, dtype=np.intp),
+        atom_mask=np.full((n_res, 37), mask_value, dtype=np.float64),
+        residue_index=np.arange(n_res, dtype=np.intp),
+        chain_index=np.zeros(n_res, dtype=np.intp),
+        b_factors=np.ones((n_res, 37), dtype=np.float64),
     )
 
 
@@ -1102,7 +1107,7 @@ def np_protein_short() -> Protein:
 
 @pytest.fixture
 def templ_disto() -> Distogram:
-    """Provide a template distogram function: 38 bins + overflow, spanning 3.25–50.75 Å."""
+    """Provide a template distogram function: 38 bins + overflow, spanning 3.25-50.75 Å."""
     return Distogram(n_bins=N_TEMPL_BINS - 1, min_dist=3.25, max_dist=50.75, overflow_bin=True)
 
 
@@ -1188,12 +1193,12 @@ def test_build_template_context_different_proteins_give_different_distograms(
     rng_b = np.random.RandomState(2)
     prot_a = _make_protein(N_RES)
     prot_b = Protein(
-        atom_positions=(rng_b.randn(N_RES, 37, 3) * 20).astype(np.float32),
-        aatype=np.zeros(N_RES, dtype=np.int32),
-        atom_mask=np.ones((N_RES, 37), dtype=np.float32),
-        residue_index=np.arange(N_RES, dtype=np.int32),
-        chain_index=np.zeros(N_RES, dtype=np.int32),
-        b_factors=np.ones((N_RES, 37), dtype=np.float32),
+        atom_positions=(rng_b.randn(N_RES, 37, 3) * 20).astype(np.float64),
+        aatype=np.zeros(N_RES, dtype=np.intp),
+        atom_mask=np.ones((N_RES, 37), dtype=np.float64),
+        residue_index=np.arange(N_RES, dtype=np.intp),
+        chain_index=np.zeros(N_RES, dtype=np.intp),
+        b_factors=np.ones((N_RES, 37), dtype=np.float64),
     )
     ctx_a = build_template_context([prot_a], templ_disto)
     ctx_b = build_template_context([prot_b], templ_disto)
@@ -1208,7 +1213,7 @@ def test_build_template_context_different_proteins_give_different_distograms(
 def test_build_template_context_full_ca_mask_gives_all_ones_pseudo_beta_mask(
     template_ctx: TemplateContext,
 ):
-    """When all atoms (including Cα) are present, every residue must have pseudo-β mask value 1."""
+    """When all atoms (including alpha C) are present, every residue has pseudo-β mask value 1."""
     assert (template_ctx.f_pseudo_beta_mask == 1).all()
 
 
@@ -1545,8 +1550,8 @@ def test_partial_templ_no_seq_context_shape(partial_templ_no_seq_ctx: Featurized
 def test_partial_templ_no_seq_distogram_has_template_info(
     partial_templ_no_seq_ctx: FeaturizedBatch,
 ):
-    """N_PARTIAL × N_PARTIAL top-left block of distogram is non-zero (encoded from the template)."""
-    # Top-left N_PARTIAL × N_PARTIAL block is from the template → not all zeros
+    """N_PARTIAL by N_PARTIAL top-left block of distogram is non-zero (encoded from template)."""
+    # Top-left N_PARTIAL by N_PARTIAL block is from the template → not all zeros
     assert not (partial_templ_no_seq_ctx.gt_res_distogram[0, :N_PARTIAL, :N_PARTIAL] == 0).all()
 
 
@@ -1614,7 +1619,7 @@ def test_full_templ_has_more_distogram_signal_than_partial_templ(
     full_templ_no_seq_ctx: FeaturizedBatch, partial_templ_no_seq_ctx: FeaturizedBatch
 ):
     """Full template distogram contains more non-zero entries than partial template distogram."""
-    # Full template has non-zero entries across the whole N_RES × N_RES distogram;
+    # Full template has non-zero entries across the whole N_RES by N_RES distogram;
     # the partial template has zeros in the padded rows/cols.  Sum of non-zero
     # entries must therefore be strictly greater for the full template.
     full_nonzero = (full_templ_no_seq_ctx.gt_res_distogram != 0).sum()
@@ -1642,14 +1647,14 @@ def test_full_atoms_partial_templ_residue_mask_all_true(
 
 
 def test_full_atoms_partial_templ_distogram_shape(full_atoms_partial_templ_ctx: FeaturizedBatch):
-    """Template distogram must still span full N_RES × N_RES space even with partial template."""
+    """Template distogram must still span full N_RES by N_RES space even with partial template."""
     assert full_atoms_partial_templ_ctx.gt_res_distogram.shape == (1, N_RES, N_RES, N_TEMPL_BINS)
 
 
 def test_full_atoms_partial_templ_distogram_has_template_info(
     full_atoms_partial_templ_ctx: FeaturizedBatch,
 ):
-    """Top-left N_PARTIAL × N_PARTIAL block encodes actual template distances (not all zero)."""
+    """Top-left N_PARTIAL by N_PARTIAL block encodes actual template distances (not all zero)."""
     assert not (full_atoms_partial_templ_ctx.gt_res_distogram[0, :N_PARTIAL, :N_PARTIAL] == 0).all()
 
 

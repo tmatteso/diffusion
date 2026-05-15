@@ -1,22 +1,24 @@
 """Script to compute and cache EDM noise schedule data parameters."""
 
 import argparse
+from collections.abc import Mapping
 
 import numpy as np
 import torch
 from einops import rearrange, reduce
 from helpers.data import make_data_loaders
+from helpers.featurize import ProteinBatch
 from train.train_config import TrainConfig
 
 
-def compute_sigma_data(train_loader: torch.utils.data.DataLoader) -> float:
+def compute_sigma_data(train_loader: torch.utils.data.DataLoader[ProteinBatch]) -> float:
     """RMS displacement of valid atom positions from the CA centroid."""
     sum_sq = 0.0
     count = 0
 
     for batch in train_loader:
-        atom_positions: torch.Tensor = batch["atom_positions"]  # (B, N_res, 37, 3)
-        atom_mask: torch.Tensor = batch["atom_mask"]  # (B, N_res, 37)
+        atom_positions: torch.Tensor = batch.atom_positions  # (B, N_res, 37, 3)
+        atom_mask: torch.Tensor = batch.atom_mask  # (B, N_res, 37)
         sq = reduce(atom_positions**2, "b n a d -> b n a", "sum")
         sum_sq += reduce(sq * atom_mask, "b n a -> ", "sum").item()
         count += atom_mask.sum().item()
@@ -24,7 +26,9 @@ def compute_sigma_data(train_loader: torch.utils.data.DataLoader) -> float:
     return (sum_sq / count) ** 0.5
 
 
-def compute_edm_noise_params(train_loader: torch.utils.data.DataLoader) -> dict:
+def compute_edm_noise_params(
+    train_loader: torch.utils.data.DataLoader[ProteinBatch],
+) -> Mapping[str, float]:
     """Fit sigma_max, sigma_min, P_mean, P_std from the training coordinate distribution.
 
     - sigma_max : 99th-percentile per-atom distance from the CA centroid
@@ -36,8 +40,8 @@ def compute_edm_noise_params(train_loader: torch.utils.data.DataLoader) -> dict:
     pairwise_dists: list[torch.Tensor] = []
 
     for batch in train_loader:
-        atom_positions: torch.Tensor = batch["atom_positions"]  # (B, N_res, 37, 3)
-        atom_mask: torch.Tensor = batch["atom_mask"]  # (B, N_res, 37)
+        atom_positions: torch.Tensor = batch.atom_positions  # (B, N_res, 37, 3)
+        atom_mask: torch.Tensor = batch.atom_mask  # (B, N_res, 37)
         dist = atom_positions.norm(dim=-1)  # (B, N_res, 37)
         valid = atom_mask.bool()
         dists_from_center.append(dist[valid].cpu().float())

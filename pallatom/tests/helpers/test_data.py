@@ -5,6 +5,7 @@ import math
 import os
 import pathlib
 import pickle
+from collections.abc import Mapping
 
 import numpy as np
 import pytest
@@ -23,7 +24,7 @@ _TEST_NAMES = ["5ee.A"]
 _N_DEBUG = 252  # debug_run sampler uses SubsetRandomSampler(range(252))
 
 
-def _make_coords(n: int) -> dict:
+def _make_coords(n: int) -> Mapping[str, list[list[float]]]:
     return {atom: np.random.randn(n, 3).tolist() for atom in ("N", "CA", "C", "O")}
 
 
