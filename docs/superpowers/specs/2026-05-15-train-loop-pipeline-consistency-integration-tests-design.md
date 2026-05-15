@@ -30,56 +30,22 @@ Add 11 integration tests to a new file
 
 | File | Change |
 |---|---|
-| `pallatom/tests/train/test_train_integration.py` | New file — 11 integration tests |
+| `pallatom/tests/train/test_train_loop.py` | Add 11 integration tests + 2 new fixtures at the bottom |
 
 ---
 
 ## Fixtures
 
-All fixtures follow the module-level-function + pytest-fixture convention from
-`pallatom/tests/CLAUDE.md`.
+All existing fixtures (`mini_batch`, `model`, `distogram_res`, `distogram_atom`, `loader`,
+`tcfg`, `tcfg_multi`, `ddp_loader`, `_FakeDDP`, `_MockSampler`, `_patch_ddp`) are already defined
+in `test_train_loop.py` and are reused directly.
 
-### Constants (reuse existing values from `test_train_loop.py`)
-
-```python
-_N_KEEP    = 16
-_C_RES     = 32
-_C_ATOM    = 32
-_C_PAIR    = 32
-_C_ATOMPAIR = 16
-_F_REF_DIM = 35
-_N_BINS    = 8
-_N_ATOM_BINS = 5
-_K_UNIT    = 1
-```
-
-### New fixtures
-
-**`mini_batch`** — single-item batch, 16 residues, same shape as `test_train_loop.py`.
+### New fixtures added to `test_train_loop.py`
 
 **`multi_loader`** — `DataLoader` backed by 3 identical copies of `mini_batch`, `batch_size=None`.
-Used by the metrics-averaging tests.
+Used by the metrics-averaging tests (tests 4 and 11).
 
-**`single_loader`** — `DataLoader` backed by 1 copy of `mini_batch`, `batch_size=None`.
-
-**`model`** — `MainTrunk` with the constants above.
-
-**`distogram_res`** / **`distogram_atom`** — eval-mode `Distogram` instances.
-
-**`tcfg_1ep`** — 1 epoch, `use_wandb=False`, `grad_clip=1.0`, `save_every=100`.
-
-**`tcfg_3ep`** — 3 epochs, `use_wandb=False`, `grad_clip=1.0`, `save_every=100`.
-
-**`tcfg_save_every_1`** — 1 epoch, `use_wandb=False`, `save_every=1`.
-
-**`ddp_loader`** — `DataLoader` backed by `_MockSampler` (copy from `test_train_loop.py` pattern).
-
-### Infrastructure reused from `test_train_loop.py` (copy into new file)
-
-- `_ListDataset` — `Dataset` wrapper around a list of `ProteinBatch` items.
-- `_FakeDDP` — CPU-compatible DDP stand-in that exposes `.module`.
-- `_MockSampler` — sampler with `.set_epoch()`.
-- `_patch_ddp` autouse fixture — monkeypatches `train.train_loop.DDP` → `_FakeDDP`.
+**`tcfg_save_every_1`** — already exists as `tcfg_save` in the file; reuse that name directly.
 
 ---
 
