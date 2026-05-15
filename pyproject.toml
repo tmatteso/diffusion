@@ -125,15 +125,13 @@ extraPaths = ["pallatom"]
 typeCheckingMode = "basic"           # baseline: enables ~30 fundamental checks
 reportInvalidTypeForm = "none" # allows shape strings for jaxtyping compatibility.
 reportIndexIssue = "none" # allows complex pytorch tensor indexing patterns.
-reportConstantRedefinition = "none" # come back to this
-# "error" # Final enforcement — error if a Final variable is reassigned
+reportConstantRedefinition = "error" # Final enforcement — error if a Final variable is reassigned
 
 # No Any
 # reportUnknownVariableType = "warning" # does not play well with jaxtyping
 # reportUnknownParameterType = "warning" # contamination from untyped libraries
 # reportUnknownMemberType = "warning" # contamination from untyped libraries
-reportUnnecessaryTypeIgnoreComment = "none" # come back to this
-# "warning" # aren't ignoring type errors without a specific reason.
+reportUnnecessaryTypeIgnoreComment = "warning" # aren't ignoring type errors without a specific reason.
 
 strictParameterNoneValue = true # prevents accessing attributes that might not exist at runtime.
 reportUninitializedInstanceVariable = "warning" # class attributes are initialized in __init__.
@@ -145,8 +143,8 @@ reportIncompatibleVariableOverride = "warning"
 
 # Ensures that if you use a generic like dict[], the inner types are also validated
 # This is key for catching things like dict[str, Any] which bypasses variance checks
-reportUnknownArgumentType = "none" #come back to this "warning"
-reportUnknownLambdaType = "none" # come back to this "warning"
+reportUnknownArgumentType = "warning"
+reportUnknownLambdaType = "warning"
 
 # Google Style / Strictness: prevent mixing positional and keyword-only args
 # in ways that break covariance in callbacks.

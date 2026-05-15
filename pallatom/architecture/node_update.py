@@ -11,6 +11,33 @@ from beartype import beartype
 from einops import einsum, rearrange
 from jaxtyping import Float, jaxtyped
 
+
+class AdaLN(nn.Module):
+    """Adaptive LayerNorm — Algorithm 26.
+
+    Normalises a conditioned on s:
+        norm_a(a) scaled and shifted by functions of norm_s(s).
+    """
+
+    def __init__(self, c_a: int, c_s: int) -> None:
+        super().__init__()
+        self.norm_a = nn.LayerNorm(c_a, elementwise_affine=False)
+        self.norm_s = nn.LayerNorm(c_s, bias=False)
+        self.to_scale = nn.Linear(c_s, c_a)
+        self.to_shift = LinearNoBias(c_s, c_a)
+
+    @jaxtyped(typechecker=beartype)
+    def forward(
+        self,
+        a: Float[torch.Tensor, "B N_res c_a"],
+        s: Float[torch.Tensor, "B N_res c_s"],
+    ) -> Float[torch.Tensor, "B N_res c_a"]:
+        """Apply adaptive layer norm: scale and shift `a` using gated projections of `s`."""
+        a = self.norm_a(a)
+        s = self.norm_s(s)
+        return torch.sigmoid(self.to_scale(s)) * a + self.to_shift(s)
+
+
 # ---------------------------------------------------------------------------
 # AttentionPairBias
 # ---------------------------------------------------------------------------
@@ -27,78 +54,89 @@ class AttentionPairBias(nn.Module):
 
     Parameters
     ----------
-    c       : single embedding dim  (default 256)
+    c_res   : single embedding dim  (default 256)
     c_pair  : pair   embedding dim
     n_heads : number of attention heads (default 8 per Algorithm 6)
     """
 
-    def __init__(self, c: int, c_pair: int, n_heads: int = 8) -> None:
+    def __init__(self, c_res: int, c_pair: int, n_heads: int = 8) -> None:
         super().__init__()
-        assert c % n_heads == 0, "c must be divisible by n_heads"
+        assert c_res % n_heads == 0, "c_res must be divisible by n_heads"
         self.n_heads = n_heads
-        self.head_dim = c // n_heads
+        self.head_dim = c_res // n_heads
 
-        self.norm_s = nn.LayerNorm(c)
-        self.norm_t = nn.LayerNorm(c)
+        self.adaLN = AdaLN(c_a=c_res, c_s=c_res)
+        self.norm_a = nn.LayerNorm(c_res)
+        self.a_to_q = nn.Linear(c_res, c_res)
+        self.a_to_k = nn.Linear(c_res, c_res)
+        self.a_to_v = nn.Linear(c_res, c_res)
+        self.z_to_b = LinearNoBias(c_pair, self.n_heads)
+        self.a_to_g = LinearNoBias(c_res, c_res)
+        self.s_to_a = nn.Linear(c_res, c_res)  # biasinit=-2.0
+        self.out_to_a = LinearNoBias(c_res, c_res)
+
         self.norm_z = nn.LayerNorm(c_pair)
-
-        # Time conditioning: project t_i → query bias
-        self.proj_t = LinearNoBias(c, c)
-
-        # QKV projections (no bias, as throughout AF3)
-        self.to_q = LinearNoBias(c, c)
-        self.to_k = LinearNoBias(c, c)
-        self.to_v = LinearNoBias(c, c)
-
-        # Pair → per-head scalar bias  (β_ij = 0 means purely additive, no extra gate)
-        self.to_bias = LinearNoBias(c_pair, n_heads)
-
-        # Gating on output (standard in AF3 attention)
-        self.to_g = nn.Linear(c, c)  # gating (bias allowed)
-        self.to_out = LinearNoBias(c, c)
 
     @jaxtyped(typechecker=beartype)
     def forward(
         self,
-        s: Float[torch.Tensor, "B N_res c_res"],
-        t: Float[torch.Tensor, "B N_res c_res"],
+        a: Float[torch.Tensor, "B N_res c_res"],
+        s: Float[torch.Tensor, "B N_res c_res"] | None,
         z: Float[torch.Tensor, "B N_res N_res c_pair"],
+        # beta_ij? (β_ij = 0 means purely additive, no extra gate)
     ) -> Float[torch.Tensor, "B N_res c_res"]:
         """Compute time-conditioned pair-biased attention over residue single embeddings."""
-        H, D = self.n_heads, self.head_dim
-
         # Inject time conditioning into queries
-        sn: Float[torch.Tensor, "B N_res c_res"] = self.norm_s(s) + self.proj_t(self.norm_t(t))
+        a = self.adaLN(a, s) if s is not None else self.norm_a(a)
 
-        Q: Float[torch.Tensor, "B N_res n_heads head_dim"] = rearrange(
-            self.to_q(sn), "b n (h d) -> b n h d", h=H
+        q: Float[torch.Tensor, "B N_res n_heads head_dim"] = rearrange(
+            self.a_to_q(a),
+            "B N_res (n_heads head_dim) -> B N_res n_heads head_dim",
+            n_heads=self.n_heads,
         )
-        K: Float[torch.Tensor, "B N_res n_heads head_dim"] = rearrange(
-            self.to_k(sn), "b n (h d) -> b n h d", h=H
+        k: Float[torch.Tensor, "B N_res n_heads head_dim"] = rearrange(
+            self.a_to_k(a),
+            "B N_res (n_heads head_dim) -> B N_res n_heads head_dim",
+            n_heads=self.n_heads,
         )
-        V: Float[torch.Tensor, "B N_res n_heads head_dim"] = rearrange(
-            self.to_v(sn), "b n (h d) -> b n h d", h=H
+        v: Float[torch.Tensor, "B N_res n_heads head_dim"] = rearrange(
+            self.a_to_v(a),
+            "B N_res (n_heads head_dim) -> B N_res n_heads head_dim",
+            n_heads=self.n_heads,
         )
-        G: Float[torch.Tensor, "B N_res c_res"] = torch.sigmoid(self.to_g(sn))
-
+        bias: Float[torch.Tensor, "B n_heads N_res N_res"] = rearrange(
+            self.z_to_b(self.norm_z(z)),
+            "B N_i N_j n_heads -> B n_heads N_i N_j",
+        )  # + beta_ij would go here if added
+        g: Float[torch.Tensor, "B N_res n_heads head_dim"] = torch.sigmoid(
+            rearrange(
+                self.a_to_g(a),
+                "B N_res (n_heads head_dim) -> B N_res n_heads head_dim",
+                n_heads=self.n_heads,
+            )
+        )
         # Attention logits: (B, h, N_q, N_k)
         attn: Float[torch.Tensor, "B n_heads N_res N_res"] = einsum(
-            Q, K, "b n_q h d, b n_k h d -> b h n_q n_k"
-        ) / math.sqrt(D)
+            q, k, "B N_q n_heads head_dim, B N_k n_heads head_dim -> B n_heads N_q N_k"
+        ) / math.sqrt(self.head_dim)
 
-        # Additive pair bias: (B, N_res, N_res, n_heads) → (B, h, N_q, N_k)
-        bias: Float[torch.Tensor, "B n_heads N_res N_res"] = rearrange(
-            self.to_bias(self.norm_z(z)), "b n_q n_k h -> b h n_q n_k"
-        )
         attn: Float[torch.Tensor, "B n_heads N_res N_res"] = F.softmax(attn + bias, dim=-1)
-
-        # Weighted sum → (B, N_res, c_res)
-        out: Float[torch.Tensor, "B N_res c_res"] = rearrange(
-            einsum(attn, V, "b h n_q n_k, b n_k h d -> b n_q h d"),
-            "b n h d -> b n (h d)",
+        # attn @ v
+        intermediate: Float[torch.Tensor, "B N_res n_heads head_dim"] = einsum(
+            attn, v, "B n_heads N_q N_k, B N_k n_heads head_dim -> B N_q n_heads head_dim"
         )
-        out: Float[torch.Tensor, "B N_res c_res"] = G * out
-        return self.to_out(out)
+        # then multiply by g
+        intermediate = g * intermediate
+        # concat over n_heads
+        out: Float[torch.Tensor, "B N_res c_res"] = rearrange(
+            intermediate,
+            "B N_q n_heads head_dim -> B N_q (n_heads head_dim)",  # c_res = n_heads * head_dim
+        )
+        a = self.out_to_a(out)
+
+        if s is not None:
+            return torch.sigmoid(self.s_to_a(s)) * a
+        return a
 
 
 # ---------------------------------------------------------------------------

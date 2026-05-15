@@ -22,8 +22,8 @@ from jaxtyping import Bool, Float, jaxtyped
 
 @jaxtyped(typechecker=beartype)
 def kabsch_rotation(
-    P: Float[torch.Tensor, "... N 3"],
-    Q: Float[torch.Tensor, "... N 3"],
+    mobile: Float[torch.Tensor, "... N 3"],
+    reference: Float[torch.Tensor, "... N 3"],
     weights: Float[torch.Tensor, "... N"] | None = None,
 ) -> Float[torch.Tensor, "... 3 3"]:
     """Compute optimal rotation matrix R that minimises RMSD between P and Q after centering.
@@ -32,8 +32,8 @@ def kabsch_rotation(
         ||W^(1/2) (P @ R.T - Q)||_F  is minimised
 
     Args:
-        P:        (..., N, 3) — mobile structure (will be rotated).
-        Q:        (..., N, 3) — target/reference structure.
+        mobile (P):        (..., N, 3) — mobile structure (will be rotated).
+        reference (Q):        (..., N, 3) — target/reference structure.
         weights:  (..., N)    — per-residue weights (optional, non-negative).
                                Useful for masking missing residues or
                                down-weighting flexible loops.
@@ -50,26 +50,26 @@ def kabsch_rotation(
     """
     if weights is not None:
         w = weights / (reduce(weights, "... n -> ... 1", "sum") + 1e-8)
-        H = torch.einsum("...ni,...nj->...ij", P * rearrange(w, "... n -> ... n 1"), Q)
+        h = torch.einsum("...ni,...nj->...ij", mobile * rearrange(w, "... n -> ... n 1"), reference)
     else:
-        H = torch.einsum("...ni,...nj->...ij", P, Q)
+        h = torch.einsum("...ni,...nj->...ij", mobile, reference)
 
     # SVD:  H = U S V^T
-    U, S, Vh = torch.linalg.svd(H)  # (...,3,3), (...,3), (...,3,3)
-    V = Vh.mH  # V = Vh^H (conjugate transpose)
+    u, s, v_h = torch.linalg.svd(h)  # (...,3,3), (...,3), (...,3,3)
+    v = v_h.mH  # V = Vh^H (conjugate transpose)
 
     # Correct for improper rotation (reflection) when det < 0
-    d = torch.linalg.det(torch.einsum("...ij,...jk->...ik", V, U.mH))
-    sign = torch.ones_like(d)
-    sign[d < 0] = -1.0
+    det = torch.linalg.det(torch.einsum("...ij,...jk->...ik", v, u.mH))
+    sign = torch.ones_like(det)
+    sign[det < 0] = -1.0
 
     # Build diagonal correction matrix: diag(1, 1, sign)
-    ones = torch.ones(*sign.shape, 2, device=P.device, dtype=P.dtype)
+    ones = torch.ones(*sign.shape, 2, device=mobile.device, dtype=mobile.dtype)
     diag_vals = torch.cat([ones, sign.unsqueeze(-1)], dim=-1)  # (..., 3)
-    D = torch.diag_embed(diag_vals)  # (..., 3, 3)
+    diag = torch.diag_embed(diag_vals)  # (..., 3, 3)
 
-    VD = torch.einsum("...ij,...jk->...ik", V, D)
-    return torch.einsum("...ij,...jk->...ik", VD, U.mH)  # (..., 3, 3)
+    v_diag = torch.einsum("...ij,...jk->...ik", v, diag)
+    return torch.einsum("...ij,...jk->...ik", v_diag, u.mH)  # (..., 3, 3)
 
 
 @jaxtyped(typechecker=beartype)
@@ -133,16 +133,16 @@ def kabsch_align(
 
 @jaxtyped(typechecker=beartype)
 def rmsd(
-    P: Float[torch.Tensor, "... N 3"],
-    Q: Float[torch.Tensor, "... N 3"],
+    predicted: Float[torch.Tensor, "... N 3"],
+    reference: Float[torch.Tensor, "... N 3"],
     weights: Float[torch.Tensor, "... N"] | None = None,
     mask: Bool[torch.Tensor, "... N"] | None = None,
 ) -> torch.Tensor:
     """Root-mean-square deviation between two (already aligned) coordinate sets.
 
     Args:
-        P:       (..., N, 3) — predicted / mobile coordinates.
-        Q:       (..., N, 3) — reference coordinates.
+        predicted:       (..., N, 3) — predicted / mobile coordinates.
+        reference:       (..., N, 3) — reference coordinates.
         weights: (..., N)    — per-residue weights (optional).
         mask:    (..., N)    — boolean mask; True = include residue (optional).
                                Applied on top of weights.
@@ -153,12 +153,12 @@ def rmsd(
     """
     if mask is not None:
         m = rearrange(mask.float(), "... n -> ... n 1")
-        P = P * m
-        Q = Q * m
+        predicted = predicted * m
+        reference = reference * m
         if weights is not None:
             weights = weights * mask.float()
 
-    sq_dev = reduce((P - Q) ** 2, "... n d -> ... n", "sum")  # (..., N)
+    sq_dev = reduce((predicted - reference) ** 2, "... n d -> ... n", "sum")  # (..., N)
 
     if weights is not None:
         w = weights / (reduce(weights, "... n -> ... 1", "sum") + 1e-8)

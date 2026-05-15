@@ -116,7 +116,7 @@ def test_pairformer_stack_preserves_shape():
     """PairformerStack used inside template embedder preserves the [B, N_res, N_res, C] shape."""
     stack = PairformerStack(c=C, n_blocks=N_BLOCKS, n_heads=N_HEADS)
     v = torch.randn(B, N_RES, N_RES, C)
-    out = stack(v)
+    out = stack(s=None, z=v)
     assert out.shape == (B, N_RES, N_RES, C)
     assert torch.isfinite(out).all()
 
@@ -125,14 +125,14 @@ def test_pairformer_stack_output_differs_from_input():
     """PairformerStack applies a non-trivial transform — output is distinct from the input."""
     stack = PairformerStack(c=C, n_blocks=N_BLOCKS, n_heads=N_HEADS)
     v = torch.randn(B, N_RES, N_RES, C)
-    assert not torch.allclose(stack(v), v)
+    assert not torch.allclose(stack(s=None, z=v), v)
 
 
 def test_pairformer_stack_gradient_flows():
     """Gradients flow through the PairformerStack back to its pair embedding input."""
     stack = PairformerStack(c=C, n_blocks=N_BLOCKS, n_heads=N_HEADS)
     v = torch.randn(B, N_RES, N_RES, C, requires_grad=True)
-    reduce(stack(v), "b n m c -> ", "sum").backward()
+    reduce(stack(s=None, z=v), "b n m c -> ", "sum").backward()
     assert v.grad is not None
     assert torch.isfinite(v.grad).all()
 

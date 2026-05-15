@@ -2,16 +2,31 @@
 
 import io
 import json
+from collections.abc import Mapping
 from pathlib import Path
+from typing import cast
 
 import torch
 import torch.utils.data
 from helpers.atom_utils import center_positions, make_fixed_size, make_np_example
+from helpers.featurize import ProteinBatch
 from torch.utils.data.distributed import DistributedSampler
 from train.train_config import TrainConfig
 
 
-class ProteinDataset(torch.utils.data.Dataset):
+def _to_protein_batch(samples: list[Mapping[str, torch.Tensor | str]]) -> ProteinBatch:
+    """Collate a list of per-protein dicts into a ProteinBatch."""
+    return ProteinBatch(
+        atom_positions=torch.stack(
+            cast(list[torch.Tensor], [s["atom_positions"] for s in samples])
+        ),
+        atom_mask=torch.stack(cast(list[torch.Tensor], [s["atom_mask"] for s in samples])),
+        residue_index=torch.stack(cast(list[torch.Tensor], [s["residue_index"] for s in samples])),
+        seq=cast(list[str], [s["seq"] for s in samples]),
+    )
+
+
+class ProteinDataset(torch.utils.data.Dataset[Mapping[str, torch.Tensor | str]]):
     """Lazy-loading Dataset backed by a JSONL file.
 
     Scans the file once at construction to build a name→byte-offset index
@@ -60,7 +75,7 @@ class ProteinDataset(torch.utils.data.Dataset):
         if self._file is None:
             self._file = open(self.jsonl_path, "rb")  # noqa: SIM115
 
-    def __getstate__(self) -> dict:
+    def __getstate__(self) -> dict[str, object]:
         """Return picklable state with the open file handle set to None."""
         state = self.__dict__.copy()
         state["_file"] = None
@@ -77,7 +92,7 @@ class ProteinDataset(torch.utils.data.Dataset):
         """Return the number of entries in the dataset."""
         return len(self._offsets)
 
-    def __getitem__(self, idx: int) -> dict:
+    def __getitem__(self, idx: int) -> Mapping[str, torch.Tensor | str]:
         """Return the parsed JSON entry at the given index."""
         self._open()
         self._file.seek(self._offsets[idx])  # type: ignore[union-attr]
@@ -99,9 +114,9 @@ def make_data_loaders(
     num_workers: int = 0,
     debug_run: bool = True,
 ) -> tuple[
-    torch.utils.data.DataLoader,
-    torch.utils.data.DataLoader,
-    torch.utils.data.DataLoader,
+    torch.utils.data.DataLoader[ProteinBatch],
+    torch.utils.data.DataLoader[ProteinBatch],
+    torch.utils.data.DataLoader[ProteinBatch],
 ]:
     """Build train, validation, and test DataLoaders from a JSONL file and a splits JSON.
 
@@ -145,6 +160,7 @@ def make_data_loaders(
             sampler=subset_sampler,
             num_workers=num_workers,
             pin_memory=True,
+            collate_fn=_to_protein_batch,
         )
         val_loader = torch.utils.data.DataLoader(
             val_set,
@@ -152,6 +168,7 @@ def make_data_loaders(
             sampler=subset_sampler,
             num_workers=num_workers,
             pin_memory=True,
+            collate_fn=_to_protein_batch,
         )
         test_loader = torch.utils.data.DataLoader(
             test_set,
@@ -159,6 +176,7 @@ def make_data_loaders(
             sampler=subset_sampler,
             num_workers=num_workers,
             pin_memory=True,
+            collate_fn=_to_protein_batch,
         )
 
     else:
@@ -168,6 +186,7 @@ def make_data_loaders(
             shuffle=True,
             num_workers=num_workers,
             pin_memory=True,
+            collate_fn=_to_protein_batch,
         )
         val_loader = torch.utils.data.DataLoader(
             val_set,
@@ -175,6 +194,7 @@ def make_data_loaders(
             shuffle=False,
             num_workers=num_workers,
             pin_memory=True,
+            collate_fn=_to_protein_batch,
         )
         test_loader = torch.utils.data.DataLoader(
             test_set,
@@ -182,9 +202,17 @@ def make_data_loaders(
             shuffle=False,
             num_workers=num_workers,
             pin_memory=True,
+            collate_fn=_to_protein_batch,
         )
 
-    return train_loader, val_loader, test_loader
+    return cast(
+        tuple[
+            torch.utils.data.DataLoader[ProteinBatch],
+            torch.utils.data.DataLoader[ProteinBatch],
+            torch.utils.data.DataLoader[ProteinBatch],
+        ],
+        (train_loader, val_loader, test_loader),
+    )
 
 
 def make_ddp_data_loaders(
@@ -195,9 +223,9 @@ def make_ddp_data_loaders(
     world_size: int,
     num_workers: int = 0,
 ) -> tuple[
-    torch.utils.data.DataLoader,
-    torch.utils.data.DataLoader,
-    torch.utils.data.DataLoader,
+    torch.utils.data.DataLoader[ProteinBatch],
+    torch.utils.data.DataLoader[ProteinBatch],
+    torch.utils.data.DataLoader[ProteinBatch],
 ]:
     """Build train/val/test DataLoaders backed by DistributedSampler for DDP training."""
     with open(splits_path) as f:
@@ -223,6 +251,7 @@ def make_ddp_data_loaders(
         sampler=train_sampler,
         num_workers=num_workers,
         pin_memory=True,
+        collate_fn=_to_protein_batch,
     )
     val_loader = torch.utils.data.DataLoader(
         val_set,
@@ -230,6 +259,7 @@ def make_ddp_data_loaders(
         sampler=val_sampler,
         num_workers=num_workers,
         pin_memory=True,
+        collate_fn=_to_protein_batch,
     )
     test_loader = torch.utils.data.DataLoader(
         test_set,
@@ -237,8 +267,16 @@ def make_ddp_data_loaders(
         sampler=test_sampler,
         num_workers=num_workers,
         pin_memory=True,
+        collate_fn=_to_protein_batch,
     )
-    return train_loader, val_loader, test_loader
+    return cast(
+        tuple[
+            torch.utils.data.DataLoader[ProteinBatch],
+            torch.utils.data.DataLoader[ProteinBatch],
+            torch.utils.data.DataLoader[ProteinBatch],
+        ],
+        (train_loader, val_loader, test_loader),
+    )
 
 
 class _FileLogProcessor:
@@ -264,6 +302,8 @@ class _FileLogProcessor:
     def __exit__(self, *_: object) -> None:
         self._f.close()
 
-    def __call__(self, _logger: object, _method: str | None, event_dict: dict) -> dict:
+    def __call__(
+        self, _logger: object, _method: str | None, event_dict: dict[str, object]
+    ) -> dict[str, object]:
         self._f.write(json.dumps(event_dict) + "\n")
         return event_dict

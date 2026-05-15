@@ -3,6 +3,7 @@
 import math
 import os
 import pathlib
+from collections.abc import Mapping
 from typing import Any, cast
 from unittest.mock import MagicMock
 
@@ -12,6 +13,7 @@ import torch.distributed as dist_module
 import torch.nn as nn
 import torch.nn.parallel
 from architecture.main_trunk import MainTrunk
+from helpers.data import _to_protein_batch
 from helpers.featurize import Distogram, ProteinBatch, apply_conditioning_dropout, featurize_batch
 from train.train_config import (
     CheckpointParams,
@@ -21,7 +23,6 @@ from train.train_config import (
     TrainingParams,
 )
 from train.train_loop import (
-    _to_protein_batch,
     evaluate,
     evaluate_ddp,
     train,
@@ -54,15 +55,21 @@ EXPECTED_EVAL_KEYS = frozenset(
 )
 
 
-class _ListDataset(torch.utils.data.Dataset[dict]):
-    def __init__(self, items: list[dict]) -> None:
+class _ListDataset(torch.utils.data.Dataset[ProteinBatch]):
+    def __init__(self, items: list[Mapping[str, torch.Tensor | list[str]]]) -> None:
         self._items = items
 
     def __len__(self) -> int:
         return len(self._items)
 
-    def __getitem__(self, idx: int) -> dict:
-        return self._items[idx]
+    def __getitem__(self, idx: int) -> ProteinBatch:
+        item = self._items[idx]
+        return ProteinBatch(
+            atom_positions=cast(torch.Tensor, item["atom_positions"]),
+            atom_mask=cast(torch.Tensor, item["atom_mask"]),
+            residue_index=cast(torch.Tensor, item["residue_index"]),
+            seq=cast(list[str], item["seq"]),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -120,7 +127,18 @@ def tcfg(tmp_path: pathlib.Path) -> TrainConfig:
 
 
 @pytest.fixture
-def mini_batch() -> dict:
+def single_sample() -> Mapping[str, torch.Tensor | str]:
+    """Provide single unbatched protein sample (no batch dimension) for _to_protein_batch tests."""
+    return {
+        "atom_positions": torch.randn(_N_KEEP, 37, 3),
+        "atom_mask": torch.ones(_N_KEEP, 37),
+        "residue_index": torch.arange(_N_KEEP, dtype=torch.float32),
+        "seq": ("ACDEFGHIKLMNPQRSTVWY" * (_N_KEEP // 20 + 1))[:_N_KEEP],
+    }
+
+
+@pytest.fixture
+def mini_batch() -> Mapping[str, torch.Tensor | list[str]]:
     """Provide a single-item mini-batch of random tensors with _N_KEEP residues."""
     return {
         "atom_positions": torch.randn(1, _N_KEEP, 37, 3),
@@ -131,11 +149,11 @@ def mini_batch() -> dict:
 
 
 @pytest.fixture
-def loader(mini_batch: dict) -> torch.utils.data.DataLoader:
+def loader(
+    mini_batch: Mapping[str, torch.Tensor | list[str]]
+) -> torch.utils.data.DataLoader[ProteinBatch]:
     """Provide a DataLoader that yields the mini_batch as a single batch."""
-    return torch.utils.data.DataLoader(
-        _ListDataset([mini_batch]), batch_size=None, collate_fn=lambda x: x
-    )
+    return torch.utils.data.DataLoader(_ListDataset([mini_batch]), batch_size=None)
 
 
 @pytest.fixture
@@ -253,45 +271,62 @@ def tcfg_save(tmp_path: pathlib.Path) -> TrainConfig:
 # ---------------------------------------------------------------------------
 
 
-def test_to_protein_batch_returns_protein_batch(mini_batch: dict) -> None:
+def test_to_protein_batch_returns_protein_batch(
+    single_sample: Mapping[str, torch.Tensor | str]
+) -> None:
     """Ensures _to_protein_batch returns a ProteinBatch dataclass instance."""
-    assert isinstance(_to_protein_batch(mini_batch), ProteinBatch)
+    assert isinstance(_to_protein_batch([single_sample]), ProteinBatch)
 
 
-def test_to_protein_batch_atom_positions_shape(mini_batch: dict) -> None:
-    """Ensures _to_protein_batch preserves the atom_positions shape from the raw batch dict."""
-    result = _to_protein_batch(mini_batch)
-    assert result.atom_positions.shape == mini_batch["atom_positions"].shape
+def test_to_protein_batch_atom_positions_shape(
+    single_sample: Mapping[str, torch.Tensor | str]
+) -> None:
+    """Ensures _to_protein_batch stacks atom_positions into batched tensor w/ leading batch dim."""
+    result = _to_protein_batch([single_sample])
+    assert result.atom_positions.shape == torch.Size(
+        [1, *cast(torch.Tensor, single_sample["atom_positions"]).shape]
+    )
 
 
-def test_to_protein_batch_atom_mask_shape(mini_batch: dict) -> None:
-    """Ensures _to_protein_batch preserves the atom_mask shape from the raw batch dict."""
-    result = _to_protein_batch(mini_batch)
-    assert result.atom_mask.shape == mini_batch["atom_mask"].shape
+def test_to_protein_batch_atom_mask_shape(single_sample: Mapping[str, torch.Tensor | str]) -> None:
+    """Ensures _to_protein_batch stacks atom_mask into a batched tensor with a leading batch dim."""
+    result = _to_protein_batch([single_sample])
+    assert result.atom_mask.shape == torch.Size(
+        [1, *cast(torch.Tensor, single_sample["atom_mask"]).shape]
+    )
 
 
-def test_to_protein_batch_residue_index_shape(mini_batch: dict) -> None:
-    """Ensures _to_protein_batch preserves the residue_index shape from the raw batch dict."""
-    result = _to_protein_batch(mini_batch)
-    assert result.residue_index.shape == mini_batch["residue_index"].shape
+def test_to_protein_batch_residue_index_shape(
+    single_sample: Mapping[str, torch.Tensor | str]
+) -> None:
+    """Ensures _to_protein_batch stacks residue_index into batched tensor with leading batch dim."""
+    result = _to_protein_batch([single_sample])
+    assert result.residue_index.shape == torch.Size(
+        [1, *cast(torch.Tensor, single_sample["residue_index"]).shape]
+    )
 
 
-def test_to_protein_batch_seq_is_list(mini_batch: dict) -> None:
+def test_to_protein_batch_seq_is_list(single_sample: Mapping[str, torch.Tensor | str]) -> None:
     """Ensures _to_protein_batch wraps the sequence field into a Python list."""
-    result = _to_protein_batch(mini_batch)
+    result = _to_protein_batch([single_sample])
     assert isinstance(result.seq, list)
 
 
-def test_to_protein_batch_seq_elements_are_strings(mini_batch: dict) -> None:
+def test_to_protein_batch_seq_elements_are_strings(
+    single_sample: Mapping[str, torch.Tensor | str]
+) -> None:
     """Ensures _to_protein_batch contains only str elements in the seq list."""
-    result = _to_protein_batch(mini_batch)
+    result = _to_protein_batch([single_sample])
     assert all(isinstance(s, str) for s in result.seq)
 
 
-def test_to_protein_batch_seq_length_matches_batch_size(mini_batch: dict) -> None:
-    """Ensures _to_protein_batch seq list has one entry per item in the batch dimension."""
-    result = _to_protein_batch(mini_batch)
-    assert len(result.seq) == mini_batch["atom_positions"].shape[0]
+def test_to_protein_batch_seq_length_matches_batch_size(
+    single_sample: Mapping[str, torch.Tensor | str]
+) -> None:
+    """Ensures _to_protein_batch seq list has one entry per sample passed in."""
+    samples = [single_sample]
+    result = _to_protein_batch(samples)
+    assert len(result.seq) == len(samples)
 
 
 # ---------------------------------------------------------------------------
@@ -301,7 +336,7 @@ def test_to_protein_batch_seq_length_matches_batch_size(mini_batch: dict) -> Non
 
 def test_evaluate_returns_dict(
     model: MainTrunk,
-    loader: torch.utils.data.DataLoader,
+    loader: torch.utils.data.DataLoader[ProteinBatch],
     tcfg: TrainConfig,
     distogram_res: Distogram,
     distogram_atom: Distogram,
@@ -313,7 +348,7 @@ def test_evaluate_returns_dict(
 
 def test_evaluate_returns_expected_keys(
     model: MainTrunk,
-    loader: torch.utils.data.DataLoader,
+    loader: torch.utils.data.DataLoader[ProteinBatch],
     tcfg: TrainConfig,
     distogram_res: Distogram,
     distogram_atom: Distogram,
@@ -325,7 +360,7 @@ def test_evaluate_returns_expected_keys(
 
 def test_evaluate_all_values_are_floats(
     model: MainTrunk,
-    loader: torch.utils.data.DataLoader,
+    loader: torch.utils.data.DataLoader[ProteinBatch],
     tcfg: TrainConfig,
     distogram_res: Distogram,
     distogram_atom: Distogram,
@@ -338,7 +373,7 @@ def test_evaluate_all_values_are_floats(
 
 def test_evaluate_all_losses_finite(
     model: MainTrunk,
-    loader: torch.utils.data.DataLoader,
+    loader: torch.utils.data.DataLoader[ProteinBatch],
     tcfg: TrainConfig,
     distogram_res: Distogram,
     distogram_atom: Distogram,
@@ -352,7 +387,7 @@ def test_evaluate_all_losses_finite(
 
 def test_evaluate_total_loss_non_negative(
     model: MainTrunk,
-    loader: torch.utils.data.DataLoader,
+    loader: torch.utils.data.DataLoader[ProteinBatch],
     tcfg: TrainConfig,
     distogram_res: Distogram,
     distogram_atom: Distogram,
@@ -364,7 +399,7 @@ def test_evaluate_total_loss_non_negative(
 
 def test_evaluate_rmsd_non_negative(
     model: MainTrunk,
-    loader: torch.utils.data.DataLoader,
+    loader: torch.utils.data.DataLoader[ProteinBatch],
     tcfg: TrainConfig,
     distogram_res: Distogram,
     distogram_atom: Distogram,
@@ -376,7 +411,7 @@ def test_evaluate_rmsd_non_negative(
 
 def test_evaluate_sets_model_to_eval_mode(
     model: MainTrunk,
-    loader: torch.utils.data.DataLoader,
+    loader: torch.utils.data.DataLoader[ProteinBatch],
     tcfg: TrainConfig,
     distogram_res: Distogram,
     distogram_atom: Distogram,
@@ -394,14 +429,14 @@ def test_evaluate_empty_loader_returns_zero_dict(
     distogram_atom: Distogram,
 ) -> None:
     """Ensures evaluate returns all-zero metrics when the loader contains no batches."""
-    empty = torch.utils.data.DataLoader(_ListDataset([]), batch_size=None, collate_fn=lambda x: x)
+    empty = torch.utils.data.DataLoader(_ListDataset([]), batch_size=None)
     result = evaluate(model, empty, tcfg, distogram_res, distogram_atom, "cpu")
     assert all(v == 0.0 for v in result.values())
 
 
 def test_evaluate_uses_no_grad(
     model: MainTrunk,
-    loader: torch.utils.data.DataLoader,
+    loader: torch.utils.data.DataLoader[ProteinBatch],
     tcfg: TrainConfig,
     distogram_res: Distogram,
     distogram_atom: Distogram,
@@ -419,7 +454,7 @@ def test_evaluate_uses_no_grad(
 
 def test_train_returns_none(
     model: MainTrunk,
-    loader: torch.utils.data.DataLoader,
+    loader: torch.utils.data.DataLoader[ProteinBatch],
     tcfg: TrainConfig,
     distogram_res: Distogram,
     distogram_atom: Distogram,
@@ -430,7 +465,7 @@ def test_train_returns_none(
 
 def test_train_saves_best_checkpoint(
     model: MainTrunk,
-    loader: torch.utils.data.DataLoader,
+    loader: torch.utils.data.DataLoader[ProteinBatch],
     tcfg: TrainConfig,
     distogram_res: Distogram,
     distogram_atom: Distogram,
@@ -442,7 +477,7 @@ def test_train_saves_best_checkpoint(
 
 def test_train_checkpoint_is_valid_state_dict(
     model: MainTrunk,
-    loader: torch.utils.data.DataLoader,
+    loader: torch.utils.data.DataLoader[ProteinBatch],
     tcfg: TrainConfig,
     distogram_res: Distogram,
     distogram_atom: Distogram,
@@ -456,7 +491,7 @@ def test_train_checkpoint_is_valid_state_dict(
 
 def test_train_updates_model_parameters(
     model: MainTrunk,
-    loader: torch.utils.data.DataLoader,
+    loader: torch.utils.data.DataLoader[ProteinBatch],
     tcfg: TrainConfig,
     distogram_res: Distogram,
     distogram_atom: Distogram,
@@ -470,7 +505,7 @@ def test_train_updates_model_parameters(
 
 def test_train_model_in_train_mode_after(
     model: MainTrunk,
-    loader: torch.utils.data.DataLoader,
+    loader: torch.utils.data.DataLoader[ProteinBatch],
     tcfg: TrainConfig,
     distogram_res: Distogram,
     distogram_atom: Distogram,
@@ -483,7 +518,7 @@ def test_train_model_in_train_mode_after(
 
 def test_train_runs_all_epochs(
     model: MainTrunk,
-    loader: torch.utils.data.DataLoader,
+    loader: torch.utils.data.DataLoader[ProteinBatch],
     tcfg_multi: TrainConfig,
     distogram_res: Distogram,
     distogram_atom: Distogram,
@@ -495,7 +530,7 @@ def test_train_runs_all_epochs(
 
     def _patched_evaluate(
         m: MainTrunk,
-        ldr: torch.utils.data.DataLoader,
+        ldr: torch.utils.data.DataLoader[ProteinBatch],
         cfg: TrainConfig,
         dr: Distogram,
         da: Distogram,
@@ -515,7 +550,7 @@ def test_train_runs_all_epochs(
 
 def test_train_no_grad_clip_runs(
     model: MainTrunk,
-    loader: torch.utils.data.DataLoader,
+    loader: torch.utils.data.DataLoader[ProteinBatch],
     tcfg_no_clip: TrainConfig,
     distogram_res: Distogram,
     distogram_atom: Distogram,
@@ -527,7 +562,7 @@ def test_train_no_grad_clip_runs(
 
 def test_train_no_grad_clip_saves_checkpoint(
     model: MainTrunk,
-    loader: torch.utils.data.DataLoader,
+    loader: torch.utils.data.DataLoader[ProteinBatch],
     tcfg_no_clip: TrainConfig,
     distogram_res: Distogram,
     distogram_atom: Distogram,
@@ -539,7 +574,7 @@ def test_train_no_grad_clip_saves_checkpoint(
 
 def test_train_save_every_creates_epoch_checkpoint(
     model: MainTrunk,
-    loader: torch.utils.data.DataLoader,
+    loader: torch.utils.data.DataLoader[ProteinBatch],
     tcfg_save: TrainConfig,
     distogram_res: Distogram,
     distogram_atom: Distogram,
@@ -554,7 +589,7 @@ def test_train_save_every_creates_epoch_checkpoint(
 
 def test_train_save_every_checkpoint_is_valid_state_dict(
     model: MainTrunk,
-    loader: torch.utils.data.DataLoader,
+    loader: torch.utils.data.DataLoader[ProteinBatch],
     tcfg_save: TrainConfig,
     distogram_res: Distogram,
     distogram_atom: Distogram,
@@ -576,14 +611,14 @@ def test_train_save_every_checkpoint_is_valid_state_dict(
 
 def test_evaluate_multi_batch_returns_expected_keys(
     model: MainTrunk,
-    mini_batch: dict,
+    mini_batch: Mapping[str, torch.Tensor | list[str]],
     tcfg: TrainConfig,
     distogram_res: Distogram,
     distogram_atom: Distogram,
 ) -> None:
     """Ensures evaluate with a 2-batch loader still returns exactly the expected metric keys."""
     loader2 = torch.utils.data.DataLoader(
-        _ListDataset([mini_batch] + [mini_batch]), batch_size=None, collate_fn=lambda x: x
+        _ListDataset([mini_batch] + [mini_batch]), batch_size=None
     )
     result = evaluate(model, loader2, tcfg, distogram_res, distogram_atom, "cpu")
     assert set(result.keys()) == EXPECTED_EVAL_KEYS
@@ -591,15 +626,13 @@ def test_evaluate_multi_batch_returns_expected_keys(
 
 def test_evaluate_multi_batch_n_batches_counted(
     model: MainTrunk,
-    mini_batch: dict,
+    mini_batch: Mapping[str, torch.Tensor | list[str]],
     tcfg: TrainConfig,
     distogram_res: Distogram,
     distogram_atom: Distogram,
 ) -> None:
     """Ensures evaluate averages correctly over 3 batches, producing finite loss values."""
-    loader3 = torch.utils.data.DataLoader(
-        _ListDataset([mini_batch] * 3), batch_size=None, collate_fn=lambda x: x
-    )
+    loader3 = torch.utils.data.DataLoader(_ListDataset([mini_batch] * 3), batch_size=None)
     result = evaluate(model, loader3, tcfg, distogram_res, distogram_atom, "cpu")
     for k, v in result.items():
         # math.isfinite returns False if the value is NaN or Infinity
@@ -613,7 +646,7 @@ def test_evaluate_multi_batch_n_batches_counted(
 
 def test_train_calls_wandb_log_when_enabled(
     model: MainTrunk,
-    loader: torch.utils.data.DataLoader,
+    loader: torch.utils.data.DataLoader[ProteinBatch],
     tcfg_wandb: TrainConfig,
     distogram_res: Distogram,
     distogram_atom: Distogram,
@@ -630,7 +663,7 @@ def test_train_calls_wandb_log_when_enabled(
 
 def test_train_wandb_log_not_called_when_disabled(
     model: MainTrunk,
-    loader: torch.utils.data.DataLoader,
+    loader: torch.utils.data.DataLoader[ProteinBatch],
     tcfg: TrainConfig,
     distogram_res: Distogram,
     distogram_atom: Distogram,
@@ -645,7 +678,7 @@ def test_train_wandb_log_not_called_when_disabled(
 
 def test_train_wandb_log_payload_has_epoch_key(
     model: MainTrunk,
-    loader: torch.utils.data.DataLoader,
+    loader: torch.utils.data.DataLoader[ProteinBatch],
     tcfg_wandb: TrainConfig,
     distogram_res: Distogram,
     distogram_atom: Distogram,
@@ -661,7 +694,7 @@ def test_train_wandb_log_payload_has_epoch_key(
 
 def test_train_wandb_log_payload_has_train_keys(
     model: MainTrunk,
-    loader: torch.utils.data.DataLoader,
+    loader: torch.utils.data.DataLoader[ProteinBatch],
     tcfg_wandb: TrainConfig,
     distogram_res: Distogram,
     distogram_atom: Distogram,
@@ -676,7 +709,7 @@ def test_train_wandb_log_payload_has_train_keys(
 
 def test_train_wandb_log_payload_has_val_keys(
     model: MainTrunk,
-    loader: torch.utils.data.DataLoader,
+    loader: torch.utils.data.DataLoader[ProteinBatch],
     tcfg_wandb: TrainConfig,
     distogram_res: Distogram,
     distogram_atom: Distogram,
@@ -691,7 +724,7 @@ def test_train_wandb_log_payload_has_val_keys(
 
 def test_train_wandb_log_step_is_positive(
     model: MainTrunk,
-    loader: torch.utils.data.DataLoader,
+    loader: torch.utils.data.DataLoader[ProteinBatch],
     tcfg_wandb: TrainConfig,
     distogram_res: Distogram,
     distogram_atom: Distogram,
@@ -711,7 +744,7 @@ def test_train_wandb_log_step_is_positive(
 
 def test_train_wandb_log_called_once_per_epoch(
     model: MainTrunk,
-    loader: torch.utils.data.DataLoader,
+    loader: torch.utils.data.DataLoader[ProteinBatch],
     tcfg_wandb_3ep: TrainConfig,
     distogram_res: Distogram,
     distogram_atom: Distogram,
@@ -726,7 +759,7 @@ def test_train_wandb_log_called_once_per_epoch(
 
 def test_train_wandb_log_epoch_increments(
     model: MainTrunk,
-    loader: torch.utils.data.DataLoader,
+    loader: torch.utils.data.DataLoader[ProteinBatch],
     tcfg_wandb_3ep: TrainConfig,
     distogram_res: Distogram,
     distogram_atom: Distogram,
@@ -742,7 +775,7 @@ def test_train_wandb_log_epoch_increments(
 
 def test_train_wandb_log_train_total_loss_is_float(
     model: MainTrunk,
-    loader: torch.utils.data.DataLoader,
+    loader: torch.utils.data.DataLoader[ProteinBatch],
     tcfg_wandb: TrainConfig,
     distogram_res: Distogram,
     distogram_atom: Distogram,
@@ -757,7 +790,7 @@ def test_train_wandb_log_train_total_loss_is_float(
 
 def test_train_wandb_log_val_total_loss_is_float(
     model: MainTrunk,
-    loader: torch.utils.data.DataLoader,
+    loader: torch.utils.data.DataLoader[ProteinBatch],
     tcfg_wandb: TrainConfig,
     distogram_res: Distogram,
     distogram_atom: Distogram,
@@ -772,7 +805,7 @@ def test_train_wandb_log_val_total_loss_is_float(
 
 def test_train_wandb_log_steps_increase_across_epochs(
     model: MainTrunk,
-    loader: torch.utils.data.DataLoader,
+    loader: torch.utils.data.DataLoader[ProteinBatch],
     tcfg_wandb_3ep: TrainConfig,
     distogram_res: Distogram,
     distogram_atom: Distogram,
@@ -798,7 +831,7 @@ def test_train_wandb_log_steps_increase_across_epochs(
 
 def test_evaluate_ddp_returns_dict(
     model: MainTrunk,
-    loader: torch.utils.data.DataLoader,
+    loader: torch.utils.data.DataLoader[ProteinBatch],
     tcfg: TrainConfig,
     distogram_res: Distogram,
     distogram_atom: Distogram,
@@ -810,7 +843,7 @@ def test_evaluate_ddp_returns_dict(
 
 def test_evaluate_ddp_returns_expected_keys(
     model: MainTrunk,
-    loader: torch.utils.data.DataLoader,
+    loader: torch.utils.data.DataLoader[ProteinBatch],
     tcfg: TrainConfig,
     distogram_res: Distogram,
     distogram_atom: Distogram,
@@ -822,7 +855,7 @@ def test_evaluate_ddp_returns_expected_keys(
 
 def test_evaluate_ddp_all_values_are_floats(
     model: MainTrunk,
-    loader: torch.utils.data.DataLoader,
+    loader: torch.utils.data.DataLoader[ProteinBatch],
     tcfg: TrainConfig,
     distogram_res: Distogram,
     distogram_atom: Distogram,
@@ -835,7 +868,7 @@ def test_evaluate_ddp_all_values_are_floats(
 
 def test_evaluate_ddp_all_losses_finite(
     model: MainTrunk,
-    loader: torch.utils.data.DataLoader,
+    loader: torch.utils.data.DataLoader[ProteinBatch],
     tcfg: TrainConfig,
     distogram_res: Distogram,
     distogram_atom: Distogram,
@@ -849,7 +882,7 @@ def test_evaluate_ddp_all_losses_finite(
 
 def test_evaluate_ddp_total_loss_non_negative(
     model: MainTrunk,
-    loader: torch.utils.data.DataLoader,
+    loader: torch.utils.data.DataLoader[ProteinBatch],
     tcfg: TrainConfig,
     distogram_res: Distogram,
     distogram_atom: Distogram,
@@ -861,7 +894,7 @@ def test_evaluate_ddp_total_loss_non_negative(
 
 def test_evaluate_ddp_rmsd_non_negative(
     model: MainTrunk,
-    loader: torch.utils.data.DataLoader,
+    loader: torch.utils.data.DataLoader[ProteinBatch],
     tcfg: TrainConfig,
     distogram_res: Distogram,
     distogram_atom: Distogram,
@@ -873,7 +906,7 @@ def test_evaluate_ddp_rmsd_non_negative(
 
 def test_evaluate_ddp_sets_model_to_eval_mode(
     model: MainTrunk,
-    loader: torch.utils.data.DataLoader,
+    loader: torch.utils.data.DataLoader[ProteinBatch],
     tcfg: TrainConfig,
     distogram_res: Distogram,
     distogram_atom: Distogram,
@@ -891,14 +924,14 @@ def test_evaluate_ddp_empty_loader_returns_zero_dict(
     distogram_atom: Distogram,
 ) -> None:
     """Ensures evaluate_ddp returns all-zero metrics when the loader contains no batches."""
-    empty = torch.utils.data.DataLoader(_ListDataset([]), batch_size=None, collate_fn=lambda x: x)
+    empty = torch.utils.data.DataLoader(_ListDataset([]), batch_size=None)
     result = evaluate_ddp(1, model, empty, tcfg, distogram_res, distogram_atom, "cpu")
     assert all(v == 0.0 for v in result.values())
 
 
 def test_evaluate_ddp_calls_all_reduce_once_when_world_size_gt_1(
     model: MainTrunk,
-    loader: torch.utils.data.DataLoader,
+    loader: torch.utils.data.DataLoader[ProteinBatch],
     tcfg: TrainConfig,
     distogram_res: Distogram,
     distogram_atom: Distogram,
@@ -913,7 +946,7 @@ def test_evaluate_ddp_calls_all_reduce_once_when_world_size_gt_1(
 
 def test_evaluate_ddp_skips_all_reduce_when_world_size_is_1(
     model: MainTrunk,
-    loader: torch.utils.data.DataLoader,
+    loader: torch.utils.data.DataLoader[ProteinBatch],
     tcfg: TrainConfig,
     distogram_res: Distogram,
     distogram_atom: Distogram,
@@ -961,12 +994,12 @@ class _MockSampler:
 
 
 @pytest.fixture
-def ddp_loader(mini_batch: dict) -> torch.utils.data.DataLoader:
+def ddp_loader(
+    mini_batch: Mapping[str, torch.Tensor | list[str]]
+) -> torch.utils.data.DataLoader[ProteinBatch]:
     """Provide a DataLoader backed by a _MockSampler to track set_epoch calls."""
     sampler = _MockSampler([mini_batch])
-    return torch.utils.data.DataLoader(
-        _ListDataset([mini_batch]), batch_size=None, sampler=sampler, collate_fn=lambda x: x
-    )
+    return torch.utils.data.DataLoader(_ListDataset([mini_batch]), batch_size=None, sampler=sampler)
 
 
 # ---------------------------------------------------------------------------
@@ -976,7 +1009,7 @@ def ddp_loader(mini_batch: dict) -> torch.utils.data.DataLoader:
 
 def test_train_ddp_returns_none(
     model: MainTrunk,
-    ddp_loader: torch.utils.data.DataLoader,
+    ddp_loader: torch.utils.data.DataLoader[ProteinBatch],
     tcfg: TrainConfig,
     distogram_res: Distogram,
     distogram_atom: Distogram,
@@ -999,7 +1032,7 @@ def test_train_ddp_returns_none(
 
 def test_train_ddp_rank0_saves_checkpoint(
     model: MainTrunk,
-    ddp_loader: torch.utils.data.DataLoader,
+    ddp_loader: torch.utils.data.DataLoader[ProteinBatch],
     tcfg: TrainConfig,
     distogram_res: Distogram,
     distogram_atom: Distogram,
@@ -1022,7 +1055,7 @@ def test_train_ddp_rank0_saves_checkpoint(
 
 def test_train_ddp_checkpoint_has_correct_keys(
     model: MainTrunk,
-    ddp_loader: torch.utils.data.DataLoader,
+    ddp_loader: torch.utils.data.DataLoader[ProteinBatch],
     tcfg: TrainConfig,
     distogram_res: Distogram,
     distogram_atom: Distogram,
@@ -1046,7 +1079,7 @@ def test_train_ddp_checkpoint_has_correct_keys(
 
 def test_train_ddp_rank1_does_not_save_checkpoint(
     model: MainTrunk,
-    ddp_loader: torch.utils.data.DataLoader,
+    ddp_loader: torch.utils.data.DataLoader[ProteinBatch],
     tcfg: TrainConfig,
     distogram_res: Distogram,
     distogram_atom: Distogram,
@@ -1069,7 +1102,7 @@ def test_train_ddp_rank1_does_not_save_checkpoint(
 
 def test_train_ddp_calls_set_epoch_each_epoch(
     model: MainTrunk,
-    ddp_loader: torch.utils.data.DataLoader,
+    ddp_loader: torch.utils.data.DataLoader[ProteinBatch],
     tcfg_multi: TrainConfig,
     distogram_res: Distogram,
     distogram_atom: Distogram,
@@ -1092,7 +1125,7 @@ def test_train_ddp_calls_set_epoch_each_epoch(
 
 def test_train_ddp_updates_model_parameters(
     model: MainTrunk,
-    ddp_loader: torch.utils.data.DataLoader,
+    ddp_loader: torch.utils.data.DataLoader[ProteinBatch],
     tcfg: TrainConfig,
     distogram_res: Distogram,
     distogram_atom: Distogram,
@@ -1119,7 +1152,7 @@ def test_train_ddp_updates_model_parameters(
 
 def test_train_ddp_wandb_not_called_when_disabled(
     model: MainTrunk,
-    ddp_loader: torch.utils.data.DataLoader,
+    ddp_loader: torch.utils.data.DataLoader[ProteinBatch],
     tcfg: TrainConfig,
     distogram_res: Distogram,
     distogram_atom: Distogram,
@@ -1145,7 +1178,7 @@ def test_train_ddp_wandb_not_called_when_disabled(
 
 def test_train_ddp_wandb_called_when_rank0_and_enabled(
     model: MainTrunk,
-    ddp_loader: torch.utils.data.DataLoader,
+    ddp_loader: torch.utils.data.DataLoader[ProteinBatch],
     tcfg_wandb: TrainConfig,
     distogram_res: Distogram,
     distogram_atom: Distogram,
@@ -1171,7 +1204,7 @@ def test_train_ddp_wandb_called_when_rank0_and_enabled(
 
 def test_train_ddp_wandb_not_called_when_rank_nonzero(
     model: MainTrunk,
-    ddp_loader: torch.utils.data.DataLoader,
+    ddp_loader: torch.utils.data.DataLoader[ProteinBatch],
     tcfg_wandb: TrainConfig,
     distogram_res: Distogram,
     distogram_atom: Distogram,
@@ -1197,7 +1230,7 @@ def test_train_ddp_wandb_not_called_when_rank_nonzero(
 
 def test_evaluate_ddp_world_size1_matches_evaluate(
     model: MainTrunk,
-    loader: torch.utils.data.DataLoader,
+    loader: torch.utils.data.DataLoader[ProteinBatch],
     tcfg: TrainConfig,
     distogram_res: Distogram,
     distogram_atom: Distogram,
@@ -1220,16 +1253,14 @@ def test_evaluate_ddp_world_size1_matches_evaluate(
 
 def test_training_step_with_full_dropout_produces_finite_outputs(
     model: MainTrunk,
-    loader: torch.utils.data.DataLoader,
+    loader: torch.utils.data.DataLoader[ProteinBatch],
     tcfg: TrainConfig,
     distogram_res: Distogram,
     distogram_atom: Distogram,
 ) -> None:
     """A forward pass with 50% conditioning dropout produces finite denoised coords and logits."""
     batch = next(iter(loader))
-    featurized = featurize_batch(
-        _to_protein_batch(batch), tcfg, distogram_res, distogram_atom, device="cpu"
-    )
+    featurized = featurize_batch(batch, tcfg, distogram_res, distogram_atom, device="cpu")
     featurized = apply_conditioning_dropout(
         featurized,
         p_distogram=0.5,
@@ -1245,7 +1276,7 @@ def test_training_step_with_full_dropout_produces_finite_outputs(
 
 def test_evaluate_loop_unchanged_by_dropout_config(
     model: MainTrunk,
-    loader: torch.utils.data.DataLoader,
+    loader: torch.utils.data.DataLoader[ProteinBatch],
     tcfg: TrainConfig,
     distogram_res: Distogram,
     distogram_atom: Distogram,

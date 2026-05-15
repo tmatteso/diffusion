@@ -550,9 +550,9 @@ class EDMSampler:
 
 @jaxtyped(typechecker=beartype)
 def atom5_to_atom37(
-    coords_5: Float[np.ndarray, "N_res 5 3"],
-    mask_5: Float[np.ndarray, "N_res 5"] | None = None,
-) -> tuple[Float[np.ndarray, "N_res 37 3"], Float[np.ndarray, "N_res 37"]]:
+    coords_5: Float[torch.Tensor, "N_res 5 3"],
+    mask_5: Float[torch.Tensor, "N_res 5"] | None = None,
+) -> tuple[Float[torch.Tensor, "N_res 37 3"], Float[torch.Tensor, "N_res 37"]]:
     """Map atom5 coordinates back into the full atom37 layout.
 
     Returns:
@@ -561,8 +561,8 @@ def atom5_to_atom37(
     mask_37: (N_res, 37).
     """
     N_res: int = coords_5.shape[0]
-    x_37: Float[np.ndarray, "N_res 37 3"] = np.zeros((N_res, 37, 3), dtype=np.float32)
-    mask_37: Float[np.ndarray, "N_res 37"] = np.zeros((N_res, 37), dtype=np.float32)
+    x_37: Float[torch.Tensor, "N_res 37 3"] = torch.zeros((N_res, 37, 3), dtype=torch.float32)
+    mask_37: Float[torch.Tensor, "N_res 37"] = torch.zeros((N_res, 37), dtype=torch.float32)
 
     for atom5_slot, atom37_idx in enumerate(ATOM5_TO_ATOM37):
         x_37[:, atom37_idx, :] = coords_5[:, atom5_slot, :]
@@ -683,13 +683,13 @@ if __name__ == "__main__":
 
         pdb_strings: list[str] = []
         for b in range(B_SAMPLE):
-            coords_np: Float[np.ndarray, "N_res 5 3"] = rearrange(
-                coords_batch[b].cpu().numpy(), "(n a) d -> n a d", n=N_RES, a=NATOM
+            coords_t: Float[torch.Tensor, "N_res 5 3"] = rearrange(
+                coords_batch[b].cpu(), "(n a) d -> n a d", n=N_RES, a=NATOM
             )
-            x_37, mask_37 = atom5_to_atom37(coords_np)
+            x_37, mask_37 = atom5_to_atom37(coords_t)
             prot = Protein(
-                atom_positions=x_37,
-                atom_mask=mask_37,
+                atom_positions=x_37.numpy(),
+                atom_mask=mask_37.numpy(),
                 residue_index=np.arange(N_RES, dtype=np.int32),
                 aatype=np.zeros(N_RES, dtype=np.int32),
                 chain_index=np.zeros(N_RES, dtype=np.int32),

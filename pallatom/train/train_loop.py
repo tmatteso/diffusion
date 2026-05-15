@@ -41,21 +41,11 @@ def _mask_seq_target(aa_indices: torch.Tensor) -> torch.Tensor:
     return aa_indices.masked_fill(aa_indices == 20, -100)
 
 
-def _to_protein_batch(batch: dict) -> ProteinBatch:
-    """Convert a DataLoader dict batch to a ProteinBatch dataclass."""
-    return ProteinBatch(
-        atom_positions=batch["atom_positions"],
-        atom_mask=batch["atom_mask"],
-        residue_index=batch["residue_index"],
-        seq=list(batch["seq"]),
-    )
-
-
 @torch.no_grad()
 @jaxtyped(typechecker=beartype)
 def evaluate(
     model: MainTrunk,
-    loader: torch.utils.data.DataLoader,
+    loader: torch.utils.data.DataLoader[ProteinBatch],
     tcfg: TrainConfig,
     distogram_res: Distogram,
     distogram_atom: Distogram,
@@ -77,9 +67,7 @@ def evaluate(
     lp = tcfg.loss
 
     for batch in loader:
-        featurized_batch = featurize_batch(
-            _to_protein_batch(batch), tcfg, distogram_res, distogram_atom, device
-        )
+        featurized_batch = featurize_batch(batch, tcfg, distogram_res, distogram_atom, device)
 
         (
             r_denoised,
@@ -174,7 +162,7 @@ def evaluate(
 def evaluate_ddp(
     world_size: int,
     model: nn.Module,
-    loader: torch.utils.data.DataLoader,
+    loader: torch.utils.data.DataLoader[ProteinBatch],
     tcfg: TrainConfig,
     distogram_res: Distogram,
     distogram_atom: Distogram,
@@ -197,9 +185,7 @@ def evaluate_ddp(
     lp = tcfg.loss
 
     for batch in loader:
-        featurized_batch = featurize_batch(
-            _to_protein_batch(batch), tcfg, distogram_res, distogram_atom, device
-        )
+        featurized_batch = featurize_batch(batch, tcfg, distogram_res, distogram_atom, device)
 
         (
             r_denoised,
@@ -290,7 +276,7 @@ def evaluate_ddp(
 
 
 def train_step(
-    batch: dict,
+    batch: ProteinBatch,
     model: nn.Module,
     tcfg: TrainConfig,
     distogram_res: Distogram,
@@ -306,9 +292,7 @@ def train_step(
     lp = tcfg.loss
     tp = tcfg.training
 
-    featurized_batch = featurize_batch(
-        _to_protein_batch(batch), tcfg, distogram_res, distogram_atom, device
-    )
+    featurized_batch = featurize_batch(batch, tcfg, distogram_res, distogram_atom, device)
     featurized_batch = apply_conditioning_dropout(
         featurized_batch,
         p_distogram=tcfg.conditioning_dropout.p_distogram,
@@ -470,8 +454,8 @@ def log_epoch(
 def train(
     model: MainTrunk,
     tcfg: TrainConfig,
-    train_loader: torch.utils.data.DataLoader,
-    test_loader: torch.utils.data.DataLoader,
+    train_loader: torch.utils.data.DataLoader[ProteinBatch],
+    test_loader: torch.utils.data.DataLoader[ProteinBatch],
     distogram_res: Distogram,
     distogram_atom: Distogram,
     device: str,
@@ -564,8 +548,8 @@ def train_ddp(
     world_size: int,
     model: MainTrunk,
     tcfg: TrainConfig,
-    train_loader: torch.utils.data.DataLoader,
-    test_loader: torch.utils.data.DataLoader,
+    train_loader: torch.utils.data.DataLoader[ProteinBatch],
+    test_loader: torch.utils.data.DataLoader[ProteinBatch],
     distogram_res: Distogram,
     distogram_atom: Distogram,
     device: str | None = None,

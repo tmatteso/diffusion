@@ -67,58 +67,61 @@ class TriangleAttentionStartingNodeWithBias(nn.Module):
     Gate with a sigmoid on z_ij.
     """
 
-    def __init__(self, c: int, n_heads: int = 4) -> None:
+    def __init__(self, c_pair: int, n_heads: int = 4) -> None:
         super().__init__()
-        assert c % n_heads == 0
+        assert c_pair % n_heads == 0
         self.n_heads = n_heads
-        self.head_dim = c // n_heads
+        self.head_dim = c_pair // n_heads
 
-        self.norm = nn.LayerNorm(c)
-        self.to_q = LinearNoBias(c, c)
-        self.to_k = LinearNoBias(c, c)
-        self.to_v = LinearNoBias(c, c)
-        self.to_g = nn.Linear(c, c)  # gating (bias allowed)
-        self.to_b = LinearNoBias(c, n_heads)  # bias projection b_ij → n_heads
-        self.norm_b = nn.LayerNorm(c)
-        self.to_out = LinearNoBias(c, c)
+        self.norm = nn.LayerNorm(c_pair)
+        self.to_q = LinearNoBias(c_pair, c_pair)
+        self.to_k = LinearNoBias(c_pair, c_pair)
+        self.to_v = LinearNoBias(c_pair, c_pair)
+        self.to_g = nn.Linear(c_pair, c_pair)  # gating (bias allowed)
+        self.to_out = LinearNoBias(c_pair, c_pair)
 
     @jaxtyped(typechecker=beartype)
     def forward(
         self,
         z: Float[torch.Tensor, "B N_res N_res c_pair"],
-        b: Float[torch.Tensor, "B N_res N_res c_pair"],
+        b: Float[torch.Tensor, "B N_res N_res n_heads"],
     ) -> Float[torch.Tensor, "B N_res N_res c_pair"]:
         """Apply row-wise gated self-attention biased by b to update pair embeddings."""
-        H, D = self.n_heads, self.head_dim
-
         zn: Float[torch.Tensor, "B N_res N_res c_pair"] = self.norm(z)
-        Q: Float[torch.Tensor, "B N_res N_res n_heads head_dim"] = rearrange(
-            self.to_q(zn), "b i j (h d) -> b i j h d", h=H
+        q: Float[torch.Tensor, "B N_res N_res n_heads head_dim"] = rearrange(
+            self.to_q(zn),
+            "B n_i n_j (n_heads head_dim) -> B n_i n_j n_heads head_dim",
+            n_heads=self.n_heads,
         )
-        K: Float[torch.Tensor, "B N_res N_res n_heads head_dim"] = rearrange(
-            self.to_k(zn), "b i j (h d) -> b i j h d", h=H
+        k: Float[torch.Tensor, "B N_res N_res n_heads head_dim"] = rearrange(
+            self.to_k(zn),
+            "B n_i n_j (n_heads head_dim) -> B n_i n_j n_heads head_dim",
+            n_heads=self.n_heads,
         )
-        V: Float[torch.Tensor, "B N_res N_res n_heads head_dim"] = rearrange(
-            self.to_v(zn), "b i j (h d) -> b i j h d", h=H
+        v: Float[torch.Tensor, "B N_res N_res n_heads head_dim"] = rearrange(
+            self.to_v(zn),
+            "B n_i n_j (n_heads head_dim) -> B n_i n_j n_heads head_dim",
+            n_heads=self.n_heads,
         )
-        G: Float[torch.Tensor, "B N_res N_res c_pair"] = torch.sigmoid(self.to_g(zn))
+        g: Float[torch.Tensor, "B N_res N_res n_heads head_dim"] = rearrange(
+            torch.sigmoid(self.to_g(zn)),
+            "B n_i n_j (n_heads head_dim) -> B n_i n_j n_heads head_dim",
+            n_heads=self.n_heads,
+        )
 
         # Starting node: fix i, attend j (queries) over k (keys)
         attn: Float[torch.Tensor, "B N_res n_heads N_res N_res"] = einsum(
-            Q, K, "b i j h d, b i k h d -> b i h j k"
-        ) / math.sqrt(D)
+            q, k, "b i j h d, b i k h d -> b i h j k"
+        ) / math.sqrt(self.head_dim)
 
-        # Bias b[j, k, h] is independent of starting node i → broadcast over i
-        bias: Float[torch.Tensor, "B 1 n_heads N_res N_res"] = rearrange(
-            self.to_b(self.norm_b(b)), "b n_j n_k h -> b 1 h n_j n_k"
+        attn = F.softmax(attn + rearrange(b, "b n_j n_k h -> b 1 h n_j n_k"), dim=-1)
+        intermediate: Float[torch.Tensor, "B N_res N_res n_heads head_dim"] = einsum(
+            attn, v, "b i h j k, b i k h d -> b i j h d"
         )
-        attn = F.softmax(attn + bias, dim=-1)
-
+        intermediate = g * intermediate
         out: Float[torch.Tensor, "B N_res N_res c_pair"] = rearrange(
-            einsum(attn, V, "b i h j k, b i k h d -> b i j h d"),
-            "b i j h d -> b i j (h d)",
+            intermediate, "b i j h d -> b i j (h d)"
         )
-        out = G * out
         return self.to_out(out)
 
 
@@ -132,60 +135,58 @@ class TriangleAttentionStartingNodeWithBias(nn.Module):
 class TriangleAttentionEndingNodeWithBias(nn.Module):
     """For each column j, attend over all i using queries/keys/values from z_ij, biased by b_ij."""
 
-    def __init__(self, c: int, n_heads: int = 4) -> None:
+    def __init__(self, c_pair: int, n_heads: int = 4) -> None:
         super().__init__()
-        assert c % n_heads == 0
+        assert c_pair % n_heads == 0
         self.n_heads = n_heads
-        self.head_dim = c // n_heads
+        self.head_dim = c_pair // n_heads
 
-        self.norm = nn.LayerNorm(c)
-        self.to_q = LinearNoBias(c, c)
-        self.to_k = LinearNoBias(c, c)
-        self.to_v = LinearNoBias(c, c)
-        self.to_g = nn.Linear(c, c)
-        self.to_b = LinearNoBias(c, n_heads)
-        self.norm_b = nn.LayerNorm(c)
-        self.to_out = LinearNoBias(c, c)
+        self.norm = nn.LayerNorm(c_pair)
+        self.to_q = LinearNoBias(c_pair, c_pair)
+        self.to_k = LinearNoBias(c_pair, c_pair)
+        self.to_v = LinearNoBias(c_pair, c_pair)
+        self.to_g = nn.Linear(c_pair, c_pair)
+        self.to_out = LinearNoBias(c_pair, c_pair)
 
     @jaxtyped(typechecker=beartype)
     def forward(
         self,
         z: Float[torch.Tensor, "B N_res N_res c_pair"],
-        b: Float[torch.Tensor, "B N_res N_res c_pair"],
+        b: Float[torch.Tensor, "B N_res N_res n_heads"],
     ) -> Float[torch.Tensor, "B N_res N_res c_pair"]:
         """Apply column-wise gated self-attention biased by b to update pair embeddings."""
-        H, D = self.n_heads, self.head_dim
-
         zn: Float[torch.Tensor, "B N_res N_res c_pair"] = self.norm(z)
         # Transpose to column-first so ending node j leads
-        Q: Float[torch.Tensor, "B N_res N_res n_heads head_dim"] = rearrange(
-            self.to_q(zn), "b n_i n_j (h d) -> b n_j n_i h d", h=H
+        q: Float[torch.Tensor, "B N_res N_res n_heads head_dim"] = rearrange(
+            self.to_q(zn), "b n_i n_j (h d) -> b n_j n_i h d", h=self.n_heads
         )
-        K: Float[torch.Tensor, "B N_res N_res n_heads head_dim"] = rearrange(
-            self.to_k(zn), "b n_i n_j (h d) -> b n_j n_i h d", h=H
+        k: Float[torch.Tensor, "B N_res N_res n_heads head_dim"] = rearrange(
+            self.to_k(zn), "b n_i n_j (h d) -> b n_j n_i h d", h=self.n_heads
         )
-        V: Float[torch.Tensor, "B N_res N_res n_heads head_dim"] = rearrange(
-            self.to_v(zn), "b n_i n_j (h d) -> b n_j n_i h d", h=H
+        v: Float[torch.Tensor, "B N_res N_res n_heads head_dim"] = rearrange(
+            self.to_v(zn), "b n_i n_j (h d) -> b n_j n_i h d", h=self.n_heads
         )
-        G: Float[torch.Tensor, "B N_res N_res c_pair"] = torch.sigmoid(self.to_g(zn))
+        g: Float[torch.Tensor, "B N_res N_res n_heads head_dim"] = rearrange(
+            torch.sigmoid(self.to_g(zn)),
+            "B n_i n_j (n_heads head_dim) -> B n_j n_i n_heads head_dim",
+            n_heads=self.n_heads,
+        )
 
         # Ending node: fix j, attend i (queries) over k (keys)
         attn: Float[torch.Tensor, "B N_res n_heads N_res N_res"] = einsum(
-            Q, K, "b n_j n_i h d, b n_j n_k h d -> b n_j h n_i n_k"
-        ) / math.sqrt(D)
+            q, k, "b n_j n_i h d, b n_j n_k h d -> b n_j h n_i n_k"
+        ) / math.sqrt(self.head_dim)
 
-        # Bias b[i, j, h] for query i ending at fixed j, broadcast over k
-        bias: Float[torch.Tensor, "B N_res n_heads N_res 1"] = rearrange(
-            self.to_b(self.norm_b(b)), "b n_i n_j h -> b n_j h n_i 1"
+        attn = F.softmax(attn + rearrange(b, "b n_i n_k h -> b 1 h n_i n_k"), dim=-1)
+        intermediate: Float[torch.Tensor, "B N_res N_res n_heads head_dim"] = einsum(
+            attn, v, "b n_j h n_i n_k, b n_j n_k h d -> b n_j n_i h d"
         )
-        attn = F.softmax(attn + bias, dim=-1)
-
+        intermediate = g * intermediate
         # Weighted sum, then transpose back to (B, N_i, N_j, C)
         out: Float[torch.Tensor, "B N_res N_res c_pair"] = rearrange(
-            einsum(attn, V, "b n_j h n_i n_k, b n_j n_k h d -> b n_j n_i h d"),
+            intermediate,
             "b n_j n_i h d -> b n_i n_j (h d)",
         )
-        out = G * out
         return self.to_out(out)
 
 
@@ -200,15 +201,18 @@ class Transition(nn.Module):
     def __init__(self, c: int, expansion: int = 4) -> None:
         super().__init__()
         self.norm = nn.LayerNorm(c)
-        self.ff1 = LinearNoBias(c, c * expansion)
-        self.ff2 = LinearNoBias(c * expansion, c)
+        self.x_to_a = LinearNoBias(c, c * expansion)
+        self.x_to_b = LinearNoBias(c, c * expansion)
+        self.hidden_to_out = LinearNoBias(c * expansion, c)
 
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply two-layer FFN with ReLU activation to any leading-dim tensor."""
         # Works for any leading dims (B N_res N_res c) or (B N_res c)
-        zn = self.norm(z)
-        hidden = F.relu(self.ff1(zn))
-        return self.ff2(hidden)
+        x = self.norm(x)
+        a = self.x_to_a(x)
+        b = self.x_to_b(x)
+        hidden = F.silu(a) * b
+        return self.hidden_to_out(hidden)
 
 
 # ---------------------------------------------------------------------------
@@ -276,6 +280,7 @@ class PairUpdate(nn.Module):
 
         # Step 2
         self.rbf = TransformRBF(c, n_rbf=n_rbf)
+        self.b_proj = LinearNoBias(c, n_heads)
 
         # Step 3
         self.tri_start = TriangleAttentionStartingNodeWithBias(c, n_heads)
@@ -306,7 +311,7 @@ class PairUpdate(nn.Module):
         # ------------------------------------------------------------------
         # Step 2: b_ij = LinearNoBias(Transform_RBF(d_ij))
         # ------------------------------------------------------------------
-        b_ij: Float[torch.Tensor, "B N_res N_res c_pair"] = self.rbf(d_ij)
+        b_ij: Float[torch.Tensor, "B N_res N_res n_heads"] = self.b_proj(self.rbf(d_ij))
 
         # ------------------------------------------------------------------
         # Step 3: z_ij += DropoutRowwise(TriangleAttentionStartingNode(z, b))

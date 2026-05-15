@@ -109,24 +109,32 @@ def test_protein_dataset_sample_keys(train_dataset: ProteinDataset):
 
 def test_protein_dataset_atom_positions_shape(train_dataset: ProteinDataset):
     """ProteinDataset pads/truncates atom_positions to (_MAX_SEQ, 37, 3)."""
-    assert train_dataset[0]["atom_positions"].shape == (_MAX_SEQ, 37, 3)
+    val = train_dataset[0]["atom_positions"]
+    assert isinstance(val, torch.Tensor)
+    assert val.shape == (_MAX_SEQ, 37, 3)
 
 
 def test_protein_dataset_atom_mask_shape(train_dataset: ProteinDataset):
     """ProteinDataset pads/truncates atom_mask to (_MAX_SEQ, 37)."""
-    assert train_dataset[0]["atom_mask"].shape == (_MAX_SEQ, 37)
+    val = train_dataset[0]["atom_mask"]
+    assert isinstance(val, torch.Tensor)
+    assert val.shape == (_MAX_SEQ, 37)
 
 
 def test_protein_dataset_residue_index_shape(train_dataset: ProteinDataset):
     """ProteinDataset pads/truncates residue_index to a 1-D tensor of length _MAX_SEQ."""
-    assert train_dataset[0]["residue_index"].shape == (_MAX_SEQ,)
+    val = train_dataset[0]["residue_index"]
+    assert isinstance(val, torch.Tensor)
+    assert val.shape == (_MAX_SEQ,)
 
 
 def test_protein_dataset_tensor_fields_are_float32(train_dataset: ProteinDataset):
     """All tensor fields in a ProteinDataset sample have dtype float32."""
     sample = train_dataset[0]
     for key in ("atom_positions", "atom_mask", "residue_index"):
-        assert sample[key].dtype == torch.float32, f"{key} is not float32"
+        val = sample[key]
+        assert isinstance(val, torch.Tensor), f"{key} is not a tensor"
+        assert val.dtype == torch.float32, f"{key} is not float32"
 
 
 def test_protein_dataset_seq_is_string(train_dataset: ProteinDataset):
@@ -193,7 +201,7 @@ def test_make_data_loaders_batch_atom_positions_shape(
     """make_data_loaders produces batch with atom_positions shape (batch_size, _MAX_SEQ, 37, 3)."""
     train_loader, _, _ = make_data_loaders(cfg, jsonl_path, splits_path, debug_run=False)
     batch = next(iter(train_loader))
-    assert batch["atom_positions"].shape == (cfg.train_loader.batch_size, _MAX_SEQ, 37, 3)
+    assert batch.atom_positions.shape == (cfg.train_loader.batch_size, _MAX_SEQ, 37, 3)
 
 
 def test_make_data_loaders_batch_seq_is_list_of_strings(
@@ -202,8 +210,8 @@ def test_make_data_loaders_batch_seq_is_list_of_strings(
     """make_data_loaders collates the seq field into a list of str, one per batch item."""
     train_loader, _, _ = make_data_loaders(cfg, jsonl_path, splits_path, debug_run=False)
     batch = next(iter(train_loader))
-    assert isinstance(batch["seq"], list)
-    assert all(isinstance(s, str) for s in batch["seq"])
+    assert isinstance(batch.seq, list)
+    assert all(isinstance(s, str) for s in batch.seq)
 
 
 # ---------------------------------------------------------------------------
@@ -255,7 +263,7 @@ def test_make_data_loaders_debug_batch_atom_positions_shape(
     """Debug-mode batches have atom_positions shape (batch_size, _MAX_SEQ, 37, 3)."""
     train_loader, _, _ = make_data_loaders(cfg, debug_jsonl_path, debug_splits_path, debug_run=True)
     batch = next(iter(train_loader))
-    assert batch["atom_positions"].shape == (cfg.train_loader.batch_size, _MAX_SEQ, 37, 3)
+    assert batch.atom_positions.shape == (cfg.train_loader.batch_size, _MAX_SEQ, 37, 3)
 
 
 def test_make_data_loaders_debug_batch_seq_is_list_of_strings(
@@ -264,8 +272,8 @@ def test_make_data_loaders_debug_batch_seq_is_list_of_strings(
     """Debug-mode batches collate seq into a list of str, one per batch item."""
     train_loader, _, _ = make_data_loaders(cfg, debug_jsonl_path, debug_splits_path, debug_run=True)
     batch = next(iter(train_loader))
-    assert isinstance(batch["seq"], list)
-    assert all(isinstance(s, str) for s in batch["seq"])
+    assert isinstance(batch.seq, list)
+    assert all(isinstance(s, str) for s in batch.seq)
 
 
 # ---------------------------------------------------------------------------

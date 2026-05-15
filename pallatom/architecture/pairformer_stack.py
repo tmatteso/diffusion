@@ -1,136 +1,198 @@
-"""Pairformer stack layers for pair-representation refinement."""
+"""Pairformer stack layers for pair and single representation refinement."""
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from architecture.atom_transformers import LinearNoBias
+from architecture.node_update import AttentionPairBias
+from architecture.pair_update import (
+    DropoutColumnwise,
+    DropoutRowwise,
+    Transition,
+    TriangleAttentionEndingNodeWithBias,
+    TriangleAttentionStartingNodeWithBias,
+)
 from beartype import beartype
-from einops import einsum, rearrange
+from einops import einsum
 from jaxtyping import Float, jaxtyped
 
+
 # ---------------------------------------------------------------------------
-# PairformerStack — simplified pair-only stack used in step 5
-# Each block: LayerNorm → triangle updates (outer-product mean approximation
-# via row/col attention) → transition FFN, all on pair representation only.
+# TriangleMultiplicationOutgoing  (Alg 17 step 2)
+# m_ij = gate(z_ij) · out(norm(Σ_k a_ik ⊙ b_kj))
 # ---------------------------------------------------------------------------
+class TriangleMultiplicationOutgoing(nn.Module):
+    """Outgoing triangle multiplicative update on pair embeddings."""
 
-
-class PairformerBlock(nn.Module):
-    """One block of the Pairformer operating purely on pair embeddings v_ij.
-
-    Uses:
-
-    - Row-wise gated self-attention  (triangle attention, rows)
-    - Column-wise gated self-attention (triangle attention, cols)
-    - Pair transition FFN
-    """
-
-    def __init__(self, c: int, n_heads: int = 4) -> None:
+    def __init__(self, c: int, c_hidden: int | None = None) -> None:
         super().__init__()
-        assert c % n_heads == 0
-        self.n_heads = n_heads
-        self.head_dim = c // n_heads
-
-        # Row-wise attention
-        self.norm_row = nn.LayerNorm(c)
-        self.q_row = LinearNoBias(c, c)
-        self.k_row = LinearNoBias(c, c)
-        self.v_row = LinearNoBias(c, c)
-        self.g_row = nn.Linear(c, c)  # gating (with bias)
-        self.out_row = LinearNoBias(c, c)
-
-        # Column-wise attention
-        self.norm_col = nn.LayerNorm(c)
-        self.q_col = LinearNoBias(c, c)
-        self.k_col = LinearNoBias(c, c)
-        self.v_col = LinearNoBias(c, c)
-        self.g_col = nn.Linear(c, c)
-        self.out_col = LinearNoBias(c, c)
-
-        # Transition FFN
-        self.norm_ff = nn.LayerNorm(c)
-        self.ff1 = LinearNoBias(c, c * 4)
-        self.ff2 = LinearNoBias(c * 4, c)
+        c_hidden = c_hidden or c
+        self.norm = nn.LayerNorm(c)
+        self.proj_a = LinearNoBias(c, c_hidden)
+        self.gate_a = nn.Linear(c, c_hidden)
+        self.proj_b = LinearNoBias(c, c_hidden)
+        self.gate_b = nn.Linear(c, c_hidden)
+        self.gate = nn.Linear(c, c)
+        self.norm_out = nn.LayerNorm(c_hidden)
+        self.proj_out = LinearNoBias(c_hidden, c)
 
     @jaxtyped(typechecker=beartype)
     def forward(
         self,
-        v: Float[torch.Tensor, "B N_res N_res c"],
-    ) -> Float[torch.Tensor, "B N_res N_res c"]:
+        z: Float[torch.Tensor, "B N_res N_res c_pair"],
+    ) -> Float[torch.Tensor, "B N_res N_res c_pair"]:
+        """Compute outgoing triangle product: m[i,j] = Σ_k a[i,k] ⊙ b[k,j]."""
+        zn: Float[torch.Tensor, "B N_res N_res c_pair"] = self.norm(z)
+        a: Float[torch.Tensor, "B N_res N_res c_hidden"] = torch.sigmoid(
+            self.gate_a(zn)
+        ) * self.proj_a(zn)
+        b: Float[torch.Tensor, "B N_res N_res c_hidden"] = torch.sigmoid(
+            self.gate_b(zn)
+        ) * self.proj_b(zn)
+        g: Float[torch.Tensor, "B N_res N_res c_pair"] = torch.sigmoid(self.gate(z))
+        m: Float[torch.Tensor, "B N_res N_res c_hidden"] = einsum(
+            a, b, "b i k c, b k j c -> b i j c"
+        )
+        return g * self.proj_out(self.norm_out(m))
+
+
+# ---------------------------------------------------------------------------
+# TriangleMultiplicationIncoming  (Alg 17 step 3)
+# m_ij = gate(z_ij) · out(norm(Σ_k a_ki ⊙ b_jk))
+# ---------------------------------------------------------------------------
+
+
+class TriangleMultiplicationIncoming(nn.Module):
+    """Incoming triangle multiplicative update on pair embeddings."""
+
+    def __init__(self, c: int, c_hidden: int | None = None) -> None:
+        super().__init__()
+        c_hidden = c_hidden or c
+        self.norm = nn.LayerNorm(c)
+        self.proj_a = LinearNoBias(c, c_hidden)
+        self.gate_a = nn.Linear(c, c_hidden)
+        self.proj_b = LinearNoBias(c, c_hidden)
+        self.gate_b = nn.Linear(c, c_hidden)
+        self.gate = nn.Linear(c, c)
+        self.norm_out = nn.LayerNorm(c_hidden)
+        self.proj_out = LinearNoBias(c_hidden, c)
+
+    @jaxtyped(typechecker=beartype)
+    def forward(
+        self,
+        z: Float[torch.Tensor, "B N_res N_res c_pair"],
+    ) -> Float[torch.Tensor, "B N_res N_res c_pair"]:
+        """Compute incoming triangle product: m[i,j] = Σ_k a[k,i] ⊙ b[j,k]."""
+        zn: Float[torch.Tensor, "B N_res N_res c_pair"] = self.norm(z)
+        a: Float[torch.Tensor, "B N_res N_res c_hidden"] = torch.sigmoid(
+            self.gate_a(zn)
+        ) * self.proj_a(zn)
+        b: Float[torch.Tensor, "B N_res N_res c_hidden"] = torch.sigmoid(
+            self.gate_b(zn)
+        ) * self.proj_b(zn)
+        g: Float[torch.Tensor, "B N_res N_res c_pair"] = torch.sigmoid(self.gate(z))
+        m: Float[torch.Tensor, "B N_res N_res c_hidden"] = einsum(
+            a, b, "b k i c, b j k c -> b i j c"
+        )
+        return g * self.proj_out(self.norm_out(m))
+
+
+class PairformerBlock(nn.Module):
+    """One block of the Pairformer, refining pair and optional single embeddings.
+
+    Applies the full AF3 Pairformer update sequence to the pair representation
+    ``z`` and, when provided, the residue single representation ``s``:
+
+    1. Outgoing triangle multiplication  (row dropout)
+    2. Incoming triangle multiplication  (row dropout)
+    3. Triangle attention starting node  (row dropout)
+    4. Triangle attention ending node    (column dropout)
+    5. Transition FFN on ``z``
+    6. Attention with pair bias on ``s`` + transition FFN on ``s``  (if ``s`` given)
+
+    Args:
+        c_pair: Channel dimension of the pair embedding ``z``.
+        c_res: Channel dimension of the residue single embedding ``s``. Optional
+        n_heads: Number of attention heads for triangle attention and pair-bias
+            attention.  Must evenly divide ``c_pair``.
+    """
+
+    def __init__(self, c_pair: int, c_res: int | None, n_heads: int = 4) -> None:
+        super().__init__()
+        assert c_pair % n_heads == 0
+        self.n_heads = n_heads
+        self.head_dim = c_pair // n_heads
+        self.c_hidden = c_pair // 2
+
+        self.row_dropout = DropoutRowwise(p=0.25)
+        self.column_dropout = DropoutColumnwise(p=0.25)
+        self.b_proj_start = LinearNoBias(c_pair, n_heads)
+        self.b_proj_end = LinearNoBias(c_pair, n_heads)
+
+        self.triangle_mult_outgoing = TriangleMultiplicationOutgoing(
+            c=c_pair, c_hidden=self.c_hidden
+        )
+        self.traingle_mult_incoming = TriangleMultiplicationIncoming(
+            c=c_pair, c_hidden=self.c_hidden
+        )
+        self.triangle_attn_starting_node = TriangleAttentionStartingNodeWithBias(
+            c_pair=c_pair, n_heads=self.n_heads
+        )
+        self.triangle_attn_ending_node = TriangleAttentionEndingNodeWithBias(
+            c_pair=c_pair, n_heads=self.n_heads
+        )
+        self.transition1 = Transition(c_pair)
+
+        if c_res is not None:
+            self.attn_pair_bias = AttentionPairBias(
+                c_res=c_res, c_pair=c_pair, n_heads=self.n_heads
+            )  # n head = 16 as per AF3.
+
+            self.transition2 = Transition(c_res)
+
+    @jaxtyped(typechecker=beartype)
+    def forward(
+        self,
+        s: Float[torch.Tensor, "B N_res c_res"] | None,
+        z: Float[torch.Tensor, "B N_res N_res c_pair"],
+    ) -> tuple[
+        Float[torch.Tensor, "B N_res c_res"] | None, Float[torch.Tensor, "B N_res N_res c_pair"]
+    ]:
         """Apply row-wise and column-wise triangle attention with transition FFN."""
-        H, D = self.n_heads, self.head_dim
-
-        # ------------------------------------------------------------------
-        # Row-wise: for each (b, i), attend over j
-        # ------------------------------------------------------------------
-        xn: Float[torch.Tensor, "B N_res N_res c"] = self.norm_row(v)
-        Q: Float[torch.Tensor, "B N_res H N_res D"] = rearrange(
-            self.q_row(xn), "b n m (h d) -> b n h m d", h=H
-        )
-        K: Float[torch.Tensor, "B N_res H N_res D"] = rearrange(
-            self.k_row(xn), "b n m (h d) -> b n h m d", h=H
-        )
-        V: Float[torch.Tensor, "B N_res H N_res D"] = rearrange(
-            self.v_row(xn), "b n m (h d) -> b n h m d", h=H
-        )
-        G: Float[torch.Tensor, "B N_res H N_res D"] = rearrange(
-            torch.sigmoid(self.g_row(xn)), "b n m (h d) -> b n h m d", h=H
-        )
-        attn: Float[torch.Tensor, "B N_res H N_res N_res"] = torch.softmax(
-            einsum(Q, K, "b n h m_q d, b n h m_k d -> b n h m_q m_k") * (D**-0.5),
-            dim=-1,
-        )
-        out: Float[torch.Tensor, "B N_res N_res c"] = rearrange(
-            G * einsum(attn, V, "b n h m_q m_k, b n h m_k d -> b n h m_q d"),
-            "b n h m d -> b n m (h d)",
-        )
-        v = v + self.out_row(out)
-
-        # ------------------------------------------------------------------
-        # Column-wise: for each (b, j), attend over i
-        # ------------------------------------------------------------------
-        xn: Float[torch.Tensor, "B N_res N_res c"] = self.norm_col(v)
-        Q: Float[torch.Tensor, "B N_res H N_res D"] = rearrange(
-            self.q_col(xn), "b n m (h d) -> b m h n d", h=H
-        )
-        K: Float[torch.Tensor, "B N_res H N_res D"] = rearrange(
-            self.k_col(xn), "b n m (h d) -> b m h n d", h=H
-        )
-        V: Float[torch.Tensor, "B N_res H N_res D"] = rearrange(
-            self.v_col(xn), "b n m (h d) -> b m h n d", h=H
-        )
-        G: Float[torch.Tensor, "B N_res H N_res D"] = rearrange(
-            torch.sigmoid(self.g_col(xn)), "b n m (h d) -> b m h n d", h=H
-        )
-        attn: Float[torch.Tensor, "B N_res H N_res N_res"] = torch.softmax(
-            einsum(Q, K, "b m h n_q d, b m h n_k d -> b m h n_q n_k") * (D**-0.5),
-            dim=-1,
-        )
-        out: Float[torch.Tensor, "B N_res N_res c"] = rearrange(
-            G * einsum(attn, V, "b m h n_q n_k, b m h n_k d -> b m h n_q d"),
-            "b m h n d -> b n m (h d)",
-        )
-        v = v + self.out_col(out)
-
-        # ------------------------------------------------------------------
-        # Transition FFN
-        # ------------------------------------------------------------------
-        return v + self.ff2(F.relu(self.ff1(self.norm_ff(v))))
+        z = z + self.row_dropout(self.triangle_mult_outgoing(z))
+        z = z + self.row_dropout(self.traingle_mult_incoming(z))
+        b: Float[torch.Tensor, "B N_res N_res n_heads"] = self.b_proj_start(z)
+        z = z + self.row_dropout(self.triangle_attn_starting_node(z, b))
+        b: Float[torch.Tensor, "B N_res N_res n_heads"] = self.b_proj_end(z)
+        z = z + self.column_dropout(self.triangle_attn_ending_node(z, b))
+        z = z + self.transition1(z)
+        if s is not None:
+            s = s + self.attn_pair_bias(a=s, s=None, z=z)
+            s = s + self.transition2(s)
+            return s, z
+        return None, z
 
 
 class PairformerStack(nn.Module):
     """Stack of PairformerBlock modules applied sequentially to pair embeddings."""
 
-    def __init__(self, c: int, n_blocks: int = 2, n_heads: int = 4) -> None:
+    def __init__(
+        self, c: int, n_blocks: int = 2, n_heads: int = 4, c_res: int | None = None
+    ) -> None:
         super().__init__()
-        self.blocks = nn.ModuleList([PairformerBlock(c, n_heads) for _ in range(n_blocks)])
+        self.blocks = nn.ModuleList([PairformerBlock(c, c_res, n_heads) for _ in range(n_blocks)])
 
     @jaxtyped(typechecker=beartype)
     def forward(
         self,
-        v: Float[torch.Tensor, "B N_res N_res c"],
-    ) -> Float[torch.Tensor, "B N_res N_res c"]:
+        s: Float[torch.Tensor, "B N_res c_res"] | None,
+        z: Float[torch.Tensor, "B N_res N_res c_pair"],
+    ) -> (
+        tuple[Float[torch.Tensor, "B N_res c_res"], Float[torch.Tensor, "B N_res N_res c_pair"]]
+        | Float[torch.Tensor, "B N_res N_res c_pair"]
+    ):
         """Pass pair embeddings through all Pairformer blocks sequentially."""
         for block in self.blocks:
-            v = block(v)
-        return v
+            s, z = block(s=s, z=z)
+        if s is not None:
+            return s, z
+        return z  # the PairformerStack in AF3 can operate on z alone or z and s.

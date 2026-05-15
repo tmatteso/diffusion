@@ -86,9 +86,9 @@ def _make_half_denoiser_mock() -> MagicMock:
 
 
 @pytest.fixture
-def coords5() -> np.ndarray:
+def coords5() -> torch.Tensor:
     """Provide random atom5 coordinates (N_RES, 5, 3) with fixed seed."""
-    return np.random.RandomState(1).randn(N_RES, 5, 3).astype(np.float32)
+    return torch.tensor(np.random.RandomState(1).randn(N_RES, 5, 3).astype(np.float32))
 
 
 @pytest.fixture
@@ -186,13 +186,13 @@ def identity_stoch_sampler_tmin_high() -> EDMSampler:
 # ---------------------------------------------------------------------------
 
 
-def test_atom5_to_atom37_x37_shape(coords5: np.ndarray):
+def test_atom5_to_atom37_x37_shape(coords5: torch.Tensor):
     """Verify that the coordinate output expands the second axis from 5 to 37 slots."""
     x_37, _ = atom5_to_atom37(coords5)
     assert x_37.shape == (N_RES, 37, 3)
 
 
-def test_atom5_to_atom37_mask37_shape(coords5: np.ndarray):
+def test_atom5_to_atom37_mask37_shape(coords5: torch.Tensor):
     """Verify that the mask output has the atom37 width, one binary entry per residue-atom slot."""
     _, mask_37 = atom5_to_atom37(coords5)
     assert mask_37.shape == (N_RES, 37)
@@ -206,24 +206,24 @@ def test_atom5_to_atom37_mask37_shape(coords5: np.ndarray):
 def test_atom5_to_atom37_each_slot_lands_at_correct_atom37_index():
     """Confirm that each atom5 slot maps coordinates to expected atom37 index in ATOM5_TO_ATOM37."""
     # Give each atom5 slot a unique sentinel value so placement is unambiguous.
-    coords_5 = np.zeros((N_RES, 5, 3), dtype=np.float32)
+    coords_5 = torch.zeros((N_RES, 5, 3), dtype=torch.float32)
     for slot in range(5):
         coords_5[:, slot, :] = float(slot + 1)
     x_37, _ = atom5_to_atom37(coords_5)
     for slot, atom37_idx in enumerate(ATOM5_TO_ATOM37):
-        assert np.allclose(
-            x_37[:, atom37_idx, :], float(slot + 1)
+        assert torch.allclose(
+            x_37[:, atom37_idx, :], torch.tensor(float(slot + 1))
         ), f"atom5 slot {slot} → atom37 slot {atom37_idx}: wrong coords"
 
 
-def test_atom5_to_atom37_unoccupied_atom37_slots_are_zero(coords5: np.ndarray):
+def test_atom5_to_atom37_unoccupied_atom37_slots_are_zero(coords5: torch.Tensor):
     """Assert that atom37 positions not covered by atom5 remain exactly zero after mapping."""
     x_37, _ = atom5_to_atom37(coords5)
     occupied = set(ATOM5_TO_ATOM37)
     for idx in range(37):
         if idx not in occupied:
-            assert np.allclose(
-                x_37[:, idx, :], 0.0
+            assert torch.allclose(
+                x_37[:, idx, :], torch.zeros(1)
             ), f"atom37 slot {idx} should be zero (unoccupied)"
 
 
@@ -232,32 +232,32 @@ def test_atom5_to_atom37_unoccupied_atom37_slots_are_zero(coords5: np.ndarray):
 # ---------------------------------------------------------------------------
 
 
-def test_atom5_to_atom37_mask_none_sets_occupied_slots_to_one(coords5: np.ndarray):
+def test_atom5_to_atom37_mask_none_sets_occupied_slots_to_one(coords5: torch.Tensor):
     """When no explicit mask is given, all atom5-occupied slots in the atom37 mask must be 1."""
     _, mask_37 = atom5_to_atom37(coords5, mask_5=None)
     for atom37_idx in ATOM5_TO_ATOM37:
-        assert np.allclose(mask_37[:, atom37_idx], 1.0)
+        assert torch.allclose(mask_37[:, atom37_idx], torch.ones(N_RES))
 
 
 def test_atom5_to_atom37_explicit_mask_placed_at_correct_atom37_positions():
     """An explicit atom5 mask must be faithfully scatter-copied into correct atom37 positions."""
     rng = np.random.RandomState(2)
-    coords_5 = rng.randn(N_RES, 5, 3).astype(np.float32)
-    mask_5 = rng.rand(N_RES, 5).astype(np.float32)
+    coords_5 = torch.tensor(rng.randn(N_RES, 5, 3).astype(np.float32))
+    mask_5 = torch.tensor(rng.rand(N_RES, 5).astype(np.float32))
     _, mask_37 = atom5_to_atom37(coords_5, mask_5)
     for slot, atom37_idx in enumerate(ATOM5_TO_ATOM37):
-        assert np.allclose(mask_37[:, atom37_idx], mask_5[:, slot])
+        assert torch.allclose(mask_37[:, atom37_idx], mask_5[:, slot])
 
 
 def test_atom5_to_atom37_unoccupied_mask_slots_are_zero():
     """Atom37 mask entries with no corresponding atom5 must remain zero when atom5 mask is ones."""
-    coords_5 = np.ones((N_RES, 5, 3), dtype=np.float32)
-    mask_5 = np.ones((N_RES, 5), dtype=np.float32)
+    coords_5 = torch.ones((N_RES, 5, 3), dtype=torch.float32)
+    mask_5 = torch.ones((N_RES, 5), dtype=torch.float32)
     _, mask_37 = atom5_to_atom37(coords_5, mask_5)
     occupied = set(ATOM5_TO_ATOM37)
     for idx in range(37):
         if idx not in occupied:
-            assert np.allclose(mask_37[:, idx], 0.0)
+            assert torch.allclose(mask_37[:, idx], torch.zeros(N_RES))
 
 
 # ---------------------------------------------------------------------------
@@ -268,12 +268,12 @@ def test_atom5_to_atom37_unoccupied_mask_slots_are_zero():
 def test_atom5_to_atom37_rejects_wrong_second_dimension():
     """A jaxtyping TypeCheckError must be raised when the second dimension is not 5."""
     with pytest.raises(TypeCheckError):
-        atom5_to_atom37(np.zeros((N_RES, 4, 3), dtype=np.float32))  # 4 ≠ 5
+        atom5_to_atom37(torch.zeros((N_RES, 4, 3), dtype=torch.float32))  # 4 ≠ 5
 
 
 def test_atom5_to_atom37_single_residue():
     """The function must handle a single-residue input without broadcasting errors."""
-    coords_5 = np.random.randn(1, 5, 3).astype(np.float32)
+    coords_5 = torch.randn(1, 5, 3)
     x_37, mask_37 = atom5_to_atom37(coords_5)
     assert x_37.shape == (1, 37, 3)
     assert mask_37.shape == (1, 37)
@@ -750,11 +750,11 @@ def test_edm_sampler_step_count_changes_output_for_nontrivial_denoiser():
 # ---------------------------------------------------------------------------
 
 
-def test_atom5_to_atom37_output_dtype_is_float32(coords5: np.ndarray):
+def test_atom5_to_atom37_output_dtype_is_float32(coords5: torch.Tensor):
     """Both the coordinate and mask outputs must be float32 to match the model's expected dtype."""
     x_37, mask_37 = atom5_to_atom37(coords5)
-    assert x_37.dtype == np.float32
-    assert mask_37.dtype == np.float32
+    assert x_37.dtype == torch.float32
+    assert mask_37.dtype == torch.float32
 
 
 # ---------------------------------------------------------------------------

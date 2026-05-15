@@ -110,9 +110,9 @@ def z() -> Float[torch.Tensor, "B N_res N_res C"]:
 
 
 @pytest.fixture
-def b() -> Float[torch.Tensor, "B N_res N_res C"]:
-    """Random pair bias tensor [B, N_RES, N_RES, C]."""
-    return torch.randn(B, N_RES, N_RES, C)
+def b() -> Float[torch.Tensor, "B N_res N_res n_heads"]:
+    """Random pair bias tensor [B, N_RES, N_RES, n_heads]."""
+    return torch.randn(B, N_RES, N_RES, N_HEADS)
 
 
 @pytest.fixture
@@ -173,7 +173,7 @@ def test_transform_rbf_symmetric_distance_gives_symmetric_output(
 def test_tri_start_output_shape(
     tri_start: TriangleAttentionStartingNodeWithBias,
     z: Float[torch.Tensor, "B N_res N_res C"],
-    b: Float[torch.Tensor, "B N_res N_res C"],
+    b: Float[torch.Tensor, "B N_res N_res n_heads"],
 ) -> None:
     """TriangleAttentionStartingNode shape [B, N_res, N_res, C] same as input pair embedding."""
     with torch.no_grad():
@@ -184,7 +184,7 @@ def test_tri_start_output_shape(
 def test_tri_start_output_finite(
     tri_start: TriangleAttentionStartingNodeWithBias,
     z: Float[torch.Tensor, "B N_res N_res C"],
-    b: Float[torch.Tensor, "B N_res N_res C"],
+    b: Float[torch.Tensor, "B N_res N_res n_heads"],
 ) -> None:
     """TriangleAttentionStartingNode produces no NaN or Inf for random valid inputs."""
     with torch.no_grad():
@@ -230,7 +230,7 @@ def test_tri_start_row_independence(
 def test_tri_end_output_shape(
     tri_end: TriangleAttentionEndingNodeWithBias,
     z: Float[torch.Tensor, "B N_res N_res C"],
-    b: Float[torch.Tensor, "B N_res N_res C"],
+    b: Float[torch.Tensor, "B N_res N_res n_heads"],
 ) -> None:
     """TriangleAttentionEndingNode out [B, N_res, N_res, C] shape same as input pair embedding."""
     with torch.no_grad():
@@ -241,7 +241,7 @@ def test_tri_end_output_shape(
 def test_tri_end_output_finite(
     tri_end: TriangleAttentionEndingNodeWithBias,
     z: Float[torch.Tensor, "B N_res N_res C"],
-    b: Float[torch.Tensor, "B N_res N_res C"],
+    b: Float[torch.Tensor, "B N_res N_res n_heads"],
 ) -> None:
     """TriangleAttentionEndingNode produces no NaN or Inf for random valid inputs."""
     with torch.no_grad():
@@ -463,8 +463,8 @@ def test_tri_start_changes_with_pair_bias(
     z: Float[torch.Tensor, "B N_res N_res C"],
 ) -> None:
     """Different pair bias tensors produce different triangle attention starting-node outputs."""
-    b1 = torch.randn(B, N_RES, N_RES, C)
-    b2 = torch.randn(B, N_RES, N_RES, C)
+    b1 = torch.randn(B, N_RES, N_RES, N_HEADS)
+    b2 = torch.randn(B, N_RES, N_RES, N_HEADS)
     with torch.no_grad():
         out1 = tri_start(z, b1)
         out2 = tri_start(z, b2)

@@ -206,12 +206,12 @@ def coords_to_pdb_strings(
     B = coords_batch.shape[0]
     pdb_strings: list[str] = []
     for b in range(B):
-        coords_np = rearrange(coords_batch[b].cpu().numpy(), "(n a) d -> n a d", n=N_res, a=NATOM)
-        x_37, mask_37 = atom5_to_atom37(coords_np)
+        coords_tensor = rearrange(coords_batch[b].cpu(), "(n a) d -> n a d", n=N_res, a=NATOM)
+        x_37, mask_37 = atom5_to_atom37(coords_tensor)
         aatype = seq_logits[b].argmax(dim=-1).cpu().numpy().astype(np.int32)
         prot_out = Protein(
-            atom_positions=x_37,
-            atom_mask=mask_37,
+            atom_positions=x_37.numpy(),
+            atom_mask=mask_37.numpy(),
             residue_index=np.arange(N_res, dtype=np.int32),
             aatype=aatype,
             chain_index=np.zeros(N_res, dtype=np.int32),

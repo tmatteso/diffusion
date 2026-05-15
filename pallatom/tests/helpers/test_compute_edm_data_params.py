@@ -5,6 +5,7 @@ import math
 import pytest
 import torch
 from helpers.compute_edm_data_params import compute_edm_noise_params, compute_sigma_data
+from helpers.featurize import ProteinBatch
 from jaxtyping import Float
 from torch.utils.data import DataLoader, Dataset
 
@@ -146,46 +147,54 @@ def test_compute_sigma_data_weighted_by_mask_count():
 # ---------------------------------------------------------------------------
 
 
-def test_compute_edm_noise_params_returns_dict(spread_loader: DataLoader) -> None:
+def test_compute_edm_noise_params_returns_dict(spread_loader: DataLoader[ProteinBatch]) -> None:
     """compute_edm_noise_params returns a plain dict for downstream consumption."""
     assert isinstance(compute_edm_noise_params(spread_loader), dict)
 
 
-def test_compute_edm_noise_params_has_required_keys(spread_loader: DataLoader) -> None:
+def test_compute_edm_noise_params_has_required_keys(
+    spread_loader: DataLoader[ProteinBatch],
+) -> None:
     """compute_edm_noise_params output includes all four noise schedule keys."""
     params = compute_edm_noise_params(spread_loader)
     assert {"sigma_max", "sigma_min", "P_mean", "P_std"} <= params.keys()
 
 
-def test_compute_edm_noise_params_sigma_max_positive(spread_loader: DataLoader) -> None:
+def test_compute_edm_noise_params_sigma_max_positive(
+    spread_loader: DataLoader[ProteinBatch],
+) -> None:
     """sigma_max is strictly positive for a non-degenerate dataset."""
     assert compute_edm_noise_params(spread_loader)["sigma_max"] > 0.0
 
 
-def test_compute_edm_noise_params_sigma_min_ge_floor(spread_loader: DataLoader) -> None:
+def test_compute_edm_noise_params_sigma_min_ge_floor(
+    spread_loader: DataLoader[ProteinBatch],
+) -> None:
     """sigma_min is always at least 2e-3, the hard floor imposed to avoid underflow."""
     assert compute_edm_noise_params(spread_loader)["sigma_min"] >= 2e-3
 
 
-def test_compute_edm_noise_params_sigma_max_gt_sigma_min(spread_loader: DataLoader) -> None:
+def test_compute_edm_noise_params_sigma_max_gt_sigma_min(
+    spread_loader: DataLoader[ProteinBatch],
+) -> None:
     """sigma_max exceeds sigma_min so the log-uniform noise distribution is well-defined."""
     params = compute_edm_noise_params(spread_loader)
     assert params["sigma_max"] > params["sigma_min"]
 
 
-def test_compute_edm_noise_params_P_std_positive(spread_loader: DataLoader) -> None:
+def test_compute_edm_noise_params_P_std_positive(spread_loader: DataLoader[ProteinBatch]) -> None:
     """P_std is strictly positive, ensuring the log-normal noise sampler has non-zero width."""
     assert compute_edm_noise_params(spread_loader)["P_std"] > 0.0
 
 
-def test_compute_edm_noise_params_P_mean_formula(spread_loader: DataLoader) -> None:
+def test_compute_edm_noise_params_P_mean_formula(spread_loader: DataLoader[ProteinBatch]) -> None:
     """P_mean equals the midpoint of (log sigma_min, log sigma_max) as specified by EDM."""
     params = compute_edm_noise_params(spread_loader)
     expected = (math.log(params["sigma_min"]) + math.log(params["sigma_max"])) / 2.0
     assert math.isclose(params["P_mean"], expected, rel_tol=1e-5)
 
 
-def test_compute_edm_noise_params_P_std_formula(spread_loader: DataLoader) -> None:
+def test_compute_edm_noise_params_P_std_formula(spread_loader: DataLoader[ProteinBatch]) -> None:
     """P_std equals half the log-range (log sigma_max − log sigma_min) / 2 as specified by EDM."""
     params = compute_edm_noise_params(spread_loader)
     expected = (math.log(params["sigma_max"]) - math.log(params["sigma_min"])) / 2.0

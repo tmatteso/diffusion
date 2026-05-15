@@ -137,9 +137,9 @@ def med_loss_per_block(
 
 
 def med_loss(
-    r_denoised_blocks: list,
+    r_denoised_blocks: list[torch.Tensor],
     r_gt: Float[torch.Tensor, "... N_res 3"],
-    logits_aa_blocks: list,
+    logits_aa_blocks: list[torch.Tensor],
     aa_gt: Int[torch.Tensor, "... N_res"],
     lam: float,
     alpha_0: float,

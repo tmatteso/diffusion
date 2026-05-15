@@ -84,6 +84,8 @@ class TemplateEmbedder(nn.Module):
             [f_distogram, b_mask, b_time], dim=-1
         )
 
+        # This part has to be done once for each template.
+
         # ------------------------------------------------------------------
         # Step 4: v_ij = LinearNoBias(LayerNorm(z_ij)) + LinearNoBias(a_ij)
         # ------------------------------------------------------------------
@@ -94,11 +96,15 @@ class TemplateEmbedder(nn.Module):
         # ------------------------------------------------------------------
         # Step 5: v_ij = PairformerStack(v_ij, N_block)
         # ------------------------------------------------------------------
-        v_ij: Float[torch.Tensor, "B N_res N_res c"] = self.pairformer(v_ij)
+        v_ij: Float[torch.Tensor, "B N_res N_res c"] = self.pairformer(s=None, z=v_ij)
 
         # ------------------------------------------------------------------
         # Step 6: u_ij = LinearNoBias(ReLU(LayerNorm(v_ij)))
         # ------------------------------------------------------------------
         u_ij: Float[torch.Tensor, "B N_res N_res d"] = self.proj_out(F.relu(self.norm_v(v_ij)))
+
+        # if you had multiple templates,
+        # you would average the u_ij across templates after the layer norm
+        # then fire a LinearNoBias(ReLu(u_ij))
 
         return u_ij
