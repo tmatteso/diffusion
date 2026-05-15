@@ -5,7 +5,12 @@ import dataclasses
 import pytest
 import torch
 import torch.nn.functional as F
-from architecture.losses import distogram_loss_atom
+from architecture.losses import (
+    atom_loss,
+    distogram_loss_atom,
+    distogram_loss_residue,
+    smooth_lddt_loss,
+)
 from architecture.main_trunk import (
     AtomDistogramHead,
     MainTrunk,
@@ -423,6 +428,79 @@ def test_main_trunk_forward_with_mask_token_aa_indices(
 
 
 # you need to add integration tests here. don't be afraid to use pytest mocks.
+
+
+def _assert_submodule_grads(model: MainTrunk) -> None:
+    """Assert every top-level submodule has at least one finite nonzero gradient.
+
+    Args:
+        model: Trunk module after a backward pass has been called.
+    """
+    buckets: dict[str, list[torch.Tensor]] = {}
+    for name, param in model.named_parameters():
+        if param.grad is not None:
+            buckets.setdefault(name.split(".")[0], []).append(param.grad)
+    for prefix, grads in buckets.items():
+        assert any(
+            torch.isfinite(g).all().item() and g.abs().max().item() > 0 for g in grads
+        ), f"submodule '{prefix}' has no finite nonzero gradients"
+
+
+def test_integration_gradient_flow_composite_loss(
+    model: MainTrunk, featurized_batch: FeaturizedBatch
+) -> None:
+    """Composite 7-term training loss propagates finite nonzero grads to every submodule."""
+    model.train()
+    (
+        r_denoised,
+        f_seq_logits,
+        residue_distogram_logits,
+        atom_distogram_logits,
+        intermediate_denoised_coord_stack,
+        intermediate_pred_aa_logit_stack,
+    ) = model(featurized_batch)
+
+    kabsch_loss = atom_loss(r_denoised, featurized_batch.r_gt, featurized_batch.atom5_mask).mean()
+    ce_loss = F.cross_entropy(
+        rearrange(f_seq_logits, "b n c -> (b n) c"),
+        rearrange(featurized_batch.aa_indices, "b n -> (b n)"),
+    )
+    lddt = smooth_lddt_loss(
+        r_denoised, featurized_batch.r_gt, featurized_batch.atom5_mask, cutoff=15.0
+    )
+    gt_res_bin_idx = featurized_batch.gt_res_distogram.argmax(dim=-1).clamp(
+        0, residue_distogram_logits.size(-1) - 1
+    )
+    res_distogram_loss = distogram_loss_residue(
+        residue_distogram_logits, gt_res_bin_idx, featurized_batch.residue_mask
+    ).mean()
+    atom_distogram_loss = distogram_loss_atom(
+        atom_distogram_logits,
+        featurized_batch.gt_atom_distogram_sparse,
+        featurized_batch.gt_atom_distogram_mask_sparse,
+    ).mean()
+
+    K_unit = len(intermediate_denoised_coord_stack)
+    intermediate_loss = torch.tensor(0.0)
+    for k_idx, (inter_coords, inter_logits) in enumerate(
+        zip(intermediate_denoised_coord_stack, intermediate_pred_aa_logit_stack, strict=False)
+    ):
+        gamma: float = 0.99 ** (K_unit - k_idx - 1)
+        k_loss = atom_loss(
+            inter_coords, featurized_batch.r_gt, featurized_batch.atom5_mask
+        ) + F.cross_entropy(
+            rearrange(inter_logits, "b n c -> (b n) c"),
+            rearrange(featurized_batch.aa_indices, "b n -> (b n)"),
+        )
+        intermediate_loss = intermediate_loss + gamma * k_loss
+    intermediate_loss = (intermediate_loss / max(K_unit, 1)).mean()
+
+    total_loss = (
+        kabsch_loss + ce_loss + lddt + res_distogram_loss + atom_distogram_loss + intermediate_loss
+    )
+    total_loss.backward()
+
+    _assert_submodule_grads(model)
 
 
 # ---------------------------------------------------------------------------

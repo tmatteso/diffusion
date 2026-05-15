@@ -205,8 +205,44 @@ the `avg_train` passed to `log_epoch`, assert averages match.
 
 ## Conventions followed
 
+Derived from `/workspaces/diffusion/CLAUDE.md` and `pyproject.toml`.
+
 - Module-level `def test_*()` functions, no class grouping.
 - `pytest` fixtures for all shared state.
-- `torch.manual_seed(42)` at module level.
+- `torch.manual_seed(42)` at module level (already present in the file).
 - No `einops` or `jaxtyping` needed (tests deal with control-flow, not tensor shapes).
 - No new external dependencies.
+
+### Docstrings
+
+Every function (test, fixture, helper) must have a Google-style docstring. The `ANN` ruff waiver
+for test files covers annotation rules only; `D` pydocstyle rules still apply. One-line
+docstrings are fine for simple helpers and test functions.
+
+### Type annotations
+
+All fixture parameters and return types must be annotated. pyright `reportMissingParameterType`
+fires for test files even though ruff `ANN` rules are waived. Pattern for test functions:
+
+```python
+def test_foo(
+    model: MainTrunk,
+    loader: torch.utils.data.DataLoader[ProteinBatch],
+    tcfg: TrainConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One-line summary."""
+    ...
+```
+
+Use fully-parameterised generics everywhere: `dict[str, float]`, `list[float]`,
+`DataLoader[ProteinBatch]`, not bare `dict` / `list` / `DataLoader`.
+
+### Import ordering
+
+isort ordering: stdlib → third-party → first-party (no `pallatom.` prefix), alphabetical within
+each group. New imports for the integration section go at the top of the existing import block.
+
+### Line length
+
+100 characters (Black-enforced). Wrap long argument lists at 100.
