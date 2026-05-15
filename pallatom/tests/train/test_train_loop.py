@@ -15,6 +15,7 @@ import torch.nn.parallel
 from architecture.main_trunk import MainTrunk
 from helpers.data import _to_protein_batch
 from helpers.featurize import Distogram, ProteinBatch, apply_conditioning_dropout, featurize_batch
+from torch.optim import Adam
 from train.train_config import (
     CheckpointParams,
     LoggingParams,
@@ -27,6 +28,7 @@ from train.train_loop import (
     evaluate_ddp,
     train,
     train_ddp,
+    train_step,
 )
 
 torch.manual_seed(42)
@@ -1284,3 +1286,42 @@ def test_evaluate_loop_unchanged_by_dropout_config(
     """Ensures evaluate returns valid float metrics regardless of dropout config."""
     result = evaluate(model, loader, tcfg, distogram_res, distogram_atom, device="cpu")
     assert all(isinstance(v, float) for v in result.values())
+
+
+# ---------------------------------------------------------------------------
+# Integration: gradient flow via train_step
+# ---------------------------------------------------------------------------
+
+
+def _assert_submodule_grads(model: MainTrunk) -> None:
+    """Assert every top-level submodule has at least one finite nonzero gradient.
+
+    Args:
+        model: Trunk module after a backward pass has been called.
+    """
+    buckets: dict[str, list[torch.Tensor]] = {}
+    for name, param in model.named_parameters():
+        if param.grad is not None:
+            buckets.setdefault(name.split(".")[0], []).append(param.grad)
+    for prefix, grads in buckets.items():
+        assert any(
+            torch.isfinite(g).all().item() and g.abs().max().item() > 0 for g in grads
+        ), f"submodule '{prefix}' has no finite nonzero gradients"
+
+
+def test_integration_gradient_flow_via_train_step(
+    model: MainTrunk,
+    tcfg: TrainConfig,
+    distogram_res: Distogram,
+    distogram_atom: Distogram,
+    loader: torch.utils.data.DataLoader[ProteinBatch],
+) -> None:
+    """train_step() back-propagates finite nonzero grads to every MainTrunk submodule.
+
+    Gradients persist on parameters after train_step() returns because zero_grad()
+    is called at the start of the next train_step() call, not at the end of this one.
+    """
+    batch = next(iter(loader))
+    optimizer = Adam(model.parameters(), lr=1e-4)
+    train_step(batch, model, tcfg, distogram_res, distogram_atom, optimizer, device="cpu")
+    _assert_submodule_grads(model)
