@@ -403,7 +403,7 @@ def test_build_sampling_context_placeholder_scalars(context: FeaturizedBatch):
 
 def test_build_sampling_context_n_atom_scales_linearly_with_n_res():
     """Doubling sequence length must double atom-axis size of ref_pos, tok_idx, and center_uid."""
-    a_fn = Distogram(n_bins=22, min_dist=2.0, max_dist=22.0)
+    a_fn = Distogram(n_bins=22, min_dist=2.0, max_dist=22.0, overflow_bin=False)
     t_fn = Distogram(n_bins=38, min_dist=3.25, max_dist=50.75, overflow_bin=True)
     with torch.no_grad():
         small = build_sampling_context(
@@ -433,7 +433,7 @@ def test_build_sampling_context_n_atom_scales_linearly_with_n_res():
 
 def test_build_sampling_context_custom_n_templ_bins():
     """A distogram with n_bins=19 + overflow_bin must produce (B, N_res, N_res, 20) tensor."""
-    a_fn = Distogram(n_bins=22, min_dist=2.0, max_dist=22.0)
+    a_fn = Distogram(n_bins=22, min_dist=2.0, max_dist=22.0, overflow_bin=False)
     t_fn = Distogram(n_bins=19, min_dist=3.25, max_dist=50.75, overflow_bin=True)
     with torch.no_grad():
         ctx = build_sampling_context(
@@ -451,7 +451,7 @@ def test_build_sampling_context_custom_n_templ_bins():
 
 def test_build_sampling_context_custom_n_atom_bins():
     """A custom atom distogram with n_bins=10 must propagate that bin count to the sparse tensor."""
-    a_fn = Distogram(n_bins=10, min_dist=2.0, max_dist=22.0)
+    a_fn = Distogram(n_bins=10, min_dist=2.0, max_dist=22.0, overflow_bin=False)
     t_fn = Distogram(n_bins=38, min_dist=3.25, max_dist=50.75, overflow_bin=True)
     with torch.no_grad():
         ctx = build_sampling_context(
@@ -920,7 +920,7 @@ def residue_idx_aa() -> torch.Tensor:
 @pytest.fixture
 def atom_disto_fn() -> Distogram:
     """Provide a standard atom distogram function with 22 bins spanning 2-22 Å."""
-    return Distogram(n_bins=N_ATOM_BINS, min_dist=2.0, max_dist=22.0)
+    return Distogram(n_bins=N_ATOM_BINS, min_dist=2.0, max_dist=22.0, overflow_bin=False)
 
 
 @pytest.fixture

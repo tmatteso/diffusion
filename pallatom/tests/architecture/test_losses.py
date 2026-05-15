@@ -43,7 +43,7 @@ def make_noisy(
 def pairwise_sq_dist(
     x: Float[torch.Tensor, "N 3"],
 ) -> Float[torch.Tensor, "N N"]:
-    """Compute the symmetric N×N pairwise squared Euclidean distance matrix."""
+    """Compute the symmetric N by N pairwise squared Euclidean distance matrix."""
     diff = rearrange(x, "n d -> n 1 d") - rearrange(x, "n d -> 1 n d")
     return einsum(diff, diff, "n m d, n m d -> n m")
 
@@ -115,7 +115,7 @@ def half_mask() -> Bool[torch.Tensor, "B N_atoms"]:
 
 @pytest.fixture
 def rotation() -> Float[torch.Tensor, "3 3"]:
-    """A random 3×3 orthogonal rotation matrix obtained via QR decomposition."""
+    """A random 3 by 3 orthogonal rotation matrix obtained via QR decomposition."""
     R, _ = torch.linalg.qr(torch.randn(3, 3))
     return R
 
@@ -336,7 +336,7 @@ def test_med_loss_mismatched_blocks_raises(
     aa_blocks: Float[torch.Tensor, "K B N_atoms VOCAB"],
 ):
     """Passing lists of different lengths for r_blocks and aa_blocks must raise ValueError."""
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="r_denoised_blocks has"):
         med_loss(
             list(r_blocks),
             r_gt,

@@ -50,7 +50,7 @@ def test_restype_num_is_21() -> None:
 @pytest.fixture
 def disto() -> Distogram:
     """Provide a Distogram without overflow bin in eval mode."""
-    return Distogram(n_bins=N_BINS, min_dist=MIN_DIST, max_dist=MAX_DIST).eval()
+    return Distogram(n_bins=N_BINS, overflow_bin=False, min_dist=MIN_DIST, max_dist=MAX_DIST).eval()
 
 
 @pytest.fixture
@@ -213,7 +213,7 @@ def test_distogram_overflow_far_pairs_land_in_last_bin(disto_overflow: Distogram
 
 
 def test_distogram_exact_bin_for_known_interior_distance(disto: Distogram) -> None:
-    """Distogram assigns a 9 Å pair to bin 5 given bin_width=(22−2)/16=1.25 Å."""
+    """Distogram assigns a 9 Å pair to bin 5 given bin_width=(22-2)/16=1.25 Å."""
     # bin_width = (MAX_DIST - MIN_DIST) / N_BINS = (22 - 2) / 16 = 1.25 Å
     # d = 9.0 Å → bin = floor((9.0 - 2.0) / 1.25) = floor(5.6) = 5
     c = torch.zeros(N_RES, 3)
@@ -261,7 +261,9 @@ def c_beta_distogram_fn(tcfg: TrainConfig) -> Distogram:
 def atom_distogram_fn(tcfg: TrainConfig) -> Distogram:
     """Provide the atom-level Distogram configured from tcfg.distogram_atom."""
     da = tcfg.distogram_atom
-    return Distogram(n_bins=da.n_bins, min_dist=da.min_dist, max_dist=da.max_dist).eval()
+    return Distogram(
+        n_bins=da.n_bins, overflow_bin=False, min_dist=da.min_dist, max_dist=da.max_dist
+    ).eval()
 
 
 @pytest.fixture
@@ -361,7 +363,7 @@ def test_featurize_batch_tok_idx_maps_atoms_to_residues(featurized_batch: Featur
 
 
 def test_featurize_batch_center_uid_points_to_ca(featurized_batch: FeaturizedBatch) -> None:
-    """center_uid[b, r] equals r*5+1, the Cα atom index for residue r."""
+    """center_uid[b, r] equals r*5+1, the C alpha atom index for residue r."""
     expected = torch.arange(N_RES) * 5 + 1  # (N_RES,)
     for b in range(B):
         assert torch.equal(featurized_batch.center_uid[b], expected)

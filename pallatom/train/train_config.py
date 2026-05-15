@@ -20,7 +20,7 @@ class ModelParams(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
-    f_ref_dim: int = Field(default=35, gt=0)  # 5 atoms × 7 features
+    f_ref_dim: int = Field(default=35, gt=0)  # 5 atoms by 7 features
     n_bins: int = Field(
         default=39, gt=0
     )  # distogram bins for TemplateEmbedder (38 + 1 overflow bin)

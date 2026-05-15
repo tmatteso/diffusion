@@ -212,7 +212,7 @@ def test_pairformer_stack_single_block_matches_pairformer_block() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Fixtures – TriangleMultiplicationOutgoing
+# Fixtures - TriangleMultiplicationOutgoing
 # ---------------------------------------------------------------------------
 
 
@@ -542,7 +542,7 @@ def test_tmo_jaxtyping_rejects_non_square_spatial_dims(
 
 
 # ---------------------------------------------------------------------------
-# Fixtures – TriangleMultiplicationIncoming
+# Fixtures - TriangleMultiplicationIncoming
 # ---------------------------------------------------------------------------
 
 

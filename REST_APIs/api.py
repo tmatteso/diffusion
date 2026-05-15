@@ -84,7 +84,7 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
     mp = ModelParams()
     noise = NoiseScheduleParams()
     model = _load_model(CHECKPOINT_PATH, mp, noise, DEVICE)
-    atom_disto = Distogram(n_bins=22, min_dist=2.0, max_dist=22.0).to(DEVICE)
+    atom_disto = Distogram(n_bins=22, min_dist=2.0, max_dist=22.0, overflow_bin=False).to(DEVICE)
     templ_disto = Distogram(
         n_bins=mp.n_bins - 1, min_dist=3.25, max_dist=50.75, overflow_bin=True
     ).to(DEVICE)

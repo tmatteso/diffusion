@@ -146,7 +146,7 @@ def _make_mock_state() -> _AppState:
         model=_make_trunk_mock(),
         mp=mp,
         noise=noise,
-        atom_disto=Distogram(n_bins=22, min_dist=2.0, max_dist=22.0),
+        atom_disto=Distogram(n_bins=22, min_dist=2.0, max_dist=22.0, overflow_bin=False),
         templ_disto=Distogram(
             n_bins=mp.n_bins - 1, min_dist=3.25, max_dist=50.75, overflow_bin=True
         ),

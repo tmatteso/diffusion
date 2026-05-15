@@ -37,7 +37,7 @@ C_ATOMPAIR = 16
 N_BINS = 38
 N_ATOM_BINS = 22  # distinct from N_BINS; must match AtomDistogramParams.n_bins
 K_UNIT = 2
-# WINDOW_SIZE=32 (half=16); interior residues span 31 residues × 3 atoms/res = 93 atom neighbours
+# WINDOW_SIZE=32 (half=16); interior residues span 31 residues by 3 atoms/res = 93 atom neighbours
 K_SPARSE = 93
 F_REF_DIM = ATOMS_PER_RES * (
     3 + E

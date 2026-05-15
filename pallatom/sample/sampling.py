@@ -634,7 +634,9 @@ if __name__ == "__main__":
 
         from helpers.featurize import Distogram as _Distogram
 
-        _atom_disto = _Distogram(n_bins=22, min_dist=2.0, max_dist=22.0).to(device)
+        _atom_disto = _Distogram(n_bins=22, min_dist=2.0, max_dist=22.0, overflow_bin=False).to(
+            device
+        )
         _templ_disto = _Distogram(
             n_bins=mp.n_bins - 1, min_dist=3.25, max_dist=50.75, overflow_bin=True
         ).to(device)

@@ -4,12 +4,14 @@ repos:
     hooks:
       - id: black
         language_version: python3
+        always_run: true
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.9.0
     hooks:
       - id: ruff
         args: [--fix]
+        always_run: true
 
   - repo: local
     hooks:

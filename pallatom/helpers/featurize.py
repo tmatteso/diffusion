@@ -55,10 +55,11 @@ class Distogram(nn.Module):
 
     def __init__(
         self,
+        *,
         n_bins: int,
+        overflow_bin: bool,
         min_dist: float = 2.0,
         max_dist: float = 22.0,
-        overflow_bin: bool = False,
     ) -> None:
         super().__init__()
         self.n_bins = n_bins
@@ -310,7 +311,7 @@ def featurize_batch(
 ) -> FeaturizedBatch:
     """Convert a raw ProteinBatch into a FeaturizedBatch ready for model input.
 
-    Draws a shared log-normal noise level σ for the entire batch, converts atom37
+    Draws a shared log-normal noise level sigma for the entire batch, converts atom37
     coordinates to the compact atom5 representation, computes Cβ and atom-level
     distograms, builds sinusoidal residue-index encodings, adds isotropic Gaussian
     noise to ground-truth positions, and gathers sparse atom-pair distogram labels
@@ -332,7 +333,7 @@ def featurize_batch(
     Returns:
         A FeaturizedBatch containing noisy input coordinates, ground-truth
         positions, distogram labels, atom masks, sequence indices, sinusoidal
-        residue encodings, and the sampled noise level σ.
+        residue encodings, and the sampled noise level sigma.
     """
     B: int = len(batch.seq)
     Natom: int = 5

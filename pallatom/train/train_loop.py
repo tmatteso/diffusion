@@ -700,7 +700,7 @@ if __name__ == "__main__":
                     n_bins=dr.n_bins, min_dist=dr.min_dist, max_dist=dr.max_dist, overflow_bin=True
                 ).to(device)
                 distogram_atom = Distogram(
-                    n_bins=da.n_bins, min_dist=da.min_dist, max_dist=da.max_dist
+                    n_bins=da.n_bins, min_dist=da.min_dist, max_dist=da.max_dist, overflow_bin=False
                 ).to(device)
 
                 if tcfg.training.pretrained_weights is not None:
