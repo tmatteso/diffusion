@@ -96,7 +96,6 @@ select = [
     "SIM",  # flake8-simplify
     "ARG",  # flake8-unused-arguments
     "RUF",  # ruff-specific — RUF100 flags unused noqa comments
-    "TCH",  # type-checking imports — move type-only imports under TYPE_CHECKING guard
     "TRY",  # exception handling hygiene
     "PERF", # performance antipatterns in hot paths
     "PGH",  # pygrep-hooks — requires specific codes on type: ignore comments
@@ -141,11 +140,11 @@ reportConstantRedefinition = "error" # Final enforcement — error if a Final va
 # reportUnknownVariableType = "warning" # does not play well with jaxtyping
 # reportUnknownParameterType = "warning" # contamination from untyped libraries
 # reportUnknownMemberType = "warning" # contamination from untyped libraries
-reportUnnecessaryTypeIgnoreComment = "warning" # aren't ignoring type errors without a specific reason.
+reportUnnecessaryTypeIgnoreComment = "error" # aren't ignoring type errors without a specific reason.
 
 strictParameterNoneValue = true # prevents accessing attributes that might not exist at runtime.
-reportUninitializedInstanceVariable = "warning" # class attributes are initialized in __init__.
-reportUnnecessaryCast = "warning" # enfirces pytorch cast() calls are actually doing work.
+reportUninitializedInstanceVariable = "error" # class attributes are initialized in __init__.
+reportUnnecessaryCast = "error" # enforces pytorch cast() calls are actually doing work.
 
 # Enforce variance safety (e.g., dict vs Mapping)
 reportIncompatibleMethodOverride = "error"

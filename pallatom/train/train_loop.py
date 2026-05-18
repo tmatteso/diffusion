@@ -36,7 +36,7 @@ from train.train_config import TrainConfig
 log = structlog.get_logger()
 
 
-def _mask_seq_target(aa_indices: torch.Tensor) -> torch.Tensor:
+def _mask_seq_target(aa_indices: Int[torch.Tensor, "B N_res"]) -> Int[torch.Tensor, "B N_res"]:
     """Replace mask-token index 20 with -100 so CE loss ignores dropped positions."""
     return aa_indices.masked_fill(aa_indices == 20, -100)
 
@@ -138,6 +138,7 @@ def evaluate(
             featurized_batch.r_gt,
             r_denoised,
             weights=featurized_batch.atom5_mask.float(),
+            return_transform=False,
         )
         r_aligned: Float[torch.Tensor, "B N_atom 3"]
         diff: Float[torch.Tensor, "B N_atom 3"] = r_denoised - r_aligned
@@ -252,6 +253,7 @@ def evaluate_ddp(
             featurized_batch.r_gt,
             r_denoised,
             weights=featurized_batch.atom5_mask.float(),
+            return_transform=False,
         )
         diff: Float[torch.Tensor, "B N_atom 3"] = r_denoised - r_aligned
         sq: Float[torch.Tensor, "B N_atom"] = (diff * diff).sum(dim=-1)
@@ -569,7 +571,7 @@ def train_ddp(
 
     for epoch in range(1, tp.num_epochs + 1):
         ddp_model.train()
-        cast(DistributedSampler[ProteinBatch], train_loader.sampler).set_epoch(epoch)
+        cast("DistributedSampler[ProteinBatch]", train_loader.sampler).set_epoch(epoch)
         epoch_metrics: dict[str, float] = dict.fromkeys(
             [
                 "total loss",

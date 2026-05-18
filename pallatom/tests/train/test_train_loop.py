@@ -15,6 +15,7 @@ import torch.nn.parallel
 from architecture.main_trunk import MainTrunk
 from helpers.data import _to_protein_batch
 from helpers.featurize import Distogram, ProteinBatch, apply_conditioning_dropout, featurize_batch
+from jaxtyping import Float
 from torch.optim import Adam
 from train.train_config import (
     CheckpointParams,
@@ -58,7 +59,7 @@ EXPECTED_EVAL_KEYS = frozenset(
 
 
 class _ListDataset(torch.utils.data.Dataset[ProteinBatch]):
-    def __init__(self, items: list[Mapping[str, torch.Tensor | list[str]]]) -> None:
+    def __init__(self, items: list[Mapping[str, Float[torch.Tensor, "..."] | list[str]]]) -> None:
         self._items = items
 
     def __len__(self) -> int:
@@ -67,10 +68,10 @@ class _ListDataset(torch.utils.data.Dataset[ProteinBatch]):
     def __getitem__(self, idx: int) -> ProteinBatch:
         item = self._items[idx]
         return ProteinBatch(
-            atom_positions=cast(torch.Tensor, item["atom_positions"]),
-            atom_mask=cast(torch.Tensor, item["atom_mask"]),
-            residue_index=cast(torch.Tensor, item["residue_index"]),
-            seq=cast(list[str], item["seq"]),
+            atom_positions=cast("torch.Tensor", item["atom_positions"]),
+            atom_mask=cast("torch.Tensor", item["atom_mask"]),
+            residue_index=cast("torch.Tensor", item["residue_index"]),
+            seq=cast("list[str]", item["seq"]),
         )
 
 
@@ -129,7 +130,7 @@ def tcfg(tmp_path: pathlib.Path) -> TrainConfig:
 
 
 @pytest.fixture
-def single_sample() -> Mapping[str, torch.Tensor | str]:
+def single_sample() -> Mapping[str, Float[torch.Tensor, "..."] | str]:
     """Provide single unbatched protein sample (no batch dimension) for _to_protein_batch tests."""
     return {
         "atom_positions": torch.randn(_N_KEEP, 37, 3),
@@ -140,7 +141,7 @@ def single_sample() -> Mapping[str, torch.Tensor | str]:
 
 
 @pytest.fixture
-def mini_batch() -> Mapping[str, torch.Tensor | list[str]]:
+def mini_batch() -> Mapping[str, Float[torch.Tensor, "..."] | list[str]]:
     """Provide a single-item mini-batch of random tensors with _N_KEEP residues."""
     return {
         "atom_positions": torch.randn(1, _N_KEEP, 37, 3),
@@ -152,7 +153,7 @@ def mini_batch() -> Mapping[str, torch.Tensor | list[str]]:
 
 @pytest.fixture
 def loader(
-    mini_batch: Mapping[str, torch.Tensor | list[str]]
+    mini_batch: Mapping[str, Float[torch.Tensor, "..."] | list[str]]
 ) -> torch.utils.data.DataLoader[ProteinBatch]:
     """Provide a DataLoader that yields the mini_batch as a single batch."""
     return torch.utils.data.DataLoader(_ListDataset([mini_batch]), batch_size=None)
@@ -274,48 +275,52 @@ def tcfg_save(tmp_path: pathlib.Path) -> TrainConfig:
 
 
 def test_to_protein_batch_returns_protein_batch(
-    single_sample: Mapping[str, torch.Tensor | str]
+    single_sample: Mapping[str, Float[torch.Tensor, "..."] | str]
 ) -> None:
     """Ensures _to_protein_batch returns a ProteinBatch dataclass instance."""
     assert isinstance(_to_protein_batch([single_sample]), ProteinBatch)
 
 
 def test_to_protein_batch_atom_positions_shape(
-    single_sample: Mapping[str, torch.Tensor | str]
+    single_sample: Mapping[str, Float[torch.Tensor, "..."] | str]
 ) -> None:
     """Ensures _to_protein_batch stacks atom_positions into batched tensor w/ leading batch dim."""
     result = _to_protein_batch([single_sample])
     assert result.atom_positions.shape == torch.Size(
-        [1, *cast(torch.Tensor, single_sample["atom_positions"]).shape]
+        [1, *cast("torch.Tensor", single_sample["atom_positions"]).shape]
     )
 
 
-def test_to_protein_batch_atom_mask_shape(single_sample: Mapping[str, torch.Tensor | str]) -> None:
+def test_to_protein_batch_atom_mask_shape(
+    single_sample: Mapping[str, Float[torch.Tensor, "..."] | str],
+) -> None:
     """Ensures _to_protein_batch stacks atom_mask into a batched tensor with a leading batch dim."""
     result = _to_protein_batch([single_sample])
     assert result.atom_mask.shape == torch.Size(
-        [1, *cast(torch.Tensor, single_sample["atom_mask"]).shape]
+        [1, *cast("torch.Tensor", single_sample["atom_mask"]).shape]
     )
 
 
 def test_to_protein_batch_residue_index_shape(
-    single_sample: Mapping[str, torch.Tensor | str]
+    single_sample: Mapping[str, Float[torch.Tensor, "..."] | str]
 ) -> None:
     """Ensures _to_protein_batch stacks residue_index into batched tensor with leading batch dim."""
     result = _to_protein_batch([single_sample])
     assert result.residue_index.shape == torch.Size(
-        [1, *cast(torch.Tensor, single_sample["residue_index"]).shape]
+        [1, *cast("torch.Tensor", single_sample["residue_index"]).shape]
     )
 
 
-def test_to_protein_batch_seq_is_list(single_sample: Mapping[str, torch.Tensor | str]) -> None:
+def test_to_protein_batch_seq_is_list(
+    single_sample: Mapping[str, Float[torch.Tensor, "..."] | str],
+) -> None:
     """Ensures _to_protein_batch wraps the sequence field into a Python list."""
     result = _to_protein_batch([single_sample])
     assert isinstance(result.seq, list)
 
 
 def test_to_protein_batch_seq_elements_are_strings(
-    single_sample: Mapping[str, torch.Tensor | str]
+    single_sample: Mapping[str, Float[torch.Tensor, "..."] | str]
 ) -> None:
     """Ensures _to_protein_batch contains only str elements in the seq list."""
     result = _to_protein_batch([single_sample])
@@ -323,7 +328,7 @@ def test_to_protein_batch_seq_elements_are_strings(
 
 
 def test_to_protein_batch_seq_length_matches_batch_size(
-    single_sample: Mapping[str, torch.Tensor | str]
+    single_sample: Mapping[str, Float[torch.Tensor, "..."] | str]
 ) -> None:
     """Ensures _to_protein_batch seq list has one entry per sample passed in."""
     samples = [single_sample]
@@ -613,7 +618,7 @@ def test_train_save_every_checkpoint_is_valid_state_dict(
 
 def test_evaluate_multi_batch_returns_expected_keys(
     model: MainTrunk,
-    mini_batch: Mapping[str, torch.Tensor | list[str]],
+    mini_batch: Mapping[str, Float[torch.Tensor, "..."] | list[str]],
     tcfg: TrainConfig,
     distogram_res: Distogram,
     distogram_atom: Distogram,
@@ -626,7 +631,7 @@ def test_evaluate_multi_batch_returns_expected_keys(
 
 def test_evaluate_multi_batch_n_batches_counted(
     model: MainTrunk,
-    mini_batch: Mapping[str, torch.Tensor | list[str]],
+    mini_batch: Mapping[str, Float[torch.Tensor, "..."] | list[str]],
     tcfg: TrainConfig,
     distogram_res: Distogram,
     distogram_atom: Distogram,
@@ -977,7 +982,7 @@ def _patch_ddp(monkeypatch: pytest.MonkeyPatch) -> None:
 class _MockSampler:
     """DataLoader sampler with set_epoch() for verifying epoch reseeding."""
 
-    def __init__(self, data: list[Mapping[str, torch.Tensor | list[str]]]) -> None:
+    def __init__(self, data: list[Mapping[str, Float[torch.Tensor, "..."] | list[str]]]) -> None:
         self._data = data
         self.set_epoch_calls: list[int] = []
 
@@ -993,7 +998,7 @@ class _MockSampler:
 
 @pytest.fixture
 def ddp_loader(
-    mini_batch: Mapping[str, torch.Tensor | list[str]]
+    mini_batch: Mapping[str, Float[torch.Tensor, "..."] | list[str]]
 ) -> torch.utils.data.DataLoader[ProteinBatch]:
     """Provide a DataLoader backed by a _MockSampler to track set_epoch calls."""
     sampler = _MockSampler([mini_batch])
@@ -1118,7 +1123,7 @@ def test_train_ddp_calls_set_epoch_each_epoch(
         distogram_atom,
         device="cpu",
     )
-    assert cast(_MockSampler, ddp_loader.sampler).set_epoch_calls == [1, 2, 3]
+    assert cast("_MockSampler", ddp_loader.sampler).set_epoch_calls == [1, 2, 3]
 
 
 def test_train_ddp_updates_model_parameters(
@@ -1295,7 +1300,7 @@ def _assert_submodule_grads(model: MainTrunk) -> None:
     Args:
         model: Trunk module after a backward pass has been called.
     """
-    buckets: dict[str, list[torch.Tensor]] = {}
+    buckets: dict[str, list[Float[torch.Tensor, "..."]]] = {}
     for name, param in model.named_parameters():
         if param.grad is not None:
             buckets.setdefault(name.split(".")[0], []).append(param.grad)

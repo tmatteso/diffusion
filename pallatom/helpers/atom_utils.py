@@ -690,7 +690,6 @@ def pseudo_cb(
 def get_cb_coords(
     atom5_positions: Float[torch.Tensor, "B N_res 5 3"],
     atom5_mask: Float[torch.Tensor, "B N_res 5"],
-    fill_pseudo: bool = True,
 ) -> tuple[Float[torch.Tensor, "B N_res 3"], Bool[torch.Tensor, "B N_res"]]:
     """Extract Cβ (slot 4) from atom5, replacing missing Cβ (Gly) with pseudo-Cβ.
 
@@ -698,7 +697,7 @@ def get_cb_coords(
     ----------
     atom5_positions : (B, N_res, 5, 3)
     atom5_mask      : (B, N_res, 5)  — 1 where atom is present
-    fill_pseudo     : if True, compute pseudo-Cβ wherever Cβ is absent
+    fill_pseudo     : if True,
 
     Returns:
     -------
@@ -709,12 +708,10 @@ def get_cb_coords(
     ca = atom5_positions[:, :, ATOM5_CA, :]
     c = atom5_positions[:, :, ATOM5_C, :]
     cb = atom5_positions[:, :, ATOM5_CB, :]  # zero / garbage where missing
-
+    # compute pseudo-Cβ wherever Cβ is absent
     cb_present = atom5_mask[:, :, ATOM5_CB].bool()  # (B, N_res)
-
-    if fill_pseudo:
-        p_cb = pseudo_cb(n, ca, c)  # (B, N_res, 3)
-        cb = torch.where(rearrange(cb_present, "b n -> b n 1"), cb, p_cb)
+    p_cb = pseudo_cb(n, ca, c)  # (B, N_res, 3)
+    cb = torch.where(rearrange(cb_present, "b n -> b n 1"), cb, p_cb)
 
     return cb, cb_present
 
@@ -735,4 +732,4 @@ def atom37_to_cb(
     pseudo_beta_mask : (B, N_res)     — True where real Cβ present, False where pseudo-Cβ was used
     """
     atom5_pos, atom5_mask = atom37_to_atom5(atom37_positions, atom37_mask)
-    return get_cb_coords(atom5_pos, atom5_mask, fill_pseudo=True)
+    return get_cb_coords(atom5_pos, atom5_mask)

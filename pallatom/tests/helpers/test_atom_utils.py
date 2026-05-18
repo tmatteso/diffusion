@@ -150,7 +150,10 @@ def test_pseudo_cb_collinear_backbone_finite():
 # ---------------------------------------------------------------------------
 
 
-def test_atom37_to_atom5_output_shapes(atom37_positions: torch.Tensor, atom37_mask: torch.Tensor):
+def test_atom37_to_atom5_output_shapes(
+    atom37_positions: Float[torch.Tensor, "B N_res 37 3"],
+    atom37_mask: Float[torch.Tensor, "B N_res 37"],
+):
     """atom37_to_atom5 returns position and mask tensors with the correct shapes."""
     pos5, mask5 = atom37_to_atom5(atom37_positions, atom37_mask)
     assert pos5.shape == (B, N_RES, 5, 3)
@@ -158,7 +161,8 @@ def test_atom37_to_atom5_output_shapes(atom37_positions: torch.Tensor, atom37_ma
 
 
 def test_atom37_to_atom5_selects_correct_atoms(
-    atom37_positions: torch.Tensor, atom37_mask: torch.Tensor
+    atom37_positions: Float[torch.Tensor, "B N_res 37 3"],
+    atom37_mask: Float[torch.Tensor, "B N_res 37"],
 ):
     """atom37_to_atom5 places N, CA, C, O, CB into the expected atom5 slots."""
     pos5, _ = atom37_to_atom5(atom37_positions, atom37_mask)
@@ -169,7 +173,7 @@ def test_atom37_to_atom5_selects_correct_atoms(
     assert torch.equal(pos5[:, :, 4, :], atom37_positions[:, :, ATOM37_CB, :])
 
 
-def test_atom37_to_atom5_mask_preserved(atom37_positions: torch.Tensor):
+def test_atom37_to_atom5_mask_preserved(atom37_positions: Float[torch.Tensor, "B N_res 37 3"]):
     """atom37_to_atom5 propagates atom37 mask entries to the correct atom5 slots."""
     mask = torch.zeros(B, N_RES, 37)
     mask[:, :, [ATOM37_N, ATOM37_CA, ATOM37_C, ATOM37_O]] = 1.0
@@ -178,7 +182,10 @@ def test_atom37_to_atom5_mask_preserved(atom37_positions: torch.Tensor):
     assert (mask5[:, :, 4] == 0.0).all()  # CB absent
 
 
-def test_atom37_to_atom5_output_finite(atom37_positions: torch.Tensor, atom37_mask: torch.Tensor):
+def test_atom37_to_atom5_output_finite(
+    atom37_positions: Float[torch.Tensor, "B N_res 37 3"],
+    atom37_mask: Float[torch.Tensor, "B N_res 37"],
+):
     """atom37_to_atom5 produces finite position and mask values for random input."""
     pos5, mask5 = atom37_to_atom5(atom37_positions, atom37_mask)
     assert torch.isfinite(pos5).all()
@@ -190,7 +197,10 @@ def test_atom37_to_atom5_output_finite(atom37_positions: torch.Tensor, atom37_ma
 # ---------------------------------------------------------------------------
 
 
-def test_get_cb_coords_output_shapes(atom5_positions: torch.Tensor, atom5_mask: torch.Tensor):
+def test_get_cb_coords_output_shapes(
+    atom5_positions: Float[torch.Tensor, "B N_res 5 3"],
+    atom5_mask: Float[torch.Tensor, "B N_res 5"],
+):
     """get_cb_coords returns Cβ positions (B, N_RES, 3) and a bool mask (B, N_RES)."""
     cb, cb_present = get_cb_coords(atom5_positions, atom5_mask)
     assert cb.shape == (B, N_RES, 3)
@@ -199,45 +209,38 @@ def test_get_cb_coords_output_shapes(atom5_positions: torch.Tensor, atom5_mask: 
 
 
 def test_get_cb_coords_real_cb_used_when_present(
-    atom5_positions: torch.Tensor, atom5_mask: torch.Tensor
+    atom5_positions: Float[torch.Tensor, "B N_res 5 3"],
+    atom5_mask: Float[torch.Tensor, "B N_res 5"],
 ):
     """get_cb_coords returns the real atom5 CB slot when CB is present in the mask."""
-    cb, cb_present = get_cb_coords(atom5_positions, atom5_mask, fill_pseudo=True)
+    cb, cb_present = get_cb_coords(atom5_positions, atom5_mask)
     assert torch.allclose(cb, atom5_positions[:, :, ATOM5_CB, :])
     assert cb_present.all()
 
 
-def test_get_cb_coords_pseudo_when_cb_absent(atom5_positions: torch.Tensor):
-    """get_cb_coords falls back to the pseudo-Cβ position when CB is absent and fill_pseudo=True."""
+def test_get_cb_coords_pseudo_when_cb_absent(atom5_positions: Float[torch.Tensor, "B N_res 5 3"]):
+    """get_cb_coords falls back to the pseudo-Cβ position when CB is absent."""
     mask = torch.ones(B, N_RES, 5)
     mask[:, :, ATOM5_CB] = 0.0
-    cb, cb_present = get_cb_coords(atom5_positions, mask, fill_pseudo=True)
+    cb, cb_present = get_cb_coords(atom5_positions, mask)
     assert not cb_present.any()
     assert torch.isfinite(cb).all()
     assert not torch.allclose(cb, atom5_positions[:, :, ATOM5_CB, :])
 
 
-def test_get_cb_coords_no_fill_pseudo_returns_raw_slot(atom5_positions: torch.Tensor):
-    """get_cb_coords returns the raw (zero) CB slot without pseudo fill when fill_pseudo=False."""
-    mask = torch.ones(B, N_RES, 5)
-    mask[:, :, ATOM5_CB] = 0.0
-    cb, cb_present = get_cb_coords(atom5_positions, mask, fill_pseudo=False)
-    assert torch.equal(cb, atom5_positions[:, :, ATOM5_CB, :])
-    assert not cb_present.any()
-
-
-def test_get_cb_coords_mixed_residues(atom5_positions: torch.Tensor):
+def test_get_cb_coords_mixed_residues(atom5_positions: Float[torch.Tensor, "B N_res 5 3"]):
     """get_cb_coords selects pseudo-Cβ for residue 0 only and real CB for all others."""
     mask = torch.ones(B, N_RES, 5)
     mask[:, 0, ATOM5_CB] = 0.0  # residue 0 has no CB (Gly-like)
-    cb, cb_present = get_cb_coords(atom5_positions, mask, fill_pseudo=True)
+    cb, cb_present = get_cb_coords(atom5_positions, mask)
     assert not cb_present[:, 0].any()
     assert cb_present[:, 1:].all()
     assert torch.allclose(cb[:, 1:, :], atom5_positions[:, 1:, ATOM5_CB, :])
 
 
 def test_get_cb_coords_pseudo_beta_mask_dtype(
-    atom5_positions: torch.Tensor, atom5_mask: torch.Tensor
+    atom5_positions: Float[torch.Tensor, "B N_res 5 3"],
+    atom5_mask: Float[torch.Tensor, "B N_res 5"],
 ):
     """get_cb_coords always returns a bool tensor for the CB-present mask."""
     _, cb_present = get_cb_coords(atom5_positions, atom5_mask)
@@ -249,7 +252,10 @@ def test_get_cb_coords_pseudo_beta_mask_dtype(
 # ---------------------------------------------------------------------------
 
 
-def test_atom37_to_cb_output_shapes(atom37_positions: torch.Tensor, atom37_mask: torch.Tensor):
+def test_atom37_to_cb_output_shapes(
+    atom37_positions: Float[torch.Tensor, "B N_res 37 3"],
+    atom37_mask: Float[torch.Tensor, "B N_res 37"],
+):
     """atom37_to_cb returns Cβ positions (B, N_RES, 3) and a bool presence mask."""
     cb, cb_present = atom37_to_cb(atom37_positions, atom37_mask)
     assert cb.shape == (B, N_RES, 3)
@@ -257,19 +263,25 @@ def test_atom37_to_cb_output_shapes(atom37_positions: torch.Tensor, atom37_mask:
     assert cb_present.dtype == torch.bool
 
 
-def test_atom37_to_cb_output_finite(atom37_positions: torch.Tensor, atom37_mask: torch.Tensor):
+def test_atom37_to_cb_output_finite(
+    atom37_positions: Float[torch.Tensor, "B N_res 37 3"],
+    atom37_mask: Float[torch.Tensor, "B N_res 37"],
+):
     """atom37_to_cb produces finite Cβ coordinates from random backbone atoms."""
     cb, _ = atom37_to_cb(atom37_positions, atom37_mask)
     assert torch.isfinite(cb).all()
 
 
-def test_atom37_to_cb_all_cb_present(atom37_positions: torch.Tensor, atom37_mask: torch.Tensor):
+def test_atom37_to_cb_all_cb_present(
+    atom37_positions: Float[torch.Tensor, "B N_res 37 3"],
+    atom37_mask: Float[torch.Tensor, "B N_res 37"],
+):
     """atom37_to_cb marks all residues as CB-present when CB is set in the mask."""
     _, cb_present = atom37_to_cb(atom37_positions, atom37_mask)
     assert cb_present.all()
 
 
-def test_atom37_to_cb_glycine_gets_pseudo_cb(atom37_positions: torch.Tensor):
+def test_atom37_to_cb_glycine_gets_pseudo_cb(atom37_positions: Float[torch.Tensor, "B N_res 37 3"]):
     """atom37_to_cb falls back to pseudo-Cβ for glycine-like residues missing CB in mask."""
     mask = torch.ones(B, N_RES, 37)
     mask[:, :, ATOM37_CB] = 0.0
@@ -279,12 +291,13 @@ def test_atom37_to_cb_glycine_gets_pseudo_cb(atom37_positions: torch.Tensor):
 
 
 def test_atom37_to_cb_matches_manual_pipeline(
-    atom37_positions: torch.Tensor, atom37_mask: torch.Tensor
+    atom37_positions: Float[torch.Tensor, "B N_res 37 3"],
+    atom37_mask: Float[torch.Tensor, "B N_res 37"],
 ):
     """atom37_to_cb is equivalent to atom37_to_atom5 followed by get_cb_coords."""
     cb_direct, mask_direct = atom37_to_cb(atom37_positions, atom37_mask)
     pos5, mask5 = atom37_to_atom5(atom37_positions, atom37_mask)
-    cb_manual, mask_manual = get_cb_coords(pos5, mask5, fill_pseudo=True)
+    cb_manual, mask_manual = get_cb_coords(pos5, mask5)
     assert torch.equal(cb_direct, cb_manual)
     assert torch.equal(mask_direct, mask_manual)
 

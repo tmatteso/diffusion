@@ -95,7 +95,7 @@ def test_apply_transform_reconstructs_target(
 
 def test_identity_alignment_unchanged(ref: Float[torch.Tensor, "N 3"]):
     """Aligning a structure to itself leaves it unchanged."""
-    (aligned,) = kabsch_align(ref, ref)
+    (aligned,) = kabsch_align(ref, ref, return_transform=False)
     assert torch.allclose(aligned, ref, atol=1e-5)
 
 

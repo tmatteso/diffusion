@@ -5,7 +5,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from architecture.atom_transformers import LinearNoBias
+from architecture.layers import LinearNoBias
 from architecture.pair_update import DropoutRowwise, Transition
 from beartype import beartype
 from einops import einsum, rearrange
@@ -82,10 +82,15 @@ class AttentionPairBias(nn.Module):
         self,
         a: Float[torch.Tensor, "B N_res c_res"],
         s: Float[torch.Tensor, "B N_res c_res"] | None,
-        z: Float[torch.Tensor, "B N_res N_res c_pair"],
-        # beta_ij? (β_ij = 0 means purely additive, no extra gate)
+        z: Float[torch.Tensor, "B N_res N_j c_pair"],
+        beta: Float[torch.Tensor, "B N_res N_j"] | None = None,
     ) -> Float[torch.Tensor, "B N_res c_res"]:
-        """Compute time-conditioned pair-biased attention over residue single embeddings."""
+        """Compute time-conditioned pair-biased attention over residue single embeddings.
+
+        Supports both dense ``[B, N, N, c_pair]`` and sparse ``[B, N, K, c_pair]`` pair
+        tensors — the second and third axes need not be equal. When ``beta`` is ``None``
+        the pair bias is purely additive (equivalent to β=0).
+        """
         # Inject time conditioning into queries
         a = self.adaLN(a, s) if s is not None else self.norm_a(a)
 
@@ -104,10 +109,13 @@ class AttentionPairBias(nn.Module):
             "B N_res (n_heads head_dim) -> B N_res n_heads head_dim",
             n_heads=self.n_heads,
         )
-        bias: Float[torch.Tensor, "B n_heads N_res N_res"] = rearrange(
+        pair_bias: Float[torch.Tensor, "B n_heads N_res N_j"] = rearrange(
             self.z_to_b(self.norm_z(z)),
             "B N_i N_j n_heads -> B n_heads N_i N_j",
-        )  # + beta_ij would go here if added
+        )
+        if beta is not None:
+            pair_bias = pair_bias + rearrange(beta, "B N_i N_j -> B 1 N_i N_j")
+
         g: Float[torch.Tensor, "B N_res n_heads head_dim"] = torch.sigmoid(
             rearrange(
                 self.a_to_g(a),
@@ -116,11 +124,11 @@ class AttentionPairBias(nn.Module):
             )
         )
         # Attention logits: (B, h, N_q, N_k)
-        attn: Float[torch.Tensor, "B n_heads N_res N_res"] = einsum(
+        attn: Float[torch.Tensor, "B n_heads N_res N_j"] = einsum(
             q, k, "B N_q n_heads head_dim, B N_k n_heads head_dim -> B n_heads N_q N_k"
         ) / math.sqrt(self.head_dim)
 
-        attn: Float[torch.Tensor, "B n_heads N_res N_res"] = F.softmax(attn + bias, dim=-1)
+        attn: Float[torch.Tensor, "B n_heads N_res N_j"] = F.softmax(attn + pair_bias, dim=-1)
         # attn @ v
         intermediate: Float[torch.Tensor, "B N_res n_heads head_dim"] = einsum(
             attn, v, "B n_heads N_q N_k, B N_k n_heads head_dim -> B N_q n_heads head_dim"

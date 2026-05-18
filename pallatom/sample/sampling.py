@@ -261,8 +261,8 @@ def build_template_context(
     """
     max_n_res: int = max(p.atom_positions.shape[0] for p in ls_of_proteins)
 
-    pos_list: list[torch.Tensor] = []
-    mask_list: list[torch.Tensor] = []
+    pos_list: list[Float[torch.Tensor, "..."]] = []
+    mask_list: list[Float[torch.Tensor, "..."]] = []
     for prot in ls_of_proteins:
         n_res: int = prot.atom_positions.shape[0]
         pad: int = max_n_res - n_res
@@ -404,7 +404,7 @@ def build_sampling_context(
         torch.arange(N_res, dtype=torch.long, device=device) * NATOM + 1  # CA slot
     )
 
-    def tile(t: torch.Tensor) -> torch.Tensor:
+    def tile(t: Float[torch.Tensor, "..."]) -> Float[torch.Tensor, "B ..."]:
         return t.unsqueeze(0).expand(B, *t.shape).contiguous()
 
     return FeaturizedBatch(

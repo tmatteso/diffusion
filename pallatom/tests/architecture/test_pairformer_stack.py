@@ -63,7 +63,7 @@ def stack() -> PairformerStack:
 
 
 @pytest.fixture
-def v() -> torch.Tensor:
+def v() -> Float[torch.Tensor, "B N_RES N_RES C"]:
     """Provide a random pair-embedding tensor (B, N_RES, N_RES, C)."""
     return torch.randn(B, N_RES, N_RES, C)
 
@@ -73,35 +73,45 @@ def v() -> torch.Tensor:
 # ---------------------------------------------------------------------------
 
 
-def test_pairformer_block_output_shape(block: PairformerBlock, v: torch.Tensor) -> None:
+def test_pairformer_block_output_shape(
+    block: PairformerBlock, v: Float[torch.Tensor, "B N_RES N_RES C"]
+) -> None:
     """PairformerBlock output shape matches the input (B, N_RES, N_RES, C)."""
     with torch.no_grad():
         _, out = block(s=None, z=v)
     assert out.shape == (B, N_RES, N_RES, C)
 
 
-def test_pairformer_block_output_finite(block: PairformerBlock, v: torch.Tensor) -> None:
+def test_pairformer_block_output_finite(
+    block: PairformerBlock, v: Float[torch.Tensor, "B N_RES N_RES C"]
+) -> None:
     """PairformerBlock output contains only finite values."""
     with torch.no_grad():
         _, out = block(s=None, z=v)
     assert torch.isfinite(out).all()
 
 
-def test_pairformer_block_output_dtype(block: PairformerBlock, v: torch.Tensor) -> None:
+def test_pairformer_block_output_dtype(
+    block: PairformerBlock, v: Float[torch.Tensor, "B N_RES N_RES C"]
+) -> None:
     """PairformerBlock output dtype matches the input dtype."""
     with torch.no_grad():
         _, out = block(s=None, z=v)
     assert out.dtype == v.dtype
 
 
-def test_pairformer_block_changes_input(block: PairformerBlock, v: torch.Tensor) -> None:
+def test_pairformer_block_changes_input(
+    block: PairformerBlock, v: Float[torch.Tensor, "B N_RES N_RES C"]
+) -> None:
     """PairformerBlock output differs from its input (non-identity transform)."""
     with torch.no_grad():
         _, out = block(s=None, z=v)
     assert not torch.allclose(out, v)
 
 
-def test_pairformer_block_gradient_flows(block: PairformerBlock, v: torch.Tensor) -> None:
+def test_pairformer_block_gradient_flows(
+    block: PairformerBlock, v: Float[torch.Tensor, "B N_RES N_RES C"]
+) -> None:
     """Gradient propagates from PairformerBlock output back to v."""
     v_g = v.clone().requires_grad_(True)
     _, out = block(s=None, z=v_g)
@@ -111,7 +121,7 @@ def test_pairformer_block_gradient_flows(block: PairformerBlock, v: torch.Tensor
 
 
 def test_pairformer_block_row_attn_preserves_col_symmetry(
-    block: PairformerBlock, v: torch.Tensor
+    block: PairformerBlock, v: Float[torch.Tensor, "B N_RES N_RES C"]
 ) -> None:
     """Symmetric input remains finite after one PairformerBlock (row+col attention both applied)."""
     # Symmetric input should remain approximately symmetric after one block
@@ -142,14 +152,18 @@ def test_pairformer_block_different_batch_items_independent(block: PairformerBlo
 # ---------------------------------------------------------------------------
 
 
-def test_pairformer_stack_output_shape(stack: PairformerStack, v: torch.Tensor) -> None:
+def test_pairformer_stack_output_shape(
+    stack: PairformerStack, v: Float[torch.Tensor, "B N_RES N_RES C"]
+) -> None:
     """PairformerStack returns an output of the same [B, N_res, N_res, C] shape as the input."""
     with torch.no_grad():
         out = stack(s=None, z=v)
     assert out.shape == (B, N_RES, N_RES, C)
 
 
-def test_pairformer_stack_output_finite(stack: PairformerStack, v: torch.Tensor) -> None:
+def test_pairformer_stack_output_finite(
+    stack: PairformerStack, v: Float[torch.Tensor, "B N_RES N_RES C"]
+) -> None:
     """Stacking N_BLOCKS pairformer blocks does not produce NaN or Inf values."""
     with torch.no_grad():
         out = stack(s=None, z=v)
@@ -173,7 +187,9 @@ def test_pairformer_stack_depth_changes_output() -> None:
     assert not torch.allclose(out1, out2)
 
 
-def test_pairformer_stack_gradient_flows(stack: PairformerStack, v: torch.Tensor) -> None:
+def test_pairformer_stack_gradient_flows(
+    stack: PairformerStack, v: Float[torch.Tensor, "B N_RES N_RES C"]
+) -> None:
     """Gradients propagate through all stacked blocks back to the input pair embedding."""
     v_g = v.clone().requires_grad_(True)
     out = stack(s=None, z=v_g)
@@ -223,13 +239,13 @@ def tmo() -> TriangleMultiplicationOutgoing:
 
 
 @pytest.fixture
-def z_pair() -> torch.Tensor:
+def z_pair() -> Float[torch.Tensor, "B N_res N_res C"]:
     """Random pair-embedding tensor (2, _N, _N, _C)."""
     return torch.randn(2, _N, _N, _C)
 
 
 @pytest.fixture
-def z_sym() -> torch.Tensor:
+def z_sym() -> Float[torch.Tensor, "B N_res N_res C"]:
     """Spatially symmetric pair tensor: z[b,i,j,c] == z[b,j,i,c]."""
     raw = torch.randn(1, _N, _N, _C)
     return (raw + rearrange(raw, "b i j c -> b j i c")) * 0.5
@@ -240,7 +256,9 @@ def z_sym() -> torch.Tensor:
 # ---------------------------------------------------------------------------
 
 
-def test_tmo_output_shape(tmo: TriangleMultiplicationOutgoing, z_pair: torch.Tensor) -> None:
+def test_tmo_output_shape(
+    tmo: TriangleMultiplicationOutgoing, z_pair: Float[torch.Tensor, "B N_res N_res C"]
+) -> None:
     """Output shape equals input shape (B, N, N, C)."""
     with torch.no_grad():
         out = tmo(z_pair)
@@ -248,7 +266,7 @@ def test_tmo_output_shape(tmo: TriangleMultiplicationOutgoing, z_pair: torch.Ten
 
 
 def test_tmo_output_dtype_preserved(
-    tmo: TriangleMultiplicationOutgoing, z_pair: torch.Tensor
+    tmo: TriangleMultiplicationOutgoing, z_pair: Float[torch.Tensor, "B N_res N_res C"]
 ) -> None:
     """Output dtype matches input dtype."""
     with torch.no_grad():
@@ -256,7 +274,9 @@ def test_tmo_output_dtype_preserved(
     assert out.dtype == z_pair.dtype
 
 
-def test_tmo_output_is_finite(tmo: TriangleMultiplicationOutgoing, z_pair: torch.Tensor) -> None:
+def test_tmo_output_is_finite(
+    tmo: TriangleMultiplicationOutgoing, z_pair: Float[torch.Tensor, "B N_res N_res C"]
+) -> None:
     """No NaN or Inf in output for a standard random input."""
     with torch.no_grad():
         out = tmo(z_pair)
@@ -264,7 +284,7 @@ def test_tmo_output_is_finite(tmo: TriangleMultiplicationOutgoing, z_pair: torch
 
 
 def test_tmo_gradient_flows_to_input(
-    tmo: TriangleMultiplicationOutgoing, z_pair: torch.Tensor
+    tmo: TriangleMultiplicationOutgoing, z_pair: Float[torch.Tensor, "B N_res N_res C"]
 ) -> None:
     """Loss gradient propagates back to z: non-None and fully finite."""
     z_g = z_pair.clone().requires_grad_(True)
@@ -300,7 +320,7 @@ def test_tmo_batch_items_are_independent(
 
 
 def test_tmo_gate_near_zero_suppresses_output(
-    tmo: TriangleMultiplicationOutgoing, z_pair: torch.Tensor
+    tmo: TriangleMultiplicationOutgoing, z_pair: Float[torch.Tensor, "B N_res N_res C"]
 ) -> None:
     """Outer gate bias << 0 → sigmoid ≈ 0 → output ≈ 0 for any pair content."""
     with torch.no_grad():
@@ -312,7 +332,7 @@ def test_tmo_gate_near_zero_suppresses_output(
 
 
 def test_tmo_gate_near_one_passes_output_through(
-    tmo: TriangleMultiplicationOutgoing, z_pair: torch.Tensor
+    tmo: TriangleMultiplicationOutgoing, z_pair: Float[torch.Tensor, "B N_res N_res C"]
 ) -> None:
     """Outer gate bias >> 0 → sigmoid ≈ 1 → output magnitude is driven by pair content."""
     with torch.no_grad():
@@ -350,7 +370,7 @@ def test_tmo_gate_responds_to_input_scale(
 
 
 def test_tmo_proj_layers_are_layernorm_scale_invariant(
-    tmo: TriangleMultiplicationOutgoing, z_pair: torch.Tensor
+    tmo: TriangleMultiplicationOutgoing, z_pair: Float[torch.Tensor, "B N_res N_res C"]
 ) -> None:
     """With outer gate pinned to 1, output is identical for z and 2·z.
 
@@ -417,7 +437,7 @@ def test_tmo_differs_from_incoming_for_asymmetric_input() -> None:
 
 
 def test_tmo_equals_incoming_for_symmetric_input_with_shared_weights(
-    z_sym: torch.Tensor,
+    z_sym: Float[torch.Tensor, "B N_res N_res C"],
 ) -> None:
     """For spatially symmetric z, outgoing == incoming when weights are shared.
 
@@ -557,7 +577,9 @@ def tmi() -> TriangleMultiplicationIncoming:
 # ---------------------------------------------------------------------------
 
 
-def test_tmi_output_shape(tmi: TriangleMultiplicationIncoming, z_pair: torch.Tensor) -> None:
+def test_tmi_output_shape(
+    tmi: TriangleMultiplicationIncoming, z_pair: Float[torch.Tensor, "B N_res N_res C"]
+) -> None:
     """Output shape equals input shape (B, N, N, C)."""
     with torch.no_grad():
         out = tmi(z_pair)
@@ -565,7 +587,7 @@ def test_tmi_output_shape(tmi: TriangleMultiplicationIncoming, z_pair: torch.Ten
 
 
 def test_tmi_output_dtype_preserved(
-    tmi: TriangleMultiplicationIncoming, z_pair: torch.Tensor
+    tmi: TriangleMultiplicationIncoming, z_pair: Float[torch.Tensor, "B N_res N_res C"]
 ) -> None:
     """Output dtype matches input dtype."""
     with torch.no_grad():
@@ -573,7 +595,9 @@ def test_tmi_output_dtype_preserved(
     assert out.dtype == z_pair.dtype
 
 
-def test_tmi_output_is_finite(tmi: TriangleMultiplicationIncoming, z_pair: torch.Tensor) -> None:
+def test_tmi_output_is_finite(
+    tmi: TriangleMultiplicationIncoming, z_pair: Float[torch.Tensor, "B N_res N_res C"]
+) -> None:
     """No NaN or Inf in output for a standard random input."""
     with torch.no_grad():
         out = tmi(z_pair)
@@ -581,7 +605,7 @@ def test_tmi_output_is_finite(tmi: TriangleMultiplicationIncoming, z_pair: torch
 
 
 def test_tmi_gradient_flows_to_input(
-    tmi: TriangleMultiplicationIncoming, z_pair: torch.Tensor
+    tmi: TriangleMultiplicationIncoming, z_pair: Float[torch.Tensor, "B N_res N_res C"]
 ) -> None:
     """Loss gradient propagates back to z: non-None and fully finite."""
     z_g = z_pair.clone().requires_grad_(True)
@@ -617,7 +641,7 @@ def test_tmi_batch_items_are_independent(
 
 
 def test_tmi_gate_near_zero_suppresses_output(
-    tmi: TriangleMultiplicationIncoming, z_pair: torch.Tensor
+    tmi: TriangleMultiplicationIncoming, z_pair: Float[torch.Tensor, "B N_res N_res C"]
 ) -> None:
     """Outer gate bias << 0 → sigmoid ≈ 0 → output ≈ 0 for any pair content."""
     with torch.no_grad():
@@ -629,7 +653,7 @@ def test_tmi_gate_near_zero_suppresses_output(
 
 
 def test_tmi_gate_near_one_passes_output_through(
-    tmi: TriangleMultiplicationIncoming, z_pair: torch.Tensor
+    tmi: TriangleMultiplicationIncoming, z_pair: Float[torch.Tensor, "B N_res N_res C"]
 ) -> None:
     """Outer gate bias >> 0 → sigmoid ≈ 1 → output magnitude is driven by pair content."""
     with torch.no_grad():
@@ -667,7 +691,7 @@ def test_tmi_gate_responds_to_input_scale(
 
 
 def test_tmi_proj_layers_are_layernorm_scale_invariant(
-    tmi: TriangleMultiplicationIncoming, z_pair: torch.Tensor
+    tmi: TriangleMultiplicationIncoming, z_pair: Float[torch.Tensor, "B N_res N_res C"]
 ) -> None:
     """With outer gate pinned to 1, output is identical for z and 2·z.
 
@@ -734,7 +758,7 @@ def test_tmi_differs_from_outgoing_for_asymmetric_input() -> None:
 
 
 def test_tmi_equals_outgoing_for_symmetric_input_with_shared_weights(
-    z_sym: torch.Tensor,
+    z_sym: Float[torch.Tensor, "B N_res N_res C"],
 ) -> None:
     """For spatially symmetric z, incoming == outgoing when weights are shared.
 

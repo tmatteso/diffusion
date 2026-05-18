@@ -10,6 +10,8 @@ References:
     https://doi.org/10.1107/S0567739476001873
 """
 
+from typing import Literal, overload
+
 import torch
 from beartype import beartype
 from einops import rearrange, reduce
@@ -72,20 +74,54 @@ def kabsch_rotation(
     return torch.einsum("...ij,...jk->...ik", v_diag, u.mH)  # (..., 3, 3)
 
 
+@overload
+def kabsch_align(
+    mobile: Float[torch.Tensor, "... N 3"],
+    target: Float[torch.Tensor, "... N 3"],
+    weights: Float[torch.Tensor, "... N"] | None = None,
+    *,
+    return_transform: Literal[False],
+) -> tuple[Float[torch.Tensor, "... N 3"]]: ...
+
+
+@overload
+def kabsch_align(
+    mobile: Float[torch.Tensor, "... N 3"],
+    target: Float[torch.Tensor, "... N 3"],
+    weights: Float[torch.Tensor, "... N"] | None = None,
+    *,
+    return_transform: Literal[True],
+) -> tuple[
+    Float[torch.Tensor, "... N 3"],
+    Float[torch.Tensor, "... 3 3"],
+    Float[torch.Tensor, "... 1 3"],
+    Float[torch.Tensor, "... 1 3"],
+]: ...
+
+
 @jaxtyped(typechecker=beartype)
 def kabsch_align(
     mobile: Float[torch.Tensor, "... N 3"],
     target: Float[torch.Tensor, "... N 3"],
     weights: Float[torch.Tensor, "... N"] | None = None,
-    return_transform: bool = False,
-) -> tuple[torch.Tensor, ...]:
+    *,
+    return_transform: bool,
+) -> (
+    tuple[Float[torch.Tensor, "... N 3"]]
+    | tuple[
+        Float[torch.Tensor, "... N 3"],
+        Float[torch.Tensor, "... 3 3"],
+        Float[torch.Tensor, "... 1 3"],
+        Float[torch.Tensor, "... 1 3"],
+    ]
+):
     """Rigidly align `mobile` onto `target` using the Kabsch algorithm.
 
     Pipeline:
         1. Compute (weighted) centroids of both structures.
         2. Centre both structures.
         3. Compute optimal rotation R via SVD (Kabsch).
-        4. Apply: aligned = (mobile − c_mobile) @ R^T + c_target
+        4. Apply: aligned = (mobile - c_mobile) @ R^T + c_target
 
     Args:
         mobile:           (..., N, 3)  — coordinates to be aligned.
@@ -137,7 +173,7 @@ def rmsd(
     reference: Float[torch.Tensor, "... N 3"],
     weights: Float[torch.Tensor, "... N"] | None = None,
     mask: Bool[torch.Tensor, "... N"] | None = None,
-) -> torch.Tensor:
+) -> Float[torch.Tensor, "..."]:
     """Root-mean-square deviation between two (already aligned) coordinate sets.
 
     Args:
@@ -180,7 +216,7 @@ def kabsch_rmsd(
     target: Float[torch.Tensor, "... N 3"],
     weights: Float[torch.Tensor, "... N"] | None = None,
     mask: Bool[torch.Tensor, "... N"] | None = None,
-) -> torch.Tensor:
+) -> Float[torch.Tensor, "..."]:
     """Align `mobile` to `target`, then return the RMSD.
 
     Args:
@@ -196,7 +232,7 @@ def kabsch_rmsd(
     if mask is not None:
         eff_weights = (weights * mask.float()) if weights is not None else mask.float()
 
-    (aligned,) = kabsch_align(mobile, target, weights=eff_weights)
+    (aligned,) = kabsch_align(mobile, target, weights=eff_weights, return_transform=False)
     return rmsd(aligned, target, weights=eff_weights, mask=mask)
 
 
@@ -214,7 +250,7 @@ def apply_transform(
 ) -> Float[torch.Tensor, "... M 3"]:
     """Apply a previously computed Kabsch rigid transform to a new set of coordinates.
 
-    Transform:  coords_aligned = (coords − t_from) @ R^T + t_to
+    Transform:  coords_aligned = (coords - t_from) @ R^T + t_to
 
     Args:
         coords:  (..., M, 3) — coordinates to transform (can differ from

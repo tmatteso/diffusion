@@ -139,19 +139,19 @@ def test_train_config_accepts_nested_overrides():
 def test_train_config_is_frozen(cfg: TrainConfig):
     """TrainConfig raises ValidationError when a top-level field is reassigned."""
     with pytest.raises(ValidationError):
-        cfg.training = TrainingParams()  # type: ignore[misc]
+        cfg.training = TrainingParams()
 
 
 def test_training_params_is_frozen(training: TrainingParams):
     """TrainingParams raises ValidationError when any field is mutated after construction."""
     with pytest.raises(ValidationError):
-        training.lr = 1e-2  # type: ignore[misc]
+        training.lr = 1e-2
 
 
 def test_model_params_is_frozen(model: ModelParams):
     """ModelParams raises ValidationError when any field is mutated after construction."""
     with pytest.raises(ValidationError):
-        model.c_res = 512  # type: ignore[misc]
+        model.c_res = 512
 
 
 # ---------------------------------------------------------------------------

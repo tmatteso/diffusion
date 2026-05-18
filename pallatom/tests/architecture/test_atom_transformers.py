@@ -7,7 +7,8 @@ from architecture.atom_transformers import (
     AtomAttentionDecoder,
     AtomFeatureEncoder,
     AtomTransformer,
-    AtomTransformerBlock,
+    ConditionedTransitionBlock,
+    DiffusionTransformer,
     build_sparse_pairs,
 )
 from beartype import beartype
@@ -26,6 +27,7 @@ C_TOKEN = 32
 C_PAIR = 32
 F_REF_DIM = ATOMS_PER_RES * (3 + E)
 B = 1
+N_HEADS = 4
 
 # K is dynamic — pre-compute once from the canonical tok_idx
 _base_tok = torch.repeat_interleave(torch.arange(N_RES), ATOMS_PER_RES)
@@ -53,9 +55,17 @@ def pairwise_sq_dist(
 
 
 @pytest.fixture
-def block() -> AtomTransformerBlock:
-    """Provide a single AtomTransformerBlock in eval mode."""
-    return AtomTransformerBlock(C_ATOM, C_ATOMPAIR, n_heads=4).eval()
+def conditioned_transition_block() -> ConditionedTransitionBlock:
+    """Provide a ConditionedTransitionBlock with c_a=c_s=C_ATOM in eval mode."""
+    return ConditionedTransitionBlock(c_a=C_ATOM, c_s=C_ATOM, expansion=2).eval()
+
+
+@pytest.fixture
+def diffusion_transformer() -> DiffusionTransformer:
+    """Provide a DiffusionTransformer with 2 blocks in eval mode."""
+    return DiffusionTransformer(
+        c_a=C_ATOM, c_s=C_ATOM, c_pair=C_PAIR, N_block=2, N_head=N_HEADS
+    ).eval()
 
 
 @pytest.fixture
@@ -154,6 +164,18 @@ def z_input() -> Float[torch.Tensor, "B N_res N_res C_pair"]:
 
 
 @pytest.fixture
+def a_res() -> Float[torch.Tensor, "B N_res C_atom"]:
+    """Random residue-level atom embeddings [B, N_res, C_atom] for transition/transformer tests."""
+    return torch.randn(B, N_RES, C_ATOM)
+
+
+@pytest.fixture
+def beta_dense() -> Float[torch.Tensor, "B N_res N_res"]:
+    """Dense window-bias mask [B, N_res, N_res] with 0 in-window and -1e10 out-of-window."""
+    return torch.zeros(B, N_RES, N_RES)
+
+
+@pytest.fixture
 def r_scaled() -> Float[torch.Tensor, "B N_atom 3"]:
     """Random atom positions [B, N_atom, 3] passed as conditioning signal to encoder."""
     return torch.randn(B, N_ATOM, 3)
@@ -249,66 +271,95 @@ def test_build_sparse_pairs_window_excludes_far_atoms():
 
 
 # ---------------------------------------------------------------------------
-# AtomTransformerBlock
+# ConditionedTransitionBlock
 # ---------------------------------------------------------------------------
 
 
-def test_atom_transformer_block_output_shape(
-    block: AtomTransformerBlock,
-    q_batched: Float[torch.Tensor, "B N_atom C_atom"],
-    c_batched: Float[torch.Tensor, "B N_atom C_atom"],
-    p_batched: Float[torch.Tensor, "B N_atom K C_atompair"],
-    neighbor_idx: Int[torch.Tensor, "N_atom K"],
-    valid_mask: Bool[torch.Tensor, "B N_atom K"],
+def test_conditioned_transition_block_output_shape(
+    conditioned_transition_block: ConditionedTransitionBlock,
+    a_res: Float[torch.Tensor, "B N_res C_atom"],
+    s_input: Float[torch.Tensor, "B N_res C_token"],
 ):
-    """A single block returns an updated query of the same [B, N_atom, C_atom] shape as input."""
+    """The block returns an updated embedding of the same [B, N_res, C_atom] shape as input."""
     with torch.no_grad():
-        out = block(q_batched, c_batched, p_batched, neighbor_idx, valid_mask)
-    assert out.shape == (B, N_ATOM, C_ATOM)
+        out = conditioned_transition_block(a_res, s_input)
+    assert out.shape == (B, N_RES, C_ATOM)
 
 
-def test_atom_transformer_block_output_finite(
-    block: AtomTransformerBlock,
-    q_batched: Float[torch.Tensor, "B N_atom C_atom"],
-    c_batched: Float[torch.Tensor, "B N_atom C_atom"],
-    p_batched: Float[torch.Tensor, "B N_atom K C_atompair"],
-    neighbor_idx: Int[torch.Tensor, "N_atom K"],
-    valid_mask: Bool[torch.Tensor, "B N_atom K"],
+def test_conditioned_transition_block_output_finite(
+    conditioned_transition_block: ConditionedTransitionBlock,
+    a_res: Float[torch.Tensor, "B N_res C_atom"],
+    s_input: Float[torch.Tensor, "B N_res C_token"],
 ):
-    """Masked sparse attention with random inputs does not produce NaN or Inf values."""
+    """The SwiGLU gated output contains no NaN or Inf for random valid inputs."""
     with torch.no_grad():
-        out = block(q_batched, c_batched, p_batched, neighbor_idx, valid_mask)
+        out = conditioned_transition_block(a_res, s_input)
     assert torch.isfinite(out).all()
 
 
-def test_atom_transformer_block_output_dtype(
-    block: AtomTransformerBlock,
-    q_batched: Float[torch.Tensor, "B N_atom C_atom"],
-    c_batched: Float[torch.Tensor, "B N_atom C_atom"],
-    p_batched: Float[torch.Tensor, "B N_atom K C_atompair"],
-    neighbor_idx: Int[torch.Tensor, "N_atom K"],
-    valid_mask: Bool[torch.Tensor, "B N_atom K"],
+def test_conditioned_transition_block_gradient_flows(
+    conditioned_transition_block: ConditionedTransitionBlock,
+    a_res: Float[torch.Tensor, "B N_res C_atom"],
+    s_input: Float[torch.Tensor, "B N_res C_token"],
 ):
-    """The block preserves the floating-point dtype of the query tensor through all internal ops."""
-    with torch.no_grad():
-        out = block(q_batched, c_batched, p_batched, neighbor_idx, valid_mask)
-    assert out.dtype == q_batched.dtype
-
-
-def test_atom_transformer_block_gradient_flows(
-    block: AtomTransformerBlock,
-    q_batched: Float[torch.Tensor, "B N_atom C_atom"],
-    c_batched: Float[torch.Tensor, "B N_atom C_atom"],
-    p_batched: Float[torch.Tensor, "B N_atom K C_atompair"],
-    neighbor_idx: Int[torch.Tensor, "N_atom K"],
-    valid_mask: Bool[torch.Tensor, "B N_atom K"],
-):
-    """Gradients flow back through the attention and MLP sub-layers to the query input."""
-    q_g = q_batched.clone().requires_grad_(True)
-    out = block(q_g, c_batched, p_batched, neighbor_idx, valid_mask)
+    """Gradients flow back through the AdaLN and SwiGLU gate to the atom embedding input."""
+    a_g = a_res.clone().requires_grad_(True)
+    out = conditioned_transition_block(a_g, s_input)
     reduce(out, "b n c -> ", "sum").backward()
-    assert q_g.grad is not None
-    assert torch.isfinite(q_g.grad).all()
+    assert a_g.grad is not None
+    assert torch.isfinite(a_g.grad).all()
+
+
+# ---------------------------------------------------------------------------
+# DiffusionTransformer
+# ---------------------------------------------------------------------------
+
+
+def test_diffusion_transformer_output_shape(
+    diffusion_transformer: DiffusionTransformer,
+    a_res: Float[torch.Tensor, "B N_res C_atom"],
+    s_input: Float[torch.Tensor, "B N_res C_token"],
+    z_input: Float[torch.Tensor, "B N_res N_res C_pair"],
+    beta_dense: Float[torch.Tensor, "B N_res N_res"],
+):
+    """Running N_block rounds leaves the atom embedding shape [B, N_res, C_atom] unchanged."""
+    with torch.no_grad():
+        out = diffusion_transformer(a_res, s_input, z_input, beta_dense)
+    assert out.shape == (B, N_RES, C_ATOM)
+
+
+def test_diffusion_transformer_output_finite(
+    diffusion_transformer: DiffusionTransformer,
+    a_res: Float[torch.Tensor, "B N_res C_atom"],
+    s_input: Float[torch.Tensor, "B N_res C_token"],
+    z_input: Float[torch.Tensor, "B N_res N_res C_pair"],
+    beta_dense: Float[torch.Tensor, "B N_res N_res"],
+):
+    """Stacked attention-plus-transition rounds produce no NaN or Inf for random valid inputs."""
+    with torch.no_grad():
+        out = diffusion_transformer(a_res, s_input, z_input, beta_dense)
+    assert torch.isfinite(out).all()
+
+
+def test_diffusion_transformer_n_block_stored():
+    """The N_block constructor argument is stored and determines iteration depth."""
+    dt = DiffusionTransformer(c_a=C_ATOM, c_s=C_ATOM, c_pair=C_PAIR, N_block=3, N_head=N_HEADS)
+    assert dt.N_block == 3
+
+
+def test_diffusion_transformer_gradient_flows(
+    diffusion_transformer: DiffusionTransformer,
+    a_res: Float[torch.Tensor, "B N_res C_atom"],
+    s_input: Float[torch.Tensor, "B N_res C_token"],
+    z_input: Float[torch.Tensor, "B N_res N_res C_pair"],
+    beta_dense: Float[torch.Tensor, "B N_res N_res"],
+):
+    """Gradients propagate through all blocks back to the atom embedding input."""
+    a_g = a_res.clone().requires_grad_(True)
+    out = diffusion_transformer(a_g, s_input, z_input, beta_dense)
+    reduce(out, "b n c -> ", "sum").backward()
+    assert a_g.grad is not None
+    assert torch.isfinite(a_g.grad).all()
 
 
 # ---------------------------------------------------------------------------
@@ -345,9 +396,9 @@ def test_atom_transformer_output_finite(
 
 
 def test_atom_transformer_block_count():
-    """The n_blocks constructor argument determines the exact number of blocks in module list."""
+    """The n_blocks constructor argument is forwarded to DiffusionTransformer.N_block."""
     t = AtomTransformer(C_ATOM, C_ATOMPAIR, n_blocks=3, n_heads=4)
-    assert len(t.blocks) == 3
+    assert t.blocks.N_block == 3
 
 
 def test_atom_transformer_gradient_flows(

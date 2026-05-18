@@ -10,7 +10,7 @@ import torch
 from einops import rearrange, reduce
 from helpers.atom_utils import Protein, restype_order, to_pdb
 from helpers.featurize import Distogram, FeaturizedBatch
-from jaxtyping import TypeCheckError
+from jaxtyping import Float, TypeCheckError
 from sample.sampling import (
     ATOM5_TO_ATOM37,
     NATOM,
@@ -86,7 +86,7 @@ def _make_half_denoiser_mock() -> MagicMock:
 
 
 @pytest.fixture
-def coords5() -> torch.Tensor:
+def coords5() -> Float[torch.Tensor, "N_RES 5 3"]:
     """Provide random atom5 coordinates (N_RES, 5, 3) with fixed seed."""
     return torch.tensor(np.random.RandomState(1).randn(N_RES, 5, 3).astype(np.float64))
 
@@ -133,7 +133,7 @@ def bare_sampler() -> EDMSampler:
         sigma_min=SIGMA_MIN,
         sigma_max=SIGMA_MAX,
         rho=7.0,
-    )  # type: ignore[arg-type]
+    )
 
 
 @pytest.fixture
@@ -161,7 +161,7 @@ def edm_precond_custom_sigmas(context: FeaturizedBatch) -> EDMPrecond:
 @pytest.fixture
 def identity_det_sampler() -> EDMSampler:
     """Provide a deterministic EDMSampler (S_churn=0) using the identity denoiser."""
-    return EDMSampler(  # type: ignore[arg-type]
+    return EDMSampler(
         _make_identity_denoiser_mock(),
         sigma_min=SIGMA_MIN,
         sigma_max=SIGMA_MAX,
@@ -172,7 +172,7 @@ def identity_det_sampler() -> EDMSampler:
 @pytest.fixture
 def identity_stoch_sampler_tmin_high() -> EDMSampler:
     """Provide a stochastic EDMSampler with S_tmin set far above sigma_max to suppress injection."""
-    return EDMSampler(  # type: ignore[arg-type]
+    return EDMSampler(
         _make_identity_denoiser_mock(),
         sigma_min=SIGMA_MIN,
         sigma_max=SIGMA_MAX,
@@ -186,13 +186,13 @@ def identity_stoch_sampler_tmin_high() -> EDMSampler:
 # ---------------------------------------------------------------------------
 
 
-def test_atom5_to_atom37_x37_shape(coords5: torch.Tensor):
+def test_atom5_to_atom37_x37_shape(coords5: Float[torch.Tensor, "N_RES 5 3"]):
     """Verify that the coordinate output expands the second axis from 5 to 37 slots."""
     x_37, _ = atom5_to_atom37(coords5)
     assert x_37.shape == (N_RES, 37, 3)
 
 
-def test_atom5_to_atom37_mask37_shape(coords5: torch.Tensor):
+def test_atom5_to_atom37_mask37_shape(coords5: Float[torch.Tensor, "N_RES 5 3"]):
     """Verify that the mask output has the atom37 width, one binary entry per residue-atom slot."""
     _, mask_37 = atom5_to_atom37(coords5)
     assert mask_37.shape == (N_RES, 37)
@@ -216,7 +216,9 @@ def test_atom5_to_atom37_each_slot_lands_at_correct_atom37_index():
         ), f"atom5 slot {slot} → atom37 slot {atom37_idx}: wrong coords"
 
 
-def test_atom5_to_atom37_unoccupied_atom37_slots_are_zero(coords5: torch.Tensor):
+def test_atom5_to_atom37_unoccupied_atom37_slots_are_zero(
+    coords5: Float[torch.Tensor, "N_RES 5 3"]
+):
     """Assert that atom37 positions not covered by atom5 remain exactly zero after mapping."""
     x_37, _ = atom5_to_atom37(coords5)
     occupied = set(ATOM5_TO_ATOM37)
@@ -232,7 +234,9 @@ def test_atom5_to_atom37_unoccupied_atom37_slots_are_zero(coords5: torch.Tensor)
 # ---------------------------------------------------------------------------
 
 
-def test_atom5_to_atom37_mask_none_sets_occupied_slots_to_one(coords5: torch.Tensor):
+def test_atom5_to_atom37_mask_none_sets_occupied_slots_to_one(
+    coords5: Float[torch.Tensor, "N_RES 5 3"]
+):
     """When no explicit mask is given, all atom5-occupied slots in the atom37 mask must be 1."""
     _, mask_37 = atom5_to_atom37(coords5, mask_5=None)
     for atom37_idx in ATOM5_TO_ATOM37:
@@ -646,9 +650,10 @@ def test_edm_sampler_identity_denoiser_z_unchanged_across_step_counts():
     # D_θ(z, sigma) = z  ⟹  d = (z - z)/sigma = 0  ⟹  z_next = z for every step.
     # The output equals the initial noise regardless of how many steps are run.
     # (steps=1 is excluded: _sigma_schedule divides by steps-1, causing 0/0.)
+
     sampler = EDMSampler(
         _make_identity_denoiser_mock(), sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX, S_churn=0.0
-    )  # type: ignore[arg-type]
+    )
     torch.manual_seed(7)
     z2, seq2 = sampler.sample((1, N_ATOM, 3), steps=2)
     torch.manual_seed(7)
@@ -663,7 +668,7 @@ def test_edm_sampler_zero_denoiser_output_is_zero():
     # at the final step sigma_next = 0, so the trajectory converges exactly to 0.
     sampler = EDMSampler(
         _make_zero_denoiser_mock(), sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX, S_churn=0.0
-    )  # type: ignore[arg-type]
+    )
     out, seq_out = sampler.sample((1, N_ATOM, 3), steps=5)
     assert torch.allclose(out, torch.zeros(1, N_ATOM, 3), atol=1e-5)
     assert torch.allclose(seq_out, torch.zeros_like(seq_out))
@@ -690,15 +695,14 @@ def test_edm_sampler_s_churn_produces_different_result_than_deterministic():
     # With the identity denoiser (d = 0), z never moves during predictor/corrector,
     # so injected noise accumulates unfiltered → output diverges from the ODE run.
     # (Zero denoiser is unsuitable here: it drives z → 0 regardless of S_churn.)
+    torch.manual_seed(5)
     det = EDMSampler(
         _make_identity_denoiser_mock(), sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX, S_churn=0.0
-    )  # type: ignore[arg-type]
+    )
     stoch = EDMSampler(
         _make_identity_denoiser_mock(), sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX, S_churn=2.0
-    )  # type: ignore[arg-type]
-    torch.manual_seed(5)
+    )
     out_det, seq_det = det.sample((1, N_ATOM, 3), steps=5)
-    torch.manual_seed(5)
     out_stoch, seq_stoch = stoch.sample((1, N_ATOM, 3), steps=5)
     assert not torch.allclose(out_det, out_stoch)
     assert torch.isfinite(seq_det).all()
@@ -716,7 +720,7 @@ def test_edm_sampler_heun_corrector_call_count():
     # Total = 2·steps - 1
     counter = _make_zero_denoiser_mock()
     steps = 5
-    sampler = EDMSampler(counter, sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX, S_churn=0.0)  # type: ignore[arg-type]
+    sampler = EDMSampler(counter, sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX, S_churn=0.0)
     sampler.sample((1, N_ATOM, 3), steps=steps)
     assert counter.call_count == 2 * steps - 1
 
@@ -730,15 +734,14 @@ def test_edm_sampler_step_count_changes_output_for_nontrivial_denoiser():
     """Coarser sigma grid (fewer steps) must integrate differently and yield a different output."""
     # D_θ(z, sigma) = 0.5·z: trajectory depends on the sigma grid.
     # Coarser grid (fewer steps) integrates differently → different final output.
+    torch.manual_seed(9)
     coarse = EDMSampler(
         _make_half_denoiser_mock(), sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX, S_churn=0.0
-    )  # type: ignore[arg-type]
+    )
     fine = EDMSampler(
         _make_half_denoiser_mock(), sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX, S_churn=0.0
-    )  # type: ignore[arg-type]
-    torch.manual_seed(9)
+    )
     out_coarse, seq_coarse = coarse.sample((1, N_ATOM, 3), steps=2)
-    torch.manual_seed(9)
     out_fine, seq_fine = fine.sample((1, N_ATOM, 3), steps=10)
     assert not torch.allclose(out_coarse, out_fine)
     assert torch.isfinite(seq_coarse).all()
@@ -750,7 +753,7 @@ def test_edm_sampler_step_count_changes_output_for_nontrivial_denoiser():
 # ---------------------------------------------------------------------------
 
 
-def test_atom5_to_atom37_output_dtype_is_float64(coords5: torch.Tensor):
+def test_atom5_to_atom37_output_dtype_is_float64(coords5: Float[torch.Tensor, "N_RES 5 3"]):
     """Both the coordinate and mask outputs must be float64 to match the model's expected dtype."""
     x_37, mask_37 = atom5_to_atom37(coords5)
     assert x_37.dtype == torch.float64
@@ -900,19 +903,19 @@ N_ATOM_BINS = 22
 
 
 @pytest.fixture
-def atom37_pos() -> torch.Tensor:
+def atom37_pos() -> Float[torch.Tensor, "N_RES_AA 37 3"]:
     """Provide random atom37 coordinates of shape (N_RES_AA, 37, 3) for AA context tests."""
     return torch.randn(N_RES_AA, 37, 3)
 
 
 @pytest.fixture
-def atom37_mask_all() -> torch.Tensor:
+def atom37_mask_all() -> Float[torch.Tensor, "N_RES_AA 37"]:
     """Provide an all-ones atom37 mask indicating every atom is present."""
     return torch.ones(N_RES_AA, 37)
 
 
 @pytest.fixture
-def residue_idx_aa() -> torch.Tensor:
+def residue_idx_aa() -> Float[torch.Tensor, "N_RES_AA"]:
     """Provide a sequential residue index [0, 1, ..., N_RES_AA-1] for AA context tests."""
     return torch.arange(N_RES_AA, dtype=torch.float)
 
@@ -925,9 +928,9 @@ def atom_disto_fn() -> Distogram:
 
 @pytest.fixture
 def aa_ctx(
-    atom37_pos: torch.Tensor,
-    atom37_mask_all: torch.Tensor,
-    residue_idx_aa: torch.Tensor,
+    atom37_pos: Float[torch.Tensor, "N_RES_AA 37 3"],
+    atom37_mask_all: Float[torch.Tensor, "N_RES_AA 37"],
+    residue_idx_aa: Float[torch.Tensor, "N_RES_AA"],
     atom_disto_fn: Distogram,
 ) -> AllAtomContext:
     """Provide fully-populated AllAtomContext for a 6-residue diverse sequence with batch_size=2."""
@@ -1047,9 +1050,9 @@ def test_build_aa_context_all_batch_slices_of_aa_indices_are_identical(aa_ctx: A
 
 
 def test_build_aa_context_batch_size_controls_leading_dim(
-    atom37_pos: torch.Tensor,
-    atom37_mask_all: torch.Tensor,
-    residue_idx_aa: torch.Tensor,
+    atom37_pos: Float[torch.Tensor, "N_RES_AA 37 3"],
+    atom37_mask_all: Float[torch.Tensor, "N_RES_AA 37"],
+    residue_idx_aa: Float[torch.Tensor, "N_RES_AA"],
     atom_disto_fn: Distogram,
 ):
     """Passing batch_size=3 must set the leading dimension of r_gt and aa_indices to 3."""
@@ -1276,7 +1279,7 @@ def partial_template_pdb(tmp_path: pathlib.Path) -> str:
 
 
 @pytest.fixture
-def partial_atom_pos() -> torch.Tensor:
+def partial_atom_pos() -> Float[torch.Tensor, "N_RES 37 3"]:
     """Provide atom37 positions where only first N_PARTIAL residues have non-zero coordinates."""
     pos = torch.zeros(N_RES, 37, 3)
     pos[:N_PARTIAL] = torch.randn(N_PARTIAL, 37, 3, generator=torch.Generator().manual_seed(10))
@@ -1284,7 +1287,7 @@ def partial_atom_pos() -> torch.Tensor:
 
 
 @pytest.fixture
-def partial_atom_msk() -> torch.Tensor:
+def partial_atom_msk() -> Float[torch.Tensor, "N_RES 37"]:
     """Provide an atom37 mask that marks only the first N_PARTIAL residues as present."""
     mask = torch.zeros(N_RES, 37)
     mask[:N_PARTIAL] = 1.0
@@ -1330,8 +1333,8 @@ def seq_only_ctx(atom_disto_fn: Distogram, templ_disto: Distogram) -> Featurized
 
 @pytest.fixture
 def seq_partial_atoms_ctx(
-    partial_atom_pos: torch.Tensor,
-    partial_atom_msk: torch.Tensor,
+    partial_atom_pos: Float[torch.Tensor, "N_RES 37 3"],
+    partial_atom_msk: Float[torch.Tensor, "N_RES 37"],
     atom_disto_fn: Distogram,
     templ_disto: Distogram,
 ) -> FeaturizedBatch:
@@ -1701,7 +1704,7 @@ def test_full_atoms_partial_templ_r_gt_all_finite_and_nonzero(
 
 
 def test_build_aa_context_x_sequence_does_not_raise(
-    atom_disto_fn: Distogram, residue_idx_aa: torch.Tensor
+    atom_disto_fn: Distogram, residue_idx_aa: Float[torch.Tensor, "N_RES_AA"]
 ):
     """All-unknown ('X') sequence is accepted by build_AA_context without raising any exception."""
     with torch.no_grad():
@@ -1719,7 +1722,7 @@ def test_build_aa_context_x_sequence_does_not_raise(
 
 
 def test_build_aa_context_x_maps_to_index_20(
-    atom_disto_fn: Distogram, residue_idx_aa: torch.Tensor
+    atom_disto_fn: Distogram, residue_idx_aa: Float[torch.Tensor, "N_RES_AA"]
 ):
     """Unknown residue 'X' maps to index 20 (the 21st slot beyond the 20 standard amino acids)."""
     with torch.no_grad():
@@ -1737,7 +1740,7 @@ def test_build_aa_context_x_maps_to_index_20(
 
 
 def test_build_aa_context_x_is_distinct_from_alanine(
-    atom_disto_fn: Distogram, residue_idx_aa: torch.Tensor
+    atom_disto_fn: Distogram, residue_idx_aa: Float[torch.Tensor, "N_RES_AA"]
 ):
     """Unknown residue 'X' (index 20) produces different aa_indices than alanine (index 0)."""
     with torch.no_grad():

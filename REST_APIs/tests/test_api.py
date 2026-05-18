@@ -18,6 +18,7 @@ import pytest  # noqa: E402
 import torch  # noqa: E402
 from helpers.atom_utils import Protein, to_pdb  # noqa: E402
 from helpers.featurize import Distogram, FeaturizedBatch  # noqa: E402
+from jaxtyping import Float  # noqa: E402
 from pydantic import ValidationError  # noqa: E402
 from train.train_config import ModelParams, NoiseScheduleParams  # noqa: E402
 
@@ -122,7 +123,7 @@ def _make_trunk_mock() -> MagicMock:
 
     def _forward(
         batch: FeaturizedBatch,
-    ) -> tuple[torch.Tensor, None, None, None, list[object], list[object]]:
+    ) -> tuple[Float[torch.Tensor, "B N_atom 3"], None, None, None, list[object], list[object]]:
         B = batch.r_input.shape[0]
         N_atom = batch.r_input.shape[1]
         return (

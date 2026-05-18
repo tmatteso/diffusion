@@ -186,12 +186,25 @@ def test_make_data_loaders_returns_three_loaders(
     cfg: TrainConfig, jsonl_path: str, splits_path: str
 ):
     """make_data_loaders returns a 3-tuple of (train, val, test) DataLoaders."""
-    assert len(make_data_loaders(cfg, jsonl_path, splits_path)) == 3
+    assert (
+        len(
+            make_data_loaders(
+                cfg=cfg,
+                jsonl_path=jsonl_path,
+                splits_path=splits_path,
+                num_workers=0,
+                debug_run=True,
+            )
+        )
+        == 3
+    )
 
 
 def test_make_data_loaders_train_len(cfg: TrainConfig, jsonl_path: str, splits_path: str):
     """make_data_loaders train loader length matches ceil(n_train / batch_size)."""
-    train_loader, _, _ = make_data_loaders(cfg, jsonl_path, splits_path, debug_run=False)
+    train_loader, _, _ = make_data_loaders(
+        cfg=cfg, jsonl_path=jsonl_path, splits_path=splits_path, num_workers=0, debug_run=False
+    )
     expected = math.ceil(len(_TRAIN_NAMES) / cfg.train_loader.batch_size)
     assert len(train_loader) == expected
 
@@ -200,7 +213,9 @@ def test_make_data_loaders_batch_atom_positions_shape(
     cfg: TrainConfig, jsonl_path: str, splits_path: str
 ):
     """make_data_loaders produces batch with atom_positions shape (batch_size, _MAX_SEQ, 37, 3)."""
-    train_loader, _, _ = make_data_loaders(cfg, jsonl_path, splits_path, debug_run=False)
+    train_loader, _, _ = make_data_loaders(
+        cfg=cfg, jsonl_path=jsonl_path, splits_path=splits_path, num_workers=0, debug_run=False
+    )
     batch = next(iter(train_loader))
     assert batch.atom_positions.shape == (cfg.train_loader.batch_size, _MAX_SEQ, 37, 3)
 
@@ -209,7 +224,9 @@ def test_make_data_loaders_batch_seq_is_list_of_strings(
     cfg: TrainConfig, jsonl_path: str, splits_path: str
 ):
     """make_data_loaders collates the seq field into a list of str, one per batch item."""
-    train_loader, _, _ = make_data_loaders(cfg, jsonl_path, splits_path, debug_run=False)
+    train_loader, _, _ = make_data_loaders(
+        cfg=cfg, jsonl_path=jsonl_path, splits_path=splits_path, num_workers=0, debug_run=False
+    )
     batch = next(iter(train_loader))
     assert isinstance(batch.seq, list)
     assert all(isinstance(s, str) for s in batch.seq)
@@ -253,7 +270,13 @@ def test_make_data_loaders_debug_train_len(
     cfg: TrainConfig, debug_jsonl_path: str, debug_splits_path: str
 ):
     """Debug-mode train loader length equals ceil(_N_DEBUG / batch_size)."""
-    train_loader, _, _ = make_data_loaders(cfg, debug_jsonl_path, debug_splits_path, debug_run=True)
+    train_loader, _, _ = make_data_loaders(
+        cfg=cfg,
+        jsonl_path=debug_jsonl_path,
+        splits_path=debug_splits_path,
+        num_workers=0,
+        debug_run=True,
+    )
     expected = math.ceil(_N_DEBUG / cfg.train_loader.batch_size)
     assert len(train_loader) == expected
 
@@ -262,7 +285,13 @@ def test_make_data_loaders_debug_batch_atom_positions_shape(
     cfg: TrainConfig, debug_jsonl_path: str, debug_splits_path: str
 ):
     """Debug-mode batches have atom_positions shape (batch_size, _MAX_SEQ, 37, 3)."""
-    train_loader, _, _ = make_data_loaders(cfg, debug_jsonl_path, debug_splits_path, debug_run=True)
+    train_loader, _, _ = make_data_loaders(
+        cfg=cfg,
+        jsonl_path=debug_jsonl_path,
+        splits_path=debug_splits_path,
+        num_workers=0,
+        debug_run=True,
+    )
     batch = next(iter(train_loader))
     assert batch.atom_positions.shape == (cfg.train_loader.batch_size, _MAX_SEQ, 37, 3)
 
@@ -271,7 +300,13 @@ def test_make_data_loaders_debug_batch_seq_is_list_of_strings(
     cfg: TrainConfig, debug_jsonl_path: str, debug_splits_path: str
 ):
     """Debug-mode batches collate seq into a list of str, one per batch item."""
-    train_loader, _, _ = make_data_loaders(cfg, debug_jsonl_path, debug_splits_path, debug_run=True)
+    train_loader, _, _ = make_data_loaders(
+        cfg=cfg,
+        jsonl_path=debug_jsonl_path,
+        splits_path=debug_splits_path,
+        num_workers=0,
+        debug_run=True,
+    )
     batch = next(iter(train_loader))
     assert isinstance(batch.seq, list)
     assert all(isinstance(s, str) for s in batch.seq)

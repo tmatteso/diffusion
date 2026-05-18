@@ -4,7 +4,7 @@ Replaces the simplified PairUpdate stub in main_trunk.py.
 
 Steps
 -----
-1. d_ij = ||r_i^center − r_j^center||           scalar pairwise distances
+1. d_ij = ||r_i^center - r_j^center||           scalar pairwise distances
 2. b_ij = LinearNoBias(Transform_RBF(d_ij))      RBF-discretized distance bias  ∈ R^c
 3. z_ij += DropoutRowwise_0.25(TriangleAttentionStartingNodeWithBias(z_ij, b_ij))
 4. z_ij += DropoutColumnwise_0.25(TriangleAttentionEndingNodeWithBias(z_ij, b_ij))
@@ -32,11 +32,11 @@ class TransformRBF(nn.Module):
     Centers are evenly spaced in [d_min, d_max]; width = spacing.
     """
 
-    centers: torch.Tensor  # registered buffer; narrowed from Tensor | Module
-
     def __init__(self, c: int, n_rbf: int = 16, d_min: float = 0.0, d_max: float = 22.0) -> None:
         super().__init__()
-        self.register_buffer("centers", torch.linspace(d_min, d_max, n_rbf))
+        centers: Float[torch.Tensor, "n_rbf"] = torch.linspace(d_min, d_max, n_rbf)
+        self.centers: Float[torch.Tensor, "n_rbf"]
+        self.register_buffer("centers", centers)
         self.sigma = (d_max - d_min) / n_rbf
         self.proj = LinearNoBias(n_rbf, c)
 
@@ -205,7 +205,7 @@ class Transition(nn.Module):
         self.x_to_b = LinearNoBias(c, c * expansion)
         self.hidden_to_out = LinearNoBias(c * expansion, c)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: Float[torch.Tensor, "..."]) -> Float[torch.Tensor, "..."]:
         """Apply two-layer FFN with ReLU activation to any leading-dim tensor."""
         # Works for any leading dims (B N_res N_res c) or (B N_res c)
         x = self.norm(x)
@@ -227,7 +227,7 @@ class DropoutRowwise(nn.Module):
         super().__init__()
         self.p = p
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: Float[torch.Tensor, "..."]) -> Float[torch.Tensor, "..."]:
         """Drop entire rows of x with probability p during training."""
         if not self.training or self.p == 0:
             return x
@@ -244,7 +244,7 @@ class DropoutColumnwise(nn.Module):
         super().__init__()
         self.p = p
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: Float[torch.Tensor, "..."]) -> Float[torch.Tensor, "..."]:
         """Drop entire columns of x with probability p during training."""
         if not self.training or self.p == 0:
             return x
@@ -301,7 +301,7 @@ class PairUpdate(nn.Module):
     ) -> Float[torch.Tensor, "B N_res N_res c_pair"]:
         """Update pair embeddings with triangle attention and coordinate-based RBF bias."""
         # ------------------------------------------------------------------
-        # Step 1: d_ij = ||r_i^center − r_j^center||
+        # Step 1: d_ij = ||r_i^center - r_j^center||
         # ------------------------------------------------------------------
         diff: Float[torch.Tensor, "B N_res N_res 3"] = rearrange(
             r_center, "b n d -> b n 1 d"

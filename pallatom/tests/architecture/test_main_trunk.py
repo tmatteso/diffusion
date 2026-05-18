@@ -37,8 +37,9 @@ C_ATOMPAIR = 16
 N_BINS = 38
 N_ATOM_BINS = 22  # distinct from N_BINS; must match AtomDistogramParams.n_bins
 K_UNIT = 2
-# WINDOW_SIZE=32 (half=16); interior residues span 31 residues by 3 atoms/res = 93 atom neighbours
-K_SPARSE = 93
+# WINDOW_SIZE=128 (half=64); with N_RES=50 all residues fall within the half-window, so
+# every atom neighbours every other atom: K = N_ATOM = 150
+K_SPARSE = N_ATOM
 F_REF_DIM = ATOMS_PER_RES * (
     3 + E
 )  # encoder groups all sibling atoms: n_per_res*(pos_dim+elem_dim)
@@ -436,7 +437,7 @@ def _assert_submodule_grads(model: MainTrunk) -> None:
     Args:
         model: Trunk module after a backward pass has been called.
     """
-    buckets: dict[str, list[torch.Tensor]] = {}
+    buckets: dict[str, list[Float[torch.Tensor, "..."]]] = {}
     for name, param in model.named_parameters():
         if param.grad is not None:
             buckets.setdefault(name.split(".")[0], []).append(param.grad)

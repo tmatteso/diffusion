@@ -5,21 +5,112 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from architecture.layers import LinearNoBias
+from architecture.node_update import AdaLN, AttentionPairBias
 from beartype import beartype
-from einops import rearrange
+from einops import rearrange, reduce, repeat
 from jaxtyping import Bool, Float, Int, jaxtyped
 
 # Local attention window size (residues), matching AlphaFold 3 atom transformer.
 # Each atom l attends only to atoms m where |tok_idx[l] - tok_idx[m]| < WINDOW_SIZE // 2,
 # giving each atom at most WINDOW_SIZE // 2 neighbours on each side.
-WINDOW_SIZE: int = 32
+WINDOW_SIZE: int = 128
 
 
-class LinearNoBias(nn.Linear):
-    """Linear layer with no bias term."""
+class ConditionedTransitionBlock(nn.Module):
+    """Gated transition block conditioned on a sequence embedding via adaLN-Zero.
 
-    def __init__(self, in_features: int, out_features: int) -> None:
-        super().__init__(in_features, out_features, bias=False)
+    Applies adaptive layer normalisation (AdaLN) to the atom features using the
+    sequence embedding, expands into an intermediate SwiGLU-style representation,
+    then projects back with a sigmoid gate derived from the sequence embedding.
+
+    Args:
+        c_a: Atom single-embedding dimension.
+        c_s: Sequence (conditioning) embedding dimension.
+        expansion: Hidden-dimension multiplier; intermediate width is ``expansion * c_a``.
+    """
+
+    def __init__(self, c_a: int, c_s: int, expansion: int = 2) -> None:
+        super().__init__()
+        self.adaln = AdaLN(c_a=c_a, c_s=c_s)
+        self.a_to_b_1 = LinearNoBias(c_a, expansion * c_a)
+        self.a_to_b_2 = LinearNoBias(c_a, expansion * c_a)
+        self.s_to_a = nn.Linear(c_s, c_a)  # biasinit=-2.0
+        self.b_to_a = LinearNoBias(expansion * c_a, c_a)
+
+    @jaxtyped(typechecker=beartype)
+    def forward(
+        self,
+        a: Float[torch.Tensor, "B N_res c_a"],
+        s: Float[torch.Tensor, "B N_res c_s"],
+    ) -> Float[torch.Tensor, "B N_res c_a"]:
+        """Apply the conditioned transition to atom features.
+
+        Computes:
+            1. ``a ← AdaLN(a, s)``
+            2. ``b ← swish(Linear(a)) ⊙ Linear(a)``  (SwiGLU gate, ``b ∈ R^{n·c_a}``)
+            3. ``a ← sigmoid(Linear(s, biasinit=-2.0)) ⊙ Linear(b)``  (adaLN-Zero output gate)
+
+        Args:
+            a: Atom single embeddings of shape ``(B, N_res, c_a)``.
+            s: Sequence conditioning embeddings of shape ``(B, N_res, c_s)``.
+
+        Returns:
+            Updated atom embeddings of shape ``(B, N_res, c_a)``.
+        """
+        a = self.adaln(a, s)
+        b: Float[torch.Tensor, "B N_res c_b"] = F.silu(self.a_to_b_1(a)) * self.a_to_b_2(a)
+        return F.sigmoid(self.s_to_a(s)) * self.b_to_a(b)
+
+
+class DiffusionTransformer(nn.Module):
+    """Iterative transformer that refines atom embeddings with pair-biased attention.
+
+    Runs ``N_block`` rounds of pair-biased attention followed by a conditioned
+    transition block, matching the AlphaFold 3 DiffusionTransformer loop:
+
+        for n in 1 … N_block:
+            b  = AttentionPairBias(a, s, z, β)
+            a  = b + ConditionedTransitionBlock(a, s)
+
+    Args:
+        c_a: Atom single-embedding dimension.
+        c_s: Sequence (conditioning) embedding dimension.
+        c_pair: Pair embedding dimension fed into attention pair bias.
+        N_block: Number of transformer blocks to apply.
+        N_head: Number of attention heads.
+    """
+
+    def __init__(self, c_a: int, c_s: int, c_pair: int, N_block: int, N_head: int) -> None:
+        super().__init__()
+        self.N_block = N_block
+        self.attn_pair_bias = AttentionPairBias(c_res=c_a, c_pair=c_pair, n_heads=N_head)
+        self.cond_trans_block = ConditionedTransitionBlock(c_a=c_a, c_s=c_s, expansion=2)
+
+    @jaxtyped(typechecker=beartype)  # q,c, p = a,s,z
+    def forward(
+        self,
+        a: Float[torch.Tensor, "B N_res c_a"],
+        s: Float[torch.Tensor, "B N_res c_s"],
+        z: Float[torch.Tensor, "B N_res N_j c_pair"],
+        beta: Float[torch.Tensor, "B N_res N_j"] | None = None,
+    ) -> Float[torch.Tensor, "B N_res c_a"]:
+        """Run N_block rounds of attention and transition over atom embeddings.
+
+        Args:
+            a: Atom single embeddings of shape ``(B, N_res, c_a)``.
+            s: Sequence conditioning embeddings of shape ``(B, N_res, c_s)``.
+            z: Pair embeddings — dense ``(B, N_res, N_res, c_pair)`` or
+                sparse ``(B, N_res, K, c_pair)``.
+            beta: Optional additive attention bias matching the pair dimension of ``z``.
+
+        Returns:
+            Refined atom embeddings of shape ``(B, N_res, c_a)``.
+        """
+        for _ in range(self.N_block):
+            b = self.attn_pair_bias(a, s, z, beta)
+            a = b + self.cond_trans_block(a, s)
+        return a
 
 
 # ---------------------------------------------------------------------------
@@ -37,7 +128,7 @@ def build_sparse_pairs(
     """For each atom l, collect indices of all atoms m within the 32-residue window.
 
     Uses an O(N²) boolean intermediate (one byte per pair) to build the index,
-    then returns O(N × K) long + bool tensors where K << N for large proteins.
+    then returns O(N by K) long + bool tensors where K << N for large proteins.
 
     Args:
         tok_idx     : [N]  residue index (0-based) for each atom
@@ -72,133 +163,27 @@ def build_sparse_pairs(
 
 
 # ---------------------------------------------------------------------------
-# AtomTransformerBlock — sparse pair-biased cross-attention
-# ---------------------------------------------------------------------------
-
-
-class AtomTransformerBlock(nn.Module):
-    """Single block of the AtomTransformer with a 32-residue local attention window.
-
-    All pair tensors are sparse [B, N, K, *] — no N² allocation.
-
-    Weight shapes:
-        to_q / to_k / to_v / to_out : [c_atom, c_atom]       (no bias)
-        pair_bias                    : [c_atompair, n_heads]   (no bias)
-        ff1                          : [c_atom, c_atom * 4]    (no bias)
-        ff2                          : [c_atom * 4, c_atom]    (no bias)
-
-    Sparse attention shapes (window_size=32, K = live neighbours per atom):
-        Q, K_proj, V : [B, N, n_heads, head_dim]
-        K_nbr, V_nbr : [B, N, K, n_heads, head_dim]  — gathered over K neighbours
-        scores       : [B, N, K, n_heads]             — O(N × K), not O(N²)
-        pair bias    : [B, N, K, n_heads]
-    """
-
-    def __init__(
-        self,
-        c_atom: int,
-        c_atompair: int,
-        n_heads: int,
-        window_size: int = WINDOW_SIZE,
-    ) -> None:
-        super().__init__()
-        assert c_atom % n_heads == 0, "c_atom must be divisible by n_heads"
-        self.n_heads = n_heads
-        self.head_dim = c_atom // n_heads
-        self.window_size = window_size
-
-        self.norm_q = nn.LayerNorm(c_atom)
-        self.norm_c = nn.LayerNorm(c_atom)
-
-        # [c_atom, c_atom] each — no bias, as in AF3
-        self.to_q = LinearNoBias(c_atom, c_atom)
-        self.to_k = LinearNoBias(c_atom, c_atom)
-        self.to_v = LinearNoBias(c_atom, c_atom)
-        self.to_out = LinearNoBias(c_atom, c_atom)
-
-        # [c_atompair, n_heads] — one scalar bias per head per live pair
-        self.pair_bias = LinearNoBias(c_atompair, n_heads)
-        self.norm_pair = nn.LayerNorm(c_atompair)
-
-        # [c_atom, c_atom*4] then [c_atom*4, c_atom]
-        self.norm_ff = nn.LayerNorm(c_atom)
-        self.ff1 = LinearNoBias(c_atom, c_atom * 4)
-        self.ff2 = LinearNoBias(c_atom * 4, c_atom)
-
-    @jaxtyped(typechecker=beartype)
-    def forward(
-        self,
-        q: Float[torch.Tensor, "B N c_atom"],
-        c: Float[torch.Tensor, "B N c_atom"],
-        p: Float[torch.Tensor, "B N K c_atompair"],
-        neighbor_idx: Int[torch.Tensor, "N K"],
-        valid_mask: Bool[torch.Tensor, "B N K"],
-    ) -> Float[torch.Tensor, "B N c_atom"]:
-        """Args:.
-
-            q            : atom query embeddings      [B, N, c_atom]
-            c            : atom context embeddings    [B, N, c_atom]
-            p            : sparse pair embeddings     [B, N, K, c_atompair]
-                           p[b, l, k] = features for pair (l, neighbor_idx[l, k])
-            neighbor_idx : window neighbour indices   [N, K]
-            valid_mask   : True = live pair           [B, N, K]
-                           encodes both window and chain constraints
-
-        Returns:
-            q : updated atom embeddings               [B, N, c_atom]
-        """
-        H, D = self.n_heads, self.head_dim
-
-        # Project to Q, K, V — each [B, N, n_heads, head_dim]
-        Q: Float[torch.Tensor, "B N n_heads head_dim"] = rearrange(
-            self.to_q(self.norm_q(q)), "b n (h d) -> b n h d", h=H
-        )
-        K_proj: Float[torch.Tensor, "B N n_heads head_dim"] = rearrange(
-            self.to_k(self.norm_c(c)), "b n (h d) -> b n h d", h=H
-        )
-        V: Float[torch.Tensor, "B N n_heads head_dim"] = rearrange(
-            self.to_v(self.norm_c(c)), "b n (h d) -> b n h d", h=H
-        )
-
-        # Gather K neighbours for keys and values — [B, N, K, n_heads, head_dim]
-        # PyTorch advanced indexing: K_proj[:, neighbor_idx] with neighbor_idx [N, K]
-        # broadcasts over B to give [B, N, K, H, D]
-        K_nbr: Float[torch.Tensor, "B N K n_heads head_dim"] = K_proj[:, neighbor_idx]
-        V_nbr: Float[torch.Tensor, "B N K n_heads head_dim"] = V[:, neighbor_idx]
-
-        # Attention scores — [B, N, K, n_heads]
-        scores: Float[torch.Tensor, "B N K n_heads"] = torch.einsum(
-            "b n h d, b n k h d -> b n k h", Q, K_nbr
-        ) / math.sqrt(D)
-
-        # Pair bias — [B, N, K, n_heads]
-        scores = scores + self.pair_bias(self.norm_pair(p))
-
-        # Mask padding and out-of-window slots
-        scores = scores.masked_fill(rearrange(~valid_mask, "b n k -> b n k 1"), float("-inf"))
-
-        # Softmax over K neighbours (not N) — O(N × K) not O(N²)
-        attn: Float[torch.Tensor, "B N K n_heads"] = F.softmax(scores, dim=2)
-
-        # Weighted sum — [B, N, n_heads, head_dim] → [B, N, c_atom]
-        out: Float[torch.Tensor, "B N n_heads head_dim"] = torch.einsum(
-            "b n k h, b n k h d -> b n h d", attn, V_nbr
-        )
-        out: Float[torch.Tensor, "B N c_atom"] = rearrange(out, "b n h d -> b n (h d)")
-
-        q = q + self.to_out(out)
-
-        # Feed-forward
-        return q + self.ff2(F.relu(self.ff1(self.norm_ff(q))))
-
-
-# ---------------------------------------------------------------------------
 # AtomTransformer — stack of sparse blocks
 # ---------------------------------------------------------------------------
 
 
 class AtomTransformer(nn.Module):
-    """Stack of n_blocks AtomTransformerBlocks, all operating on sparse [B, N, K, *] pairs."""
+    """Implements Algorithm 7 (AtomTransformer).
+
+    Constructs the sequence-local β mask once — 0 for atom pairs that share a
+    sliding window centre, -1e10 elsewhere — then runs n_blocks rounds of
+    sparse pair-biased attention (the DiffusionTransformer loop), passing beta as
+    an additive bias to every block.
+
+    Args:
+        c_atom: Atom single-embedding dimension.
+        c_atompair: Atom-pair embedding dimension.
+        n_blocks: Number of transformer blocks (N_block in the paper, default 3).
+        n_heads: Number of attention heads (N_head).
+        n_queries: Query-window half-width in atoms (N_queries, default 32).
+        n_keys: Key-window full-width in atoms (N_keys, default 128).
+        window_size: Residue-level neighbour window used to build sparse pairs.
+    """
 
     def __init__(
         self,
@@ -206,15 +191,14 @@ class AtomTransformer(nn.Module):
         c_atompair: int,
         n_blocks: int = 3,
         n_heads: int = 4,
-        window_size: int = WINDOW_SIZE,
+        n_queries: int = 32,
+        n_keys: int = 128,
     ) -> None:
         super().__init__()
-        self.window_size = window_size
-        self.blocks = nn.ModuleList(
-            [
-                AtomTransformerBlock(c_atom, c_atompair, n_heads, window_size=window_size)
-                for _ in range(n_blocks)
-            ]
+        self.n_queries = n_queries
+        self.n_keys = n_keys
+        self.blocks = DiffusionTransformer(
+            c_a=c_atom, c_s=c_atom, c_pair=c_atompair, N_block=n_blocks, N_head=n_heads
         )
 
     @jaxtyped(typechecker=beartype)
@@ -222,12 +206,13 @@ class AtomTransformer(nn.Module):
         self,
         q: Float[torch.Tensor, "B N c_atom"],
         c: Float[torch.Tensor, "B N c_atom"],
-        p: Float[torch.Tensor, "B N K c_atompair"],
+        p: Float[torch.Tensor, "B N K c_atompair"],  # K should be 128 now!
         neighbor_idx: Int[torch.Tensor, "N K"],
         valid_mask: Bool[torch.Tensor, "B N K"],
     ) -> Float[torch.Tensor, "B N c_atom"]:
-        """Args:.
+        """Run Algorithm 7: construct beta then run the DiffusionTransformer loop.
 
+        Args:
             q            : atom query embeddings   [B, N, c_atom]
             c            : atom context embeddings [B, N, c_atom]
             p            : sparse pair embeddings  [B, N, K, c_atompair]
@@ -237,9 +222,50 @@ class AtomTransformer(nn.Module):
         Returns:
             q : updated atom embeddings            [B, N, c_atom]
         """
-        for block in self.blocks:
-            q = block(q, c, p, neighbor_idx, valid_mask)
-        return q
+        B = q.shape[0]
+        N, K = neighbor_idx.shape
+        half_q = self.n_queries / 2.0
+        half_k = self.n_keys / 2.0
+
+        # Algorithm 7 line 1: β_lm
+        # Centres at n_queries/2 - 0.5, 3·n_queries/2 - 0.5, …
+        # (e.g. 15.5, 47.5, 79.5, … for n_queries=32)
+        n_centres = math.ceil(N / self.n_queries)
+        centres: Float[torch.Tensor, "n_centres"] = torch.arange(
+            n_centres, device=q.device, dtype=torch.float32
+        ) * self.n_queries + (half_q - 0.5)
+
+        atom_idx: Float[torch.Tensor, "B N"] = repeat(
+            torch.arange(N, device=q.device, dtype=torch.float32), "N -> B N", B=B
+        )
+        m_idx: Float[torch.Tensor, "B N K"] = atom_idx[
+            :, neighbor_idx
+        ]  # [B, N, K] — atom index of each sparse neighbour
+
+        # [B, N, n_centres]: True where atom l qualifies as a query for centre c
+        l_in_window: Bool[torch.Tensor, "B N n_centres"] = (
+            rearrange(atom_idx, "B N -> B N 1") - rearrange(centres, "c -> 1 1 c")
+        ).abs() < half_q
+        # [B, N, K, n_centres]: True where neighbour m qualifies as a key for centre c
+        m_in_window: Bool[torch.Tensor, "B N K n_centres"] = (
+            rearrange(m_idx, "B N K -> B N K 1") - rearrange(centres, "c -> 1 1 1 c")
+        ).abs() < half_k
+        # [B, N, K]: True if any centre admits both l as query and m as key
+        both_in_window: Bool[torch.Tensor, "B N K n_centres"] = (
+            rearrange(l_in_window, "B N c -> B N 1 c") & m_in_window
+        )
+        in_window: Bool[torch.Tensor, "B N K"] = reduce(
+            both_in_window.float(), "B N K c -> B N K", "max"
+        ).bool()
+
+        beta: Float[torch.Tensor, "B N K"] = torch.where(
+            in_window & valid_mask,
+            torch.zeros(B, N, K, device=q.device, dtype=q.dtype),
+            torch.full((B, N, K), -1e10, device=q.device, dtype=q.dtype),
+        )
+
+        # Algorithm 7 line 2: DiffusionTransformer — n_blocks rounds of attention + transition
+        return self.blocks(q, c, p, beta)
 
 
 # ---------------------------------------------------------------------------
@@ -250,8 +276,8 @@ class AtomTransformer(nn.Module):
 class AtomFeatureEncoder(nn.Module):
     """Encodes per-atom reference features into per-residue embeddings.
 
-    All N×N pair tensors (d_lm, p_lm, z_gathered) are replaced by sparse
-    [B, N, K, *] tensors indexed over the N × K live pairs within the 32-residue
+    All N by N pair tensors (d_lm, p_lm, z_gathered) are replaced by sparse
+    [B, N, K, *] tensors indexed over the N by K live pairs within the 32-residue
     window. K is the maximum number of window-neighbours any atom has.
 
     Parameters
@@ -326,7 +352,8 @@ class AtomFeatureEncoder(nn.Module):
             c_atompair=d,
             n_blocks=n_blocks,
             n_heads=n_heads,
-            window_size=window_size,
+            n_queries=window_size * 4,
+            n_keys=window_size,
         )
 
         self.proj_agg = LinearNoBias(m, c)  # [m, c]
@@ -369,11 +396,11 @@ class AtomFeatureEncoder(nn.Module):
         N_atom = ref_pos.size(1)
         N_token = s_input.size(1)
 
-        # tok_idx is identical across batch items; use [0] for index builds
-        tok = tok_idx[0]  # [N_atom]
+        # tok_idx is identical across batch items; use [0] for index builds.
+        tok: Int[torch.Tensor, "N_atom"] = tok_idx[0]  # [N_atom] This bothers me.
 
         # ------------------------------------------------------------------
-        # Build sparse pair index — O(N²) bool then O(N × K) permanently
+        # Build sparse pair index — O(N²) bool then O(N by K) permanently
         # ------------------------------------------------------------------
         neighbor_idx: Int[torch.Tensor, "N_atom K"]
         window_valid: Bool[torch.Tensor, "N_atom K"]
@@ -410,7 +437,7 @@ class AtomFeatureEncoder(nn.Module):
         # Steps 5-10: sparse atom-pair embeddings p_lm   [B, N_atom, K, d]
         # ------------------------------------------------------------------
 
-        # Step 5: d_lm = ref_pos[b, l] − ref_pos[b, m]  [B, N_atom, K, 3]
+        # Step 5: d_lm = ref_pos[b, l] - ref_pos[b, m]  [B, N_atom, K, 3]
         d_lm: Float[torch.Tensor, "B N_atom K 3"] = (
             rearrange(ref_pos, "b n d -> b n 1 d") - ref_pos[:, neighbor_idx]
         )
@@ -470,8 +497,9 @@ class AtomFeatureEncoder(nn.Module):
         p_lm = p_lm + self.mlp_p(p_lm)
 
         # ------------------------------------------------------------------
-        # Step 16: AtomTransformer with 32-residue sparse window
+        # Step 16: AtomTransformer with 32 / 128 sparse window described in AF3
         # ------------------------------------------------------------------
+        # this function signature has changed. it will also have changed in AtomDecoder.
         q_skip: Float[torch.Tensor, "B N_atom m"] = self.transformer(
             q_skip,
             c_l,
@@ -486,7 +514,7 @@ class AtomFeatureEncoder(nn.Module):
         proj_q: Float[torch.Tensor, "B N_atom c"] = F.relu(self.proj_agg(q_skip))
         C = proj_q.size(-1)
 
-        # Vectorized scatter: offset tok_idx by b*N_token to flatten B×N_token → (B*N_token)
+        # Vectorized scatter: offset tok_idx by b*N_token to flatten B by N_token → (B*N_token)
         tok_offset: Int[torch.Tensor, "B N_atom"] = (
             tok_idx + torch.arange(B, device=tok_idx.device).unsqueeze(1) * N_token
         )
@@ -548,7 +576,8 @@ class AtomAttentionDecoder(nn.Module):
         window_size: int = WINDOW_SIZE,
     ) -> None:
         super().__init__()
-        self.window_size = window_size
+        self.n_keys = window_size
+        self.n_queries = window_size * 4
 
         self.norm_s_q = nn.LayerNorm(c_token)
         self.proj_s_q = LinearNoBias(c_token, c_atom)  # [c_token, c_atom]
@@ -557,7 +586,6 @@ class AtomAttentionDecoder(nn.Module):
         self.proj_z = LinearNoBias(c_pair, c_atompair)  # [c_pair, c_atompair]
 
         self.mlp_p = nn.Sequential(  # [c_atompair, c_atompair] each
-            LinearNoBias(c_atompair, c_atompair),
             nn.ReLU(),
             LinearNoBias(c_atompair, c_atompair),
             nn.ReLU(),
@@ -571,7 +599,8 @@ class AtomAttentionDecoder(nn.Module):
             c_atompair=c_atompair,
             n_blocks=n_blocks,
             n_heads=n_heads,
-            window_size=window_size,
+            n_queries=window_size * 4,
+            n_keys=window_size,
         )
 
         self.norm_q_out = nn.LayerNorm(c_atom)
@@ -618,7 +647,7 @@ class AtomAttentionDecoder(nn.Module):
         # Build sparse pair index (window only; chain info lives in p_skip)
         neighbor_idx: Int[torch.Tensor, "N_atom K"]
         window_valid: Bool[torch.Tensor, "N_atom K"]
-        neighbor_idx, window_valid = build_sparse_pairs(tok, self.window_size)
+        neighbor_idx, window_valid = build_sparse_pairs(tok, self.n_keys)
         K_built = neighbor_idx.size(1)
         B = tok_idx.size(0)
         valid_mask: Bool[torch.Tensor, "B N_atom K"] = window_valid.unsqueeze(0).expand(B, -1, -1)
@@ -637,8 +666,6 @@ class AtomAttentionDecoder(nn.Module):
         # Step 3: p += MLP(p) residual; zero padding slots
         p = (p + self.mlp_p(p)) * rearrange(valid_mask, "b n k -> b n k 1")
 
-        # why shouldn't the atom distogram head use this p as its input?
-
         # Step 4: AtomTransformer — 32-residue sparse window
         q: Float[torch.Tensor, "B N_atom c_atom"] = self.transformer(
             q,
@@ -647,8 +674,6 @@ class AtomAttentionDecoder(nn.Module):
             neighbor_idx,
             valid_mask,
         )
-
-        # this is suspect. I believe p should be passed through the transformer as well.
 
         # Step 5: r_update = proj(LayerNorm(q))             [B, N_atom, 3]
         r_update: Float[torch.Tensor, "B N_atom 3"] = self.proj_r(self.norm_q_out(q))

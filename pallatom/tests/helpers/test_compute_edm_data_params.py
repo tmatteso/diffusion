@@ -20,7 +20,10 @@ N_RES = 6
 # ---------------------------------------------------------------------------
 
 
-def _batch(atom_positions: torch.Tensor, atom_mask: torch.Tensor) -> ProteinBatch:
+def _batch(
+    atom_positions: Float[torch.Tensor, "B N_res 37 3"],
+    atom_mask: Float[torch.Tensor, "B N_res 37"],
+) -> ProteinBatch:
     """Build a minimal ProteinBatch from positions and mask."""
     _, N_res = atom_positions.shape[:2]
     return ProteinBatch(

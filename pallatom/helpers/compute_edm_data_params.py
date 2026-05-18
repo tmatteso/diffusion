@@ -8,6 +8,7 @@ import torch
 from einops import rearrange, reduce
 from helpers.data import make_data_loaders
 from helpers.featurize import ProteinBatch
+from jaxtyping import Float
 from train.train_config import TrainConfig
 
 
@@ -17,8 +18,8 @@ def compute_sigma_data(train_loader: torch.utils.data.DataLoader[ProteinBatch]) 
     count = 0
 
     for batch in train_loader:
-        atom_positions: torch.Tensor = batch.atom_positions  # (B, N_res, 37, 3)
-        atom_mask: torch.Tensor = batch.atom_mask  # (B, N_res, 37)
+        atom_positions: Float[torch.Tensor, "B N_res 37 3"] = batch.atom_positions
+        atom_mask: Float[torch.Tensor, "B N_res 37"] = batch.atom_mask
         sq = reduce(atom_positions**2, "b n a d -> b n a", "sum")
         sum_sq += reduce(sq * atom_mask, "b n a -> ", "sum").item()
         count += atom_mask.sum().item()
@@ -36,12 +37,12 @@ def compute_edm_noise_params(
     - P_mean    : midpoint of [log sigma_min, log sigma_max]
     - P_std     : half-width of that interval (±1 std spans the full range)
     """
-    dists_from_center: list[torch.Tensor] = []
-    pairwise_dists: list[torch.Tensor] = []
+    dists_from_center: list[Float[torch.Tensor, "..."]] = []
+    pairwise_dists: list[Float[torch.Tensor, "..."]] = []
 
     for batch in train_loader:
-        atom_positions: torch.Tensor = batch.atom_positions  # (B, N_res, 37, 3)
-        atom_mask: torch.Tensor = batch.atom_mask  # (B, N_res, 37)
+        atom_positions: Float[torch.Tensor, "B N_res 37 3"] = batch.atom_positions
+        atom_mask: Float[torch.Tensor, "B N_res 37"] = batch.atom_mask
         dist = atom_positions.norm(dim=-1)  # (B, N_res, 37)
         valid = atom_mask.bool()
         dists_from_center.append(dist[valid].cpu().float())
@@ -100,7 +101,11 @@ if __name__ == "__main__":
         tcfg = TrainConfig()
 
     train_loader, _, _ = make_data_loaders(
-        tcfg, args.data, args.splits, num_workers=args.num_workers, debug_run=False
+        cfg=tcfg,
+        jsonl_path=args.data,
+        splits_path=args.splits,
+        num_workers=args.num_workers,
+        debug_run=False,
     )
 
     sigma_data = compute_sigma_data(train_loader)
