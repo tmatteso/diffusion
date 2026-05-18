@@ -34,6 +34,17 @@ _base_tok = torch.repeat_interleave(torch.arange(N_RES), ATOMS_PER_RES)
 _base_nbrs, _ = build_sparse_pairs(_base_tok)
 K = _base_nbrs.size(1)
 
+# Sparse-mismatch regression constants.
+# With a small window_size, K < N_ATOM, reproducing the production crash where
+# attn (B, n_heads, N, N) and pair_bias (B, n_heads, N, K) had different last dims.
+_SPARSE_WINDOW = 4  # small window so K << N_ATOM
+_SPARSE_RES = 20  # number of residues — gives N_ATOM_SPARSE = 20 * 2 = 40
+_ATOMS_PER_RES_SPARSE = 2
+N_ATOM_SPARSE = _SPARSE_RES * _ATOMS_PER_RES_SPARSE
+_sparse_tok = torch.repeat_interleave(torch.arange(_SPARSE_RES), _ATOMS_PER_RES_SPARSE)
+_sparse_nbrs, _sparse_mask_raw = build_sparse_pairs(_sparse_tok, window_size=_SPARSE_WINDOW)
+K_SPARSE = _sparse_nbrs.size(1)  # guaranteed < N_ATOM_SPARSE for _SPARSE_WINDOW small enough
+
 
 # ---------------------------------------------------------------------------
 # Typed helpers
@@ -635,3 +646,101 @@ def test_atom_attention_decoder_gradient_flows_to_q_skip(
     reduce(r_update, "b n d -> ", "sum").backward()
     assert q_skip_g.grad is not None
     assert torch.isfinite(q_skip_g.grad).all()
+
+
+# ---------------------------------------------------------------------------
+# Sparse-mismatch regression: K_SPARSE < N_ATOM_SPARSE
+#
+# Before the fix, DiffusionTransformer (and thus AtomTransformer) computed dense
+# attention logits of shape (B, n_heads, N, N) then tried to add a sparse pair
+# bias of shape (B, n_heads, N, K) with K != N, producing:
+#   RuntimeError: The size of tensor a (N) must match the size of tensor b (K)
+# These tests exercise the exact shape regime that triggered that crash.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def sparse_neighbor_idx() -> Int[torch.Tensor, "N_atom_sparse K_sparse"]:
+    """Sparse neighbour index [N_ATOM_SPARSE, K_SPARSE] with K_SPARSE < N_ATOM_SPARSE."""
+    return _sparse_nbrs
+
+
+@pytest.fixture
+def sparse_valid_mask() -> Bool[torch.Tensor, "B N_atom_sparse K_sparse"]:
+    """Validity mask [B, N_ATOM_SPARSE, K_SPARSE] for the sparse regression scenario."""
+    return _sparse_mask_raw.unsqueeze(0).expand(B, -1, -1)
+
+
+@pytest.fixture
+def q_sparse() -> Float[torch.Tensor, "B N_atom_sparse C_atom"]:
+    """Query atom embeddings [B, N_ATOM_SPARSE, C_ATOM] for sparse regression."""
+    return torch.randn(B, N_ATOM_SPARSE, C_ATOM)
+
+
+@pytest.fixture
+def p_sparse() -> Float[torch.Tensor, "B N_atom_sparse K_sparse C_atompair"]:
+    """Sparse pair embeddings [B, N_ATOM_SPARSE, K_SPARSE, C_ATOMPAIR] with K < N."""
+    return torch.randn(B, N_ATOM_SPARSE, K_SPARSE, C_ATOMPAIR)
+
+
+@pytest.fixture
+def z_sparse_dt() -> Float[torch.Tensor, "B N_atom_sparse K_sparse C_atom"]:
+    """Sparse pair embeddings for DiffusionTransformer [B, N, K, C_ATOM] with K < N."""
+    return torch.randn(B, N_ATOM_SPARSE, K_SPARSE, C_ATOM)
+
+
+@pytest.fixture
+def beta_sparse_dt() -> Float[torch.Tensor, "B N_atom_sparse K_sparse"]:
+    """Sparse attention bias [B, N, K] aligned with z_sparse_dt."""
+    return torch.zeros(B, N_ATOM_SPARSE, K_SPARSE)
+
+
+def test_diffusion_transformer_sparse_no_shape_mismatch(
+    z_sparse_dt: Float[torch.Tensor, "B N_atom_sparse K_sparse C_atom"],
+    beta_sparse_dt: Float[torch.Tensor, "B N_atom_sparse K_sparse"],
+    sparse_neighbor_idx: Int[torch.Tensor, "N_atom_sparse K_sparse"],
+) -> None:
+    """DiffusionTransformer with sparse z (K<N) and neighbor_idx raises no RuntimeError."""
+    model = DiffusionTransformer(
+        c_a=C_ATOM, c_s=C_ATOM, c_pair=C_ATOM, N_block=1, N_head=N_HEADS
+    ).eval()
+    a = torch.randn(B, N_ATOM_SPARSE, C_ATOM)
+    s = torch.randn(B, N_ATOM_SPARSE, C_ATOM)
+    with torch.no_grad():
+        out = model(a, s, z_sparse_dt, beta_sparse_dt, neighbor_idx=sparse_neighbor_idx)
+    assert out.shape == (B, N_ATOM_SPARSE, C_ATOM)
+    assert torch.isfinite(out).all()
+
+
+def test_atom_transformer_sparse_k_lt_n_no_shape_mismatch(
+    q_sparse: Float[torch.Tensor, "B N_atom_sparse C_atom"],
+    p_sparse: Float[torch.Tensor, "B N_atom_sparse K_sparse C_atompair"],
+    sparse_neighbor_idx: Int[torch.Tensor, "N_atom_sparse K_sparse"],
+    sparse_valid_mask: Bool[torch.Tensor, "B N_atom_sparse K_sparse"],
+) -> None:
+    """AtomTransformer with K_SPARSE < N_ATOM_SPARSE raises no RuntimeError.
+
+    This is the exact shape regime that caused the production crash:
+        attn (B, n_heads, N, N) + pair_bias (B, n_heads, N, K) with N != K.
+    """
+    model = AtomTransformer(C_ATOM, C_ATOMPAIR, n_blocks=1, n_heads=N_HEADS).eval()
+    c = torch.randn(B, N_ATOM_SPARSE, C_ATOM)
+    with torch.no_grad():
+        out = model(q_sparse, c, p_sparse, sparse_neighbor_idx, sparse_valid_mask)
+    assert out.shape == (B, N_ATOM_SPARSE, C_ATOM)
+    assert torch.isfinite(out).all()
+
+
+def test_atom_transformer_sparse_gradient_flows(
+    p_sparse: Float[torch.Tensor, "B N_atom_sparse K_sparse C_atompair"],
+    sparse_neighbor_idx: Int[torch.Tensor, "N_atom_sparse K_sparse"],
+    sparse_valid_mask: Bool[torch.Tensor, "B N_atom_sparse K_sparse"],
+) -> None:
+    """Gradients flow through the sparse attention path when K < N."""
+    model = AtomTransformer(C_ATOM, C_ATOMPAIR, n_blocks=1, n_heads=N_HEADS).eval()
+    q_g = torch.randn(B, N_ATOM_SPARSE, C_ATOM, requires_grad=True)
+    c = torch.randn(B, N_ATOM_SPARSE, C_ATOM)
+    out = model(q_g, c, p_sparse, sparse_neighbor_idx, sparse_valid_mask)
+    reduce(out, "b n c -> ", "sum").backward()
+    assert q_g.grad is not None
+    assert torch.isfinite(q_g.grad).all()

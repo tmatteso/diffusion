@@ -94,6 +94,7 @@ class DiffusionTransformer(nn.Module):
         s: Float[torch.Tensor, "B N_res c_s"],
         z: Float[torch.Tensor, "B N_res N_j c_pair"],
         beta: Float[torch.Tensor, "B N_res N_j"] | None = None,
+        neighbor_idx: Int[torch.Tensor, "N_res N_j"] | None = None,
     ) -> Float[torch.Tensor, "B N_res c_a"]:
         """Run N_block rounds of attention and transition over atom embeddings.
 
@@ -103,12 +104,14 @@ class DiffusionTransformer(nn.Module):
             z: Pair embeddings — dense ``(B, N_res, N_res, c_pair)`` or
                 sparse ``(B, N_res, K, c_pair)``.
             beta: Optional additive attention bias matching the pair dimension of ``z``.
+            neighbor_idx: Sparse neighbour indices ``(N_res, K)``; pass when z is sparse so
+                attention is computed over K neighbours rather than all N positions.
 
         Returns:
             Refined atom embeddings of shape ``(B, N_res, c_a)``.
         """
         for _ in range(self.N_block):
-            b = self.attn_pair_bias(a, s, z, beta)
+            b = self.attn_pair_bias(a, s, z, beta, neighbor_idx=neighbor_idx)
             a = b + self.cond_trans_block(a, s)
         return a
 
@@ -265,7 +268,7 @@ class AtomTransformer(nn.Module):
         )
 
         # Algorithm 7 line 2: DiffusionTransformer — n_blocks rounds of attention + transition
-        return self.blocks(q, c, p, beta)
+        return self.blocks(q, c, p, beta, neighbor_idx=neighbor_idx)
 
 
 # ---------------------------------------------------------------------------

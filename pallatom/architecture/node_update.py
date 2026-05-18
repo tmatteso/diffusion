@@ -9,7 +9,7 @@ from architecture.layers import LinearNoBias
 from architecture.pair_update import DropoutRowwise, Transition
 from beartype import beartype
 from einops import einsum, rearrange
-from jaxtyping import Float, jaxtyped
+from jaxtyping import Float, Int, jaxtyped
 
 
 class AdaLN(nn.Module):
@@ -84,14 +84,28 @@ class AttentionPairBias(nn.Module):
         s: Float[torch.Tensor, "B N_res c_res"] | None,
         z: Float[torch.Tensor, "B N_res N_j c_pair"],
         beta: Float[torch.Tensor, "B N_res N_j"] | None = None,
+        neighbor_idx: Int[torch.Tensor, "N_res N_j"] | None = None,
     ) -> Float[torch.Tensor, "B N_res c_res"]:
         """Compute time-conditioned pair-biased attention over residue single embeddings.
 
         Supports both dense ``[B, N, N, c_pair]`` and sparse ``[B, N, K, c_pair]`` pair
-        tensors — the second and third axes need not be equal. When ``beta`` is ``None``
-        the pair bias is purely additive (equivalent to β=0).
+        tensors.  When ``neighbor_idx`` is provided the attention is sparse: for each query
+        position i, only its K neighbours listed in ``neighbor_idx[i]`` are used as
+        keys/values, keeping the logit shape ``(B, n_heads, N, K)`` consistent with the
+        sparse pair bias derived from ``z``.  When ``neighbor_idx`` is ``None``, standard
+        dense self-attention over all N positions is used.
+
+        Args:
+            a: Node embeddings of shape ``(B, N, c_res)``.
+            s: Optional conditioning embeddings of shape ``(B, N, c_res)``; if ``None``
+                a plain LayerNorm is applied instead of AdaLN.
+            z: Pair embeddings — dense ``(B, N, N, c_pair)`` or sparse ``(B, N, K, c_pair)``.
+            beta: Optional additive attention bias of shape ``(B, N, N_j)`` matching z.
+            neighbor_idx: Sparse neighbour indices ``(N, K)``; required when z is sparse.
+
+        Returns:
+            Updated node embeddings of shape ``(B, N, c_res)``.
         """
-        # Inject time conditioning into queries
         a = self.adaLN(a, s) if s is not None else self.norm_a(a)
 
         q: Float[torch.Tensor, "B N_res n_heads head_dim"] = rearrange(
@@ -123,22 +137,33 @@ class AttentionPairBias(nn.Module):
                 n_heads=self.n_heads,
             )
         )
-        # Attention logits: (B, h, N_q, N_k)
-        attn: Float[torch.Tensor, "B n_heads N_res N_j"] = einsum(
-            q, k, "B N_q n_heads head_dim, B N_k n_heads head_dim -> B n_heads N_q N_k"
-        ) / math.sqrt(self.head_dim)
 
-        attn: Float[torch.Tensor, "B n_heads N_res N_j"] = F.softmax(attn + pair_bias, dim=-1)
-        # attn @ v
-        intermediate: Float[torch.Tensor, "B N_res n_heads head_dim"] = einsum(
-            attn, v, "B n_heads N_q N_k, B N_k n_heads head_dim -> B N_q n_heads head_dim"
-        )
-        # then multiply by g
+        if neighbor_idx is not None:
+            # Sparse path: gather keys/values at each query's K neighbour positions so
+            # that the logit tensor shape (B, n_heads, N, K) matches the sparse pair bias.
+            k_gathered: Float[torch.Tensor, "B N_res N_j n_heads head_dim"] = k[:, neighbor_idx]
+            attn: Float[torch.Tensor, "B n_heads N_res N_j"] = einsum(
+                q, k_gathered, "B N h d, B N K h d -> B h N K"
+            ) / math.sqrt(self.head_dim)
+            attn = F.softmax(attn + pair_bias, dim=-1)
+            v_gathered: Float[torch.Tensor, "B N_res N_j n_heads head_dim"] = v[:, neighbor_idx]
+            intermediate: Float[torch.Tensor, "B N_res n_heads head_dim"] = einsum(
+                attn, v_gathered, "B h N K, B N K h d -> B N h d"
+            )
+        else:
+            # Dense path: full N-by-N self-attention.
+            attn = einsum(
+                q, k, "B N_q n_heads head_dim, B N_k n_heads head_dim -> B n_heads N_q N_k"
+            ) / math.sqrt(self.head_dim)
+            attn = F.softmax(attn + pair_bias, dim=-1)
+            intermediate = einsum(
+                attn, v, "B n_heads N_q N_k, B N_k n_heads head_dim -> B N_q n_heads head_dim"
+            )
+
         intermediate = g * intermediate
-        # concat over n_heads
         out: Float[torch.Tensor, "B N_res c_res"] = rearrange(
             intermediate,
-            "B N_q n_heads head_dim -> B N_q (n_heads head_dim)",  # c_res = n_heads * head_dim
+            "B N_q n_heads head_dim -> B N_q (n_heads head_dim)",
         )
         a = self.out_to_a(out)
 

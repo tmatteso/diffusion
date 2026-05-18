@@ -16,7 +16,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from architecture.atom_transformers import LinearNoBias
+from architecture.layers import LinearNoBias
 from beartype import beartype
 from einops import einsum, rearrange
 from jaxtyping import Float, jaxtyped

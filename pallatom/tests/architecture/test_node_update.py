@@ -5,7 +5,7 @@ import torch
 from architecture.node_update import AttentionPairBias, NodeUpdate
 from beartype import beartype
 from einops import reduce
-from jaxtyping import Float, jaxtyped
+from jaxtyping import Float, Int, jaxtyped
 
 torch.manual_seed(42)
 
@@ -14,6 +14,11 @@ C_RES = 32
 C_PAIR = 32
 N_HEADS = 4
 B = 2
+
+# Sparse regression constants: K < N_RES to reproduce the production mismatch.
+# In production the crash was attn (B, h, 640, 640) + pair_bias (B, h, 640, 635).
+N_RES_LARGE = 20  # total atom / node count
+K_SPARSE = 6  # neighbour count strictly less than N_RES_LARGE
 
 
 # ---------------------------------------------------------------------------
@@ -256,3 +261,112 @@ def test_node_update_train_dropout_preserves_shape_and_finite(
         out = model(s, t, z)
     assert out.shape == (B, N_RES, C_RES)
     assert torch.isfinite(out).all()
+
+
+# ---------------------------------------------------------------------------
+# AttentionPairBias — sparse path (K < N_res regression tests)
+#
+# Production crash: attn (B, n_heads, N, N) + pair_bias (B, n_heads, N, K)
+# with N != K.  These tests use K_SPARSE < N_RES_LARGE to guarantee the
+# mismatch that caused the RuntimeError.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def attn_large() -> AttentionPairBias:
+    """AttentionPairBias sized for the large-N sparse tests."""
+    return AttentionPairBias(C_RES, C_PAIR, n_heads=N_HEADS).eval()
+
+
+@pytest.fixture
+def a_large() -> Float[torch.Tensor, "B N_res_large C_res"]:
+    """Node embeddings for the large sparse scenario [B, N_RES_LARGE, C_RES]."""
+    return torch.randn(B, N_RES_LARGE, C_RES)
+
+
+@pytest.fixture
+def s_large() -> Float[torch.Tensor, "B N_res_large C_res"]:
+    """Conditioning embeddings for the large sparse scenario [B, N_RES_LARGE, C_RES]."""
+    return torch.randn(B, N_RES_LARGE, C_RES)
+
+
+@pytest.fixture
+def z_sparse() -> Float[torch.Tensor, "B N_res_large K_sparse C_pair"]:
+    """Sparse pair embeddings [B, N_RES_LARGE, K_SPARSE, C_PAIR] with K_SPARSE < N_RES_LARGE."""
+    return torch.randn(B, N_RES_LARGE, K_SPARSE, C_PAIR)
+
+
+@pytest.fixture
+def neighbor_idx_sparse() -> Int[torch.Tensor, "N_res_large K_sparse"]:
+    """Neighbour index [N_RES_LARGE, K_SPARSE] — each node's K_SPARSE nearest neighbours."""
+    idx = torch.zeros(N_RES_LARGE, K_SPARSE, dtype=torch.long)
+    for i in range(N_RES_LARGE):
+        neighbours = torch.arange(max(0, i - K_SPARSE // 2), max(K_SPARSE, i + K_SPARSE // 2 + 1))[
+            :K_SPARSE
+        ]
+        idx[i] = neighbours.clamp(0, N_RES_LARGE - 1)
+    return idx
+
+
+@pytest.fixture
+def beta_sparse() -> Float[torch.Tensor, "B N_res_large K_sparse"]:
+    """Sparse attention bias [B, N_RES_LARGE, K_SPARSE] aligned with z_sparse."""
+    return torch.zeros(B, N_RES_LARGE, K_SPARSE)
+
+
+def test_attn_pair_bias_sparse_output_shape(
+    attn_large: AttentionPairBias,
+    a_large: Float[torch.Tensor, "B N_res_large C_res"],
+    s_large: Float[torch.Tensor, "B N_res_large C_res"],
+    z_sparse: Float[torch.Tensor, "B N_res_large K_sparse C_pair"],
+    neighbor_idx_sparse: Int[torch.Tensor, "N_res_large K_sparse"],
+) -> None:
+    """Sparse attention (K < N) returns the correct [B, N, C_res] shape without RuntimeError."""
+    with torch.no_grad():
+        out = attn_large(a_large, s_large, z_sparse, neighbor_idx=neighbor_idx_sparse)
+    assert out.shape == (B, N_RES_LARGE, C_RES)
+
+
+def test_attn_pair_bias_sparse_output_finite(
+    attn_large: AttentionPairBias,
+    a_large: Float[torch.Tensor, "B N_res_large C_res"],
+    s_large: Float[torch.Tensor, "B N_res_large C_res"],
+    z_sparse: Float[torch.Tensor, "B N_res_large K_sparse C_pair"],
+    neighbor_idx_sparse: Int[torch.Tensor, "N_res_large K_sparse"],
+) -> None:
+    """Sparse attention output contains no NaN or Inf values."""
+    with torch.no_grad():
+        out = attn_large(a_large, s_large, z_sparse, neighbor_idx=neighbor_idx_sparse)
+    assert torch.isfinite(out).all()
+
+
+def test_attn_pair_bias_sparse_with_beta(
+    attn_large: AttentionPairBias,
+    a_large: Float[torch.Tensor, "B N_res_large C_res"],
+    s_large: Float[torch.Tensor, "B N_res_large C_res"],
+    z_sparse: Float[torch.Tensor, "B N_res_large K_sparse C_pair"],
+    beta_sparse: Float[torch.Tensor, "B N_res_large K_sparse"],
+    neighbor_idx_sparse: Int[torch.Tensor, "N_res_large K_sparse"],
+) -> None:
+    """Sparse attention works when both beta and neighbor_idx are provided."""
+    with torch.no_grad():
+        out = attn_large(
+            a_large, s_large, z_sparse, beta=beta_sparse, neighbor_idx=neighbor_idx_sparse
+        )
+    assert out.shape == (B, N_RES_LARGE, C_RES)
+    assert torch.isfinite(out).all()
+
+
+def test_attn_pair_bias_sparse_gradient_flows(
+    attn_large: AttentionPairBias,
+    a_large: Float[torch.Tensor, "B N_res_large C_res"],
+    s_large: Float[torch.Tensor, "B N_res_large C_res"],
+    z_sparse: Float[torch.Tensor, "B N_res_large K_sparse C_pair"],
+    neighbor_idx_sparse: Int[torch.Tensor, "N_res_large K_sparse"],
+) -> None:
+    """Gradients flow through sparse attention back to the node embedding input."""
+    a_g = a_large.clone().requires_grad_(True)
+    out = attn_large(a_g, s_large, z_sparse, neighbor_idx=neighbor_idx_sparse)
+    reduce(out, "b n c -> ", "sum").backward()
+    assert a_g.grad is not None
+    assert torch.isfinite(a_g.grad).all()
