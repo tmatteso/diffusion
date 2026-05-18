@@ -166,7 +166,7 @@ class PairformerBlock(nn.Module):
         z = z + self.column_dropout(self.triangle_attn_ending_node(z, b))
         z = z + self.transition1(z)
         if s is not None:
-            s = s + self.attn_pair_bias(a=s, s=None, z=z)
+            s = s + self.attn_pair_bias(a=s, s=None, z=z, n_heads=8)
             s = s + self.transition2(s)
             return s, z
         return None, z

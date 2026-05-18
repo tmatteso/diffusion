@@ -66,7 +66,9 @@ class AttentionPairBias(nn.Module):
         self.head_dim = c_res // n_heads
 
         self.adaLN = AdaLN(c_a=c_res, c_s=c_res)
-        self.norm_a = nn.LayerNorm(c_res)
+        # all actual model callers (NodeUpdate, DiffusionTransformer) always pass a real s,
+        # so norm_a is never called
+        self.norm_a = nn.LayerNorm(c_res, elementwise_affine=False)
         self.a_to_q = nn.Linear(c_res, c_res)
         self.a_to_k = nn.Linear(c_res, c_res)
         self.a_to_v = nn.Linear(c_res, c_res)

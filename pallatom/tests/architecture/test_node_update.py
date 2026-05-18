@@ -156,6 +156,55 @@ def test_attn_pair_bias_pair_bias_affects_output(
     assert not torch.allclose(out1, out2)
 
 
+def test_attn_pair_bias_norm_a_has_no_learnable_params() -> None:
+    """norm_a must be non-learnable (elementwise_affine=False).
+
+    All callers that exist in the current model (NodeUpdate, DiffusionTransformer)
+    always supply a real conditioning tensor, so the s=None fallback path through
+    norm_a is never taken.  If norm_a had learnable parameters they would never
+    receive gradients, triggering a DDP "unused parameter" crash at runtime.
+    """
+    attn = AttentionPairBias(C_RES, C_PAIR, n_heads=N_HEADS)
+    assert list(attn.norm_a.parameters()) == [], (
+        "norm_a must have no learnable parameters (elementwise_affine=False); "
+        "making it learnable causes DDP to crash because norm_a is never called "
+        "when s is always provided"
+    )
+
+
+def test_attn_pair_bias_all_params_receive_gradients(
+    s: Float[torch.Tensor, "B N_res C_res"],
+    t: Float[torch.Tensor, "B N_res C_res"],
+    z: Float[torch.Tensor, "B N_res N_res C_pair"],
+) -> None:
+    """Every learnable parameter in AttentionPairBias receives a finite gradient.
+
+    Regression test for the DDP unused-parameter bug: ensures no parameter
+    silently skips the forward pass when the module is called with real s.
+    """
+    attn = AttentionPairBias(C_RES, C_PAIR, n_heads=N_HEADS)
+    scalar_sum(attn(s, t, z)).backward()
+    for name, param in attn.named_parameters():
+        assert param.grad is not None, f"parameter {name!r} has no gradient"
+        assert torch.isfinite(param.grad).all(), f"parameter {name!r} has non-finite gradient"
+
+
+def test_node_update_all_params_receive_gradients(
+    s: Float[torch.Tensor, "B N_res C_res"],
+    t: Float[torch.Tensor, "B N_res C_res"],
+    z: Float[torch.Tensor, "B N_res N_res C_pair"],
+) -> None:
+    """Every learnable parameter in NodeUpdate receives a finite gradient.
+
+    Regression test for the DDP unused-parameter bug.
+    """
+    node = NodeUpdate(C_RES, C_PAIR, n_heads=N_HEADS, dropout=0.0)
+    scalar_sum(node(s, t, z)).backward()
+    for name, param in node.named_parameters():
+        assert param.grad is not None, f"parameter {name!r} has no gradient"
+        assert torch.isfinite(param.grad).all(), f"parameter {name!r} has non-finite gradient"
+
+
 # ---------------------------------------------------------------------------
 # NodeUpdate
 # ---------------------------------------------------------------------------
