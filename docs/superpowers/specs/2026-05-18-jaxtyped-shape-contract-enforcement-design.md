@@ -10,32 +10,35 @@ fire when a decorated function is called with real tensors, not during static an
 pyright). This means a newly added `@jaxtyped` function with no tests is just documentation at
 commit time; no pre-commit hook catches the gap.
 
-The repo currently has 49 `@jaxtyped`-decorated functions across:
+The repo currently has **56** `@jaxtyped` decorators across source files: 50 on
+functions/methods and 6 on frozen dataclasses (which validates constructor field types at
+instantiation time via beartype).
 
-| Module | Functions |
-|---|---|
-| `pallatom/architecture/atom_transformers.py` | 5 |
-| `pallatom/architecture/losses.py` | 6 |
-| `pallatom/architecture/node_update.py` | 3 |
-| `pallatom/architecture/pair_update.py` | 4 |
-| `pallatom/architecture/pairformer_stack.py` | 4 |
-| `pallatom/architecture/main_trunk.py` | 3 |
-| `pallatom/architecture/template_embedder.py` | 1 |
-| `pallatom/helpers/alignment.py` | 5 |
-| `pallatom/helpers/atom_utils.py` | 4 |
-| `pallatom/helpers/featurize.py` | 6 |
-| `pallatom/sample/sampling.py` | 8 |
-| `pallatom/train/train_loop.py` | 1 |
+| Module | Functions/methods | Dataclasses |
+|---|---|---|
+| `pallatom/architecture/atom_transformers.py` | 5 | — |
+| `pallatom/architecture/losses.py` | 6 | — |
+| `pallatom/architecture/node_update.py` | 3 | — |
+| `pallatom/architecture/pair_update.py` | 4 | — |
+| `pallatom/architecture/pairformer_stack.py` | 4 | — |
+| `pallatom/architecture/main_trunk.py` | 3 | — |
+| `pallatom/architecture/template_embedder.py` | 1 | — |
+| `pallatom/helpers/alignment.py` | 5 | — |
+| `pallatom/helpers/atom_utils.py` | 4 | `Protein` |
+| `pallatom/helpers/featurize.py` | 6 | `ProteinBatch`, `FeaturizedBatch`, `FeaturizedItem` |
+| `pallatom/sample/sampling.py` | 9 | `AllAtomContext`, `TemplateContext` |
+| `pallatom/train/train_loop.py` | 2 | — |
 
-All 49 already have positive tests and all 614 existing tests pass. The gap: no guarantee that
-future additions stay covered, and no test explicitly proves each annotation has beartype teeth.
+All 56 already have positive tests (614 tests pass). The gap: no guarantee that future additions
+stay covered, and no test explicitly proves each annotation has beartype teeth.
 
 ## Goals
 
-1. **CI gate** — a test that fails if any `@jaxtyped`-decorated function has no reference in the
-   corresponding test file.
+1. **CI gate** — a test that fails if any `@jaxtyped`-decorated function or dataclass has no
+   reference in the corresponding test file.
 2. **Negative tests** — one explicit "wrong-shape → `BeartypeCallHintParamViolation`" test per
-   decorated function, proving the annotation enforces at runtime.
+   decorated function/method, and one per dataclass (wrong field shape at construction), proving
+   the annotation enforces at runtime.
 
 ## Approach: Static AST gate + inline negative tests
 
@@ -55,10 +58,11 @@ A single test function `test_every_jaxtyped_function_has_a_test`:
 2. **Test file derivation** — Maps source path to test path:
    `pallatom/{subpkg}/{mod}.py` → `pallatom/tests/{subpkg}/test_{mod}.py`
 
-3. **Coverage check** — For each decorated function, parses the test file's AST and checks that
-   the relevant name appears as an `ast.Name` node anywhere in the tree:
+3. **Coverage check** — For each decorated function or class, parses the test file's AST and
+   checks that the relevant name appears as an `ast.Name` node anywhere in the tree:
    - Standalone function `foo` → `ast.Name(id="foo")` present in test AST.
    - Class method `ClassName.forward` → `ast.Name(id="ClassName")` present in test AST.
+   - Dataclass `FooDataclass` → `ast.Name(id="FooDataclass")` present in test AST.
    - AST name nodes exclude comments, docstrings, and string literals.
 
 4. **Failure message** — Collects all uncovered functions and fails once with a list, so a single
@@ -73,11 +77,14 @@ Detects both call forms of `@jaxtyped`:
 # @jaxtyped                        → ast.Name(id="jaxtyped")
 ```
 
-Walks all function and class definitions, including nested ones.
+Walks all function and class definitions, including nested ones. When the decorated node is a
+`ClassDef`, it's treated as a dataclass — the class name is the lookup key in the test file.
 
 ## Section 2: Negative tests
 
-For each of the 49 `@jaxtyped` functions, one test is added to the existing test file:
+For each of the 56 `@jaxtyped` decorators, one test is added to the existing test file.
+
+### Functions and methods (50 tests)
 
 - **Naming:** `test_<funcname>_wrong_shape` for standalone functions;
   `test_<ClassName>_forward_wrong_shape` for methods.
@@ -89,6 +96,14 @@ For each of the 49 `@jaxtyped` functions, one test is added to the existing test
 - **Fixtures:** Reuses existing fixtures (e.g. `conditioned_transition_block`,
   `encoder`, `transformer`) already defined in each test file. No new fixtures needed.
 - **Private helpers** (e.g. `_pairwise_dist`): Called directly; no fixture needed.
+
+### Dataclasses (6 tests)
+
+- **Naming:** `test_<DataclassName>_wrong_shape`.
+- **Structure:** Instantiates the dataclass with one field set to a wrong-shaped tensor while all
+  other fields are correct. Since frozen dataclasses require all fields, a helper builder is used
+  where needed for classes with many fields (`FeaturizedBatch`, `FeaturizedItem`).
+- **Exception type:** same `BeartypeCallHintParamViolation`.
 
 ### Example
 
@@ -120,17 +135,17 @@ def test_conditioned_transition_block_wrong_shape(
 | `pallatom/tests/architecture/test_main_trunk.py` | +3 negative tests |
 | `pallatom/tests/architecture/test_template_embedder.py` | +1 negative test |
 | `pallatom/tests/helpers/test_alignment.py` | +5 negative tests |
-| `pallatom/tests/helpers/test_atom_utils.py` | +4 negative tests |
-| `pallatom/tests/helpers/test_featurize.py` | +6 negative tests |
-| `pallatom/tests/sample/test_sampling.py` | +8 negative tests |
-| `pallatom/tests/train/test_train_loop.py` | +1 negative test |
+| `pallatom/tests/helpers/test_atom_utils.py` | +5 negative tests (4 fns + `Protein`) |
+| `pallatom/tests/helpers/test_featurize.py` | +9 negative tests (6 fns + 3 dataclasses) |
+| `pallatom/tests/sample/test_sampling.py` | +11 negative tests (9 fns + 2 dataclasses) |
+| `pallatom/tests/train/test_train_loop.py` | +2 negative tests |
 
-**Total:** ~49 new test functions + 1 new file.
+**Total:** ~56 new test functions + 1 new file.
 
 ### What we are NOT doing
 
 - Not modifying any source files.
-- Not adding positive tests (all 49 already have them).
+- Not adding positive tests (all 56 already have them).
 - Not adding new fixtures (reusing existing ones throughout).
 - Not adding a pre-commit hook (the CI gate lives in the pytest suite, which pre-commit already
   runs via the existing `pytest` hook in `.pre-commit-config.yaml`).
