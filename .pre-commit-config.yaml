@@ -19,8 +19,10 @@ repos:
       - id: check-github-workflows
         name: "🐙 github-actions · Validate gh workflow files"
         args: ["--verbose"]
+        stages: [pre-commit]
       - id: check-taskfile
         name: "✅ taskfile · Validate Task configuration"
+        stages: [pre-commit]
 
   ### YAML ###
   - repo: https://github.com/pre-commit/pre-commit-hooks
@@ -28,6 +30,7 @@ repos:
     hooks:
       - id: check-yaml
         name: "📄 yaml · Validate YAML files"
+        stages: [pre-commit]
 
   ### Makefile ###
   - repo: https://github.com/mrtazz/checkmake.git
@@ -35,6 +38,7 @@ repos:
     hooks:
       - id: checkmake
         name: "🐮 Makefile · Lint Makefile"
+        stages: [pre-commit]
 
   ### Shell ###
 
@@ -57,7 +61,6 @@ repos:
     hooks:
       - id: black
         language_version: python3
-        always_run: true
         stages: [pre-commit]
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
@@ -65,7 +68,6 @@ repos:
     hooks:
       - id: ruff
         args: [--fix]
-        always_run: true
         stages: [pre-commit]
 
   - repo: local
