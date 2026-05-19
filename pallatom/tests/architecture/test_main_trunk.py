@@ -21,7 +21,7 @@ from architecture.main_trunk import (
 from beartype import beartype
 from einops import einsum, rearrange, reduce, repeat
 from helpers.featurize import FeaturizedBatch, sinusoidal_encoding
-from jaxtyping import Bool, Float, Int, jaxtyped
+from jaxtyping import Bool, Float, Int, TypeCheckError, jaxtyped
 
 torch.manual_seed(42)
 
@@ -141,14 +141,14 @@ def r_input() -> Float[torch.Tensor, "B N_atom 3"]:
 def tok_idx() -> Int[torch.Tensor, "B N_atom"]:
     """Residue index for each atom [B, N_ATOM] — ATOMS_PER_RES atoms map to same residue."""
     single = torch.repeat_interleave(torch.arange(N_RES), ATOMS_PER_RES)
-    return single.unsqueeze(0).expand(B, -1).contiguous()
+    return repeat(single, "n -> b n", b=B).contiguous()
 
 
 @pytest.fixture
 def center_uid() -> Int[torch.Tensor, "B N_res"]:
     """Index of center atom of each residue [B, N_RES], used to extract per-residue positions."""
     single = torch.arange(0, N_ATOM, ATOMS_PER_RES)
-    return single.unsqueeze(0).expand(B, -1).contiguous()
+    return repeat(single, "n -> b n", b=B).contiguous()
 
 
 @pytest.fixture
@@ -518,8 +518,12 @@ _SM_C = 6
 @pytest.fixture
 def sm_src() -> Float[torch.Tensor, "B N_atom C"]:
     """Sequential source feature tensor with known values for deterministic scatter tests."""
-    return torch.arange(_SM_B * _SM_N_ATOM * _SM_C, dtype=torch.float32).reshape(
-        _SM_B, _SM_N_ATOM, _SM_C
+    return rearrange(
+        torch.arange(_SM_B * _SM_N_ATOM * _SM_C, dtype=torch.float32),
+        "(b n c) -> b n c",
+        b=_SM_B,
+        n=_SM_N_ATOM,
+        c=_SM_C,
     )
 
 
@@ -621,3 +625,28 @@ def test_scatter_mean_multichannel_mean_matches_per_channel():
     )
     expected: Float[torch.Tensor, "B N_tgt C"] = reduce(src_grouped, "b n a c -> b n c", "mean")
     assert torch.allclose(out, expected, atol=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# Shape-contract enforcement — negative tests
+# ---------------------------------------------------------------------------
+
+
+def test_scatter_mean_wrong_shape() -> None:
+    """Wrong src ndim (2-D instead of 3-D) triggers TypeCheckError."""
+    src_bad = torch.zeros(B, N_ATOM)  # missing channel dim C
+    index = torch.zeros(B, N_ATOM, dtype=torch.long)
+    with pytest.raises(TypeCheckError):
+        scatter_mean(src_bad, index, N_RES, B)
+
+
+def test_main_trunk_embed_inputs_wrong_type(model: MainTrunk) -> None:
+    """Passing a non-FeaturizedBatch triggers TypeCheckError."""
+    with pytest.raises(TypeCheckError):
+        model.embed_inputs("not a FeaturizedBatch")  # type: ignore[reportArgumentType]
+
+
+def test_main_trunk_forward_wrong_type(model: MainTrunk) -> None:
+    """Passing a non-FeaturizedBatch triggers TypeCheckError."""
+    with pytest.raises(TypeCheckError):
+        model("not a FeaturizedBatch")
