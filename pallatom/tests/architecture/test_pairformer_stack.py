@@ -904,3 +904,38 @@ def test_tmi_jaxtyping_rejects_non_square_spatial_dims(
     z_bad = torch.randn(1, _N, _N + 1, _C)
     with pytest.raises(TypeCheckError):
         tmi(z_bad)
+
+
+# ---------------------------------------------------------------------------
+# Shape-contract enforcement — negative tests
+# ---------------------------------------------------------------------------
+
+
+def test_triangle_mult_outgoing_forward_wrong_shape() -> None:
+    """Wrong z ndim (3-D instead of 4-D) triggers TypeCheckError."""
+    mod = TriangleMultiplicationOutgoing(c=_C, c_hidden=_C_HIDDEN).eval()
+    z_bad = torch.zeros(B, _N, _N)  # missing c_pair dim
+    with pytest.raises(TypeCheckError):
+        mod(z_bad)
+
+
+def test_triangle_mult_incoming_forward_wrong_shape() -> None:
+    """Wrong z ndim (3-D instead of 4-D) triggers TypeCheckError."""
+    mod = TriangleMultiplicationIncoming(c=_C, c_hidden=_C_HIDDEN).eval()
+    z_bad = torch.zeros(B, _N, _N)  # missing c_pair dim
+    with pytest.raises(TypeCheckError):
+        mod(z_bad)
+
+
+def test_pairformer_block_forward_wrong_shape(block: PairformerBlock) -> None:
+    """Wrong z ndim (3-D instead of 4-D) triggers TypeCheckError."""
+    z_bad = torch.zeros(B, N_RES, N_RES)  # missing c_pair dim
+    with pytest.raises(TypeCheckError):
+        block(None, z_bad)
+
+
+def test_pairformer_stack_forward_wrong_shape(stack: PairformerStack) -> None:
+    """Wrong z ndim (3-D instead of 4-D) triggers TypeCheckError."""
+    z_bad = torch.zeros(B, N_RES, N_RES)  # missing c_pair dim
+    with pytest.raises(TypeCheckError):
+        stack(None, z_bad)
