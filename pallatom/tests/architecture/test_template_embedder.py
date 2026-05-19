@@ -7,7 +7,7 @@ from architecture.pairformer_stack import PairformerStack
 from architecture.template_embedder import TemplateEmbedder
 from beartype import beartype
 from einops import einsum, rearrange, reduce
-from jaxtyping import Float, jaxtyped
+from jaxtyping import Float, TypeCheckError, jaxtyped
 
 torch.manual_seed(42)
 
@@ -255,3 +255,17 @@ def test_gradient_flows_to_f_pseudo_beta_mask(
     reduce(out, "b n m d -> ", "sum").backward()
     assert mask_g.grad is not None
     assert torch.isfinite(mask_g.grad).all()
+
+
+# ---------------------------------------------------------------------------
+# Shape-contract enforcement — negative tests
+# ---------------------------------------------------------------------------
+
+
+def test_template_embedder_forward_wrong_shape(embedder: TemplateEmbedder) -> None:
+    """Wrong f_distogram ndim (3-D instead of 4-D) triggers TypeCheckError."""
+    f_distogram_bad = torch.zeros(B, N_RES, N_RES)  # missing n_bins dim
+    f_pseudo_beta_mask = torch.zeros(B, N_RES)
+    z_ij = torch.zeros(B, N_RES, N_RES, C_Z)
+    with pytest.raises(TypeCheckError):
+        embedder(f_distogram_bad, f_pseudo_beta_mask, z_ij, 0.5)
