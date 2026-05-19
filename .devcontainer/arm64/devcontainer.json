@@ -8,10 +8,14 @@
     }
   },
   "workspaceFolder": "/workspaces/diffusion",
+  "mounts": [
+    "source=/run/host-services/ssh-auth.sock,target=/run/host-services/ssh-auth.sock,type=bind"
+  ],
   "remoteEnv": {
     "VIRTUAL_ENV": "/opt/venv",
     "PATH": "/opt/venv/bin:${containerEnv:PATH}",
-    "PYTHONPATH": "/workspaces/diffusion"
+    "PYTHONPATH": "/workspaces/diffusion",
+    "SSH_AUTH_SOCK": "/run/host-services/ssh-auth.sock"
   },
   "customizations": {
     "vscode": {
