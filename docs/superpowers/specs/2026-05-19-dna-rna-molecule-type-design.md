@@ -5,6 +5,22 @@
 
 ---
 
+## Pre-commit hook requirements
+
+All hooks declared in `.pre-commit-config.yaml` must pass. The implementation must satisfy:
+
+| Hook | Constraint relevant to this work |
+|------|----------------------------------|
+| **commitlint** | Commit message must start with a Conventional Commits prefix (`feat:`, `fix:`, `docs:`, `test:`, etc.) |
+| **black** | Line-length 100, Python 3.10+, double quotes, trailing commas |
+| **ruff** | Full ruleset including `D` (Google docstrings on every public function/class), `ANN` (type hints; waived in test files), `I` (isort), `FBT`/`TRY`/`PT`/etc. — see `pyproject.toml` |
+| **pyright** | `basic` mode; `reportMissingParameterType`, `reportReturnType`, `reportUnnecessaryTypeIgnoreComment`, and most other settings are **errors**. `MappingProxyType` must carry explicit type args |
+| **enforce-einops** | No `.reshape()`, `.view()`, `.permute()`, `.unsqueeze()`, `.squeeze()`, or `torch.einsum()` |
+| **enforce-jaxtyping** | No bare `torch.Tensor` / `Tensor` in annotations — always wrap with `Float[...]`, `Int[...]`, etc. |
+| **pytest** | All existing and new tests must pass |
+
+---
+
 ## Goal
 
 Extend the `Protein` dataclass and `protein_from_pdb()` so that the parsed structure carries

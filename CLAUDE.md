@@ -2,8 +2,31 @@
 
 ## Code quality tooling
 
-Three pre-commit hooks run on every commit: **black**, **ruff**, and **pyright**.
-All three must pass before a commit is accepted.
+All hooks are declared in `.pre-commit-config.yaml`. Configuration for the Python
+tools lives in `pyproject.toml`. **Every hook listed below must pass before a commit
+is accepted** — run `pre-commit run --all-files` locally to verify before pushing.
+
+> **Authoritative sources:** `.pre-commit-config.yaml` (hook inventory) and
+> `pyproject.toml` (tool configuration). The summaries below are kept in sync with
+> those files — when in doubt, check them directly.
+
+### Hook inventory
+
+| Stage | Hook | What it checks |
+|-------|------|----------------|
+| `commit-msg` | **commitlint** | Commit message follows [Conventional Commits](https://www.conventionalcommits.org/) (`feat:`, `fix:`, `docs:`, `test:`, `refactor:`, `chore:`, etc.) |
+| `pre-commit` | **check-github-workflows** | GitHub Actions YAML is schema-valid |
+| `pre-commit` | **check-taskfile** | `Taskfile.yml` is schema-valid |
+| `pre-commit` | **check-yaml** | All YAML files parse without errors |
+| `pre-commit` | **checkmake** | `Makefile` passes style checks |
+| `pre-commit` | **black** | Python code is formatted (line-length 100, Python 3.10+) |
+| `pre-commit` | **ruff** | Python linting (auto-fixes applied; remaining errors block commit) |
+| `pre-commit` | **pyright** | Type-checking of `pallatom/` and `REST_APIs/` |
+| `pre-commit` | **enforce-einops** | Bans raw tensor ops (see below) |
+| `pre-commit` | **enforce-jaxtyping** | Bans bare `torch.Tensor` / `Tensor` annotations (see below) |
+| `pre-commit` | **pytest** | Full test suite must pass |
+
+---
 
 ---
 
@@ -37,6 +60,13 @@ All three must pass before a commit is accepted.
 | `RET` | return consistency | |
 | `SIM` | flake8-simplify | |
 | `ARG` | unused arguments | |
+| `RUF` | ruff-specific | `RUF100` flags unused `# noqa` comments |
+| `TRY` | exception handling hygiene | |
+| `PERF` | performance antipatterns | |
+| `PGH` | pygrep-hooks | `# type: ignore` comments must include a specific error code |
+| `FBT` | boolean trap | prefer keyword-only args or enums over bare `bool` parameters |
+| `PT` | pytest style | enforces `match=` on `raises`, one statement per block, parametrize format |
+| `ISC` | implicit string concatenation | catches `("foo" "bar")` copy-paste bugs |
 
 **Key ignores (ML-friendly carve-outs):**
 
@@ -50,6 +80,8 @@ All three must pass before a commit is accepted.
 | `N817` | `DDP` abbreviation is fine |
 | `PLR0402` | `import torch.nn as nn` is fine |
 | `D107` | no docstring required on `__init__`; use the class-level docstring |
+| `TRY003` | long exception messages are fine in ML code |
+| `FBT003` | boolean literals at call sites are unavoidable in ML code |
 
 **Docstring convention (Google):**
 
@@ -81,22 +113,25 @@ sections only when there are no arguments or the meaning is completely obvious f
 
 | Setting | Meaning |
 |---------|---------|
-| `reportConstantRedefinition` | Reassigning a `Final` variable is an error |
-
-**Enforced as warnings (pre-commit treats these as failures):**
-
-| Setting | Meaning |
-|---------|---------|
+| `reportConstantRedefinition` | Reassigning a `Final` variable |
 | `reportMissingParameterType` | All parameters need type annotations |
 | `reportMissingTypeArgument` | Generics need type args — `dict[str, X]` not bare `dict` |
-| `reportUnknownArgumentType` | Argument types must be resolvable |
-| `reportUnknownLambdaType` | Lambda return types must be resolvable |
 | `reportUninitializedInstanceVariable` | Class attributes must be initialised in `__init__` |
 | `reportUnnecessaryCast` | `cast()` calls must do real work |
 | `reportUnnecessaryTypeIgnoreComment` | `# type: ignore` must suppress an actual error |
 | `reportIncompatibleMethodOverride` | Overrides must be covariant |
 | `reportIncompatibleVariableOverride` | Same for variable overrides |
 | `reportCallInDefaultInitializer` | No function calls in default argument values |
+| `reportReturnType` | All public functions must have explicit return type annotations |
+| `strictParameterNoneValue` | Prevents accessing attributes that might be `None` at runtime |
+
+**Enforced as warnings (pre-commit treats these as failures too):**
+
+| Setting | Meaning |
+|---------|---------|
+| `reportUnknownArgumentType` | Argument types must be resolvable |
+| `reportUnknownLambdaType` | Lambda return types must be resolvable |
+| `reportDeprecated` | Catches deprecated PyTorch/CUDA API usage early |
 
 **Disabled (contamination from untyped libraries):**
 
@@ -108,6 +143,46 @@ sections only when there are no arguments or the meaning is completely obvious f
 | `reportPrivateImportUsage` | disabled by project choice |
 | `reportInvalidTypeForm` | jaxtyping shape strings |
 | `reportIndexIssue` | complex PyTorch tensor indexing patterns |
+
+---
+
+### enforce-einops (`scripts/check_einops.py`)
+
+The following patterns are **banned** in non-comment Python lines and will fail the commit:
+
+| Banned call | Use instead |
+|-------------|-------------|
+| `.reshape(` | `einops.rearrange` |
+| `.view(` | `einops.rearrange` |
+| `.permute(` | `einops.rearrange` |
+| `.unsqueeze(` | `einops.rearrange` |
+| `.squeeze(` | `einops.rearrange` |
+| `torch.einsum(` | `einops.einsum` |
+
+---
+
+### enforce-jaxtyping (`scripts/check_jaxtyping.py`)
+
+Bare `torch.Tensor` or `Tensor` is **banned** in all function argument annotations,
+return-type annotations, and variable annotations. Every tensor annotation must be
+wrapped with a jaxtyping dtype class:
+
+```python
+# ✗ banned
+def foo(x: torch.Tensor) -> torch.Tensor: ...
+
+# ✓ required
+def foo(x: Float[torch.Tensor, "N 3"]) -> Float[torch.Tensor, "N 3"]: ...
+```
+
+Valid wrappers: `Bool`, `Complex`, `Float`, `Inexact`, `Int`, `Integer`, `Num`, `Shaped`.
+
+---
+
+### commitlint
+
+Commit messages must follow Conventional Commits. Examples of valid prefixes:
+`feat:`, `fix:`, `docs:`, `test:`, `refactor:`, `chore:`, `perf:`, `ci:`.
 
 ---
 
