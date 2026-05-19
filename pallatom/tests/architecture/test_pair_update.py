@@ -13,7 +13,7 @@ from architecture.pair_update import (
 )
 from beartype import beartype
 from einops import einsum, rearrange, reduce
-from jaxtyping import Float, jaxtyped
+from jaxtyping import Float, TypeCheckError, jaxtyped
 
 torch.manual_seed(42)
 
@@ -549,3 +549,45 @@ def test_pair_update_rotation_invariant(
         out_orig = pair_update(z, r_center)
         out_rot = pair_update(z, apply_rotation(r_center, R))
     assert torch.allclose(out_orig, out_rot, atol=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# Shape-contract enforcement — negative tests
+# ---------------------------------------------------------------------------
+
+
+def test_transform_rbf_forward_wrong_shape(rbf: TransformRBF) -> None:
+    """Wrong d ndim (2-D instead of 3-D) triggers TypeCheckError."""
+    d_bad = torch.zeros(B, N_RES)  # missing last N_res dim
+    with pytest.raises(TypeCheckError):
+        rbf(d_bad)
+
+
+def test_triangle_attn_starting_node_forward_wrong_shape(
+    tri_start: TriangleAttentionStartingNodeWithBias,
+    b: Float[torch.Tensor, "B N_res N_res n_heads"],
+) -> None:
+    """Wrong z ndim (3-D instead of 4-D) triggers TypeCheckError."""
+    z_bad = torch.zeros(B, N_RES, N_RES)  # missing c_pair dim
+    with pytest.raises(TypeCheckError):
+        tri_start(z_bad, b)
+
+
+def test_triangle_attn_ending_node_forward_wrong_shape(
+    tri_end: TriangleAttentionEndingNodeWithBias,
+    b: Float[torch.Tensor, "B N_res N_res n_heads"],
+) -> None:
+    """Wrong z ndim (3-D instead of 4-D) triggers TypeCheckError."""
+    z_bad = torch.zeros(B, N_RES, N_RES)  # missing c_pair dim
+    with pytest.raises(TypeCheckError):
+        tri_end(z_bad, b)
+
+
+def test_pair_update_forward_wrong_shape(
+    pair_update: PairUpdate,
+    r_center: Float[torch.Tensor, "B N_res 3"],
+) -> None:
+    """Wrong z ndim (3-D instead of 4-D) triggers TypeCheckError."""
+    z_bad = torch.zeros(B, N_RES, N_RES)  # missing c_pair dim
+    with pytest.raises(TypeCheckError):
+        pair_update(z_bad, r_center)
