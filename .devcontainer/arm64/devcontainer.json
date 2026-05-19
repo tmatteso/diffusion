@@ -11,12 +11,8 @@
   "remoteEnv": {
     "VIRTUAL_ENV": "/opt/venv",
     "PATH": "/opt/venv/bin:${containerEnv:PATH}",
-    "PYTHONPATH": "/workspaces/diffusion",
-    "SSH_AUTH_SOCK": "/ssh-agent"
+    "PYTHONPATH": "/workspaces/diffusion"
   },
-  "mounts": [
-    "source=${localEnv:SSH_AUTH_SOCK},target=/ssh-agent,type=bind"
-  ],
   "customizations": {
     "vscode": {
       "extensions": [

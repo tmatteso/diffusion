@@ -1,0 +1,35 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import sys; sys.path.insert\\(0, 'pallatom'\\); import importlib.util; spec = importlib.util.spec_from_file_location\\('api', 'REST_APIs/api.py'\\); m = importlib.util.module_from_spec\\(spec\\); spec.loader.exec_module\\(m\\); print\\('import OK'\\)\")",
+      "Bash(sed -n '70,82p' pallatom/train/train_loop.py)",
+      "Bash(sed -n '192,210p' pallatom/train/train_loop.py)",
+      "Bash(ruff check *)",
+      "Bash(awk -F: '{print $1}')",
+      "Bash(awk '{print $2}')",
+      "Bash(python3 -c \"import json,sys; data=json.load\\(sys.stdin\\); files=sorted\\(set\\(d['filename'] for d in data\\)\\); print\\('\\\\n'.join\\(files\\)\\)\")",
+      "Bash(python -c \"from helpers.data import _FileLogProcessor; print\\('helpers.data OK'\\)\")",
+      "Bash(python -c \"from train.train_loop import train; print\\('train_loop OK'\\)\")",
+      "Bash(python -c \"from sample.sampling import sample; print\\('sampling OK'\\)\")",
+      "Bash(python -m pytest /workspaces/diffusion/pallatom/tests/train/test_train_loop.py -x -q)",
+      "Bash(awk '{print $1}')",
+      "Bash(python3 -c \"import json,sys; data=json.load\\(sys.stdin\\); files={}; [files.update\\({d['filename']: files.get\\(d['filename'],0\\)+1}\\) for d in data]; [print\\(f'{v:3d} {k}'\\) for k,v in sorted\\(files.items\\(\\), key=lambda x: -x[1]\\)]\")",
+      "Bash(python3 -c ' *)",
+      "Bash(awk '{print $NF}')",
+      "Bash(grep -oP '`[^`]+`')",
+      "Bash(awk '{print $NF, $2}')",
+      "Bash(python3 -c \"import json,sys; data=json.load\\(sys.stdin\\); [print\\(f\\\\\"{d['filename']}:{d['location']['row']}\\\\\"\\) for d in data]\")",
+      "Bash(python -m pyright pallatom/tests/architecture/test_template_embedder.py)",
+      "Bash(python -m pytest pallatom/tests/architecture/test_node_update.py pallatom/tests/architecture/test_atom_transformers.py -x -q)",
+      "Bash(python -m pytest pallatom/tests/ -x -q)",
+      "Bash(pre-commit run *)",
+      "Bash(python -m pytest pallatom/tests/test_jaxtyped_coverage.py -v)",
+      "Bash(python -m pytest pallatom/tests/helpers/test_atom_utils.py -k \"wrong_shape\" -v)",
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(python -m pytest pallatom/tests/helpers/test_featurize.py -k \"wrong_shape or wrong_type\" -v)",
+      "Bash(python -m pytest pallatom/tests/sample/test_sampling.py -k \"wrong_shape or wrong_type\" -v)",
+      "Bash(python -m pytest pallatom/tests/train/test_train_loop.py -k \"wrong_device_type\" -v)"
+    ]
+  }
+}

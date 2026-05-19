@@ -160,9 +160,10 @@ def build_AA_context(
     N_res: int = atom_37_coordinate_tensor.shape[0]
     _aa_vals = [restype_order.get(r, 20) for r in aa_sequence]
     aa_indices_i: Int[torch.Tensor, N_res] = torch.tensor(_aa_vals, dtype=torch.long, device=device)
-    f_residue_idx_i: Float[torch.Tensor, "N_res c_res"] = sinusoidal_encoding(
-        residue_index.unsqueeze(0), dim=c_res
-    ).squeeze(0)
+    f_residue_idx_i: Float[torch.Tensor, "N_res c_res"] = rearrange(
+        sinusoidal_encoding(rearrange(residue_index, "n_res -> 1 n_res"), dim=c_res),
+        "1 n_res c_res -> n_res c_res",
+    )
 
     atom5_pos, atom5_mask = atom37_to_atom5(
         rearrange(atom_37_coordinate_tensor, "n a d -> 1 n a d"),
@@ -384,7 +385,7 @@ def build_sampling_context(
         pos_by_name = {name: pos for name, _, pos in rigid_group_atom_positions["ALA"]}
         return torch.tensor(
             [pos_by_name.get(name, (0.0, 0.0, 0.0)) for name in ATOM5_NAMES],
-            dtype=torch.float64,
+            dtype=torch.float32,
         )
 
     ref_pos_single: Float[torch.Tensor, "N_atom 3"] = rearrange(
@@ -405,7 +406,7 @@ def build_sampling_context(
     )
 
     def tile(t: Float[torch.Tensor, "..."]) -> Float[torch.Tensor, "B ..."]:
-        return t.unsqueeze(0).expand(B, *t.shape).contiguous()
+        return repeat(t, "... -> b ...", b=B)
 
     return FeaturizedBatch(
         ref_pos=tile(ref_pos_single),
