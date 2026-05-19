@@ -4,15 +4,17 @@ import pytest
 import torch
 import torch.nn.functional as F
 from architecture.losses import (
+    _pairwise_dist,
     atom_loss,
     distogram_loss_atom,
     distogram_loss_residue,
     med_loss,
+    med_loss_per_block,
     smooth_lddt_loss,
 )
 from beartype import beartype
-from einops import einsum, rearrange
-from jaxtyping import Bool, Float, Int, jaxtyped
+from einops import einsum, rearrange, repeat
+from jaxtyping import Bool, Float, Int, TypeCheckError, jaxtyped
 
 torch.manual_seed(42)
 
@@ -196,7 +198,7 @@ def atom_onehot(
 def atom_local_mask() -> Bool[torch.Tensor, "B N_atoms N_atoms"]:
     """Bool local-window mask [B, N_ATOMS, N_ATOMS] — True within ±2*ATOMS_PER_RES of diagonal."""
     lmask = local_window_mask(N_ATOMS, 2 * ATOMS_PER_RES)
-    return lmask.unsqueeze(0).expand(B, -1, -1)
+    return repeat(lmask, "n m -> b n m", b=B)
 
 
 # ---------------------------------------------------------------------------
@@ -593,3 +595,57 @@ def test_distogram_atom_onehot_index_same_loss(
         distogram_loss_atom(atom_logits, atom_bin_idx, atom_local_mask),
         atol=1e-4,
     )
+
+
+# ---------------------------------------------------------------------------
+# Shape-contract enforcement — negative tests
+# ---------------------------------------------------------------------------
+
+
+def test_atom_loss_wrong_shape() -> None:
+    """Wrong last dim (4 instead of 3) on r_denoised triggers TypeCheckError."""
+    r_bad = torch.zeros(B, N, 4)  # last dim must be 3
+    r_gt = torch.zeros(B, N, 3)
+    with pytest.raises(TypeCheckError):
+        atom_loss(r_bad, r_gt)
+
+
+def test_med_loss_per_block_wrong_shape() -> None:
+    """Wrong last dim on r_denoised_k triggers TypeCheckError."""
+    r_bad = torch.zeros(B, N, 4)  # last dim must be 3
+    r_gt = torch.zeros(B, N, 3)
+    logits = torch.zeros(B, N, VOCAB)
+    aa_gt = torch.zeros(B, N, dtype=torch.long)
+    with pytest.raises(TypeCheckError):
+        med_loss_per_block(r_bad, r_gt, logits, aa_gt, LAM, ALPHA)
+
+
+def test_pairwise_dist_wrong_shape() -> None:
+    """Wrong last dim (4 instead of 3) triggers TypeCheckError."""
+    x_bad = torch.zeros(10, 4)  # last dim must be 3
+    with pytest.raises(TypeCheckError):
+        _pairwise_dist(x_bad)
+
+
+def test_smooth_lddt_loss_wrong_shape() -> None:
+    """Wrong last dim (4 instead of 3) on r_pred triggers TypeCheckError."""
+    r_pred_bad = torch.zeros(N, 4)  # last dim must be 3
+    r_true = torch.zeros(N, 3)
+    with pytest.raises(TypeCheckError):
+        smooth_lddt_loss(r_pred_bad, r_true)
+
+
+def test_distogram_loss_residue_wrong_shape() -> None:
+    """2-D p (below min 3-D for '... N N n_bins') triggers TypeCheckError."""
+    p_bad = torch.zeros(N, N)  # needs at least 3 dims for "... N_res N_res n_bins"
+    y = torch.zeros(N, N, dtype=torch.long)
+    with pytest.raises(TypeCheckError):
+        distogram_loss_residue(p_bad, y)
+
+
+def test_distogram_loss_atom_wrong_shape() -> None:
+    """2-D q (below min 3-D for '... N K n_bins') triggers TypeCheckError."""
+    q_bad = torch.zeros(N_ATOMS, K)  # needs at least 3 dims for "... N_atom K n_bins"
+    y = torch.zeros(N_ATOMS, K, dtype=torch.long)
+    with pytest.raises(TypeCheckError):
+        distogram_loss_atom(q_bad, y)
