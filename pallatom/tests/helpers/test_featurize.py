@@ -17,7 +17,7 @@ from helpers.featurize import (
     featurize_single_item,
     sinusoidal_encoding,
 )
-from jaxtyping import Bool, Float
+from jaxtyping import Bool, Float, TypeCheckError
 from train.train_config import TrainConfig
 
 torch.manual_seed(42)
@@ -529,3 +529,116 @@ def test_featurize_single_item_returns_featurized_item(c_beta_distogram_fn: Dist
     )
     assert isinstance(item, FeaturizedItem)
     assert item.N_res == N_RES
+
+
+# ---------------------------------------------------------------------------
+# Shape-contract enforcement — negative tests
+# ---------------------------------------------------------------------------
+
+
+def test_distogram_forward_wrong_shape(disto: Distogram) -> None:
+    """Wrong coords last dim (4 instead of 3) triggers TypeCheckError."""
+    coords_bad = torch.zeros(N_RES, 4)  # last dim must be 3
+    with pytest.raises(TypeCheckError):
+        disto(coords_bad)
+
+
+def test_sinusoidal_encoding_wrong_shape() -> None:
+    """Wrong positions ndim (3-D instead of 2-D) triggers TypeCheckError."""
+    positions_bad = torch.zeros(B, N_RES, 1)  # must be 2-D
+    with pytest.raises(TypeCheckError):
+        sinusoidal_encoding(positions_bad)
+
+
+def test_ref_pos_for_residue_wrong_type() -> None:
+    """Non-str resname triggers TypeCheckError."""
+    with pytest.raises(TypeCheckError):
+        _ref_pos_for_residue(42)  # type: ignore[arg-type]
+
+
+def test_protein_batch_wrong_shape() -> None:
+    """Wrong atom_positions last dim (4 instead of 3) triggers TypeCheckError."""
+    with pytest.raises(TypeCheckError):
+        ProteinBatch(
+            atom_positions=torch.zeros(B, N_RES, 37, 4),  # last dim must be 3
+            atom_mask=torch.ones(B, N_RES, 37),
+            residue_index=repeat(torch.arange(N_RES, dtype=torch.float), "n -> b n", b=B),
+            seq=[AA_SEQ] * B,
+        )
+
+
+def test_featurized_batch_wrong_shape() -> None:
+    """Wrong ref_pos ndim (2-D instead of 3-D) triggers TypeCheckError."""
+    n_atom = N_RES * 5
+    k_local = 4
+    with pytest.raises(TypeCheckError):
+        FeaturizedBatch(
+            ref_pos=torch.zeros(B, n_atom),  # must be 3-D
+            ref_element=torch.zeros(B, n_atom, 4),
+            ref_space_uid=torch.zeros(B, n_atom, dtype=torch.long),
+            gt_res_distogram=torch.zeros(B, N_RES, N_RES, N_BINS, dtype=torch.long),
+            f_pseudo_beta_mask=torch.zeros(B, N_RES, dtype=torch.long),
+            f_residue_idx=torch.zeros(B, N_RES, C_RES),
+            r_input=torch.zeros(B, n_atom, 3),
+            r_gt=torch.zeros(B, n_atom, 3),
+            atom5_mask=torch.zeros(B, n_atom, dtype=torch.bool),
+            aa_indices=torch.zeros(B, N_RES, dtype=torch.long),
+            residue_mask=torch.zeros(B, N_RES, dtype=torch.bool),
+            t_hat=1.0,
+            t_normalized=0.5,
+            tok_idx=torch.zeros(B, n_atom, dtype=torch.long),
+            center_uid=torch.zeros(B, N_RES, dtype=torch.long),
+            gt_atom_distogram_sparse=torch.zeros(B, n_atom, k_local, 5),
+            gt_atom_distogram_mask_sparse=torch.zeros(B, n_atom, k_local, dtype=torch.bool),
+        )
+
+
+def test_featurized_item_wrong_shape() -> None:
+    """Wrong flat_pos ndim (1-D instead of 2-D) triggers TypeCheckError."""
+    n_atom = N_RES * 5
+    with pytest.raises(TypeCheckError):
+        FeaturizedItem(
+            N_res=N_RES,
+            flat_pos=torch.zeros(n_atom),  # must be 2-D "N_atom 3"
+            atom_mask_flat=torch.zeros(n_atom, dtype=torch.bool),
+            residue_mask=torch.zeros(N_RES, dtype=torch.bool),
+            f_pseudo_beta=torch.zeros(N_RES, dtype=torch.long),
+            gt_res_distogram=torch.zeros(N_RES, N_RES, N_BINS, dtype=torch.long),
+            aa_indices=torch.zeros(N_RES, dtype=torch.long),
+            ref_pos=torch.zeros(n_atom, 3),
+            ref_element=torch.zeros(n_atom, 4),
+            f_residue_idx=torch.zeros(N_RES, C_RES),
+        )
+
+
+def test_featurize_single_item_wrong_shape(disto: Distogram) -> None:
+    """Wrong atom37_positions last dim (4 instead of 3) triggers TypeCheckError."""
+    ala_ref_pos = _ref_pos_for_residue("ALA")
+    ala_ref_elem = torch.zeros(5, 4)
+    positions_bad = torch.zeros(N_RES, 37, 4)  # last dim must be 3
+    atom37_mask = torch.ones(N_RES, 37)
+    index = torch.arange(N_RES, dtype=torch.float)
+    with pytest.raises(TypeCheckError):
+        featurize_single_item(
+            positions_bad,
+            atom37_mask,
+            index,
+            AA_SEQ,
+            ala_ref_pos,
+            ala_ref_elem,
+            c_res=C_RES,
+            c_beta_distogram_fn=disto,
+            device="cpu",
+        )
+
+
+def test_featurize_batch_wrong_type() -> None:
+    """Non-ProteinBatch first arg triggers TypeCheckError."""
+    with pytest.raises(TypeCheckError):
+        featurize_batch("not a batch", None, None, None)  # type: ignore[arg-type]
+
+
+def test_apply_conditioning_dropout_wrong_type() -> None:
+    """Non-FeaturizedBatch first arg triggers TypeCheckError."""
+    with pytest.raises(TypeCheckError):
+        apply_conditioning_dropout("not a batch", 0.5, 0.5, 0.5, "cpu")  # type: ignore[arg-type]
