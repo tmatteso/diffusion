@@ -1765,3 +1765,100 @@ def test_build_aa_context_x_is_distinct_from_alanine(
             c_res=C_RES_AA,
         )
     assert not torch.equal(ctx_x.aa_indices, ctx_a.aa_indices)
+
+
+# ---------------------------------------------------------------------------
+# Shape-contract enforcement — negative tests
+# ---------------------------------------------------------------------------
+
+
+def test_edm_precond_forward_wrong_shape(edm_precond: EDMPrecond) -> None:
+    """Wrong r_input ndim (2-D instead of 3-D) triggers TypeCheckError."""
+    r_bad = torch.zeros(1, N_ATOM)  # missing coordinate dim
+    with pytest.raises(TypeCheckError):
+        edm_precond(r_bad, 1.0)
+
+
+def test_all_atom_context_wrong_shape() -> None:
+    """Wrong r_gt ndim (2-D instead of 3-D) triggers TypeCheckError."""
+    b_local, n_atom_local, n_res_local, k_local = 2, N_ATOM, N_RES, 4
+    with pytest.raises(TypeCheckError):
+        AllAtomContext(
+            r_gt=torch.zeros(b_local, n_atom_local),  # must be 3-D "B N_atom 3"
+            atom5_mask=torch.zeros(b_local, n_atom_local, dtype=torch.bool),
+            residue_mask=torch.zeros(b_local, n_res_local, dtype=torch.bool),
+            gt_atom_distogram_sparse=torch.zeros(b_local, n_atom_local, k_local, N_ATOM_BINS),
+            gt_atom_distogram_mask_sparse=torch.zeros(
+                b_local, n_atom_local, k_local, dtype=torch.bool
+            ),
+            aa_indices=torch.zeros(b_local, n_res_local, dtype=torch.long),
+            f_residue_idx=torch.zeros(b_local, n_res_local, 32),
+        )
+
+
+def test_build_aa_context_wrong_shape(atom_disto_fn: Distogram) -> None:
+    """Wrong coord last dim (4 instead of 3) triggers TypeCheckError."""
+    coord_bad = torch.zeros(N_RES, 37, 4)  # last dim must be 3
+    with pytest.raises(TypeCheckError):
+        build_AA_context(
+            atom_37_coordinate_tensor=coord_bad,
+            atom_37_mask=torch.ones(N_RES, 37),
+            residue_index=torch.arange(N_RES, dtype=torch.float),
+            aa_sequence="A" * N_RES,
+            atom_distogram_fn=atom_disto_fn,
+            batch_size=1,
+            device="cpu",
+            c_res=32,
+        )
+
+
+def test_template_context_wrong_shape() -> None:
+    """Wrong f_template_distogram ndim (3-D instead of 4-D) triggers TypeCheckError."""
+    with pytest.raises(TypeCheckError):
+        TemplateContext(
+            f_template_distogram=torch.zeros(1, N_RES, N_RES, dtype=torch.long),  # missing bins dim
+            f_pseudo_beta_mask=torch.zeros(1, N_RES, dtype=torch.long),
+        )
+
+
+def test_build_template_context_wrong_type(templ_disto: Distogram) -> None:
+    """Non-Protein list element triggers TypeCheckError."""
+    with pytest.raises(TypeCheckError):
+        build_template_context([42], templ_disto)  # type: ignore[list-item]
+
+
+def test_build_sampling_context_wrong_shape(
+    atom_disto_fn: Distogram, templ_disto: Distogram
+) -> None:
+    """Wrong atom_positions last dim (4 instead of 3) triggers TypeCheckError."""
+    positions_bad = torch.zeros(N_RES, 37, 4)  # last dim must be 3
+    with pytest.raises(TypeCheckError):
+        build_sampling_context(
+            atom_positions=positions_bad,
+            atom_mask=torch.ones(N_RES, 37),
+            residue_index=torch.arange(N_RES, dtype=torch.float),
+            seq="A" * N_RES,
+            pdb_files=[],
+            atom_distogram_fn=atom_disto_fn,
+            templ_distogram_fn=templ_disto,
+            c_res=32,
+        )
+
+
+def test_edm_sampler_sigma_schedule_wrong_type(bare_sampler: EDMSampler) -> None:
+    """Non-int steps triggers TypeCheckError."""
+    with pytest.raises(TypeCheckError):
+        bare_sampler._sigma_schedule(3.14, "cpu")  # type: ignore[arg-type]
+
+
+def test_edm_sampler_sample_wrong_type(edm_sampler: EDMSampler) -> None:
+    """Tuple with non-int element triggers TypeCheckError."""
+    with pytest.raises(TypeCheckError):
+        edm_sampler.sample(shape=(1, N_ATOM, "bad"), steps=2)  # type: ignore[arg-type]
+
+
+def test_atom5_to_atom37_wrong_shape() -> None:
+    """Wrong coords_5 last dim (4 instead of 3) triggers TypeCheckError."""
+    coords_bad = torch.zeros(N_RES, 5, 4)  # last dim must be 3
+    with pytest.raises(TypeCheckError):
+        atom5_to_atom37(coords_bad)
