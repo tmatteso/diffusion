@@ -13,9 +13,10 @@ import torch.distributed as dist_module
 import torch.nn as nn
 import torch.nn.parallel
 from architecture.main_trunk import MainTrunk
+from einops import rearrange
 from helpers.data import _to_protein_batch
 from helpers.featurize import Distogram, ProteinBatch, apply_conditioning_dropout, featurize_batch
-from jaxtyping import Float
+from jaxtyping import Float, TypeCheckError
 from torch.optim import Adam
 from train.train_config import (
     CheckpointParams,
@@ -146,7 +147,7 @@ def mini_batch() -> Mapping[str, Float[torch.Tensor, "..."] | list[str]]:
     return {
         "atom_positions": torch.randn(1, _N_KEEP, 37, 3),
         "atom_mask": torch.ones(1, _N_KEEP, 37),
-        "residue_index": torch.arange(_N_KEEP, dtype=torch.float32).unsqueeze(0),
+        "residue_index": rearrange(torch.arange(_N_KEEP, dtype=torch.float32), "n -> 1 n"),
         "seq": [("ACDEFGHIKLMNPQRSTVWY" * (_N_KEEP // 20 + 1))[:_N_KEEP]],
     }
 
@@ -1328,3 +1329,32 @@ def test_integration_gradient_flow_via_train_step(
     optimizer = Adam(model.parameters(), lr=1e-4)
     train_step(batch, model, tcfg, distogram_res, distogram_atom, optimizer, device="cpu")
     _assert_submodule_grads(model)
+
+
+# ---------------------------------------------------------------------------
+# Shape-contract enforcement — negative tests
+# ---------------------------------------------------------------------------
+
+
+def test_evaluate_wrong_device_type(
+    model: MainTrunk,
+    loader: torch.utils.data.DataLoader[ProteinBatch],
+    tcfg: TrainConfig,
+    distogram_res: Distogram,
+    distogram_atom: Distogram,
+) -> None:
+    """Non-str device triggers TypeCheckError for evaluate."""
+    with pytest.raises(TypeCheckError):
+        evaluate(model, loader, tcfg, distogram_res, distogram_atom, 42)  # type: ignore[arg-type]
+
+
+def test_train_wrong_device_type(
+    model: MainTrunk,
+    loader: torch.utils.data.DataLoader[ProteinBatch],
+    tcfg: TrainConfig,
+    distogram_res: Distogram,
+    distogram_atom: Distogram,
+) -> None:
+    """Non-str device triggers TypeCheckError for train."""
+    with pytest.raises(TypeCheckError):
+        train(model, tcfg, loader, loader, distogram_res, distogram_atom, 42)  # type: ignore[arg-type]
