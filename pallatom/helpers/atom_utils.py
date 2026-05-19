@@ -2,6 +2,8 @@
 
 import dataclasses
 from collections.abc import Mapping, MutableMapping
+from types import MappingProxyType
+from typing import Final
 
 import numpy as np
 import numpy.typing as npt
@@ -134,6 +136,31 @@ restype_1to3 = {
 }
 
 restype_3to1 = {v: k for k, v in restype_1to3.items()}
+
+# Molecule type encoding stored in Protein.b_factors (broadcast to all atom slots per residue).
+# 0.0 = amino-acid residue, 1.0 = DNA nucleotide, 2.0 = RNA nucleotide.
+MOL_TYPE_PROTEIN: Final[int] = 0
+MOL_TYPE_DNA: Final[int] = 1
+MOL_TYPE_RNA: Final[int] = 2
+
+# DNA monomers — PDB ATOM residue names for deoxyribonucleotides.
+# Mirrors OpenFold's restype_3to1 / restype_order naming convention.
+DNA_RESTYPES: Final[list[str]] = ["DA", "DC", "DG", "DT"]
+DNA_RESTYPE_ORDER: Final[MappingProxyType[str, int]] = MappingProxyType(
+    {restype: i for i, restype in enumerate(DNA_RESTYPES)}
+)
+DNA_RESTYPE_3TO1: Final[MappingProxyType[str, str]] = MappingProxyType(
+    {"DA": "a", "DC": "c", "DG": "g", "DT": "t"}
+)
+
+# RNA monomers — PDB ATOM residue names for ribonucleotides.
+RNA_RESTYPES: Final[list[str]] = ["A", "C", "G", "U"]
+RNA_RESTYPE_ORDER: Final[MappingProxyType[str, int]] = MappingProxyType(
+    {restype: i for i, restype in enumerate(RNA_RESTYPES)}
+)
+RNA_RESTYPE_3TO1: Final[MappingProxyType[str, str]] = MappingProxyType(
+    {"A": "a", "C": "c", "G": "g", "U": "u"}
+)
 
 
 # Format: (atom_name, rigid_group_idx, (x, y, z))
@@ -440,9 +467,9 @@ class Protein:
     # belongs to.
     chain_index: Int[npt.NDArray[np.intp], "num_res"]
 
-    # B-factors, or temperature factors, of each residue (in sq. angstroms units),
-    # representing the displacement of the residue from its ground truth mean
-    # value.
+    # typically this would be B-factors, or temperature factors, of each residue
+    # (in sq. angstroms units), representing the displacement of the residue from its
+    # ground truth mean value.
     b_factors: Float[npt.NDArray[np.float64], "num_res num_atom_type"]
 
 

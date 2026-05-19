@@ -13,7 +13,16 @@ from helpers.atom_utils import (
     ATOM37_CB,
     ATOM37_N,
     ATOM37_O,
+    DNA_RESTYPE_3TO1,
+    DNA_RESTYPE_ORDER,
+    DNA_RESTYPES,
+    MOL_TYPE_DNA,
+    MOL_TYPE_PROTEIN,
+    MOL_TYPE_RNA,
     PDB_MAX_CHAINS,
+    RNA_RESTYPE_3TO1,
+    RNA_RESTYPE_ORDER,
+    RNA_RESTYPES,
     Protein,
     _chain_end,
     atom37_to_atom5,
@@ -768,3 +777,37 @@ def test_atom37_to_cb_wrong_shape() -> None:
     atom37_mask = torch.ones(B, N_RES, 37)
     with pytest.raises(TypeCheckError):
         atom37_to_cb(positions_bad, atom37_mask)
+
+
+# ---------------------------------------------------------------------------
+# Molecule-type and nucleotide constants
+# ---------------------------------------------------------------------------
+
+
+def test_mol_type_constants() -> None:
+    """MOL_TYPE_* constants encode protein=0, DNA=1, RNA=2."""
+    assert MOL_TYPE_PROTEIN == 0
+    assert MOL_TYPE_DNA == 1
+    assert MOL_TYPE_RNA == 2
+
+
+def test_dna_restype_constants() -> None:
+    """DNA_RESTYPE_* constants have the expected keys, values, and ordering."""
+    from types import MappingProxyType
+
+    assert list(DNA_RESTYPES) == ["DA", "DC", "DG", "DT"]
+    assert isinstance(DNA_RESTYPE_ORDER, MappingProxyType)
+    assert dict(DNA_RESTYPE_ORDER) == {"DA": 0, "DC": 1, "DG": 2, "DT": 3}
+    assert isinstance(DNA_RESTYPE_3TO1, MappingProxyType)
+    assert dict(DNA_RESTYPE_3TO1) == {"DA": "a", "DC": "c", "DG": "g", "DT": "t"}
+
+
+def test_rna_restype_constants() -> None:
+    """RNA_RESTYPE_* constants have the expected keys, values, and ordering."""
+    from types import MappingProxyType
+
+    assert list(RNA_RESTYPES) == ["A", "C", "G", "U"]
+    assert isinstance(RNA_RESTYPE_ORDER, MappingProxyType)
+    assert dict(RNA_RESTYPE_ORDER) == {"A": 0, "C": 1, "G": 2, "U": 3}
+    assert isinstance(RNA_RESTYPE_3TO1, MappingProxyType)
+    assert dict(RNA_RESTYPE_3TO1) == {"A": "a", "C": "c", "G": "g", "U": "u"}
