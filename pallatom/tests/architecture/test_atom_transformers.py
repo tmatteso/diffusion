@@ -12,8 +12,8 @@ from architecture.atom_transformers import (
     build_sparse_pairs,
 )
 from beartype import beartype
-from einops import einsum, rearrange, reduce
-from jaxtyping import Bool, Float, Int, jaxtyped
+from einops import einsum, rearrange, reduce, repeat
+from jaxtyping import Bool, Float, Int, TypeCheckError, jaxtyped
 
 torch.manual_seed(42)
 
@@ -127,7 +127,7 @@ def tok_idx() -> Int[torch.Tensor, "N_atom"]:
 @pytest.fixture
 def tok_idx_batched(tok_idx: Int[torch.Tensor, "N_atom"]) -> Int[torch.Tensor, "B N_atom"]:
     """Batched token index [B, N_atom] — passed to encoder/decoder."""
-    return tok_idx.unsqueeze(0).expand(B, -1).contiguous()
+    return repeat(tok_idx, "n -> b n", b=B).contiguous()
 
 
 @pytest.fixture
@@ -141,7 +141,7 @@ def neighbor_idx(tok_idx: Int[torch.Tensor, "N_atom"]) -> Int[torch.Tensor, "N_a
 def valid_mask(tok_idx: Int[torch.Tensor, "N_atom"]) -> Bool[torch.Tensor, "B N_atom K"]:
     """Bool validity mask [B=1, N_atom, K] — True where neighbor slot is real atom, not padding."""
     _, mask = build_sparse_pairs(tok_idx)
-    return mask.unsqueeze(0)  # [B=1, N_atom, K]
+    return rearrange(mask, "n k -> 1 n k")  # [B=1, N_atom, K]
 
 
 @pytest.fixture
@@ -668,7 +668,7 @@ def sparse_neighbor_idx() -> Int[torch.Tensor, "N_atom_sparse K_sparse"]:
 @pytest.fixture
 def sparse_valid_mask() -> Bool[torch.Tensor, "B N_atom_sparse K_sparse"]:
     """Validity mask [B, N_ATOM_SPARSE, K_SPARSE] for the sparse regression scenario."""
-    return _sparse_mask_raw.unsqueeze(0).expand(B, -1, -1)
+    return repeat(_sparse_mask_raw, "n k -> b n k", b=B)
 
 
 @pytest.fixture
@@ -744,3 +744,68 @@ def test_atom_transformer_sparse_gradient_flows(
     reduce(out, "b n c -> ", "sum").backward()
     assert q_g.grad is not None
     assert torch.isfinite(q_g.grad).all()
+
+
+# ---------------------------------------------------------------------------
+# Shape-contract enforcement — negative tests
+# ---------------------------------------------------------------------------
+
+
+def test_conditioned_transition_block_forward_wrong_shape(
+    conditioned_transition_block: ConditionedTransitionBlock,
+) -> None:
+    """Wrong a ndim (2-D instead of 3-D) triggers TypeCheckError."""
+    a_bad = torch.zeros(B, N_RES)  # missing c_a dim
+    s = torch.zeros(B, N_RES, C_ATOM)
+    with pytest.raises(TypeCheckError):
+        conditioned_transition_block(a_bad, s)
+
+
+def test_diffusion_transformer_forward_wrong_shape(
+    diffusion_transformer: DiffusionTransformer,
+) -> None:
+    """Wrong a ndim (2-D instead of 3-D) triggers TypeCheckError."""
+    a_bad = torch.zeros(B, N_RES)  # missing c_a dim
+    s = torch.zeros(B, N_RES, C_ATOM)
+    z = torch.zeros(B, N_RES, N_RES, C_PAIR)
+    with pytest.raises(TypeCheckError):
+        diffusion_transformer(a_bad, s, z)
+
+
+def test_atom_transformer_forward_wrong_shape(transformer: AtomTransformer) -> None:
+    """Wrong q ndim (2-D instead of 3-D) triggers TypeCheckError."""
+    tok_idx = torch.repeat_interleave(torch.arange(N_RES), ATOMS_PER_RES)
+    nbrs, mask = build_sparse_pairs(tok_idx)
+    q_bad = torch.zeros(B, N_ATOM)  # missing c_atom dim
+    c = torch.zeros(B, N_ATOM, C_ATOM)
+    p = torch.zeros(B, N_ATOM, K, C_ATOMPAIR)
+    with pytest.raises(TypeCheckError):
+        transformer(q_bad, c, p, nbrs, repeat(mask, "n k -> b n k", b=B))
+
+
+def test_atom_feature_encoder_forward_wrong_shape(encoder: AtomFeatureEncoder) -> None:
+    """Wrong ref_pos ndim (2-D instead of 3-D) triggers TypeCheckError."""
+    tok_idx = torch.repeat_interleave(torch.arange(N_RES), ATOMS_PER_RES)
+    ref_pos_bad = torch.zeros(B, N_ATOM)  # missing coordinate dim
+    ref_element = torch.zeros(B, N_ATOM, E)
+    ref_space_uid = torch.zeros(B, N_ATOM, dtype=torch.long)
+    s_input = torch.zeros(B, N_RES, C_TOKEN)
+    z_input = torch.zeros(B, N_RES, N_RES, C_PAIR)
+    r_scaled = torch.zeros(B, N_ATOM, 3)
+    tok = repeat(tok_idx, "n -> b n", b=B)
+    with pytest.raises(TypeCheckError):
+        encoder(ref_pos_bad, ref_element, ref_space_uid, s_input, z_input, r_scaled, tok)
+
+
+def test_atom_attention_decoder_forward_wrong_shape(decoder: AtomAttentionDecoder) -> None:
+    """Wrong q_skip ndim (2-D instead of 3-D) triggers TypeCheckError."""
+    tok_idx = torch.repeat_interleave(torch.arange(N_RES), ATOMS_PER_RES)
+    tok = repeat(tok_idx, "n -> b n", b=B)
+    q_skip_bad = torch.zeros(B, N_ATOM)  # missing c_atom dim
+    p_skip = torch.zeros(B, N_ATOM, K, C_ATOMPAIR)
+    c_skip = torch.zeros(B, N_ATOM, C_ATOM)
+    c = torch.zeros(B, N_ATOM, C_ATOM)
+    s = torch.zeros(B, N_RES, C_TOKEN)
+    z = torch.zeros(B, N_RES, N_RES, C_PAIR)
+    with pytest.raises(TypeCheckError):
+        decoder(q_skip_bad, p_skip, c_skip, c, s, z, tok)
