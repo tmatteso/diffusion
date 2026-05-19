@@ -716,3 +716,55 @@ def test_to_pdb_raises_too_many_chains():
     )
     with pytest.raises(ValueError, match="chains"):
         to_pdb(prot)
+
+
+# ---------------------------------------------------------------------------
+# Shape-contract enforcement — negative tests
+# ---------------------------------------------------------------------------
+
+
+def test_protein_wrong_shape() -> None:
+    """Wrong atom_positions last dim (4 instead of 3) triggers TypeCheckError."""
+    n_res = 5
+    with pytest.raises(TypeCheckError):
+        Protein(
+            atom_positions=np.zeros((n_res, 37, 4), dtype=np.float64),  # last dim must be 3
+            aatype=np.zeros(n_res, dtype=np.intp),
+            atom_mask=np.zeros((n_res, 37), dtype=np.float64),
+            residue_index=np.zeros(n_res, dtype=np.intp),
+            chain_index=np.zeros(n_res, dtype=np.intp),
+            b_factors=np.zeros((n_res, 37), dtype=np.float64),
+        )
+
+
+def test_atom37_to_atom5_wrong_shape() -> None:
+    """Wrong last dim (4 instead of 3) on atom37_positions triggers TypeCheckError."""
+    positions_bad = torch.zeros(B, N_RES, 37, 4)  # last dim must be 3
+    atom37_mask = torch.ones(B, N_RES, 37)
+    with pytest.raises(TypeCheckError):
+        atom37_to_atom5(positions_bad, atom37_mask)
+
+
+def test_pseudo_cb_wrong_shape() -> None:
+    """Wrong last dim (4 instead of 3) on n triggers TypeCheckError."""
+    n_bad = torch.zeros(10, 4)  # last dim must be 3
+    ca = torch.zeros(10, 3)
+    c = torch.zeros(10, 3)
+    with pytest.raises(TypeCheckError):
+        pseudo_cb(n_bad, ca, c)
+
+
+def test_get_cb_coords_wrong_shape() -> None:
+    """Wrong last dim (4 instead of 3) on atom5_positions triggers TypeCheckError."""
+    positions_bad = torch.zeros(B, N_RES, 5, 4)  # last dim must be 3
+    atom5_mask = torch.ones(B, N_RES, 5)
+    with pytest.raises(TypeCheckError):
+        get_cb_coords(positions_bad, atom5_mask)
+
+
+def test_atom37_to_cb_wrong_shape() -> None:
+    """Wrong last dim (4 instead of 3) on atom37_positions triggers TypeCheckError."""
+    positions_bad = torch.zeros(B, N_RES, 37, 4)  # last dim must be 3
+    atom37_mask = torch.ones(B, N_RES, 37)
+    with pytest.raises(TypeCheckError):
+        atom37_to_cb(positions_bad, atom37_mask)
