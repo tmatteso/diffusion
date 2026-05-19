@@ -4,8 +4,8 @@ import pytest
 import torch
 from architecture.losses import atom_loss
 from einops import einsum, rearrange
-from helpers.alignment import apply_transform, kabsch_align, kabsch_rmsd
-from jaxtyping import Float
+from helpers.alignment import apply_transform, kabsch_align, kabsch_rmsd, kabsch_rotation, rmsd
+from jaxtyping import Float, TypeCheckError
 
 torch.manual_seed(42)
 N, B = 50, 8
@@ -112,3 +112,49 @@ def test_atom_loss_noisy_prediction_positive_and_finite():
     loss = atom_loss(r, r_noisy)
     assert (loss > 0).all()
     assert torch.isfinite(loss).all()
+
+
+# ---------------------------------------------------------------------------
+# Shape-contract enforcement — negative tests
+# ---------------------------------------------------------------------------
+
+
+def test_kabsch_rotation_wrong_shape() -> None:
+    """Wrong last dim (4 instead of 3) triggers TypeCheckError."""
+    mobile_bad = torch.zeros(N, 4)  # last dim must be 3
+    reference = torch.zeros(N, 3)
+    with pytest.raises(TypeCheckError):
+        kabsch_rotation(mobile_bad, reference)
+
+
+def test_kabsch_align_wrong_shape() -> None:
+    """Wrong last dim (4 instead of 3) triggers TypeCheckError."""
+    mobile_bad = torch.zeros(N, 4)  # last dim must be 3
+    target = torch.zeros(N, 3)
+    with pytest.raises(TypeCheckError):
+        kabsch_align(mobile_bad, target, return_transform=False)
+
+
+def test_rmsd_wrong_shape() -> None:
+    """Wrong last dim (4 instead of 3) triggers TypeCheckError."""
+    predicted_bad = torch.zeros(N, 4)  # last dim must be 3
+    reference = torch.zeros(N, 3)
+    with pytest.raises(TypeCheckError):
+        rmsd(predicted_bad, reference)
+
+
+def test_kabsch_rmsd_wrong_shape() -> None:
+    """Wrong last dim (4 instead of 3) triggers TypeCheckError."""
+    mobile_bad = torch.zeros(N, 4)  # last dim must be 3
+    target = torch.zeros(N, 3)
+    with pytest.raises(TypeCheckError):
+        kabsch_rmsd(mobile_bad, target)
+
+
+def test_apply_transform_wrong_shape() -> None:
+    """Wrong coords last dim (4 instead of 3) triggers TypeCheckError."""
+    coords_bad = torch.zeros(N, 4)  # last dim must be 3
+    R = rearrange(torch.eye(3), "r c -> 1 r c")
+    t = torch.zeros(1, 1, 3)
+    with pytest.raises(TypeCheckError):
+        apply_transform(coords_bad, R, t, t)

@@ -4,14 +4,18 @@ import dataclasses
 
 import pytest
 import torch
-from einops import rearrange, reduce
+from einops import rearrange, reduce, repeat
 from helpers.atom_utils import restype_num, restype_order
 from helpers.featurize import (
     Distogram,
     FeaturizedBatch,
+    FeaturizedItem,
     ProteinBatch,
+    _ref_pos_for_residue,
     apply_conditioning_dropout,
     featurize_batch,
+    featurize_single_item,
+    sinusoidal_encoding,
 )
 from jaxtyping import Bool, Float
 from train.train_config import TrainConfig
@@ -237,7 +241,7 @@ def protein_batch() -> ProteinBatch:
     return ProteinBatch(
         atom_positions=torch.randn(B, N_RES, 37, 3),
         atom_mask=torch.ones(B, N_RES, 37),
-        residue_index=torch.arange(N_RES).float().unsqueeze(0).expand(B, -1).clone(),
+        residue_index=repeat(torch.arange(N_RES).float(), "n -> b n", b=B),
         seq=[AA_SEQ, AA_SEQ],
     )
 
@@ -387,7 +391,7 @@ def test_featurize_batch_rejects_wrong_atom_positions_rank() -> None:
         ProteinBatch(
             atom_positions=torch.randn(B, N_RES, 37),  # missing last dim
             atom_mask=torch.ones(B, N_RES, 37),
-            residue_index=torch.arange(N_RES).float().unsqueeze(0).expand(B, -1).clone(),
+            residue_index=repeat(torch.arange(N_RES).float(), "n -> b n", b=B),
             seq=[AA_SEQ, AA_SEQ],
         )
 
@@ -399,7 +403,7 @@ def test_featurize_batch_rejects_wrong_atom_count() -> None:
         ProteinBatch(
             atom_positions=torch.randn(B, N_RES, 36, 3),
             atom_mask=torch.ones(B, N_RES, 37),
-            residue_index=torch.arange(N_RES).float().unsqueeze(0).expand(B, -1).clone(),
+            residue_index=repeat(torch.arange(N_RES).float(), "n -> b n", b=B),
             seq=[AA_SEQ, AA_SEQ],
         )
 
@@ -471,3 +475,57 @@ def test_conditioning_dropout_respects_residue_mask(featurized_batch: Featurized
         batch_with_padding, p_distogram=1.0, p_atom=1.0, p_seq=1.0, device="cpu"
     )
     assert torch.equal(out.aa_indices, batch_with_padding.aa_indices)
+
+
+# ---------------------------------------------------------------------------
+# sinusoidal_encoding, _ref_pos_for_residue, featurize_single_item, FeaturizedItem
+# ---------------------------------------------------------------------------
+
+
+def test_sinusoidal_encoding_output_shape() -> None:
+    """sinusoidal_encoding maps (batch, N_res) positions to (batch, N_res, dim) encodings."""
+    positions = rearrange(torch.arange(N_RES).float(), "n -> 1 n")  # (1, N_RES)
+    out = sinusoidal_encoding(positions, dim=32)
+    assert out.shape == (1, N_RES, 32)
+
+
+def test_sinusoidal_encoding_output_finite() -> None:
+    """sinusoidal_encoding produces finite values for standard residue indices."""
+    positions = rearrange(torch.arange(N_RES).float(), "n -> 1 n")  # (1, N_RES)
+    out = sinusoidal_encoding(positions, dim=32)
+    assert torch.isfinite(out).all()
+
+
+def test_ref_pos_for_residue_output_shape() -> None:
+    """_ref_pos_for_residue returns a (5, 3) tensor of reference atom positions."""
+    pos = _ref_pos_for_residue("ALA")
+    assert pos.shape == (5, 3)
+
+
+def test_ref_pos_for_residue_output_finite() -> None:
+    """_ref_pos_for_residue returns finite coordinates for a standard amino acid."""
+    pos = _ref_pos_for_residue("ALA")
+    assert torch.isfinite(pos).all()
+
+
+def test_featurize_single_item_returns_featurized_item(c_beta_distogram_fn: Distogram) -> None:
+    """featurize_single_item returns a FeaturizedItem with the expected N_res."""
+    atom37_positions = torch.randn(N_RES, 37, 3)
+    atom37_mask = torch.ones(N_RES, 37)
+    index = torch.arange(N_RES).float()
+    ala_ref_pos = _ref_pos_for_residue("ALA")
+    ala_ref_elem = torch.zeros(5, 4)
+    ala_ref_elem[:, 0] = 1.0  # C element for all atoms
+    item = featurize_single_item(
+        atom37_positions,
+        atom37_mask,
+        index,
+        AA_SEQ,
+        ala_ref_pos,
+        ala_ref_elem,
+        c_res=C_RES,
+        c_beta_distogram_fn=c_beta_distogram_fn,
+        device="cpu",
+    )
+    assert isinstance(item, FeaturizedItem)
+    assert item.N_res == N_RES
