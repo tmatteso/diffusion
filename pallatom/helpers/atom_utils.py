@@ -145,7 +145,7 @@ MOL_TYPE_RNA: Final[int] = 2
 
 # DNA monomers — PDB ATOM residue names for deoxyribonucleotides.
 # Mirrors OpenFold's restype_3to1 / restype_order naming convention.
-DNA_RESTYPES: Final[list[str]] = ["DA", "DC", "DG", "DT"]
+DNA_RESTYPES: Final[tuple[str, ...]] = ("DA", "DC", "DG", "DT")
 DNA_RESTYPE_ORDER: Final[MappingProxyType[str, int]] = MappingProxyType(
     {restype: i for i, restype in enumerate(DNA_RESTYPES)}
 )
@@ -154,7 +154,7 @@ DNA_RESTYPE_3TO1: Final[MappingProxyType[str, str]] = MappingProxyType(
 )
 
 # RNA monomers — PDB ATOM residue names for ribonucleotides.
-RNA_RESTYPES: Final[list[str]] = ["A", "C", "G", "U"]
+RNA_RESTYPES: Final[tuple[str, ...]] = ("A", "C", "G", "U")
 RNA_RESTYPE_ORDER: Final[MappingProxyType[str, int]] = MappingProxyType(
     {restype: i for i, restype in enumerate(RNA_RESTYPES)}
 )

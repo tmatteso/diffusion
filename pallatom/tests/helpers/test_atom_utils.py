@@ -1,6 +1,7 @@
 """Tests for atom utility dataclasses and functions."""
 
 from collections.abc import Mapping
+from types import MappingProxyType
 
 import numpy as np
 import numpy.typing as npt
@@ -793,8 +794,6 @@ def test_mol_type_constants() -> None:
 
 def test_dna_restype_constants() -> None:
     """DNA_RESTYPE_* constants have the expected keys, values, and ordering."""
-    from types import MappingProxyType
-
     assert list(DNA_RESTYPES) == ["DA", "DC", "DG", "DT"]
     assert isinstance(DNA_RESTYPE_ORDER, MappingProxyType)
     assert dict(DNA_RESTYPE_ORDER) == {"DA": 0, "DC": 1, "DG": 2, "DT": 3}
@@ -804,10 +803,24 @@ def test_dna_restype_constants() -> None:
 
 def test_rna_restype_constants() -> None:
     """RNA_RESTYPE_* constants have the expected keys, values, and ordering."""
-    from types import MappingProxyType
-
     assert list(RNA_RESTYPES) == ["A", "C", "G", "U"]
     assert isinstance(RNA_RESTYPE_ORDER, MappingProxyType)
     assert dict(RNA_RESTYPE_ORDER) == {"A": 0, "C": 1, "G": 2, "U": 3}
     assert isinstance(RNA_RESTYPE_3TO1, MappingProxyType)
     assert dict(RNA_RESTYPE_3TO1) == {"A": "a", "C": "c", "G": "g", "U": "u"}
+
+
+def test_dna_restype_mappings_are_immutable() -> None:
+    """Verify that DNA mapping constants reject mutation at runtime."""
+    with pytest.raises(TypeError):
+        DNA_RESTYPE_ORDER["DX"] = 99
+    with pytest.raises(TypeError):
+        DNA_RESTYPE_3TO1["DX"] = "x"
+
+
+def test_rna_restype_mappings_are_immutable() -> None:
+    """Verify that RNA mapping constants reject mutation at runtime."""
+    with pytest.raises(TypeError):
+        RNA_RESTYPE_ORDER["UX"] = 99
+    with pytest.raises(TypeError):
+        RNA_RESTYPE_3TO1["UX"] = "x"
