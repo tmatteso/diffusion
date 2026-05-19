@@ -2,10 +2,10 @@
 
 import pytest
 import torch
-from architecture.node_update import AttentionPairBias, NodeUpdate
+from architecture.node_update import AdaLN, AttentionPairBias, NodeUpdate
 from beartype import beartype
 from einops import reduce
-from jaxtyping import Float, Int, jaxtyped
+from jaxtyping import Float, Int, TypeCheckError, jaxtyped
 
 torch.manual_seed(42)
 
@@ -419,3 +419,38 @@ def test_attn_pair_bias_sparse_gradient_flows(
     reduce(out, "b n c -> ", "sum").backward()
     assert a_g.grad is not None
     assert torch.isfinite(a_g.grad).all()
+
+
+# ---------------------------------------------------------------------------
+# Shape-contract enforcement — negative tests
+# ---------------------------------------------------------------------------
+
+
+def test_adaln_forward_wrong_shape() -> None:
+    """Wrong a ndim (2-D instead of 3-D) triggers TypeCheckError."""
+    adaln = AdaLN(c_a=C_RES, c_s=C_RES).eval()
+    a_bad = torch.zeros(B, N_RES)  # missing c_a dim
+    s_good = torch.zeros(B, N_RES, C_RES)
+    with pytest.raises(TypeCheckError):
+        adaln(a_bad, s_good)
+
+
+def test_attention_pair_bias_forward_wrong_shape(
+    attn: AttentionPairBias,
+    z: Float[torch.Tensor, "B N_res N_res C_pair"],
+) -> None:
+    """Wrong a ndim (2-D instead of 3-D) triggers TypeCheckError."""
+    a_bad = torch.zeros(B, N_RES)  # missing c_res dim
+    with pytest.raises(TypeCheckError):
+        attn(a_bad, None, z)
+
+
+def test_node_update_forward_wrong_shape(
+    node_update: NodeUpdate,
+    t: Float[torch.Tensor, "B N_res C_res"],
+    z: Float[torch.Tensor, "B N_res N_res C_pair"],
+) -> None:
+    """Wrong s ndim (2-D instead of 3-D) triggers TypeCheckError."""
+    s_bad = torch.zeros(B, N_RES)  # missing c_res dim
+    with pytest.raises(TypeCheckError):
+        node_update(s_bad, t, z)
