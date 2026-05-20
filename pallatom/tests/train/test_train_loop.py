@@ -135,7 +135,7 @@ def model() -> MainTrunk:
 def tcfg(tmp_path: pathlib.Path) -> TrainConfig:
     """Provide a single-epoch TrainConfig with a temporary checkpoint path."""
     return TrainConfig(
-        training=TrainingParams(num_epochs=1, lr=1e-4, grad_clip=1.0),
+        training=TrainingParams(num_epochs=1, lr=1e-4, grad_clip=1.0, accumulated_batch_size=2),
         model=ModelParams(
             f_ref_dim=_F_REF_DIM,
             n_bins=_N_BINS,
@@ -187,7 +187,7 @@ def loader(
 def tcfg_multi(tmp_path: pathlib.Path) -> TrainConfig:
     """Provide a 3-epoch TrainConfig for multi-epoch loop tests."""
     return TrainConfig(
-        training=TrainingParams(num_epochs=3, lr=1e-3, grad_clip=1.0),
+        training=TrainingParams(num_epochs=3, lr=1e-3, grad_clip=1.0, accumulated_batch_size=2),
         model=ModelParams(
             f_ref_dim=_F_REF_DIM,
             n_bins=_N_BINS,
@@ -209,7 +209,7 @@ def tcfg_multi(tmp_path: pathlib.Path) -> TrainConfig:
 def tcfg_no_clip(tmp_path: pathlib.Path) -> TrainConfig:
     """Provide a TrainConfig with grad_clip=None to exercise the unclipped gradient path."""
     return TrainConfig(
-        training=TrainingParams(num_epochs=1, lr=1e-4, grad_clip=None),
+        training=TrainingParams(num_epochs=1, lr=1e-4, grad_clip=None, accumulated_batch_size=2),
         model=ModelParams(
             f_ref_dim=_F_REF_DIM,
             n_bins=_N_BINS,
@@ -231,7 +231,7 @@ def tcfg_no_clip(tmp_path: pathlib.Path) -> TrainConfig:
 def tcfg_wandb(tmp_path: pathlib.Path) -> TrainConfig:
     """Provide a 1-epoch TrainConfig with W&B logging enabled for wandb-branch tests."""
     return TrainConfig(
-        training=TrainingParams(num_epochs=1, lr=1e-4, grad_clip=1.0),
+        training=TrainingParams(num_epochs=1, lr=1e-4, grad_clip=1.0, accumulated_batch_size=2),
         model=ModelParams(
             f_ref_dim=_F_REF_DIM,
             n_bins=_N_BINS,
@@ -253,7 +253,7 @@ def tcfg_wandb(tmp_path: pathlib.Path) -> TrainConfig:
 def tcfg_wandb_3ep(tmp_path: pathlib.Path) -> TrainConfig:
     """Provide a 3-epoch TrainConfig with W&B logging enabled for multi-epoch wandb tests."""
     return TrainConfig(
-        training=TrainingParams(num_epochs=3, lr=1e-4, grad_clip=1.0),
+        training=TrainingParams(num_epochs=3, lr=1e-4, grad_clip=1.0, accumulated_batch_size=2),
         model=ModelParams(
             f_ref_dim=_F_REF_DIM,
             n_bins=_N_BINS,
@@ -275,7 +275,7 @@ def tcfg_wandb_3ep(tmp_path: pathlib.Path) -> TrainConfig:
 def tcfg_save(tmp_path: pathlib.Path) -> TrainConfig:
     """Provide a TrainConfig with save_every=1 to exercise the periodic epoch checkpoint path."""
     return TrainConfig(
-        training=TrainingParams(num_epochs=1, lr=1e-4, grad_clip=1.0),
+        training=TrainingParams(num_epochs=1, lr=1e-4, grad_clip=1.0, accumulated_batch_size=2),
         model=ModelParams(
             f_ref_dim=_F_REF_DIM,
             n_bins=_N_BINS,
@@ -1468,7 +1468,7 @@ def test_train_resume_runs_remaining_epochs(
     """Resuming from a 1-epoch checkpoint with num_epochs=3 runs exactly 2 more epochs."""
     ckpt_path = str(tmp_path / "best.pt")
     tcfg_first = TrainConfig(
-        training=TrainingParams(num_epochs=1, lr=1e-4, grad_clip=1.0),
+        training=TrainingParams(num_epochs=1, lr=1e-4, grad_clip=1.0, accumulated_batch_size=2),
         model=ModelParams(
             f_ref_dim=_F_REF_DIM,
             n_bins=_N_BINS,
@@ -1500,7 +1500,13 @@ def test_train_resume_runs_remaining_epochs(
 
     monkeypatch.setattr("train.train_loop.evaluate", _counting_evaluate)
     tcfg_resume = TrainConfig(
-        training=TrainingParams(num_epochs=3, lr=1e-4, grad_clip=1.0, resume_checkpoint=ckpt_path),
+        training=TrainingParams(
+            num_epochs=3,
+            lr=1e-4,
+            grad_clip=1.0,
+            resume_checkpoint=ckpt_path,
+            accumulated_batch_size=2,
+        ),
         model=ModelParams(
             f_ref_dim=_F_REF_DIM,
             n_bins=_N_BINS,
@@ -1529,7 +1535,7 @@ def test_train_resume_restores_optimizer_state(
     """Optimizer state (exp_avg) loaded from checkpoint is non-zero after one resumed step."""
     ckpt_path = str(tmp_path / "opt.pt")
     tcfg_first = TrainConfig(
-        training=TrainingParams(num_epochs=1, lr=1e-4, grad_clip=1.0),
+        training=TrainingParams(num_epochs=1, lr=1e-4, grad_clip=1.0, accumulated_batch_size=2),
         model=ModelParams(
             f_ref_dim=_F_REF_DIM,
             n_bins=_N_BINS,
@@ -1562,7 +1568,7 @@ def test_train_resume_restores_scheduler_state(
     """Scheduler last_epoch in saved checkpoint matches the epoch at which it was written."""
     ckpt_path = str(tmp_path / "sched.pt")
     tcfg_first = TrainConfig(
-        training=TrainingParams(num_epochs=1, lr=1e-4, grad_clip=1.0),
+        training=TrainingParams(num_epochs=1, lr=1e-4, grad_clip=1.0, accumulated_batch_size=2),
         model=ModelParams(
             f_ref_dim=_F_REF_DIM,
             n_bins=_N_BINS,
@@ -1591,7 +1597,7 @@ def test_train_resume_checkpoint_epoch_and_step(
     """Saved checkpoint records the correct epoch number and global_step."""
     ckpt_path = str(tmp_path / "meta.pt")
     tcfg_first = TrainConfig(
-        training=TrainingParams(num_epochs=1, lr=1e-4, grad_clip=1.0),
+        training=TrainingParams(num_epochs=1, lr=1e-4, grad_clip=1.0, accumulated_batch_size=2),
         model=ModelParams(
             f_ref_dim=_F_REF_DIM,
             n_bins=_N_BINS,
@@ -1706,3 +1712,38 @@ def test_train_config_validator_accepts_accum_eq_batch_size() -> None:
         train_loader=LoaderConfig(batch_size=2),
     )
     assert cfg.training.accumulated_batch_size == 2
+
+
+@pytest.fixture
+def tcfg_accum(tmp_path: pathlib.Path) -> TrainConfig:
+    """TrainConfig with accumulated_batch_size=4, giving accum_steps=2 with batch_size=2."""
+    return TrainConfig(
+        training=TrainingParams(num_epochs=1, lr=1e-4, grad_clip=1.0, accumulated_batch_size=4),
+        model=ModelParams(
+            f_ref_dim=_F_REF_DIM,
+            n_bins=_N_BINS,
+            c_atom=_C_ATOM,
+            c_pair=_C_PAIR,
+            c_res=_C_RES,
+            c_atompair=_C_ATOMPAIR,
+            K_unit=_K_UNIT,
+        ),
+        checkpoint=CheckpointParams(
+            checkpoint_path=str(tmp_path / "best_accum.pt"),
+            save_every=100,
+        ),
+        logging=LoggingParams(use_wandb=False, log_interval=1),
+    )
+
+
+def test_train_partial_window_does_not_update_params(
+    model: MainTrunk,
+    loader: torch.utils.data.DataLoader[ProteinBatch],
+    tcfg_accum: TrainConfig,
+    distogram_res: Distogram,
+    distogram_atom: Distogram,
+) -> None:
+    """Partial accum window dropped (accum_steps=2, loader has 1 batch): params stay unchanged."""
+    params_before = [p.clone().detach() for p in model.parameters()]
+    train(model, tcfg_accum, loader, loader, distogram_res, distogram_atom, "cpu")
+    assert all(torch.equal(b, a) for b, a in zip(params_before, model.parameters(), strict=False))

@@ -483,6 +483,70 @@ def log_epoch(
     return best_val_loss
 
 
+_METRIC_KEYS: list[str] = [
+    "total loss",
+    "Kabsch aligned MSE loss",
+    "Cross Entropy loss",
+    "smooth lddt",
+    "Residue Distogram loss",
+    "Atom Distogram loss",
+    "Intermediate loss",
+    "pack_rate",
+    "residues_per_sec",
+    "atoms_per_sec",
+]
+
+
+def _process_accum_window(
+    micro_buffer: list[ProteinBatch],
+    model: nn.Module,
+    tcfg: TrainConfig,
+    distogram_res: Distogram,
+    distogram_atom: Distogram,
+    device: str,
+) -> dict[str, float]:
+    """Forward + backward over one full accumulation window; returns averaged metrics.
+
+    Calls ``train_step`` on each micro-batch with ``grad_scale=len(micro_buffer)`` so
+    that accumulated gradients are equivalent to a single large-batch backward.  The
+    ``no_sync()`` context manager is used on all but the last micro-batch when the model
+    exposes it (DDP), so gradient all-reduces happen only once per window.
+
+    Args:
+        micro_buffer: Exactly ``accum_steps`` micro-batches to process.
+        model: Model to forward through (plain ``MainTrunk`` or DDP-wrapped).
+        tcfg: Training configuration.
+        distogram_res: Residue-level distogram.
+        distogram_atom: Atom-level distogram.
+        device: PyTorch device string.
+
+    Returns:
+        Dict of metrics averaged over all micro-batches in the window.
+    """
+    accum_steps = len(micro_buffer)
+    window_metrics: dict[str, float] = dict.fromkeys(_METRIC_KEYS, 0.0)
+    for micro_idx, mb in enumerate(micro_buffer):
+        is_last = micro_idx == accum_steps - 1
+        _no_sync = getattr(model, "no_sync", None)
+        ctx = cast(
+            contextlib.AbstractContextManager[None],
+            _no_sync() if (not is_last and callable(_no_sync)) else contextlib.nullcontext(),
+        )
+        with ctx:
+            step_metrics = train_step(
+                mb,
+                model,
+                tcfg,
+                distogram_res,
+                distogram_atom,
+                device,
+                grad_scale=float(accum_steps),
+            )
+        for k in window_metrics:
+            window_metrics[k] += step_metrics[k] / accum_steps
+    return window_metrics
+
+
 @jaxtyped(typechecker=beartype)
 def train(
     model: MainTrunk,
@@ -527,6 +591,12 @@ def train(
     """
     tp = tcfg.training
     lg = tcfg.logging
+    accum_steps: int = max(1, tp.accumulated_batch_size // tcfg.train_loader.batch_size)
+    log.info(
+        "gradient_accumulation",
+        accum_steps=accum_steps,
+        effective_batch_size=tp.accumulated_batch_size,
+    )
 
     optimizer = Adam(model.parameters(), lr=tp.lr, weight_decay=tp.weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=tp.num_epochs, eta_min=tp.lr * 0.01)
@@ -547,28 +617,21 @@ def train(
 
     for epoch in range(start_epoch, tp.num_epochs + 1):
         model.train()
-        epoch_metrics: dict[str, float] = dict.fromkeys(
-            [
-                "total loss",
-                "Kabsch aligned MSE loss",
-                "Cross Entropy loss",
-                "smooth lddt",
-                "Residue Distogram loss",
-                "Atom Distogram loss",
-                "Intermediate loss",
-                "pack_rate",
-                "residues_per_sec",
-                "atoms_per_sec",
-            ],
-            0.0,
-        )
+        epoch_metrics: dict[str, float] = dict.fromkeys(_METRIC_KEYS, 0.0)
         n_batches = 0
+        micro_buffer: list[ProteinBatch] = []
+        optimizer.zero_grad()
 
         pbar = tqdm(train_loader, desc=f"Epoch {epoch:03d}/{tp.num_epochs}", leave=False)
 
-        optimizer.zero_grad()
         for batch in pbar:
-            step_metrics = train_step(batch, model, tcfg, distogram_res, distogram_atom, device)
+            micro_buffer.append(batch)
+            if len(micro_buffer) < accum_steps:
+                continue
+
+            window_metrics = _process_accum_window(
+                micro_buffer, model, tcfg, distogram_res, distogram_atom, device
+            )
             grad_norm: float = float(
                 nn.utils.clip_grad_norm_(
                     model.parameters(),
@@ -577,13 +640,20 @@ def train(
             )
             optimizer.step()
             optimizer.zero_grad()
+
             for k in epoch_metrics:
-                epoch_metrics[k] += step_metrics[k]
+                epoch_metrics[k] += window_metrics[k]
             n_batches += 1
             global_step += 1
+            micro_buffer = []
 
             if global_step % lg.log_interval == 0:
-                pbar.set_postfix(loss=f"{step_metrics['total loss']:.4f}", gnorm=f"{grad_norm:.3f}")
+                pbar.set_postfix(
+                    loss=f"{window_metrics['total loss']:.4f}", gnorm=f"{grad_norm:.3f}"
+                )
+
+        if micro_buffer:
+            log.warning("dropped_partial_window", n_dropped=len(micro_buffer))
 
         scheduler.step()
 
