@@ -1747,3 +1747,30 @@ def test_train_partial_window_does_not_update_params(
     params_before = [p.clone().detach() for p in model.parameters()]
     train(model, tcfg_accum, loader, loader, distogram_res, distogram_atom, "cpu")
     assert all(torch.equal(b, a) for b, a in zip(params_before, model.parameters(), strict=False))
+
+
+def test_train_ddp_partial_window_does_not_update_params(
+    model: MainTrunk,
+    ddp_loader: torch.utils.data.DataLoader[ProteinBatch],
+    tcfg_accum: TrainConfig,
+    distogram_res: Distogram,
+    distogram_atom: Distogram,
+) -> None:
+    """With accum_steps=2 and only 1 batch, train_ddp() drops the partial window.
+
+    Params must remain unchanged when no full accumulation window completes.
+    """
+    params_before = [p.clone().detach() for p in model.parameters()]
+    train_ddp(
+        0,
+        0,
+        1,
+        model,
+        tcfg_accum,
+        ddp_loader,
+        ddp_loader,
+        distogram_res,
+        distogram_atom,
+        device="cpu",
+    )
+    assert all(torch.equal(b, a) for b, a in zip(params_before, model.parameters(), strict=False))

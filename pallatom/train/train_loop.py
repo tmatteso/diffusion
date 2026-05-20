@@ -483,6 +483,39 @@ def log_epoch(
     return best_val_loss
 
 
+def _load_ddp_checkpoint(
+    path: str,
+    ddp_model: nn.Module,
+    optimizer: Adam,
+    scheduler: CosineAnnealingLR,
+    device: str,
+    rank: int,
+) -> tuple[float, int, int]:
+    """Load a DDP checkpoint and restore all mutable training state.
+
+    Args:
+        path: Filesystem path to the checkpoint file.
+        ddp_model: DDP-wrapped model; weights are loaded into ``ddp_model.module``.
+        optimizer: Adam optimizer whose state will be restored.
+        scheduler: Cosine annealing scheduler whose state will be restored.
+        device: Target device for ``torch.load``.
+        rank: Current process rank; info log emitted only on rank 0.
+
+    Returns:
+        A ``(best_val_loss, global_step, start_epoch)`` triple.
+    """
+    ckpt = torch.load(path, map_location=device)
+    ddp_model.module.load_state_dict(ckpt["model"])  # type: ignore[union-attr]
+    optimizer.load_state_dict(ckpt["optimizer"])
+    scheduler.load_state_dict(ckpt["scheduler"])
+    best_val_loss: float = ckpt["best_val_loss"]
+    global_step: int = ckpt["global_step"]
+    start_epoch: int = ckpt["epoch"] + 1
+    if rank == 0:
+        log.info("resumed from checkpoint", path=path, start_epoch=start_epoch)
+    return best_val_loss, global_step, start_epoch
+
+
 _METRIC_KEYS: list[str] = [
     "total loss",
     "Kabsch aligned MSE loss",
@@ -688,6 +721,15 @@ def train_ddp(
 
     tp = tcfg.training
     lg = tcfg.logging
+    accum_steps: int = max(
+        1, tp.accumulated_batch_size // (tcfg.train_loader.batch_size * world_size)
+    )
+    if rank == 0:
+        log.info(
+            "gradient_accumulation",
+            accum_steps=accum_steps,
+            effective_batch_size=tp.accumulated_batch_size,
+        )
 
     optimizer = Adam(ddp_model.parameters(), lr=tp.lr, weight_decay=tp.weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=tp.num_epochs, eta_min=tp.lr * 0.01)
@@ -697,35 +739,17 @@ def train_ddp(
     start_epoch = 1
 
     if tp.resume_checkpoint is not None:
-        ckpt = torch.load(tp.resume_checkpoint, map_location=device)
-        ddp_model.module.load_state_dict(ckpt["model"])
-        optimizer.load_state_dict(ckpt["optimizer"])
-        scheduler.load_state_dict(ckpt["scheduler"])
-        best_val_loss = ckpt["best_val_loss"]
-        global_step = ckpt["global_step"]
-        start_epoch = ckpt["epoch"] + 1
-        if rank == 0:
-            log.info("resumed from checkpoint", path=tp.resume_checkpoint, start_epoch=start_epoch)
+        best_val_loss, global_step, start_epoch = _load_ddp_checkpoint(
+            tp.resume_checkpoint, ddp_model, optimizer, scheduler, device, rank
+        )
 
     for epoch in range(start_epoch, tp.num_epochs + 1):
         ddp_model.train()
         cast(BucketedBatchSampler, train_loader.batch_sampler).set_epoch(epoch)
-        epoch_metrics: dict[str, float] = dict.fromkeys(
-            [
-                "total loss",
-                "Kabsch aligned MSE loss",
-                "Cross Entropy loss",
-                "smooth lddt",
-                "Residue Distogram loss",
-                "Atom Distogram loss",
-                "Intermediate loss",
-                "pack_rate",
-                "residues_per_sec",
-                "atoms_per_sec",
-            ],
-            0.0,
-        )
+        epoch_metrics: dict[str, float] = dict.fromkeys(_METRIC_KEYS, 0.0)
         n_batches = 0
+        micro_buffer: list[ProteinBatch] = []
+        optimizer.zero_grad()
 
         pbar = tqdm(
             train_loader,
@@ -734,12 +758,19 @@ def train_ddp(
             disable=(rank != 0),
         )
 
-        optimizer.zero_grad()
         for batch in pbar:
-            step_metrics = train_step(batch, ddp_model, tcfg, distogram_res, distogram_atom, device)
-            if rank == 0 and math.isnan(step_metrics["total loss"]):
-                nan_keys = [k for k, v in step_metrics.items() if math.isnan(v)]
+            micro_buffer.append(batch)
+            if len(micro_buffer) < accum_steps:
+                continue
+
+            window_metrics = _process_accum_window(
+                micro_buffer, ddp_model, tcfg, distogram_res, distogram_atom, device
+            )
+
+            if rank == 0 and math.isnan(window_metrics["total loss"]):
+                nan_keys = [k for k, v in window_metrics.items() if math.isnan(v)]
                 log.warning("nan_loss", step=global_step, nan_components=nan_keys)
+
             grad_norm: float = float(
                 nn.utils.clip_grad_norm_(
                     ddp_model.parameters(),
@@ -748,13 +779,20 @@ def train_ddp(
             )
             optimizer.step()
             optimizer.zero_grad()
+
             for k in epoch_metrics:
-                epoch_metrics[k] += step_metrics[k]
+                epoch_metrics[k] += window_metrics[k]
             n_batches += 1
             global_step += 1
+            micro_buffer = []
 
             if rank == 0 and global_step % lg.log_interval == 0:
-                pbar.set_postfix(loss=f"{step_metrics['total loss']:.4f}", gnorm=f"{grad_norm:.3f}")
+                pbar.set_postfix(
+                    loss=f"{window_metrics['total loss']:.4f}", gnorm=f"{grad_norm:.3f}"
+                )
+
+        if micro_buffer and rank == 0:
+            log.warning("dropped_partial_window", n_dropped=len(micro_buffer))
 
         scheduler.step()
 
