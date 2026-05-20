@@ -587,7 +587,7 @@ def train(
 
         scheduler.step()
 
-        avg_train = {k: v / n_batches for k, v in epoch_metrics.items()}
+        avg_train = {k: v / max(n_batches, 1) for k, v in epoch_metrics.items()}
         avg_val = evaluate(model, test_loader, tcfg, distogram_res, distogram_atom, device)
         model.train()
 
@@ -684,7 +684,7 @@ def train_ddp(
 
         scheduler.step()
 
-        avg_train = {k: v / n_batches for k, v in epoch_metrics.items()}
+        avg_train = {k: v / max(n_batches, 1) for k, v in epoch_metrics.items()}
         _eff_world_size = world_size if dist.is_initialized() else 1
         avg_val = evaluate_ddp(
             _eff_world_size, ddp_model, test_loader, tcfg, distogram_res, distogram_atom, device
