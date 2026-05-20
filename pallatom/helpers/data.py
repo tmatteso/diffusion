@@ -7,8 +7,15 @@ from pathlib import Path
 from typing import cast
 
 import torch
+import torch.nn.functional as F
 import torch.utils.data
-from helpers.atom_utils import center_positions, make_fixed_size, make_np_example
+from helpers.atom_utils import (
+    center_positions,
+    make_fixed_size,
+    make_np_example,
+    truncate_to_length,
+)
+from helpers.cluster_index import ClusterIndex
 from helpers.featurize import ProteinBatch
 from jaxtyping import Float
 from torch.utils.data.distributed import DistributedSampler
@@ -110,6 +117,134 @@ class ProteinDataset(torch.utils.data.Dataset[Mapping[str, torch.Tensor | str]])
         sample = {k: torch.tensor(v, dtype=torch.float32) for k, v in np_example.items()}
         sample["seq"] = entry["seq"][: self.max_seq_length]
         return sample
+
+
+class ClusteredProteinDataset(
+    torch.utils.data.Dataset[Mapping[str, Float[torch.Tensor, "..."] | str]]
+):
+    """Lazy-loading Dataset backed by per-cluster JSONL files built by ClusterIndex.
+
+    At construction, builds or loads a ClusterIndex (writing 65 cluster files the first
+    time, reading cached files thereafter). __getitem__ seeks directly into the correct
+    cluster file and returns the protein at its actual residue count — no padding. Items
+    are variable-length; padding is deferred to the collate function.
+
+    Compatible with num_workers > 0: all file handles are excluded from pickling and
+    re-opened lazily inside each worker process.
+
+    Args:
+        jsonl_path:   Path to the source JSONL protein dataset.
+        names:        List of entry names to include.
+        token_budget: Hard truncation ceiling; proteins longer than this are truncated.
+                      Default 512.
+        n_clusters:   Number of regular length clusters. Default 64.
+    """
+
+    def __init__(
+        self,
+        jsonl_path: str | Path,
+        names: list[str],
+        token_budget: int = 512,
+        n_clusters: int = 64,
+    ) -> None:
+        self.token_budget = token_budget
+        self.cluster_index = ClusterIndex(jsonl_path, names, token_budget, n_clusters)
+        self._files: list[io.BufferedReader | None] = [None] * (n_clusters + 1)
+
+    def _open(self, k: int) -> None:
+        """Open cluster file k lazily if not already open."""
+        if self._files[k] is None:
+            self._files[k] = open(self.cluster_index.cluster_file(k), "rb")  # noqa: SIM115
+
+    def __getstate__(self) -> dict[str, object]:
+        """Return picklable state with all open file handles set to None."""
+        state = self.__dict__.copy()
+        state["_files"] = [None] * len(self._files)
+        return state
+
+    def __del__(self) -> None:
+        """Close all open cluster file handles on deletion."""
+        for f in self._files:
+            if f is not None:
+                f.close()
+
+    def __len__(self) -> int:
+        """Return the total number of proteins across all clusters."""
+        return len(self.cluster_index)
+
+    def __getitem__(self, idx: int) -> Mapping[str, Float[torch.Tensor, "..."] | str]:
+        """Return the protein at flat index idx at its actual (un-padded) length.
+
+        Args:
+            idx: Flat dataset index in [0, len(self)).
+
+        Returns:
+            Dict with atom_positions (N, 37, 3), atom_mask (N, 37),
+            residue_index (N,), and seq (str), where N <= token_budget.
+        """
+        cluster_id = self.cluster_index.flat_to_cluster[idx]
+        local_idx = self.cluster_index.flat_to_local[idx]
+        offset = self.cluster_index.cluster_offsets[cluster_id][local_idx]
+
+        self._open(cluster_id)
+        self._files[cluster_id].seek(offset)  # type: ignore[union-attr]
+        raw = self._files[cluster_id].readline()  # type: ignore[union-attr]
+        entry: Mapping[str, object] = json.loads(raw)
+
+        np_example = make_np_example(entry["coords"])  # type: ignore[arg-type]
+        center_positions(np_example)
+        truncate_to_length(np_example, self.token_budget)
+
+        sample: dict[str, Float[torch.Tensor, "..."] | str] = {
+            k: torch.tensor(v, dtype=torch.float32) for k, v in np_example.items()
+        }
+        seq = cast(str, entry["seq"])
+        sample["seq"] = seq[: self.token_budget]
+        return sample
+
+
+def _to_protein_batch_dynamic(
+    samples: list[Mapping[str, Float[torch.Tensor, "..."] | str]],
+) -> ProteinBatch:
+    """Collate variable-length protein samples into a ProteinBatch, padding to batch max.
+
+    Pads each sample's tensors along axis 0 to the longest sample in the batch.
+    Within a length-bucketed batch, all samples are within one bucket width of each
+    other, so padding is near-zero.
+
+    Args:
+        samples: List of per-protein dicts from ClusteredProteinDataset.__getitem__.
+
+    Returns:
+        ProteinBatch with tensors of shape (B, max_len, ...).
+    """
+    max_len = max(cast(torch.Tensor, s["atom_positions"]).shape[0] for s in samples)
+    padded_positions: list[Float[torch.Tensor, "..."]] = []
+    padded_mask: list[Float[torch.Tensor, "..."]] = []
+    padded_residue_index: list[Float[torch.Tensor, "..."]] = []
+    seqs: list[str] = []
+
+    for s in samples:
+        pos = cast(torch.Tensor, s["atom_positions"])  # (n, 37, 3)
+        mask = cast(torch.Tensor, s["atom_mask"])  # (n, 37)
+        ridx = cast(torch.Tensor, s["residue_index"])  # (n,)
+        n = pos.shape[0]
+        pad = max_len - n
+        if pad > 0:
+            pos = F.pad(pos, (0, 0, 0, 0, 0, pad))
+            mask = F.pad(mask, (0, 0, 0, pad))
+            ridx = F.pad(ridx, (0, pad))
+        padded_positions.append(pos)
+        padded_mask.append(mask)
+        padded_residue_index.append(ridx)
+        seqs.append(cast(str, s["seq"]))
+
+    return ProteinBatch(
+        atom_positions=torch.stack(padded_positions),
+        atom_mask=torch.stack(padded_mask),
+        residue_index=torch.stack(padded_residue_index),
+        seq=seqs,
+    )
 
 
 def make_data_loaders(

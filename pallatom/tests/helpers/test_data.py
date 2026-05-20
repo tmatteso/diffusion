@@ -6,11 +6,19 @@ import os
 import pathlib
 import pickle
 from collections.abc import Mapping
+from typing import cast
 
 import numpy as np
 import pytest
 import torch
-from helpers.data import ProteinDataset, _FileLogProcessor, make_data_loaders, make_ddp_data_loaders
+from helpers.data import (
+    ClusteredProteinDataset,
+    ProteinDataset,
+    _FileLogProcessor,
+    _to_protein_batch_dynamic,
+    make_data_loaders,
+    make_ddp_data_loaders,
+)
 from torch.utils.data.distributed import DistributedSampler
 from train.train_config import TestLoaderConfig as EvalLoaderConfig
 from train.train_config import TrainConfig, TrainLoaderConfig
@@ -463,3 +471,98 @@ def test_file_log_processor_context_manager_closes_file(tmp_path: pathlib.Path):
     with proc:
         proc(None, None, {"event": "inside"})
     assert proc._f.closed
+
+
+# ---------------------------------------------------------------------------
+# Helpers for ClusteredProteinDataset tests
+# ---------------------------------------------------------------------------
+
+
+def _make_entry(name: str, seq_len: int) -> dict[str, object]:
+    """Build a minimal JSONL entry with the given name and sequence length."""
+    return {
+        "name": name,
+        "seq": "A" * seq_len,
+        "coords": _make_coords(seq_len),
+    }
+
+
+def _write_jsonl(path: pathlib.Path, entries: list[dict[str, object]]) -> None:
+    """Write entries as JSONL to path."""
+    with open(path, "w") as f:
+        for entry in entries:
+            f.write(json.dumps(entry) + "\n")
+
+
+# ---------------------------------------------------------------------------
+# ClusteredProteinDataset
+# ---------------------------------------------------------------------------
+
+
+def test_clustered_dataset_len(tmp_path: pathlib.Path) -> None:
+    """ClusteredProteinDataset.__len__ returns the number of included proteins."""
+    entries = [_make_entry(f"p{i}", 8) for i in range(5)]
+    _write_jsonl(tmp_path / "p.jsonl", entries)
+    ds = ClusteredProteinDataset(tmp_path / "p.jsonl", [f"p{i}" for i in range(5)])
+    assert len(ds) == 5
+
+
+def test_clustered_dataset_item_keys(tmp_path: pathlib.Path) -> None:
+    """__getitem__ returns a dict with atom_positions, atom_mask, residue_index, seq."""
+    entries = [_make_entry("p1", 10)]
+    _write_jsonl(tmp_path / "p.jsonl", entries)
+    ds = ClusteredProteinDataset(tmp_path / "p.jsonl", ["p1"])
+    item = ds[0]
+    assert set(item.keys()) == {"atom_positions", "atom_mask", "residue_index", "seq"}
+
+
+def test_clustered_dataset_variable_lengths(tmp_path: pathlib.Path) -> None:
+    """Items have their actual length, not a fixed padded length."""
+    entries = [_make_entry("p1", 8), _make_entry("p2", 16), _make_entry("p3", 32)]
+    _write_jsonl(tmp_path / "p.jsonl", entries)
+    ds = ClusteredProteinDataset(tmp_path / "p.jsonl", ["p1", "p2", "p3"])
+    lengths = {cast(torch.Tensor, ds[i]["atom_positions"]).shape[0] for i in range(len(ds))}
+    assert lengths == {8, 16, 32}
+
+
+def test_clustered_dataset_truncates_to_budget(tmp_path: pathlib.Path) -> None:
+    """Proteins longer than token_budget are truncated to token_budget."""
+    entries = [_make_entry("p1", 600)]
+    _write_jsonl(tmp_path / "p.jsonl", entries)
+    ds = ClusteredProteinDataset(tmp_path / "p.jsonl", ["p1"], token_budget=512)
+    assert cast(torch.Tensor, ds[0]["atom_positions"]).shape[0] == 512
+
+
+def test_clustered_dataset_pickles(tmp_path: pathlib.Path) -> None:
+    """ClusteredProteinDataset survives pickle round-trip (for DataLoader workers)."""
+    entries = [_make_entry("p1", 8)]
+    _write_jsonl(tmp_path / "p.jsonl", entries)
+    ds = ClusteredProteinDataset(tmp_path / "p.jsonl", ["p1"])
+    restored = pickle.loads(pickle.dumps(ds))
+    item = restored[0]
+    assert item["atom_positions"].shape[0] == 8
+
+
+# ---------------------------------------------------------------------------
+# _to_protein_batch_dynamic
+# ---------------------------------------------------------------------------
+
+
+def test_to_protein_batch_dynamic_pads_to_max(tmp_path: pathlib.Path) -> None:
+    """_to_protein_batch_dynamic pads shorter items to the longest item in the batch."""
+    entries = [_make_entry("p1", 8), _make_entry("p2", 16)]
+    _write_jsonl(tmp_path / "p.jsonl", entries)
+    ds = ClusteredProteinDataset(tmp_path / "p.jsonl", ["p1", "p2"])
+    batch = _to_protein_batch_dynamic([ds[0], ds[1]])
+    assert batch.atom_positions.shape == (2, 16, 37, 3)
+    assert batch.atom_mask.shape == (2, 16, 37)
+    assert batch.residue_index.shape == (2, 16)
+
+
+def test_to_protein_batch_dynamic_uniform_lengths(tmp_path: pathlib.Path) -> None:
+    """_to_protein_batch_dynamic is a no-op when all items have the same length."""
+    entries = [_make_entry("p1", 10), _make_entry("p2", 10)]
+    _write_jsonl(tmp_path / "p.jsonl", entries)
+    ds = ClusteredProteinDataset(tmp_path / "p.jsonl", ["p1", "p2"])
+    batch = _to_protein_batch_dynamic([ds[0], ds[1]])
+    assert batch.atom_positions.shape == (2, 10, 37, 3)
