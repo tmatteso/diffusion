@@ -125,6 +125,12 @@ for batch in loader:
 | `test_train_step_throughput_metrics_positive` | Same — remove `optimizer` |
 | `test_integration_gradient_flow_via_train_step` | Remove `optimizer` arg; remove `grad_norm` destructuring — backward is still called so gradients still exist |
 
+### Fixture updates
+
+All existing `tcfg` fixtures that do not explicitly set `accumulated_batch_size` will default to 32, giving `accum_steps = 32 // 2 = 16`. Because the test loaders contain only 1–3 batches, the partial window would always be dropped and no optimizer step would fire — breaking parameter-update assertions and `global_step` checkpoint tests.
+
+Fix: set `accumulated_batch_size = train_loader.batch_size` (i.e., `= 2`) in all existing `TrainingParams(...)` fixture calls. This gives `accum_steps = 1`, preserving all current test behaviour while the new tests explicitly exercise `accum_steps > 1`.
+
 ### New tests
 
 **`test_train_config_accumulated_batch_size_validator`**
