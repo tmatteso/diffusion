@@ -418,6 +418,21 @@ def make_fixed_size(
             np_example[k] = v[:max_seq_length]
 
 
+def truncate_to_length(
+    np_example: Mapping[str, npt.NDArray[np.float64] | npt.NDArray[np.intp]],
+    max_length: int,
+) -> None:
+    """Truncate features to at most max_length along axis 0. Does not pad.
+
+    Args:
+        np_example: Dict of numpy arrays all sharing the same axis-0 size.
+        max_length: Maximum allowed length along axis 0.
+    """
+    for k, v in np_example.items():
+        if v.shape[0] > max_length:
+            np_example[k] = v[:max_length]
+
+
 def center_positions(
     np_example: Mapping[str, npt.NDArray[np.float64] | npt.NDArray[np.intp]]
 ) -> None:

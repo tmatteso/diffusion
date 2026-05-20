@@ -39,6 +39,7 @@ from helpers.atom_utils import (
     pseudo_cb,
     restype_num,
     to_pdb,
+    truncate_to_length,
 )
 from jaxtyping import Float, TypeCheckError
 
@@ -1101,3 +1102,34 @@ def test_protein_from_pdb_correct_residue_count_with_hetatm(tmp_path: pathlib.Pa
     )
     prot = protein_from_pdb(str(pdb))
     assert prot.atom_positions.shape[0] == 3
+
+
+def test_truncate_to_length_shortens_all_arrays() -> None:
+    """truncate_to_length truncates all arrays to max_length along axis 0."""
+    np_example: dict[str, npt.NDArray[np.float64] | npt.NDArray[np.intp]] = {
+        "atom_positions": np.zeros((100, 37, 3)),
+        "atom_mask": np.zeros((100, 37)),
+        "residue_index": np.arange(100),
+    }
+    truncate_to_length(np_example, 50)
+    assert np_example["atom_positions"].shape == (50, 37, 3)
+    assert np_example["atom_mask"].shape == (50, 37)
+    assert np_example["residue_index"].shape == (50,)
+
+
+def test_truncate_to_length_noop_when_already_short() -> None:
+    """truncate_to_length leaves arrays unchanged when they are shorter than max_length."""
+    np_example: dict[str, npt.NDArray[np.float64] | npt.NDArray[np.intp]] = {
+        "atom_positions": np.zeros((30, 37, 3)),
+    }
+    truncate_to_length(np_example, 50)
+    assert np_example["atom_positions"].shape == (30, 37, 3)
+
+
+def test_truncate_to_length_noop_when_exact() -> None:
+    """truncate_to_length leaves arrays unchanged when they are exactly max_length."""
+    np_example: dict[str, npt.NDArray[np.float64] | npt.NDArray[np.intp]] = {
+        "atom_positions": np.zeros((50, 37, 3)),
+    }
+    truncate_to_length(np_example, 50)
+    assert np_example["atom_positions"].shape == (50, 37, 3)
