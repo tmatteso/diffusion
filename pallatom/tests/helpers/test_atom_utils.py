@@ -812,15 +812,15 @@ def test_rna_restype_constants() -> None:
 
 def test_dna_restype_mappings_are_immutable() -> None:
     """Verify that DNA mapping constants reject mutation at runtime."""
-    with pytest.raises(TypeError):
+    with pytest.raises(TypeError, match=r"does not support item assignment"):
         DNA_RESTYPE_ORDER["DX"] = 99
-    with pytest.raises(TypeError):
+    with pytest.raises(TypeError, match=r"does not support item assignment"):
         DNA_RESTYPE_3TO1["DX"] = "x"
 
 
 def test_rna_restype_mappings_are_immutable() -> None:
     """Verify that RNA mapping constants reject mutation at runtime."""
-    with pytest.raises(TypeError):
+    with pytest.raises(TypeError, match=r"does not support item assignment"):
         RNA_RESTYPE_ORDER["UX"] = 99
-    with pytest.raises(TypeError):
+    with pytest.raises(TypeError, match=r"does not support item assignment"):
         RNA_RESTYPE_3TO1["UX"] = "x"
