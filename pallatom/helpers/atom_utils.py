@@ -606,7 +606,7 @@ def protein_from_pdb(pdb_path: str) -> "Protein":
             frozenset(_residue_atoms[_key].keys()),
         )
         _b_factors[_i, :] = float(_mol)
-        for _aname, (_x, _y, _z, _bf) in _residue_atoms[_key].items():
+        for _aname, (_x, _y, _z, _) in _residue_atoms[_key].items():
             if _aname in _atom_type_idx:
                 _idx = _atom_type_idx[_aname]
                 _atom_positions[_i, _idx] = [_x, _y, _z]
