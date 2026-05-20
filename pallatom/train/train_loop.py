@@ -397,6 +397,8 @@ def log_epoch(
     avg_train: dict[str, float],
     avg_val: dict[str, float],
     model: nn.Module,
+    optimizer: Adam,
+    scheduler: CosineAnnealingLR,
     tcfg: TrainConfig,
     best_val_loss: float,
     *,
@@ -409,6 +411,10 @@ def log_epoch(
     ``tcfg.checkpoint.save_every`` divides ``epoch``.  Handles both plain ``nn.Module``
     and DDP-wrapped models (accesses ``.module`` when present).  Pass ``do_log=False``
     on non-rank-0 workers to skip all I/O.
+
+    Checkpoints include model weights, optimizer state, scheduler state, epoch number,
+    global step, and best validation loss so training can be resumed exactly via
+    ``TrainingParams.resume_checkpoint``.
 
     Returns the (possibly updated) best validation loss.
     """
@@ -440,14 +446,22 @@ def log_epoch(
         )
 
     inner: nn.Module = model.module if isinstance(model, DDP) else model
-    state_dict = inner.state_dict()
+    checkpoint = {
+        "model": inner.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict(),
+        "epoch": epoch,
+        "global_step": global_step,
+        "best_val_loss": best_val_loss,
+    }
 
     if avg_val["total loss"] < best_val_loss:
         best_val_loss = avg_val["total loss"]
-        torch.save({"model": state_dict}, ck.checkpoint_path)
+        checkpoint["best_val_loss"] = best_val_loss
+        torch.save(checkpoint, ck.checkpoint_path)
 
-    if epoch % ck.save_every == 0:
-        torch.save({"model": state_dict}, f"checkpoint_epoch_{epoch:03d}.pt")
+    if ck.save_every > 0 and epoch % ck.save_every == 0:
+        torch.save(checkpoint, f"checkpoint_epoch_{epoch:03d}.pt")
 
     return best_val_loss
 
@@ -502,8 +516,19 @@ def train(
 
     best_val_loss = float("inf")
     global_step = 0
+    start_epoch = 1
 
-    for epoch in range(1, tp.num_epochs + 1):
+    if tp.resume_checkpoint is not None:
+        ckpt = torch.load(tp.resume_checkpoint, map_location=device)
+        model.load_state_dict(ckpt["model"])
+        optimizer.load_state_dict(ckpt["optimizer"])
+        scheduler.load_state_dict(ckpt["scheduler"])
+        best_val_loss = ckpt["best_val_loss"]
+        global_step = ckpt["global_step"]
+        start_epoch = ckpt["epoch"] + 1
+        log.info("resumed from checkpoint", path=tp.resume_checkpoint, start_epoch=start_epoch)
+
+    for epoch in range(start_epoch, tp.num_epochs + 1):
         model.train()
         epoch_metrics: dict[str, float] = dict.fromkeys(
             [
@@ -540,7 +565,7 @@ def train(
         model.train()
 
         best_val_loss = log_epoch(
-            epoch, global_step, avg_train, avg_val, model, tcfg, best_val_loss
+            epoch, global_step, avg_train, avg_val, model, optimizer, scheduler, tcfg, best_val_loss
         )
 
 
@@ -568,8 +593,20 @@ def train_ddp(
 
     best_val_loss = float("inf")
     global_step = 0
+    start_epoch = 1
 
-    for epoch in range(1, tp.num_epochs + 1):
+    if tp.resume_checkpoint is not None:
+        ckpt = torch.load(tp.resume_checkpoint, map_location=device)
+        ddp_model.module.load_state_dict(ckpt["model"])
+        optimizer.load_state_dict(ckpt["optimizer"])
+        scheduler.load_state_dict(ckpt["scheduler"])
+        best_val_loss = ckpt["best_val_loss"]
+        global_step = ckpt["global_step"]
+        start_epoch = ckpt["epoch"] + 1
+        if rank == 0:
+            log.info("resumed from checkpoint", path=tp.resume_checkpoint, start_epoch=start_epoch)
+
+    for epoch in range(start_epoch, tp.num_epochs + 1):
         ddp_model.train()
         cast("DistributedSampler[ProteinBatch]", train_loader.sampler).set_epoch(epoch)
         epoch_metrics: dict[str, float] = dict.fromkeys(
@@ -623,6 +660,8 @@ def train_ddp(
             avg_train,
             avg_val,
             ddp_model,
+            optimizer,
+            scheduler,
             tcfg,
             best_val_loss,
             do_log=(rank == 0),

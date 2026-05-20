@@ -13,6 +13,7 @@ class TrainingParams(BaseModel):
     weight_decay: float = Field(default=1e-4, ge=0)
     grad_clip: float | None = Field(default=2.0, gt=0)
     pretrained_weights: str | None = None
+    resume_checkpoint: str | None = None
 
 
 class ModelParams(BaseModel):

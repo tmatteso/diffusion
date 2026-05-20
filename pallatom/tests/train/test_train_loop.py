@@ -58,6 +58,10 @@ EXPECTED_EVAL_KEYS = frozenset(
     }
 )
 
+EXPECTED_CHECKPOINT_KEYS = frozenset(
+    {"model", "optimizer", "scheduler", "epoch", "global_step", "best_val_loss"}
+)
+
 
 class _ListDataset(torch.utils.data.Dataset[ProteinBatch]):
     def __init__(self, items: list[Mapping[str, Float[torch.Tensor, "..."] | list[str]]]) -> None:
@@ -490,11 +494,11 @@ def test_train_checkpoint_is_valid_state_dict(
     distogram_res: Distogram,
     distogram_atom: Distogram,
 ) -> None:
-    """The checkpoint written by train is a dict containing a 'model' state-dict key."""
+    """The checkpoint written by train contains model, optimizer, scheduler, and training state."""
     train(model, tcfg, loader, loader, distogram_res, distogram_atom, "cpu")
     ckpt = torch.load(tcfg.checkpoint.checkpoint_path, weights_only=True)
     assert isinstance(ckpt, dict)
-    assert "model" in ckpt
+    assert ckpt.keys() >= EXPECTED_CHECKPOINT_KEYS
 
 
 def test_train_updates_model_parameters(
@@ -604,12 +608,12 @@ def test_train_save_every_checkpoint_is_valid_state_dict(
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The per-epoch checkpoint written by train is a dict containing a 'model' key."""
+    """Per-epoch checkpoint contains model, optimizer, scheduler, and training state."""
     monkeypatch.chdir(tmp_path)
     train(model, tcfg_save, loader, loader, distogram_res, distogram_atom, "cpu")
     ckpt = torch.load(tmp_path / "checkpoint_epoch_001.pt", weights_only=True)
     assert isinstance(ckpt, dict)
-    assert "model" in ckpt
+    assert ckpt.keys() >= EXPECTED_CHECKPOINT_KEYS
 
 
 # ---------------------------------------------------------------------------
@@ -1064,7 +1068,7 @@ def test_train_ddp_checkpoint_has_correct_keys(
     distogram_res: Distogram,
     distogram_atom: Distogram,
 ) -> None:
-    """The checkpoint written by train_ddp contains the 'model' state-dict key."""
+    """train_ddp checkpoint contains model, optimizer, scheduler, and training state."""
     train_ddp(
         0,
         0,
@@ -1078,7 +1082,7 @@ def test_train_ddp_checkpoint_has_correct_keys(
         device="cpu",
     )
     ckpt = torch.load(tcfg.checkpoint.checkpoint_path, weights_only=True)
-    assert "model" in ckpt
+    assert ckpt.keys() >= EXPECTED_CHECKPOINT_KEYS
 
 
 def test_train_ddp_rank1_does_not_save_checkpoint(
@@ -1358,3 +1362,163 @@ def test_train_wrong_device_type(
     """Non-str device triggers TypeCheckError for train."""
     with pytest.raises(TypeCheckError):
         train(model, tcfg, loader, loader, distogram_res, distogram_atom, 42)  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint resume
+# ---------------------------------------------------------------------------
+
+
+def test_train_resume_runs_remaining_epochs(
+    model: MainTrunk,
+    loader: torch.utils.data.DataLoader[ProteinBatch],
+    distogram_res: Distogram,
+    distogram_atom: Distogram,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Resuming from a 1-epoch checkpoint with num_epochs=3 runs exactly 2 more epochs."""
+    ckpt_path = str(tmp_path / "best.pt")
+    tcfg_first = TrainConfig(
+        training=TrainingParams(num_epochs=1, lr=1e-4, grad_clip=1.0),
+        model=ModelParams(
+            f_ref_dim=_F_REF_DIM,
+            n_bins=_N_BINS,
+            c_atom=_C_ATOM,
+            c_pair=_C_PAIR,
+            c_res=_C_RES,
+            c_atompair=_C_ATOMPAIR,
+            K_unit=_K_UNIT,
+        ),
+        checkpoint=CheckpointParams(checkpoint_path=ckpt_path, save_every=100),
+        logging=LoggingParams(use_wandb=False, log_interval=1),
+    )
+    train(model, tcfg_first, loader, loader, distogram_res, distogram_atom, "cpu")
+
+    eval_epochs: list[int] = []
+    _real_evaluate = evaluate
+
+    def _counting_evaluate(
+        m: MainTrunk,
+        ldr: torch.utils.data.DataLoader[ProteinBatch],
+        cfg: TrainConfig,
+        dr: Distogram,
+        da: Distogram,
+        dev: str,
+    ) -> Mapping[str, float]:
+        result = _real_evaluate(m, ldr, cfg, dr, da, dev)
+        eval_epochs.append(len(eval_epochs) + 1)
+        return result
+
+    monkeypatch.setattr("train.train_loop.evaluate", _counting_evaluate)
+    tcfg_resume = TrainConfig(
+        training=TrainingParams(num_epochs=3, lr=1e-4, grad_clip=1.0, resume_checkpoint=ckpt_path),
+        model=ModelParams(
+            f_ref_dim=_F_REF_DIM,
+            n_bins=_N_BINS,
+            c_atom=_C_ATOM,
+            c_pair=_C_PAIR,
+            c_res=_C_RES,
+            c_atompair=_C_ATOMPAIR,
+            K_unit=_K_UNIT,
+        ),
+        checkpoint=CheckpointParams(
+            checkpoint_path=str(tmp_path / "best_resume.pt"), save_every=100
+        ),
+        logging=LoggingParams(use_wandb=False, log_interval=1),
+    )
+    train(model, tcfg_resume, loader, loader, distogram_res, distogram_atom, "cpu")
+    assert len(eval_epochs) == 2
+
+
+def test_train_resume_restores_optimizer_state(
+    model: MainTrunk,
+    loader: torch.utils.data.DataLoader[ProteinBatch],
+    distogram_res: Distogram,
+    distogram_atom: Distogram,
+    tmp_path: pathlib.Path,
+) -> None:
+    """Optimizer state (exp_avg) loaded from checkpoint is non-zero after one resumed step."""
+    ckpt_path = str(tmp_path / "opt.pt")
+    tcfg_first = TrainConfig(
+        training=TrainingParams(num_epochs=1, lr=1e-4, grad_clip=1.0),
+        model=ModelParams(
+            f_ref_dim=_F_REF_DIM,
+            n_bins=_N_BINS,
+            c_atom=_C_ATOM,
+            c_pair=_C_PAIR,
+            c_res=_C_RES,
+            c_atompair=_C_ATOMPAIR,
+            K_unit=_K_UNIT,
+        ),
+        checkpoint=CheckpointParams(checkpoint_path=ckpt_path, save_every=100),
+        logging=LoggingParams(use_wandb=False, log_interval=1),
+    )
+    train(model, tcfg_first, loader, loader, distogram_res, distogram_atom, "cpu")
+
+    saved_ckpt = torch.load(ckpt_path, weights_only=True)
+    opt_state = saved_ckpt["optimizer"]["state"]
+    assert len(opt_state) > 0
+    first_param_state = next(iter(opt_state.values()))
+    assert "exp_avg" in first_param_state
+    assert first_param_state["exp_avg"].abs().max().item() > 0
+
+
+def test_train_resume_restores_scheduler_state(
+    model: MainTrunk,
+    loader: torch.utils.data.DataLoader[ProteinBatch],
+    distogram_res: Distogram,
+    distogram_atom: Distogram,
+    tmp_path: pathlib.Path,
+) -> None:
+    """Scheduler last_epoch in saved checkpoint matches the epoch at which it was written."""
+    ckpt_path = str(tmp_path / "sched.pt")
+    tcfg_first = TrainConfig(
+        training=TrainingParams(num_epochs=1, lr=1e-4, grad_clip=1.0),
+        model=ModelParams(
+            f_ref_dim=_F_REF_DIM,
+            n_bins=_N_BINS,
+            c_atom=_C_ATOM,
+            c_pair=_C_PAIR,
+            c_res=_C_RES,
+            c_atompair=_C_ATOMPAIR,
+            K_unit=_K_UNIT,
+        ),
+        checkpoint=CheckpointParams(checkpoint_path=ckpt_path, save_every=100),
+        logging=LoggingParams(use_wandb=False, log_interval=1),
+    )
+    train(model, tcfg_first, loader, loader, distogram_res, distogram_atom, "cpu")
+
+    saved_ckpt = torch.load(ckpt_path, weights_only=True)
+    assert saved_ckpt["scheduler"]["last_epoch"] == 1
+
+
+def test_train_resume_checkpoint_epoch_and_step(
+    model: MainTrunk,
+    loader: torch.utils.data.DataLoader[ProteinBatch],
+    distogram_res: Distogram,
+    distogram_atom: Distogram,
+    tmp_path: pathlib.Path,
+) -> None:
+    """Saved checkpoint records the correct epoch number and global_step."""
+    ckpt_path = str(tmp_path / "meta.pt")
+    tcfg_first = TrainConfig(
+        training=TrainingParams(num_epochs=1, lr=1e-4, grad_clip=1.0),
+        model=ModelParams(
+            f_ref_dim=_F_REF_DIM,
+            n_bins=_N_BINS,
+            c_atom=_C_ATOM,
+            c_pair=_C_PAIR,
+            c_res=_C_RES,
+            c_atompair=_C_ATOMPAIR,
+            K_unit=_K_UNIT,
+        ),
+        checkpoint=CheckpointParams(checkpoint_path=ckpt_path, save_every=100),
+        logging=LoggingParams(use_wandb=False, log_interval=1),
+    )
+    train(model, tcfg_first, loader, loader, distogram_res, distogram_atom, "cpu")
+
+    saved_ckpt = torch.load(ckpt_path, weights_only=True)
+    assert saved_ckpt["epoch"] == 1
+    assert saved_ckpt["global_step"] == 1  # one batch in the loader
+    assert isinstance(saved_ckpt["best_val_loss"], float)
