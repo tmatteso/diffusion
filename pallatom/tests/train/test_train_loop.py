@@ -1774,3 +1774,83 @@ def test_train_ddp_partial_window_does_not_update_params(
         device="cpu",
     )
     assert all(torch.equal(b, a) for b, a in zip(params_before, model.parameters(), strict=False))
+
+
+@pytest.fixture
+def loader_2batch(
+    mini_batch: Mapping[str, Float[torch.Tensor, "..."] | list[str]]
+) -> torch.utils.data.DataLoader[ProteinBatch]:
+    """DataLoader with two identical mini-batches for accumulation tests."""
+    return torch.utils.data.DataLoader(_ListDataset([mini_batch, mini_batch]), batch_size=None)
+
+
+def test_train_step_grad_scale_halves_gradient_norm(
+    protein_batch: ProteinBatch,
+    model: MainTrunk,
+    tcfg: TrainConfig,
+    distogram_res: Distogram,
+    distogram_atom: Distogram,
+) -> None:
+    """Loss divided by grad_scale=2 yields approximately half the gradient norm of grad_scale=1."""
+    torch.manual_seed(0)
+    model.zero_grad()
+    train_step(protein_batch, model, tcfg, distogram_res, distogram_atom, "cpu", grad_scale=1.0)
+    norm1: float = (
+        sum(p.grad.norm().item() ** 2 for p in model.parameters() if p.grad is not None) ** 0.5
+    )
+
+    torch.manual_seed(0)
+    model.zero_grad()
+    train_step(protein_batch, model, tcfg, distogram_res, distogram_atom, "cpu", grad_scale=2.0)
+    norm2: float = (
+        sum(p.grad.norm().item() ** 2 for p in model.parameters() if p.grad is not None) ** 0.5
+    )
+
+    assert abs(norm2 - norm1 / 2.0) < 1e-3
+
+
+def test_train_accumulation_full_window_updates_params(
+    model: MainTrunk,
+    loader_2batch: torch.utils.data.DataLoader[ProteinBatch],
+    tcfg_accum: TrainConfig,
+    distogram_res: Distogram,
+    distogram_atom: Distogram,
+) -> None:
+    """With accum_steps=2 and a 2-batch loader, train() completes one window and updates params."""
+    params_before = [p.clone().detach() for p in model.parameters()]
+    train(model, tcfg_accum, loader_2batch, loader_2batch, distogram_res, distogram_atom, "cpu")
+    assert any(
+        not torch.equal(b, a) for b, a in zip(params_before, model.parameters(), strict=False)
+    )
+
+
+def test_train_ddp_accumulation_full_window_updates_params(
+    model: MainTrunk,
+    tcfg_accum: TrainConfig,
+    distogram_res: Distogram,
+    distogram_atom: Distogram,
+    mini_batch: Mapping[str, Float[torch.Tensor, "..."] | list[str]],
+) -> None:
+    """With accum_steps=2 and a 2-batch DDP loader, train_ddp() updates params after one window."""
+    sampler = _MockSampler([mini_batch, mini_batch])
+    ddp_loader_2batch: torch.utils.data.DataLoader[ProteinBatch] = torch.utils.data.DataLoader(
+        _ListDataset([mini_batch, mini_batch]),
+        batch_sampler=sampler,
+        collate_fn=_identity_collate,
+    )
+    params_before = [p.clone().detach() for p in model.parameters()]
+    train_ddp(
+        rank=0,
+        local_rank=0,
+        world_size=1,
+        model=model,
+        tcfg=tcfg_accum,
+        train_loader=ddp_loader_2batch,
+        test_loader=ddp_loader_2batch,
+        distogram_res=distogram_res,
+        distogram_atom=distogram_atom,
+        device="cpu",
+    )
+    assert any(
+        not torch.equal(b, a) for b, a in zip(params_before, model.parameters(), strict=False)
+    )
