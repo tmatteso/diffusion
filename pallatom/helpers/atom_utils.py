@@ -473,6 +473,33 @@ class Protein:
     b_factors: Float[npt.NDArray[np.float64], "num_res num_atom_type"]
 
 
+def _classify_mol_type(resname: str, atom_names: frozenset[str]) -> int:
+    """Return the molecule-type constant for a PDB residue.
+
+    Uses residue name first; falls back to 2'-OH atom presence for the
+    ambiguous single-letter nucleotides A/C/G, which appear in both
+    D-prefix-less DNA and canonical RNA.
+
+    Args:
+        resname: Stripped residue name from the PDB ATOM record
+            (e.g. "ALA", "DA", "A").
+        atom_names: All atom names observed in this residue; used to
+            detect the RNA 2'-hydroxyl oxygen "O2'".
+
+    Returns:
+        MOL_TYPE_PROTEIN (0), MOL_TYPE_DNA (1), or MOL_TYPE_RNA (2).
+    """
+    if resname in restype_3to1:
+        return MOL_TYPE_PROTEIN
+    if resname in DNA_RESTYPE_3TO1 or resname == "T":
+        return MOL_TYPE_DNA
+    if resname == "U":
+        return MOL_TYPE_RNA
+    if resname in RNA_RESTYPE_3TO1:  # A / C / G — ambiguous
+        return MOL_TYPE_RNA if "O2'" in atom_names else MOL_TYPE_DNA
+    return MOL_TYPE_PROTEIN  # unknown residue → treat as protein
+
+
 def protein_from_pdb(pdb_path: str) -> "Protein":
     """Parse a PDB file (ATOM records only) into a Protein using the atom37 layout."""
     _atom_type_idx = {name: i for i, name in enumerate(atom_types)}
