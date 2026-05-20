@@ -1703,7 +1703,7 @@ def test_training_params_accumulated_batch_size_default() -> None:
 
 def test_train_config_validator_rejects_accum_lt_batch_size() -> None:
     """TrainConfig raises ValidationError when accumulated_batch_size < train_loader.batch_size."""
-    with pytest.raises(ValidationError):
+    with pytest.raises(ValidationError, match="accumulated_batch_size"):
         TrainConfig(
             training=TrainingParams(accumulated_batch_size=1),
             train_loader=LoaderConfig(batch_size=2),
