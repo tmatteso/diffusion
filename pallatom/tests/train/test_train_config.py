@@ -505,3 +505,15 @@ def test_train_config_conditioning_dropout_defaults():
     """TrainConfig.conditioning_dropout uses the default p_distogram of 0.15."""
     cfg = TrainConfig()
     assert cfg.conditioning_dropout.p_distogram == 0.15
+
+
+def test_loader_config_default_token_budget() -> None:
+    """LoaderConfig.token_budget defaults to 512."""
+    cfg = LoaderConfig()
+    assert cfg.token_budget == 512
+
+
+def test_loader_config_custom_token_budget() -> None:
+    """LoaderConfig accepts a custom token_budget."""
+    cfg = LoaderConfig(token_budget=256)
+    assert cfg.token_budget == 256

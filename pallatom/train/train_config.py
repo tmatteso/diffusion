@@ -114,12 +114,13 @@ class LoggingParams(BaseModel):
 
 
 class LoaderConfig(BaseModel):
-    """DataLoader sequence length cap and batch size."""
+    """DataLoader sequence length cap, batch size, and token budget."""
 
     model_config = ConfigDict(frozen=True)
 
     max_seq_length: int = Field(default=128, gt=0)  # was 256
     batch_size: int = Field(default=2, gt=0)  # was 2
+    token_budget: int = Field(default=512, gt=0)
 
 
 TrainLoaderConfig = LoaderConfig
