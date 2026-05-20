@@ -3,6 +3,7 @@
 import json
 import pathlib
 
+import pytest
 from helpers.cluster_index import ClusterIndex
 
 # ---------------------------------------------------------------------------
@@ -146,3 +147,17 @@ def test_cluster_index_cache_hit_same_result(tmp_path: pathlib.Path) -> None:
     idx2 = ClusterIndex(tmp_path / "proteins.jsonl", ["p1", "p2"])
     assert idx1.flat_to_cluster == idx2.flat_to_cluster
     assert idx1.flat_to_local == idx2.flat_to_local
+    assert idx1.cluster_offsets == idx2.cluster_offsets
+
+
+# ---------------------------------------------------------------------------
+# assign_cluster edge cases
+# ---------------------------------------------------------------------------
+
+
+def test_assign_cluster_raises_on_zero(tmp_path: pathlib.Path) -> None:
+    """assign_cluster raises ValueError for seq_len <= 0."""
+    _write_jsonl(tmp_path / "p.jsonl", [{"name": "p1", "seq": "A", "coords": _make_coords(1)}])
+    idx = ClusterIndex(tmp_path / "p.jsonl", ["p1"], token_budget=512, n_clusters=64)
+    with pytest.raises(ValueError, match="seq_len must be positive"):
+        idx.assign_cluster(0)

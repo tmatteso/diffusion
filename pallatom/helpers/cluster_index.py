@@ -67,6 +67,8 @@ class ClusterIndex:
         Returns:
             Cluster id in [0, n_clusters].
         """
+        if seq_len <= 0:
+            raise ValueError(f"seq_len must be positive, got {seq_len}")
         if seq_len > self._token_budget:
             return self._n_clusters
         bin_width = self._token_budget // self._n_clusters
