@@ -500,41 +500,86 @@ def _classify_mol_type(resname: str, atom_names: frozenset[str]) -> int:
     return MOL_TYPE_PROTEIN  # unknown residue → treat as protein
 
 
+def _parse_pdb_atoms(
+    pdb_path: str,
+) -> tuple[
+    MutableMapping[tuple[str, int, str], MutableMapping[str, tuple[float, float, float, float]]],
+    MutableMapping[tuple[str, int, str], str],
+    MutableMapping[tuple[str, int, str], str],
+]:
+    """Read ATOM records from a PDB file and collect per-residue atom data.
+
+    HETATM records are explicitly skipped. Alternate locations other than
+    blank or "A" are also ignored.
+
+    Args:
+        pdb_path: Path to the PDB file.
+
+    Returns:
+        A 3-tuple of ``(residue_atoms, residue_name, residue_chain)``.
+        ``residue_atoms`` maps ``(chain_id, resseq, icode)`` to a dict of
+        ``atom_name → (x, y, z, b_factor)``.
+        ``residue_name`` maps the same key to the residue name string.
+        ``residue_chain`` maps the same key to the single-character chain ID.
+    """
+    residue_atoms: MutableMapping[
+        tuple[str, int, str], MutableMapping[str, tuple[float, float, float, float]]
+    ] = {}
+    residue_name: MutableMapping[tuple[str, int, str], str] = {}
+    residue_chain: MutableMapping[tuple[str, int, str], str] = {}
+
+    with open(pdb_path) as fh:
+        for line in fh:
+            rec = line[:6].strip()
+            if rec == "HETATM":
+                continue  # skip: water, ions, ligands, crystallographic reagents
+            if rec != "ATOM":
+                continue
+            atom_name = line[12:16].strip()
+            alt_loc = line[16]
+            if alt_loc not in (" ", "A"):
+                continue
+            resname = line[17:20].strip()
+            chain_id = line[21]
+            resseq = int(line[22:26])
+            icode = line[26]
+            x = float(line[30:38])
+            y = float(line[38:46])
+            z = float(line[46:54])
+            bfac = float(line[60:66]) if len(line) > 66 else 0.0
+            key = (chain_id, resseq, icode)
+            if key not in residue_atoms:
+                residue_atoms[key] = {}
+                residue_name[key] = resname
+                residue_chain[key] = chain_id
+            if atom_name not in residue_atoms[key]:
+                residue_atoms[key][atom_name] = (x, y, z, bfac)
+
+    return residue_atoms, residue_name, residue_chain
+
+
 def protein_from_pdb(pdb_path: str) -> "Protein":
-    """Parse a PDB file (ATOM records only) into a Protein using the atom37 layout."""
+    """Parse a PDB file (ATOM records only) into a Protein using the atom37 layout.
+
+    HETATM records (water, ions, ligands, crystallographic reagents) are
+    explicitly detected and skipped; only ATOM records produce residues in
+    the returned Protein. The b_factors field encodes molecule type rather
+    than real PDB B-factors: 0.0 = protein, 1.0 = DNA, 2.0 = RNA.
+
+    Args:
+        pdb_path: Path to the PDB file to parse.
+
+    Returns:
+        A Protein with atom37-layout coordinates; b_factors encodes
+        MOL_TYPE_PROTEIN / MOL_TYPE_DNA / MOL_TYPE_RNA per residue.
+
+    Raises:
+        ValueError: If the file contains no ATOM records.
+    """
     _atom_type_idx = {name: i for i, name in enumerate(atom_types)}
     _seen_chains: dict[str, int] = {}
 
-    # key = (chain_id, resseq, icode); value = per-atom dict
-    _residue_atoms: MutableMapping[
-        tuple[str, int, str], MutableMapping[str, tuple[float, float, float, float]]
-    ] = {}
-    _residue_name: MutableMapping[tuple[str, int, str], str] = {}
-    _residue_chain: MutableMapping[tuple[str, int, str], str] = {}
-
-    with open(pdb_path) as _fh:
-        for _line in _fh:
-            if not _line.startswith("ATOM"):
-                continue
-            _atom_name = _line[12:16].strip()
-            _alt_loc = _line[16]
-            if _alt_loc not in (" ", "A"):
-                continue
-            _resname = _line[17:20].strip()
-            _chain_id = _line[21]
-            _resseq = int(_line[22:26])
-            _icode = _line[26]
-            _x = float(_line[30:38])
-            _y = float(_line[38:46])
-            _z = float(_line[46:54])
-            _bfac = float(_line[60:66]) if len(_line) > 66 else 0.0
-            _key = (_chain_id, _resseq, _icode)
-            if _key not in _residue_atoms:
-                _residue_atoms[_key] = {}
-                _residue_name[_key] = _resname
-                _residue_chain[_key] = _chain_id
-            if _atom_name not in _residue_atoms[_key]:
-                _residue_atoms[_key][_atom_name] = (_x, _y, _z, _bfac)
+    _residue_atoms, _residue_name, _residue_chain = _parse_pdb_atoms(pdb_path)
 
     if not _residue_atoms:
         raise ValueError(f"No ATOM records found in {pdb_path}")
@@ -556,12 +601,16 @@ def protein_from_pdb(pdb_path: str) -> "Protein":
         _residue_index[_i] = _key[1]
         _one = restype_3to1.get(_residue_name[_key], "X")
         _aatype[_i] = restype_order.get(_one, 20)
+        _mol = _classify_mol_type(
+            _residue_name[_key],
+            frozenset(_residue_atoms[_key].keys()),
+        )
+        _b_factors[_i, :] = float(_mol)
         for _aname, (_x, _y, _z, _bf) in _residue_atoms[_key].items():
             if _aname in _atom_type_idx:
                 _idx = _atom_type_idx[_aname]
                 _atom_positions[_i, _idx] = [_x, _y, _z]
                 _atom_mask[_i, _idx] = 1.0
-                _b_factors[_i, _idx] = _bf
 
     return Protein(
         atom_positions=_atom_positions,

@@ -1,5 +1,6 @@
 """Tests for atom utility dataclasses and functions."""
 
+import pathlib
 from collections.abc import Mapping
 from types import MappingProxyType
 
@@ -34,6 +35,7 @@ from helpers.atom_utils import (
     get_cb_coords,
     make_fixed_size,
     make_np_example,
+    protein_from_pdb,
     pseudo_cb,
     restype_num,
     to_pdb,
@@ -878,3 +880,224 @@ def test_classify_mol_type_unknown_defaults_protein() -> None:
     assert _classify_mol_type("UNK", frozenset()) == MOL_TYPE_PROTEIN
     assert _classify_mol_type("MSE", frozenset()) == MOL_TYPE_PROTEIN
     assert _classify_mol_type("", frozenset()) == MOL_TYPE_PROTEIN
+
+
+# ---------------------------------------------------------------------------
+# protein_from_pdb helpers
+# ---------------------------------------------------------------------------
+
+
+def _pdb_atom_line(
+    record: str,
+    serial: int,
+    atom_name: str,
+    resname: str,
+    chain: str,
+    resseq: int,
+    x: float = 1.0,
+    y: float = 2.0,
+    z: float = 3.0,
+) -> str:
+    """Build an 80-character PDB ATOM or HETATM record for test fixtures.
+
+    Args:
+        record: Record type string, e.g. "ATOM" or "HETATM".
+        serial: Atom serial number.
+        atom_name: PDB atom name (e.g. "N", "CA", "O2'").
+        resname: Residue name (e.g. "ALA", "DA", "HOH").
+        chain: Single-character chain ID.
+        resseq: Residue sequence number.
+        x: Cartesian x coordinate in Angstroms.
+        y: Cartesian y coordinate in Angstroms.
+        z: Cartesian z coordinate in Angstroms.
+
+    Returns:
+        An 80-character string formatted as a PDB record.
+    """
+    atom_field = f" {atom_name:<3}" if len(atom_name) < 4 else atom_name[:4]
+    return (
+        f"{record:<6}{serial:>5} {atom_field} {resname:>3} {chain}{resseq:>4}    "
+        f"{x:8.3f}{y:8.3f}{z:8.3f}  1.00  0.00"
+    ).ljust(80)
+
+
+# ---------------------------------------------------------------------------
+# protein_from_pdb — integration tests
+# ---------------------------------------------------------------------------
+
+
+def test_protein_from_pdb_protein_only(tmp_path: pathlib.Path) -> None:
+    """protein_from_pdb sets b_factors to MOL_TYPE_PROTEIN for amino-acid residues."""
+    pdb = tmp_path / "prot.pdb"
+    pdb.write_text(
+        _pdb_atom_line("ATOM", 1, "N", "ALA", "A", 1)
+        + "\n"
+        + _pdb_atom_line("ATOM", 2, "CA", "ALA", "A", 1)
+        + "\n"
+        + _pdb_atom_line("ATOM", 3, "N", "GLY", "A", 2)
+        + "\n"
+    )
+    prot = protein_from_pdb(str(pdb))
+    assert prot.atom_positions.shape == (2, 37, 3)
+    assert np.all(prot.b_factors == float(MOL_TYPE_PROTEIN))
+    assert prot.aatype[0] == 0  # ALA → index 0 in restypes
+
+
+def test_protein_from_pdb_dna_canonical(tmp_path: pathlib.Path) -> None:
+    """protein_from_pdb sets b_factors to MOL_TYPE_DNA for DA/DC/DG/DT residues."""
+    pdb = tmp_path / "dna.pdb"
+    pdb.write_text(
+        _pdb_atom_line("ATOM", 1, "P", "DA", "A", 1)
+        + "\n"
+        + _pdb_atom_line("ATOM", 2, "P", "DT", "A", 2)
+        + "\n"
+    )
+    prot = protein_from_pdb(str(pdb))
+    assert prot.atom_positions.shape == (2, 37, 3)
+    assert np.all(prot.b_factors == float(MOL_TYPE_DNA))
+    assert np.all(prot.aatype == 20)
+
+
+def test_protein_from_pdb_rna_canonical(tmp_path: pathlib.Path) -> None:
+    """protein_from_pdb classifies A/U residues as RNA when O2' atom is present."""
+    pdb = tmp_path / "rna.pdb"
+    pdb.write_text(
+        _pdb_atom_line("ATOM", 1, "O2'", "A", "A", 1)
+        + "\n"
+        + _pdb_atom_line("ATOM", 2, "O2'", "U", "A", 2)
+        + "\n"
+    )
+    prot = protein_from_pdb(str(pdb))
+    assert prot.atom_positions.shape == (2, 37, 3)
+    assert np.all(prot.b_factors == float(MOL_TYPE_RNA))
+    assert np.all(prot.aatype == 20)
+
+
+def test_protein_from_pdb_dna_no_prefix(tmp_path: pathlib.Path) -> None:
+    """protein_from_pdb classifies A/T residues as DNA when no O2' atom is present."""
+    pdb = tmp_path / "dna_noprefix.pdb"
+    pdb.write_text(
+        _pdb_atom_line("ATOM", 1, "C1'", "A", "A", 1)
+        + "\n"
+        + _pdb_atom_line("ATOM", 2, "C1'", "T", "A", 2)
+        + "\n"
+    )
+    prot = protein_from_pdb(str(pdb))
+    assert prot.atom_positions.shape == (2, 37, 3)
+    assert np.all(prot.b_factors == float(MOL_TYPE_DNA))
+
+
+def test_protein_from_pdb_protein_dna_multichain(tmp_path: pathlib.Path) -> None:
+    """protein_from_pdb assigns correct chain_index and b_factors in a protein+DNA complex."""
+    pdb = tmp_path / "complex.pdb"
+    pdb.write_text(
+        _pdb_atom_line("ATOM", 1, "N", "ALA", "A", 1)
+        + "\n"
+        + _pdb_atom_line("ATOM", 2, "N", "GLY", "A", 2)
+        + "\n"
+        + _pdb_atom_line("ATOM", 3, "P", "DA", "B", 1)
+        + "\n"
+        + _pdb_atom_line("ATOM", 4, "P", "DT", "B", 2)
+        + "\n"
+    )
+    prot = protein_from_pdb(str(pdb))
+    assert prot.atom_positions.shape == (4, 37, 3)
+    np.testing.assert_array_equal(prot.chain_index, [0, 0, 1, 1])
+    assert np.all(prot.b_factors[:2] == float(MOL_TYPE_PROTEIN))
+    assert np.all(prot.b_factors[2:] == float(MOL_TYPE_DNA))
+
+
+def test_protein_from_pdb_multi_chain_protein(tmp_path: pathlib.Path) -> None:
+    """protein_from_pdb assigns distinct chain_index values for each PDB chain ID."""
+    pdb = tmp_path / "twochains.pdb"
+    pdb.write_text(
+        _pdb_atom_line("ATOM", 1, "N", "ALA", "A", 1)
+        + "\n"
+        + _pdb_atom_line("ATOM", 2, "N", "GLY", "A", 2)
+        + "\n"
+        + _pdb_atom_line("ATOM", 3, "N", "ALA", "B", 1)
+        + "\n"
+        + _pdb_atom_line("ATOM", 4, "N", "GLY", "B", 2)
+        + "\n"
+    )
+    prot = protein_from_pdb(str(pdb))
+    np.testing.assert_array_equal(prot.chain_index, [0, 0, 1, 1])
+
+
+def test_protein_from_pdb_residue_index(tmp_path: pathlib.Path) -> None:
+    """protein_from_pdb sets residue_index to the PDB RESSEQ numbers."""
+    pdb = tmp_path / "resseq.pdb"
+    pdb.write_text(
+        _pdb_atom_line("ATOM", 1, "N", "ALA", "A", 5)
+        + "\n"
+        + _pdb_atom_line("ATOM", 2, "N", "ALA", "A", 10)
+        + "\n"
+    )
+    prot = protein_from_pdb(str(pdb))
+    np.testing.assert_array_equal(prot.residue_index, [5, 10])
+
+
+def test_protein_from_pdb_no_atoms_raises(tmp_path: pathlib.Path) -> None:
+    """protein_from_pdb raises ValueError when the PDB file has no ATOM records."""
+    pdb = tmp_path / "empty.pdb"
+    pdb.write_text("REMARK empty structure\nHEADER test\n")
+    with pytest.raises(ValueError, match="No ATOM records"):
+        protein_from_pdb(str(pdb))
+
+
+def test_protein_from_pdb_ignores_water_hetatm(tmp_path: pathlib.Path) -> None:
+    """protein_from_pdb excludes HOH HETATM records from the output Protein."""
+    pdb = tmp_path / "water.pdb"
+    pdb.write_text(
+        _pdb_atom_line("ATOM", 1, "N", "ALA", "A", 1)
+        + "\n"
+        + _pdb_atom_line("HETATM", 2, "O", "HOH", "A", 100)
+        + "\n"
+    )
+    prot = protein_from_pdb(str(pdb))
+    assert prot.atom_positions.shape[0] == 1
+
+
+def test_protein_from_pdb_ignores_ion_hetatm(tmp_path: pathlib.Path) -> None:
+    """protein_from_pdb excludes ion HETATM records (MG, ZN, etc.) from the output."""
+    pdb = tmp_path / "ion.pdb"
+    pdb.write_text(
+        _pdb_atom_line("ATOM", 1, "N", "ALA", "A", 1)
+        + "\n"
+        + _pdb_atom_line("HETATM", 2, "MG", "MG", "A", 200)
+        + "\n"
+    )
+    prot = protein_from_pdb(str(pdb))
+    assert prot.atom_positions.shape[0] == 1
+
+
+def test_protein_from_pdb_ignores_ligand_hetatm(tmp_path: pathlib.Path) -> None:
+    """protein_from_pdb excludes ligand HETATM records (ATP, HEM, etc.) from the output."""
+    pdb = tmp_path / "ligand.pdb"
+    pdb.write_text(
+        _pdb_atom_line("ATOM", 1, "N", "ALA", "A", 1)
+        + "\n"
+        + _pdb_atom_line("HETATM", 2, "N1", "ATP", "A", 300)
+        + "\n"
+    )
+    prot = protein_from_pdb(str(pdb))
+    assert prot.atom_positions.shape[0] == 1
+
+
+def test_protein_from_pdb_correct_residue_count_with_hetatm(tmp_path: pathlib.Path) -> None:
+    """protein_from_pdb counts only ATOM-record residues when HETATM records are present."""
+    pdb = tmp_path / "mixed.pdb"
+    pdb.write_text(
+        _pdb_atom_line("ATOM", 1, "N", "ALA", "A", 1)
+        + "\n"
+        + _pdb_atom_line("ATOM", 2, "N", "GLY", "A", 2)
+        + "\n"
+        + _pdb_atom_line("ATOM", 3, "N", "SER", "A", 3)
+        + "\n"
+        + _pdb_atom_line("HETATM", 4, "O", "HOH", "A", 100)
+        + "\n"
+        + _pdb_atom_line("HETATM", 5, "O", "HOH", "A", 101)
+        + "\n"
+    )
+    prot = protein_from_pdb(str(pdb))
+    assert prot.atom_positions.shape[0] == 3
