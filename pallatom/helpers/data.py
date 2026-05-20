@@ -15,6 +15,7 @@ from helpers.atom_utils import (
     make_np_example,
     truncate_to_length,
 )
+from helpers.bucketed_sampler import BucketedBatchSampler
 from helpers.cluster_index import ClusterIndex
 from helpers.featurize import ProteinBatch
 from jaxtyping import Float
@@ -410,6 +411,185 @@ def make_ddp_data_loaders(
         pin_memory=True,
         collate_fn=_to_protein_batch,
     )
+    return cast(
+        """tuple[
+            torch.utils.data.DataLoader[ProteinBatch],
+            torch.utils.data.DataLoader[ProteinBatch],
+            torch.utils.data.DataLoader[ProteinBatch]
+        ]""",
+        (train_loader, val_loader, test_loader),
+    )
+
+
+def make_bucketed_data_loaders(
+    *,
+    cfg: TrainConfig,
+    jsonl_path: str | Path,
+    splits_path: str | Path,
+    num_workers: int,
+    debug_run: bool,
+) -> tuple[
+    torch.utils.data.DataLoader[ProteinBatch],
+    torch.utils.data.DataLoader[ProteinBatch],
+    torch.utils.data.DataLoader[ProteinBatch],
+]:
+    """Build bucketed train loader and fixed-batch val/test loaders.
+
+    The training loader uses ClusteredProteinDataset + BucketedBatchSampler for
+    near-zero-padding token-budget batching. Val/test loaders use the original
+    ProteinDataset with a fixed batch_size.
+
+    Args:
+        cfg:         TrainConfig; cfg.train_loader.token_budget controls packing budget.
+        jsonl_path:  Path to the JSONL protein dataset.
+        splits_path: Path to a JSON file with keys "train", "validation", "test".
+        num_workers: DataLoader worker processes.
+        debug_run:   If True, restrict training to the first 252 protein names.
+
+    Returns:
+        Tuple of (train_loader, val_loader, test_loader).
+    """
+    with open(splits_path) as f:
+        splits: dict[str, list[str]] = json.load(f)
+
+    train_names = splits["train"][:252] if debug_run else splits["train"]
+
+    train_set = ClusteredProteinDataset(
+        jsonl_path,
+        train_names,
+        token_budget=cfg.train_loader.token_budget,
+    )
+    val_set = ProteinDataset(
+        jsonl_path,
+        splits["validation"],
+        max_seq_length=cfg.test_loader.max_seq_length,
+    )
+    test_set = ProteinDataset(
+        jsonl_path,
+        splits["test"],
+        max_seq_length=cfg.test_loader.max_seq_length,
+    )
+
+    train_sampler = BucketedBatchSampler(
+        train_set.cluster_index,
+        token_budget=cfg.train_loader.token_budget,
+    )
+
+    train_loader = torch.utils.data.DataLoader(
+        train_set,
+        batch_sampler=train_sampler,
+        num_workers=num_workers,
+        pin_memory=True,
+        collate_fn=_to_protein_batch_dynamic,
+    )
+    val_loader = torch.utils.data.DataLoader(
+        val_set,
+        batch_size=cfg.test_loader.batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+        collate_fn=_to_protein_batch,
+    )
+    test_loader = torch.utils.data.DataLoader(
+        test_set,
+        batch_size=cfg.test_loader.batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+        collate_fn=_to_protein_batch,
+    )
+
+    return cast(
+        """tuple[
+            torch.utils.data.DataLoader[ProteinBatch],
+            torch.utils.data.DataLoader[ProteinBatch],
+            torch.utils.data.DataLoader[ProteinBatch]
+        ]""",
+        (train_loader, val_loader, test_loader),
+    )
+
+
+def make_ddp_bucketed_data_loaders(
+    cfg: TrainConfig,
+    jsonl_path: str | Path,
+    splits_path: str | Path,
+    rank: int,
+    world_size: int,
+    num_workers: int = 0,
+) -> tuple[
+    torch.utils.data.DataLoader[ProteinBatch],
+    torch.utils.data.DataLoader[ProteinBatch],
+    torch.utils.data.DataLoader[ProteinBatch],
+]:
+    """Build bucketed train loader and distributed val/test loaders for DDP training.
+
+    The training loader uses ClusteredProteinDataset + BucketedBatchSampler (with
+    world_size and rank) for token-budget batching across ranks. Val/test loaders use
+    ProteinDataset with DistributedSampler and a fixed batch_size.
+
+    Args:
+        cfg:         TrainConfig; cfg.train_loader.token_budget controls packing budget.
+        jsonl_path:  Path to the JSONL protein dataset.
+        splits_path: Path to a JSON file with keys "train", "validation", "test".
+        rank:        This process's DDP rank.
+        world_size:  Total number of DDP processes.
+        num_workers: DataLoader worker processes per rank.
+
+    Returns:
+        Tuple of (train_loader, val_loader, test_loader).
+    """
+    with open(splits_path) as f:
+        splits: dict[str, list[str]] = json.load(f)
+
+    train_set = ClusteredProteinDataset(
+        jsonl_path,
+        splits["train"],
+        token_budget=cfg.train_loader.token_budget,
+    )
+    val_set = ProteinDataset(
+        jsonl_path,
+        splits["validation"],
+        max_seq_length=cfg.test_loader.max_seq_length,
+    )
+    test_set = ProteinDataset(
+        jsonl_path,
+        splits["test"],
+        max_seq_length=cfg.test_loader.max_seq_length,
+    )
+
+    train_sampler = BucketedBatchSampler(
+        train_set.cluster_index,
+        token_budget=cfg.train_loader.token_budget,
+        world_size=world_size,
+        rank=rank,
+    )
+    val_sampler = DistributedSampler(val_set, num_replicas=world_size, rank=rank, shuffle=False)
+    test_sampler = DistributedSampler(test_set, num_replicas=world_size, rank=rank, shuffle=False)
+
+    train_loader = torch.utils.data.DataLoader(
+        train_set,
+        batch_sampler=train_sampler,
+        num_workers=num_workers,
+        pin_memory=True,
+        collate_fn=_to_protein_batch_dynamic,
+    )
+    val_loader = torch.utils.data.DataLoader(
+        val_set,
+        batch_size=cfg.test_loader.batch_size,
+        sampler=val_sampler,
+        num_workers=num_workers,
+        pin_memory=True,
+        collate_fn=_to_protein_batch,
+    )
+    test_loader = torch.utils.data.DataLoader(
+        test_set,
+        batch_size=cfg.test_loader.batch_size,
+        sampler=test_sampler,
+        num_workers=num_workers,
+        pin_memory=True,
+        collate_fn=_to_protein_batch,
+    )
+
     return cast(
         """tuple[
             torch.utils.data.DataLoader[ProteinBatch],

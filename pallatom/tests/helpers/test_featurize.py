@@ -277,7 +277,12 @@ def featurized_batch(
     c_beta_distogram_fn: Distogram,
     atom_distogram_fn: Distogram,
 ) -> FeaturizedBatch:
-    """Provide a FeaturizedBatch produced by featurize_batch on the protein_batch fixture."""
+    """Provide a FeaturizedBatch produced by featurize_batch on the protein_batch fixture.
+
+    Sets a fixed random seed so that the log-normal noise sample lands within
+    [sigma_min, sigma_max], keeping t_normalized in [0, 1] regardless of prior RNG state.
+    """
+    torch.manual_seed(1)
     return featurize_batch(
         protein_batch, tcfg, c_beta_distogram_fn, atom_distogram_fn, device="cpu"
     )
