@@ -1,6 +1,11 @@
 """Tests for _compute_batch_plan and BucketedBatchSampler."""
 
-from helpers.bucketed_sampler import _compute_batch_plan
+import json
+import pathlib
+
+import pytest
+from helpers.bucketed_sampler import BucketedBatchSampler, _compute_batch_plan
+from helpers.cluster_index import ClusterIndex
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -58,3 +63,86 @@ def test_batch_plan_different_seeds_differ() -> None:
     indices_a = [i for batch in batches_a for i in batch]
     indices_b = [i for batch in batches_b for i in batch]
     assert indices_a != indices_b
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+
+def _make_coords(n: int) -> dict[str, list[list[float]]]:
+    """Build a minimal coords dict with n atoms at the origin."""
+    return {atom: [[0.0, 0.0, 0.0]] * n for atom in ("N", "CA", "C", "O")}
+
+
+@pytest.fixture
+def small_cluster_index(tmp_path: pathlib.Path) -> ClusterIndex:
+    """ClusterIndex over 80 synthetic proteins spread across 8 clusters."""
+    entries = [
+        {
+            "name": f"p{i}",
+            "seq": "A" * ((i % 8 + 1) * 8),
+            "coords": _make_coords((i % 8 + 1) * 8),
+        }
+        for i in range(80)
+    ]
+    path = tmp_path / "proteins.jsonl"
+    with open(path, "w") as f:
+        for entry in entries:
+            f.write(json.dumps(entry) + "\n")
+    return ClusterIndex(path, [f"p{i}" for i in range(80)], token_budget=512, n_clusters=64)
+
+
+# ---------------------------------------------------------------------------
+# BucketedBatchSampler
+# ---------------------------------------------------------------------------
+
+
+def test_sampler_covers_all_proteins(small_cluster_index: ClusterIndex) -> None:
+    """Every protein index appears exactly once per epoch."""
+    sampler = BucketedBatchSampler(small_cluster_index, token_budget=512, seed=0, prefetch_epochs=1)
+    sampler.set_epoch(0)
+    all_indices = sorted(i for batch in sampler for i in batch)
+    assert all_indices == list(range(len(small_cluster_index)))
+
+
+def test_sampler_respects_token_budget(small_cluster_index: ClusterIndex) -> None:
+    """No batch exceeds the token budget (by representative lengths)."""
+    sampler = BucketedBatchSampler(small_cluster_index, token_budget=512, seed=0, prefetch_epochs=1)
+    sampler.set_epoch(0)
+    for batch in sampler:
+        total = sum(
+            small_cluster_index.cluster_rep_len[small_cluster_index.flat_to_cluster[i]]
+            for i in batch
+        )
+        assert total <= 512
+
+
+def test_sampler_ddp_equal_length(small_cluster_index: ClusterIndex) -> None:
+    """Both DDP ranks receive the same number of batches per epoch."""
+    sampler_r0 = BucketedBatchSampler(
+        small_cluster_index, token_budget=512, world_size=2, rank=0, seed=0, prefetch_epochs=1
+    )
+    sampler_r1 = BucketedBatchSampler(
+        small_cluster_index, token_budget=512, world_size=2, rank=1, seed=0, prefetch_epochs=1
+    )
+    sampler_r0.set_epoch(0)
+    sampler_r1.set_epoch(0)
+    assert len(list(sampler_r0)) == len(list(sampler_r1))
+
+
+def test_sampler_set_epoch_reshuffles(small_cluster_index: ClusterIndex) -> None:
+    """Different epochs produce different batch orderings."""
+    sampler = BucketedBatchSampler(small_cluster_index, token_budget=512, seed=0, prefetch_epochs=3)
+    sampler.set_epoch(0)
+    batches_e0 = [batch[:] for batch in sampler]
+    sampler.set_epoch(1)
+    batches_e1 = [batch[:] for batch in sampler]
+    assert batches_e0 != batches_e1
+
+
+def test_sampler_len_after_set_epoch(small_cluster_index: ClusterIndex) -> None:
+    """__len__ returns the correct batch count after set_epoch."""
+    sampler = BucketedBatchSampler(small_cluster_index, token_budget=512, seed=0, prefetch_epochs=1)
+    sampler.set_epoch(0)
+    assert len(sampler) == len(list(sampler))
