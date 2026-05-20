@@ -525,12 +525,16 @@ def _process_accum_window(
     """
     accum_steps = len(micro_buffer)
     window_metrics: dict[str, float] = dict.fromkeys(_METRIC_KEYS, 0.0)
+    maybe_no_sync = getattr(model, "no_sync", None)
     for micro_idx, mb in enumerate(micro_buffer):
         is_last = micro_idx == accum_steps - 1
-        _no_sync = getattr(model, "no_sync", None)
         ctx = cast(
             contextlib.AbstractContextManager[None],
-            _no_sync() if (not is_last and callable(_no_sync)) else contextlib.nullcontext(),
+            (
+                maybe_no_sync()
+                if (not is_last and callable(maybe_no_sync))
+                else contextlib.nullcontext()
+            ),
         )
         with ctx:
             step_metrics = train_step(
