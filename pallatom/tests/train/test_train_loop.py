@@ -58,6 +58,21 @@ EXPECTED_EVAL_KEYS = frozenset(
     }
 )
 
+EXPECTED_STEP_KEYS = frozenset(
+    {
+        "total loss",
+        "Kabsch aligned MSE loss",
+        "Cross Entropy loss",
+        "smooth lddt",
+        "Residue Distogram loss",
+        "Atom Distogram loss",
+        "Intermediate loss",
+        "pack_rate",
+        "residues_per_sec",
+        "atoms_per_sec",
+    }
+)
+
 EXPECTED_CHECKPOINT_KEYS = frozenset(
     {"model", "optimizer", "scheduler", "epoch", "global_step", "best_val_loss"}
 )
@@ -272,6 +287,63 @@ def tcfg_save(tmp_path: pathlib.Path) -> TrainConfig:
         ),
         logging=LoggingParams(use_wandb=False, log_interval=1),
     )
+
+
+@pytest.fixture
+def protein_batch() -> ProteinBatch:
+    """Provide a single-item ProteinBatch with _N_KEEP residues for train_step tests."""
+    return ProteinBatch(
+        atom_positions=torch.randn(1, _N_KEEP, 37, 3),
+        atom_mask=torch.ones(1, _N_KEEP, 37),
+        residue_index=rearrange(torch.arange(_N_KEEP, dtype=torch.float32), "n -> 1 n"),
+        seq=[("ACDEFGHIKLMNPQRSTVWY" * (_N_KEEP // 20 + 1))[:_N_KEEP]],
+    )
+
+
+def test_train_step_returns_expected_keys(
+    protein_batch: ProteinBatch,
+    model: MainTrunk,
+    tcfg: TrainConfig,
+    distogram_res: Distogram,
+    distogram_atom: Distogram,
+) -> None:
+    """train_step return dict contains exactly EXPECTED_STEP_KEYS."""
+    optimizer = Adam(model.parameters(), lr=1e-4)
+    metrics, _ = train_step(
+        protein_batch, model, tcfg, distogram_res, distogram_atom, optimizer, "cpu"
+    )
+    assert set(metrics.keys()) == EXPECTED_STEP_KEYS
+
+
+def test_train_step_pack_rate_in_range(
+    protein_batch: ProteinBatch,
+    model: MainTrunk,
+    tcfg: TrainConfig,
+    distogram_res: Distogram,
+    distogram_atom: Distogram,
+) -> None:
+    """pack_rate is in (0, 1]."""
+    optimizer = Adam(model.parameters(), lr=1e-4)
+    metrics, _ = train_step(
+        protein_batch, model, tcfg, distogram_res, distogram_atom, optimizer, "cpu"
+    )
+    assert 0.0 < metrics["pack_rate"] <= 1.0
+
+
+def test_train_step_throughput_metrics_positive(
+    protein_batch: ProteinBatch,
+    model: MainTrunk,
+    tcfg: TrainConfig,
+    distogram_res: Distogram,
+    distogram_atom: Distogram,
+) -> None:
+    """residues_per_sec and atoms_per_sec are positive floats."""
+    optimizer = Adam(model.parameters(), lr=1e-4)
+    metrics, _ = train_step(
+        protein_batch, model, tcfg, distogram_res, distogram_atom, optimizer, "cpu"
+    )
+    assert metrics["residues_per_sec"] > 0.0
+    assert metrics["atoms_per_sec"] > 0.0
 
 
 # ---------------------------------------------------------------------------

@@ -4,6 +4,7 @@ import argparse
 import contextlib
 import math
 import os
+import time
 import traceback
 from typing import cast
 
@@ -303,6 +304,7 @@ def train_step(
         device=device,
     )
 
+    t0 = time.perf_counter()
     (
         r_denoised,
         f_seq_logits,
@@ -380,6 +382,13 @@ def train_step(
     )
     optimizer.step()
 
+    t1 = time.perf_counter()
+    step_time = t1 - t0
+
+    b_size, n_res = featurized_batch.residue_mask.shape
+    actual_residues = int(featurized_batch.residue_mask.sum().item())
+    actual_atoms = int(featurized_batch.atom5_mask.sum().item())
+
     return {
         "total loss": total_loss.item(),
         "Kabsch aligned MSE loss": Kabsch_aligned_MSE_loss.item(),
@@ -388,6 +397,9 @@ def train_step(
         "Residue Distogram loss": residue_distogram_loss.item(),
         "Atom Distogram loss": atom_distogram_loss.item(),
         "Intermediate loss": intermediate_med_loss.item(),
+        "pack_rate": actual_residues / (b_size * n_res),
+        "residues_per_sec": actual_residues / step_time,
+        "atoms_per_sec": actual_atoms / step_time,
     }, grad_norm
 
 
@@ -539,6 +551,9 @@ def train(
                 "Residue Distogram loss",
                 "Atom Distogram loss",
                 "Intermediate loss",
+                "pack_rate",
+                "residues_per_sec",
+                "atoms_per_sec",
             ],
             0.0,
         )
@@ -618,6 +633,9 @@ def train_ddp(
                 "Residue Distogram loss",
                 "Atom Distogram loss",
                 "Intermediate loss",
+                "pack_rate",
+                "residues_per_sec",
+                "atoms_per_sec",
             ],
             0.0,
         )
