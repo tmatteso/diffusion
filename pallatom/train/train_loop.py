@@ -485,7 +485,7 @@ def log_epoch(
 
 def _load_ddp_checkpoint(
     path: str,
-    ddp_model: nn.Module,
+    ddp_model: DDP,
     optimizer: Adam,
     scheduler: CosineAnnealingLR,
     device: str,
@@ -505,7 +505,7 @@ def _load_ddp_checkpoint(
         A ``(best_val_loss, global_step, start_epoch)`` triple.
     """
     ckpt = torch.load(path, map_location=device)
-    ddp_model.module.load_state_dict(ckpt["model"])  # type: ignore[union-attr]
+    ddp_model.module.load_state_dict(ckpt["model"])
     optimizer.load_state_dict(ckpt["optimizer"])
     scheduler.load_state_dict(ckpt["scheduler"])
     best_val_loss: float = ckpt["best_val_loss"]
@@ -715,7 +715,27 @@ def train_ddp(
     distogram_atom: Distogram,
     device: str | None = None,
 ) -> None:
-    """DDP training loop. Launched via torchrun — one process per GPU."""
+    """DDP training loop for the MainTrunk diffusion model.
+
+    Mirrors :func:`train` but runs under PyTorch DDP — one process per GPU,
+    launched via ``torchrun``.  The ``accumulated_batch_size`` field of
+    ``tcfg.training`` is divided by ``train_loader.batch_size * world_size``
+    to derive the per-rank ``accum_steps``; the micro-buffer pattern is shared
+    with :func:`train` via :func:`_process_accum_window`.
+
+    Args:
+        rank: Global process rank (0 = primary).
+        local_rank: Device-local rank used to select ``cuda:<local_rank>``.
+        world_size: Total number of DDP processes.
+        model: ``MainTrunk`` to train; must already be on the correct device.
+        tcfg: Training configuration (hyper-parameters, loss weights, logging).
+        train_loader: DataLoader for training batches; its
+            ``BucketedBatchSampler`` must support ``set_epoch``.
+        test_loader: DataLoader for evaluation batches.
+        distogram_res: Callable producing Cβ residue-level distograms.
+        distogram_atom: Callable producing atom-level distograms.
+        device: Device string override; defaults to ``"cuda:<local_rank>"``.
+    """
     device = device or f"cuda:{local_rank}"
     ddp_model = DDP(model, device_ids=[local_rank])
 
@@ -767,9 +787,10 @@ def train_ddp(
                 micro_buffer, ddp_model, tcfg, distogram_res, distogram_atom, device
             )
 
-            if rank == 0 and math.isnan(window_metrics["total loss"]):
+            if math.isnan(window_metrics["total loss"]):
                 nan_keys = [k for k, v in window_metrics.items() if math.isnan(v)]
-                log.warning("nan_loss", step=global_step, nan_components=nan_keys)
+                if rank == 0:
+                    log.warning("nan_loss", step=global_step, nan_components=nan_keys)
 
             grad_norm: float = float(
                 nn.utils.clip_grad_norm_(
