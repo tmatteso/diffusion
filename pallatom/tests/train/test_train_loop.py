@@ -21,7 +21,6 @@ from helpers.data import _to_protein_batch, make_bucketed_data_loaders
 from helpers.featurize import Distogram, ProteinBatch, apply_conditioning_dropout, featurize_batch
 from jaxtyping import Float, TypeCheckError
 from pydantic import ValidationError
-from torch.optim import Adam
 from train.train_config import (
     CheckpointParams,
     LoaderConfig,
@@ -313,10 +312,8 @@ def test_train_step_returns_expected_keys(
     distogram_atom: Distogram,
 ) -> None:
     """train_step return dict contains exactly EXPECTED_STEP_KEYS."""
-    optimizer = Adam(model.parameters(), lr=1e-4)
-    metrics, _ = train_step(
-        protein_batch, model, tcfg, distogram_res, distogram_atom, optimizer, "cpu"
-    )
+    model.zero_grad()
+    metrics = train_step(protein_batch, model, tcfg, distogram_res, distogram_atom, "cpu")
     assert set(metrics.keys()) == EXPECTED_STEP_KEYS
 
 
@@ -328,10 +325,8 @@ def test_train_step_pack_rate_in_range(
     distogram_atom: Distogram,
 ) -> None:
     """pack_rate is in (0, 1]."""
-    optimizer = Adam(model.parameters(), lr=1e-4)
-    metrics, _ = train_step(
-        protein_batch, model, tcfg, distogram_res, distogram_atom, optimizer, "cpu"
-    )
+    model.zero_grad()
+    metrics = train_step(protein_batch, model, tcfg, distogram_res, distogram_atom, "cpu")
     assert 0.0 < metrics["pack_rate"] <= 1.0
 
 
@@ -343,10 +338,8 @@ def test_train_step_throughput_metrics_positive(
     distogram_atom: Distogram,
 ) -> None:
     """residues_per_sec and atoms_per_sec are positive floats."""
-    optimizer = Adam(model.parameters(), lr=1e-4)
-    metrics, _ = train_step(
-        protein_batch, model, tcfg, distogram_res, distogram_atom, optimizer, "cpu"
-    )
+    model.zero_grad()
+    metrics = train_step(protein_batch, model, tcfg, distogram_res, distogram_atom, "cpu")
     assert metrics["residues_per_sec"] > 0.0
     assert metrics["atoms_per_sec"] > 0.0
 
@@ -1422,15 +1415,11 @@ def test_integration_gradient_flow_via_train_step(
     distogram_atom: Distogram,
     loader: torch.utils.data.DataLoader[ProteinBatch],
 ) -> None:
-    """train_step() back-propagates finite nonzero grads to every MainTrunk submodule.
-
-    Gradients persist on parameters after train_step() returns because zero_grad()
-    is called at the start of the next train_step() call, not at the end of this one.
-    """
+    """train_step() back-propagates finite nonzero grads to every MainTrunk submodule."""
     model.train()
     batch = next(iter(loader))
-    optimizer = Adam(model.parameters(), lr=1e-4)
-    train_step(batch, model, tcfg, distogram_res, distogram_atom, optimizer, device="cpu")
+    model.zero_grad()
+    train_step(batch, model, tcfg, distogram_res, distogram_atom, device="cpu")
     _assert_submodule_grads(model)
 
 

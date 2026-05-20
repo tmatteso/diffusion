@@ -287,16 +287,28 @@ def train_step(
     tcfg: TrainConfig,
     distogram_res: Distogram,
     distogram_atom: Distogram,
-    optimizer: Adam,
     device: str,
-) -> tuple[dict[str, float], float]:
-    """Process one training batch: featurize, forward, compute losses, backward, step.
+    grad_scale: float = 1.0,
+) -> dict[str, float]:
+    """Forward and backward pass for one micro-batch.
 
-    Returns step-level metrics (scalar floats, same keys as epoch averages) and the
-    gradient norm after clipping.
+    The caller owns ``optimizer.zero_grad()``, ``clip_grad_norm_``, and
+    ``optimizer.step()``.  Pass ``accum_steps`` as ``grad_scale`` so that
+    accumulated gradients match a single large-batch backward.
+
+    Args:
+        batch: Raw protein micro-batch.
+        model: Model to forward through (plain ``MainTrunk`` or DDP-wrapped).
+        tcfg: Training configuration.
+        distogram_res: Residue-level distogram.
+        distogram_atom: Atom-level distogram.
+        device: PyTorch device string.
+        grad_scale: Divide total loss by this value before backward (default 1.0).
+
+    Returns:
+        Step-level metrics dict with keys matching ``EXPECTED_STEP_KEYS``.
     """
     lp = tcfg.loss
-    tp = tcfg.training
 
     featurized_batch = featurize_batch(batch, tcfg, distogram_res, distogram_atom, device)
     featurized_batch = apply_conditioning_dropout(
@@ -374,17 +386,7 @@ def train_step(
         + lp.alpha_4 * intermediate_med_loss
     )
 
-    optimizer.zero_grad()
-    total_loss.backward()
-
-    grad_norm: float = float(
-        nn.utils.clip_grad_norm_(
-            model.parameters(),
-            tp.grad_clip if tp.grad_clip is not None else float("inf"),
-        )
-    )
-    optimizer.step()
-
+    (total_loss / grad_scale).backward()
     t1 = time.perf_counter()
     step_time = t1 - t0
 
@@ -403,7 +405,7 @@ def train_step(
         "pack_rate": actual_residues / (b_size * n_res),
         "residues_per_sec": actual_residues / step_time,
         "atoms_per_sec": actual_atoms / step_time,
-    }, grad_norm
+    }
 
 
 def log_epoch(
@@ -564,10 +566,17 @@ def train(
 
         pbar = tqdm(train_loader, desc=f"Epoch {epoch:03d}/{tp.num_epochs}", leave=False)
 
+        optimizer.zero_grad()
         for batch in pbar:
-            step_metrics, grad_norm = train_step(
-                batch, model, tcfg, distogram_res, distogram_atom, optimizer, device
+            step_metrics = train_step(batch, model, tcfg, distogram_res, distogram_atom, device)
+            grad_norm: float = float(
+                nn.utils.clip_grad_norm_(
+                    model.parameters(),
+                    tp.grad_clip if tp.grad_clip is not None else float("inf"),
+                )
             )
+            optimizer.step()
+            optimizer.zero_grad()
             for k in epoch_metrics:
                 epoch_metrics[k] += step_metrics[k]
             n_batches += 1
@@ -651,13 +660,20 @@ def train_ddp(
             disable=(rank != 0),
         )
 
+        optimizer.zero_grad()
         for batch in pbar:
-            step_metrics, grad_norm = train_step(
-                batch, ddp_model, tcfg, distogram_res, distogram_atom, optimizer, device
-            )
+            step_metrics = train_step(batch, ddp_model, tcfg, distogram_res, distogram_atom, device)
             if rank == 0 and math.isnan(step_metrics["total loss"]):
                 nan_keys = [k for k, v in step_metrics.items() if math.isnan(v)]
                 log.warning("nan_loss", step=global_step, nan_components=nan_keys)
+            grad_norm: float = float(
+                nn.utils.clip_grad_norm_(
+                    ddp_model.parameters(),
+                    tp.grad_clip if tp.grad_clip is not None else float("inf"),
+                )
+            )
+            optimizer.step()
+            optimizer.zero_grad()
             for k in epoch_metrics:
                 epoch_metrics[k] += step_metrics[k]
             n_batches += 1
