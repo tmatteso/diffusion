@@ -630,6 +630,10 @@ def _chain_end(atom_index: int, end_resname: str, chain_name: str, residue_index
 def to_pdb(prot: Protein) -> str:
     """Converts a `Protein` instance to a PDB string.
 
+    Note: `Protein.b_factors` encodes molecule type (0=protein, 1=DNA, 2=RNA)
+    rather than crystallographic B-factors. The PDB B-factor column will
+    therefore contain 0.00, 1.00, or 2.00 for model-generated structures.
+
     Args:
       prot: The protein to convert to PDB.
 
