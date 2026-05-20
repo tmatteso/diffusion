@@ -24,13 +24,16 @@ from architecture.main_trunk import MainTrunk
 from beartype import beartype
 from einops import rearrange
 from helpers.alignment import kabsch_align
-from helpers.data import _FileLogProcessor, make_ddp_data_loaders
+from helpers.bucketed_sampler import BucketedBatchSampler
+from helpers.data import (
+    _FileLogProcessor,
+    make_ddp_bucketed_data_loaders,
+)
 from helpers.featurize import Distogram, ProteinBatch, apply_conditioning_dropout, featurize_batch
 from jaxtyping import Float, Int, jaxtyped
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import Adam
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 from train.train_config import TrainConfig
 
@@ -623,7 +626,7 @@ def train_ddp(
 
     for epoch in range(start_epoch, tp.num_epochs + 1):
         ddp_model.train()
-        cast("DistributedSampler[ProteinBatch]", train_loader.sampler).set_epoch(epoch)
+        cast(BucketedBatchSampler, train_loader.batch_sampler).set_epoch(epoch)
         epoch_metrics: dict[str, float] = dict.fromkeys(
             [
                 "total loss",
@@ -731,7 +734,7 @@ if __name__ == "__main__":
                 else:
                     tcfg = TrainConfig()
 
-                train_loader, val_loader, _ = make_ddp_data_loaders(
+                train_loader, val_loader, _ = make_ddp_bucketed_data_loaders(
                     tcfg,
                     args.data,
                     args.splits,

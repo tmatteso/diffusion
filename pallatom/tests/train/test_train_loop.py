@@ -1,5 +1,6 @@
 """Tests for the training loop."""
 
+import json
 import math
 import os
 import pathlib
@@ -7,6 +8,7 @@ from collections.abc import Mapping
 from typing import Any, cast
 from unittest.mock import MagicMock
 
+import numpy as np
 import pytest
 import torch
 import torch.distributed as dist_module
@@ -14,7 +16,8 @@ import torch.nn as nn
 import torch.nn.parallel
 from architecture.main_trunk import MainTrunk
 from einops import rearrange
-from helpers.data import _to_protein_batch
+from helpers.bucketed_sampler import BucketedBatchSampler
+from helpers.data import _to_protein_batch, make_bucketed_data_loaders
 from helpers.featurize import Distogram, ProteinBatch, apply_conditioning_dropout, featurize_batch
 from jaxtyping import Float, TypeCheckError
 from torch.optim import Adam
@@ -1057,29 +1060,51 @@ def _patch_ddp(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 class _MockSampler:
-    """DataLoader sampler with set_epoch() for verifying epoch reseeding."""
+    """Batch sampler with set_epoch() for verifying epoch reseeding in train_ddp tests.
+
+    Implements the batch-sampler protocol: __iter__ yields lists of indices so it can
+    be passed as batch_sampler to DataLoader.
+    """
 
     def __init__(self, data: list[Mapping[str, Float[torch.Tensor, "..."] | list[str]]]) -> None:
         self._data = data
         self.set_epoch_calls: list[int] = []
 
     def __iter__(self):
-        return iter(range(len(self._data)))
+        return iter([[i] for i in range(len(self._data))])
 
     def __len__(self) -> int:
         return len(self._data)
 
     def set_epoch(self, epoch: int) -> None:
+        """Record epoch for later assertion."""
         self.set_epoch_calls.append(epoch)
+
+
+def _identity_collate(
+    items: list[ProteinBatch],
+) -> ProteinBatch:
+    """Return the single ProteinBatch item from a singleton batch list.
+
+    Args:
+        items: A one-element list produced by the DataLoader when batch_sampler
+               yields a single-index list.
+
+    Returns:
+        The unwrapped ProteinBatch.
+    """
+    return items[0]
 
 
 @pytest.fixture
 def ddp_loader(
     mini_batch: Mapping[str, Float[torch.Tensor, "..."] | list[str]]
 ) -> torch.utils.data.DataLoader[ProteinBatch]:
-    """Provide a DataLoader backed by a _MockSampler to track set_epoch calls."""
+    """Provide a DataLoader with _MockSampler as batch_sampler to track set_epoch calls."""
     sampler = _MockSampler([mini_batch])
-    return torch.utils.data.DataLoader(_ListDataset([mini_batch]), batch_size=None, sampler=sampler)
+    return torch.utils.data.DataLoader(
+        _ListDataset([mini_batch]), batch_sampler=sampler, collate_fn=_identity_collate
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1200,7 +1225,7 @@ def test_train_ddp_calls_set_epoch_each_epoch(
         distogram_atom,
         device="cpu",
     )
-    assert cast("_MockSampler", ddp_loader.sampler).set_epoch_calls == [1, 2, 3]
+    assert cast("_MockSampler", ddp_loader.batch_sampler).set_epoch_calls == [1, 2, 3]
 
 
 def test_train_ddp_updates_model_parameters(
@@ -1594,3 +1619,71 @@ def test_train_resume_checkpoint_epoch_and_step(
     assert saved_ckpt["epoch"] == 1
     assert saved_ckpt["global_step"] == 1  # one batch in the loader
     assert isinstance(saved_ckpt["best_val_loss"], float)
+
+
+# ---------------------------------------------------------------------------
+# BucketedBatchSampler integration
+# ---------------------------------------------------------------------------
+
+_N_RES_BUCKET = 6
+_ENTRY_NAMES_BUCKET = ["1aa.A", "2bb.A", "3cc.A", "4dd.A", "5ee.A"]
+_TRAIN_NAMES_BUCKET = ["1aa.A", "2bb.A", "3cc.A"]
+_VAL_NAMES_BUCKET = ["4dd.A"]
+_TEST_NAMES_BUCKET = ["5ee.A"]
+
+
+@pytest.fixture
+def jsonl_path(tmp_path: pathlib.Path) -> str:
+    """Write a temporary JSONL file with synthetic protein entries and return its path."""
+    path = tmp_path / "proteins.jsonl"
+    with open(path, "w") as f:
+        for name in _ENTRY_NAMES_BUCKET:
+            entry = {
+                "name": name,
+                "seq": "ACDEFG"[:_N_RES_BUCKET],
+                "coords": {
+                    atom: np.random.randn(_N_RES_BUCKET, 3).tolist()
+                    for atom in ("N", "CA", "C", "O")
+                },
+            }
+            f.write(json.dumps(entry) + "\n")
+    return str(path)
+
+
+@pytest.fixture
+def splits_path(tmp_path: pathlib.Path) -> str:
+    """Write a temporary splits JSON with train/val/test name lists and return its path."""
+    path = tmp_path / "splits.json"
+    with open(path, "w") as f:
+        json.dump(
+            {
+                "train": _TRAIN_NAMES_BUCKET,
+                "validation": _VAL_NAMES_BUCKET,
+                "test": _TEST_NAMES_BUCKET,
+            },
+            f,
+        )
+    return str(path)
+
+
+def test_train_one_epoch_with_bucketed_loader(
+    model: MainTrunk,
+    tcfg: TrainConfig,
+    distogram_res: Distogram,
+    distogram_atom: Distogram,
+    jsonl_path: str,
+    splits_path: str,
+) -> None:
+    """train() runs one epoch with a bucketed DataLoader without error."""
+    train_loader, val_loader, _ = make_bucketed_data_loaders(
+        cfg=tcfg,
+        jsonl_path=jsonl_path,
+        splits_path=splits_path,
+        num_workers=0,
+        debug_run=False,
+    )
+    sampler = train_loader.batch_sampler
+    assert isinstance(sampler, BucketedBatchSampler)
+    sampler.set_epoch(0)
+    result = train(model, tcfg, train_loader, val_loader, distogram_res, distogram_atom, "cpu")
+    assert result is None
