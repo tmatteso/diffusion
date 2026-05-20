@@ -20,9 +20,11 @@ from helpers.bucketed_sampler import BucketedBatchSampler
 from helpers.data import _to_protein_batch, make_bucketed_data_loaders
 from helpers.featurize import Distogram, ProteinBatch, apply_conditioning_dropout, featurize_batch
 from jaxtyping import Float, TypeCheckError
+from pydantic import ValidationError
 from torch.optim import Adam
 from train.train_config import (
     CheckpointParams,
+    LoaderConfig,
     LoggingParams,
     ModelParams,
     TrainConfig,
@@ -1687,3 +1689,31 @@ def test_train_one_epoch_with_bucketed_loader(
     sampler.set_epoch(0)
     result = train(model, tcfg, train_loader, val_loader, distogram_res, distogram_atom, "cpu")
     assert result is None
+
+
+# ---------------------------------------------------------------------------
+# TrainingParams.accumulated_batch_size and TrainConfig cross-config validator
+# ---------------------------------------------------------------------------
+
+
+def test_training_params_accumulated_batch_size_default() -> None:
+    """accumulated_batch_size defaults to 32."""
+    assert TrainingParams().accumulated_batch_size == 32
+
+
+def test_train_config_validator_rejects_accum_lt_batch_size() -> None:
+    """TrainConfig raises ValidationError when accumulated_batch_size < train_loader.batch_size."""
+    with pytest.raises(ValidationError):
+        TrainConfig(
+            training=TrainingParams(accumulated_batch_size=1),
+            train_loader=LoaderConfig(batch_size=2),
+        )
+
+
+def test_train_config_validator_accepts_accum_eq_batch_size() -> None:
+    """TrainConfig accepts accumulated_batch_size == train_loader.batch_size."""
+    cfg = TrainConfig(
+        training=TrainingParams(accumulated_batch_size=2),
+        train_loader=LoaderConfig(batch_size=2),
+    )
+    assert cfg.training.accumulated_batch_size == 2

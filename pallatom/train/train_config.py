@@ -14,6 +14,7 @@ class TrainingParams(BaseModel):
     grad_clip: float | None = Field(default=2.0, gt=0)
     pretrained_weights: str | None = None
     resume_checkpoint: str | None = None
+    accumulated_batch_size: int = Field(default=32, gt=0)
 
 
 class ModelParams(BaseModel):
@@ -156,3 +157,13 @@ class TrainConfig(BaseModel):
     conditioning_dropout: ConditioningDropoutConfig = Field(
         default_factory=ConditioningDropoutConfig
     )
+
+    @model_validator(mode="after")
+    def _accumulated_batch_size_gte_loader_batch_size(self) -> "TrainConfig":
+        """Validate accumulated_batch_size is at least one loader micro-batch."""
+        if self.training.accumulated_batch_size < self.train_loader.batch_size:
+            raise ValueError(
+                f"accumulated_batch_size ({self.training.accumulated_batch_size}) must be"
+                f" >= train_loader.batch_size ({self.train_loader.batch_size})"
+            )
+        return self
