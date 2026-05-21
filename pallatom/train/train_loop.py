@@ -802,6 +802,8 @@ def train(  # noqa: PLR0915
         accum_tokens: int = 0
         optimizer.zero_grad()
 
+        if isinstance(train_loader.batch_sampler, BucketedBatchSampler):
+            train_loader.batch_sampler.set_epoch(epoch)
         pbar = tqdm(train_loader, desc=f"Epoch {epoch:03d}/{tp.num_epochs}", leave=False)
 
         for batch in pbar:
