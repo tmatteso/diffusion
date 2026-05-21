@@ -723,7 +723,7 @@ def _optimizer_step(
     return window_metrics, component_norms, grad_norm, global_step + 1
 
 
-def train(
+def train(  # noqa: PLR0915
     model: MainTrunk,
     tcfg: TrainConfig,
     train_loader: torch.utils.data.DataLoader[ProteinBatch],
@@ -814,6 +814,7 @@ def train(
 
             # Pre-flush: if adding this batch would push tokens over the budget, flush first.
             if micro_buffer and accum_tokens + n_tokens > per_rank_token_budget:
+                log.info(f"Too many tokens in batch, given budget {per_rank_token_budget}.")
                 window_metrics, component_norms, grad_norm, global_step = _optimizer_step(
                     micro_buffer,
                     n_proteins_buffer,
@@ -851,6 +852,7 @@ def train(
 
         # Flush any remaining micro-batches at epoch end, regardless of token count.
         if micro_buffer:
+            log.info("Flushing remaining batch at epoch end")
             _, _, _, global_step = _optimizer_step(
                 micro_buffer,
                 n_proteins_buffer,
