@@ -612,21 +612,25 @@ def _component_grad_norms(model: nn.Module) -> dict[str, float]:
 
 def _process_accum_window(
     micro_buffer: list[ProteinBatch],
+    n_proteins_per_batch: list[int],
     model: nn.Module,
     tcfg: TrainConfig,
     distogram_res: Distogram,
     distogram_atom: Distogram,
     device: str,
 ) -> dict[str, float]:
-    """Forward + backward over one full accumulation window; returns averaged metrics.
+    """Forward + backward over one accumulation window; returns protein-weighted metrics.
 
-    Calls ``train_step`` on each micro-batch with ``grad_scale=len(micro_buffer)`` so
-    that accumulated gradients are equivalent to a single large-batch backward.  The
-    ``no_sync()`` context manager is used on all but the last micro-batch when the model
-    exposes it (DDP), so gradient all-reduces happen only once per window.
+    Each micro-batch's loss is scaled by ``total_proteins / n_proteins_i`` so that the
+    accumulated gradient is equivalent to a single large-batch backward over all proteins
+    in the window.  Metrics are averaged with the same protein-count weights.
+
+    The ``no_sync()`` context manager is used on all but the last micro-batch when the
+    model exposes it (DDP), so gradient all-reduces happen only once per window.
 
     Args:
-        micro_buffer: Exactly ``accum_steps`` micro-batches to process.
+        micro_buffer: Micro-batches to process.
+        n_proteins_per_batch: Protein count per micro-batch (``batch.atom_positions.shape[0]``).
         model: Model to forward through (plain ``MainTrunk`` or DDP-wrapped).
         tcfg: Training configuration.
         distogram_res: Residue-level distogram.
@@ -634,13 +638,16 @@ def _process_accum_window(
         device: PyTorch device string.
 
     Returns:
-        Dict of metrics averaged over all micro-batches in the window.
+        Dict of metrics averaged by protein count over all micro-batches in the window.
     """
-    accum_steps = len(micro_buffer)
+    total_proteins: int = sum(n_proteins_per_batch)
+    n_micro: int = len(micro_buffer)
     window_metrics: dict[str, float] = dict.fromkeys(_METRIC_KEYS, 0.0)
     maybe_no_sync = getattr(model, "no_sync", None)
-    for micro_idx, mb in enumerate(micro_buffer):
-        is_last = micro_idx == accum_steps - 1
+    for micro_idx, (mb, n_proteins) in enumerate(
+        zip(micro_buffer, n_proteins_per_batch, strict=False)
+    ):
+        is_last = micro_idx == n_micro - 1
         ctx = cast(
             contextlib.AbstractContextManager[None],
             (
@@ -649,6 +656,8 @@ def _process_accum_window(
                 else contextlib.nullcontext()
             ),
         )
+        grad_scale: float = total_proteins / n_proteins
+        weight: float = n_proteins / total_proteins
         with ctx:
             step_metrics = train_step(
                 mb,
@@ -657,11 +666,61 @@ def _process_accum_window(
                 distogram_res,
                 distogram_atom,
                 device,
-                grad_scale=float(accum_steps),
+                grad_scale=grad_scale,
             )
         for k in window_metrics:
-            window_metrics[k] += step_metrics[k] / accum_steps
+            window_metrics[k] += step_metrics[k] * weight
     return window_metrics
+
+
+def _optimizer_step(
+    micro_buffer: list[ProteinBatch],
+    n_proteins_buffer: list[int],
+    model: nn.Module,
+    tcfg: TrainConfig,
+    distogram_res: Distogram,
+    distogram_atom: Distogram,
+    device: str,
+    optimizer: Adam,
+    epoch_metrics: dict[str, float],
+    global_step: int,
+) -> tuple[dict[str, float], dict[str, float], float, int]:
+    """Run one accumulation window, clip gradients, and step the optimizer.
+
+    Mutates ``epoch_metrics`` in-place. Returns the window metrics, per-component
+    gradient norms, the clipped gradient norm, and the incremented global step.
+
+    Args:
+        micro_buffer: Micro-batches accumulated for this optimizer step.
+        n_proteins_buffer: Protein count per micro-batch.
+        model: Model (plain or DDP-wrapped).
+        tcfg: Training configuration.
+        distogram_res: Residue-level distogram.
+        distogram_atom: Atom-level distogram.
+        device: PyTorch device string.
+        optimizer: The optimizer to step.
+        epoch_metrics: Running per-epoch metric sums, updated in place.
+        global_step: Current global step count before this flush.
+
+    Returns:
+        Tuple of (window_metrics, component_norms, grad_norm, global_step + 1).
+    """
+    window_metrics = _process_accum_window(
+        micro_buffer, n_proteins_buffer, model, tcfg, distogram_res, distogram_atom, device
+    )
+    component_norms = _component_grad_norms(model)
+    tp = tcfg.training
+    grad_norm = float(
+        nn.utils.clip_grad_norm_(
+            model.parameters(),
+            tp.grad_clip if tp.grad_clip is not None else float("inf"),
+        )
+    )
+    optimizer.step()
+    optimizer.zero_grad()
+    for k in epoch_metrics:
+        epoch_metrics[k] += window_metrics[k]
+    return window_metrics, component_norms, grad_norm, global_step + 1
 
 
 def train(
@@ -709,11 +768,11 @@ def train(
     """
     tp = tcfg.training
     lg = tcfg.logging
-    accum_steps: int = max(1, tp.accumulated_batch_size // tcfg.train_loader.batch_size)
+    per_rank_token_budget: int = tp.accumulated_token_budget
     log.info(
         "gradient_accumulation",
-        accum_steps=accum_steps,
-        effective_batch_size=tp.accumulated_batch_size,
+        token_budget_per_rank=per_rank_token_budget,
+        global_token_budget=tp.accumulated_token_budget,
     )
 
     optimizer = Adam(model.parameters(), lr=tp.lr, weight_decay=tp.weight_decay)
@@ -738,53 +797,74 @@ def train(
         epoch_metrics: dict[str, float] = dict.fromkeys(_METRIC_KEYS, 0.0)
         n_batches = 0
         micro_buffer: list[ProteinBatch] = []
+        n_proteins_buffer: list[int] = []
+        accum_tokens: int = 0
         optimizer.zero_grad()
 
         pbar = tqdm(train_loader, desc=f"Epoch {epoch:03d}/{tp.num_epochs}", leave=False)
 
         for batch in pbar:
+            n_tokens: int = int(batch.atom_mask.any(dim=-1).sum().item())
+            n_proteins: int = batch.atom_positions.shape[0]
+
+            # Pre-flush: if adding this batch would push tokens over the budget, flush first.
+            if micro_buffer and accum_tokens + n_tokens > per_rank_token_budget:
+                window_metrics, component_norms, grad_norm, global_step = _optimizer_step(
+                    micro_buffer,
+                    n_proteins_buffer,
+                    model,
+                    tcfg,
+                    distogram_res,
+                    distogram_atom,
+                    device,
+                    optimizer,
+                    epoch_metrics,
+                    global_step,
+                )
+                n_batches += 1
+                micro_buffer, n_proteins_buffer, accum_tokens = [], [], 0
+                if global_step % lg.log_interval == 0:
+                    pbar.set_postfix(
+                        {
+                            "loss": f"{window_metrics['total loss']:.2f}",
+                            "MSE_loss": f"{window_metrics['Kabsch aligned MSE loss']:.2f}",
+                            "CE_loss": f"{window_metrics['Cross Entropy loss']:.2f}",
+                            "smooth_lddt_loss": f"{window_metrics['smooth lddt']:.2f}",
+                            "residue_distogram_loss": (
+                                f"{window_metrics['Residue Distogram loss']:.2f}"
+                            ),
+                            "atom_distogram_loss": f"{window_metrics['Atom Distogram loss']:.2f}",
+                            "intermediate_loss": f"{window_metrics['Intermediate loss']:.2f}",
+                            "gnorm": f"{grad_norm:.2f}",
+                            **{k: f"{v:.2f}" for k, v in component_norms.items()},
+                        }
+                    )
+
             micro_buffer.append(batch)
-            if len(micro_buffer) < accum_steps:
-                continue
+            n_proteins_buffer.append(n_proteins)
+            accum_tokens += n_tokens
 
-            window_metrics = _process_accum_window(
-                micro_buffer, model, tcfg, distogram_res, distogram_atom, device
+        # Flush any window that reached the budget at epoch end.
+        if micro_buffer and accum_tokens >= per_rank_token_budget:
+            _, _, _, global_step = _optimizer_step(
+                micro_buffer,
+                n_proteins_buffer,
+                model,
+                tcfg,
+                distogram_res,
+                distogram_atom,
+                device,
+                optimizer,
+                epoch_metrics,
+                global_step,
             )
-            component_norms = _component_grad_norms(model)
-            grad_norm: float = float(
-                nn.utils.clip_grad_norm_(
-                    model.parameters(),
-                    tp.grad_clip if tp.grad_clip is not None else float("inf"),
-                )
-            )
-            optimizer.step()
-            optimizer.zero_grad()
-
-            for k in epoch_metrics:
-                epoch_metrics[k] += window_metrics[k]
             n_batches += 1
-            global_step += 1
             micro_buffer = []
-
-            if global_step % lg.log_interval == 0:
-                pbar.set_postfix(
-                    {
-                        "loss": f"{window_metrics['total loss']:.2f}",
-                        "MSE_loss": f"{window_metrics['Kabsch aligned MSE loss']:.2f}",
-                        "CE_loss": f"{window_metrics['Cross Entropy loss']:.2f}",
-                        "smooth_lddt_loss": f"{window_metrics['smooth lddt']:.2f}",
-                        "residue_distogram_loss": f"{window_metrics['Residue Distogram loss']:.2f}",
-                        "atom_distogram_loss": f"{window_metrics['Atom Distogram loss']:.2f}",
-                        "intermediate_loss": f"{window_metrics['Intermediate loss']:.2f}",
-                        "gnorm": f"{grad_norm:.2f}",
-                        **{k: f"{v:.2f}" for k, v in component_norms.items()},
-                    }
-                )
-
-        if micro_buffer:
+        elif micro_buffer:
             log.warning("dropped_partial_window", n_dropped=len(micro_buffer))
 
-        scheduler.step()
+        if n_batches > 0:
+            scheduler.step()
 
         avg_train = {k: v / max(n_batches, 1) for k, v in epoch_metrics.items()}
         avg_val = evaluate(model, test_loader, tcfg, distogram_res, distogram_atom, device)
@@ -820,10 +900,10 @@ def train_ddp(
     """DDP training loop for the MainTrunk diffusion model.
 
     Mirrors :func:`train` but runs under PyTorch DDP — one process per GPU,
-    launched via ``torchrun``.  The ``accumulated_batch_size`` field of
-    ``tcfg.training`` is divided by ``train_loader.batch_size * world_size``
-    to derive the per-rank ``accum_steps``; the micro-buffer pattern is shared
-    with :func:`train` via :func:`_process_accum_window`.
+    launched via ``torchrun``.  ``tcfg.training.accumulated_token_budget`` is
+    divided by ``world_size`` to get the per-rank token threshold; micro-batches
+    accumulate until their combined token count hits that threshold before each
+    optimizer step.
 
     Args:
         rank: Global process rank (0 = primary).
@@ -844,14 +924,12 @@ def train_ddp(
 
     tp = tcfg.training
     lg = tcfg.logging
-    accum_steps: int = max(
-        1, tp.accumulated_batch_size // (tcfg.train_loader.batch_size * world_size)
-    )
+    per_rank_token_budget: int = max(1, tp.accumulated_token_budget // world_size)
     if rank == 0:
         log.info(
             "gradient_accumulation",
-            accum_steps=accum_steps,
-            effective_batch_size=tp.accumulated_batch_size,
+            token_budget_per_rank=per_rank_token_budget,
+            global_token_budget=tp.accumulated_token_budget,
         )
 
     optimizer = Adam(ddp_model.parameters(), lr=tp.lr, weight_decay=tp.weight_decay)
@@ -872,6 +950,8 @@ def train_ddp(
         epoch_metrics: dict[str, float] = dict.fromkeys(_METRIC_KEYS, 0.0)
         n_batches = 0
         micro_buffer: list[ProteinBatch] = []
+        n_proteins_buffer: list[int] = []
+        accum_tokens: int = 0
         optimizer.zero_grad()
 
         pbar = tqdm(
@@ -882,59 +962,87 @@ def train_ddp(
         )
 
         for batch in pbar:
+            n_tokens: int = int(batch.atom_mask.any(dim=-1).sum().item())
+            n_proteins: int = batch.atom_positions.shape[0]
+
+            # Pre-flush: if adding this batch would push tokens over the budget, flush first.
+            if micro_buffer and accum_tokens + n_tokens > per_rank_token_budget:
+                window_metrics, component_norms, grad_norm, global_step = _optimizer_step(
+                    micro_buffer,
+                    n_proteins_buffer,
+                    ddp_model,
+                    tcfg,
+                    distogram_res,
+                    distogram_atom,
+                    device,
+                    optimizer,
+                    epoch_metrics,
+                    global_step,
+                )
+                if math.isnan(window_metrics["total loss"]) and rank == 0:
+                    log.warning(
+                        "nan_loss",
+                        step=global_step,
+                        nan_components=[k for k, v in window_metrics.items() if math.isnan(v)],
+                    )
+                n_batches += 1
+                micro_buffer, n_proteins_buffer, accum_tokens = [], [], 0
+                if rank == 0 and global_step % lg.log_interval == 0:
+                    pbar.set_postfix(
+                        {
+                            "loss": f"{window_metrics['total loss']:.2f}",
+                            "MSE_loss": f"{window_metrics['Kabsch aligned MSE loss']:.2f}",
+                            "CE_loss": f"{window_metrics['Cross Entropy loss']:.2f}",
+                            "smooth_lddt_loss": f"{window_metrics['smooth lddt']:.2f}",
+                            "residue_distogram_loss": (
+                                f"{window_metrics['Residue Distogram loss']:.2f}"
+                            ),
+                            "atom_distogram_loss": f"{window_metrics['Atom Distogram loss']:.2f}",
+                            "intermediate_loss": f"{window_metrics['Intermediate loss']:.2f}",
+                            "gnorm": f"{grad_norm:.2f}",
+                            **{k: f"{v:.2f}" for k, v in component_norms.items()},
+                        }
+                    )
+
             micro_buffer.append(batch)
-            if len(micro_buffer) < accum_steps:
-                continue
+            n_proteins_buffer.append(n_proteins)
+            accum_tokens += n_tokens
 
-            window_metrics = _process_accum_window(
-                micro_buffer, ddp_model, tcfg, distogram_res, distogram_atom, device
+        # Flush any window that reached the budget at epoch end.
+        if micro_buffer and accum_tokens >= per_rank_token_budget:
+            window_metrics, _, _, global_step = _optimizer_step(
+                micro_buffer,
+                n_proteins_buffer,
+                ddp_model,
+                tcfg,
+                distogram_res,
+                distogram_atom,
+                device,
+                optimizer,
+                epoch_metrics,
+                global_step,
             )
-
-            if math.isnan(window_metrics["total loss"]):
-                nan_keys = [k for k, v in window_metrics.items() if math.isnan(v)]
-                if rank == 0:
-                    log.warning("nan_loss", step=global_step, nan_components=nan_keys)
-
-            component_norms = _component_grad_norms(ddp_model)
-            grad_norm: float = float(
-                nn.utils.clip_grad_norm_(
-                    ddp_model.parameters(),
-                    tp.grad_clip if tp.grad_clip is not None else float("inf"),
+            if math.isnan(window_metrics["total loss"]) and rank == 0:
+                log.warning(
+                    "nan_loss",
+                    step=global_step,
+                    nan_components=[k for k, v in window_metrics.items() if math.isnan(v)],
                 )
-            )
-            optimizer.step()
-            optimizer.zero_grad()
-
-            for k in epoch_metrics:
-                epoch_metrics[k] += window_metrics[k]
-            n_batches += 1
-            global_step += 1
-            micro_buffer = []
-
-            if rank == 0 and global_step % lg.log_interval == 0:
-                pbar.set_postfix(
-                    {
-                        "loss": f"{window_metrics['total loss']:.2f}",
-                        "MSE_loss": f"{window_metrics['Kabsch aligned MSE loss']:.2f}",
-                        "CE_loss": f"{window_metrics['Cross Entropy loss']:.2f}",
-                        "smooth_lddt_loss": f"{window_metrics['smooth lddt']:.2f}",
-                        "residue_distogram_loss": f"{window_metrics['Residue Distogram loss']:.2f}",
-                        "atom_distogram_loss": f"{window_metrics['Atom Distogram loss']:.2f}",
-                        "intermediate_loss": f"{window_metrics['Intermediate loss']:.2f}",
-                        "gnorm": f"{grad_norm:.2f}",
-                        **{k: f"{v:.2f}" for k, v in component_norms.items()},
-                    }
-                )
-
-        if micro_buffer and rank == 0:
+            n_batches, micro_buffer = n_batches + 1, []
+        elif micro_buffer and rank == 0:
             log.warning("dropped_partial_window", n_dropped=len(micro_buffer))
 
         scheduler.step()
 
         avg_train = {k: v / max(n_batches, 1) for k, v in epoch_metrics.items()}
-        _eff_world_size = world_size if dist.is_initialized() else 1
         avg_val = evaluate_ddp(
-            _eff_world_size, ddp_model, test_loader, tcfg, distogram_res, distogram_atom, device
+            world_size if dist.is_initialized() else 1,
+            ddp_model,
+            test_loader,
+            tcfg,
+            distogram_res,
+            distogram_atom,
+            device,
         )
         ddp_model.train()
 

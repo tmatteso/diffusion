@@ -139,7 +139,9 @@ def model() -> MainTrunk:
 def tcfg(tmp_path: pathlib.Path) -> TrainConfig:
     """Provide a single-epoch TrainConfig with a temporary checkpoint path."""
     return TrainConfig(
-        training=TrainingParams(num_epochs=1, lr=1e-4, grad_clip=1.0, accumulated_batch_size=2),
+        training=TrainingParams(
+            num_epochs=1, lr=1e-4, grad_clip=1.0, accumulated_token_budget=_BATCH_TOKENS
+        ),
         model=ModelParams(
             f_ref_dim=_F_REF_DIM,
             n_bins=_N_BINS,
@@ -191,7 +193,9 @@ def loader(
 def tcfg_multi(tmp_path: pathlib.Path) -> TrainConfig:
     """Provide a 3-epoch TrainConfig for multi-epoch loop tests."""
     return TrainConfig(
-        training=TrainingParams(num_epochs=3, lr=1e-3, grad_clip=1.0, accumulated_batch_size=2),
+        training=TrainingParams(
+            num_epochs=3, lr=1e-3, grad_clip=1.0, accumulated_token_budget=_BATCH_TOKENS
+        ),
         model=ModelParams(
             f_ref_dim=_F_REF_DIM,
             n_bins=_N_BINS,
@@ -213,7 +217,9 @@ def tcfg_multi(tmp_path: pathlib.Path) -> TrainConfig:
 def tcfg_no_clip(tmp_path: pathlib.Path) -> TrainConfig:
     """Provide a TrainConfig with grad_clip=None to exercise the unclipped gradient path."""
     return TrainConfig(
-        training=TrainingParams(num_epochs=1, lr=1e-4, grad_clip=None, accumulated_batch_size=2),
+        training=TrainingParams(
+            num_epochs=1, lr=1e-4, grad_clip=None, accumulated_token_budget=_BATCH_TOKENS
+        ),
         model=ModelParams(
             f_ref_dim=_F_REF_DIM,
             n_bins=_N_BINS,
@@ -235,7 +241,9 @@ def tcfg_no_clip(tmp_path: pathlib.Path) -> TrainConfig:
 def tcfg_wandb(tmp_path: pathlib.Path) -> TrainConfig:
     """Provide a 1-epoch TrainConfig with W&B logging enabled for wandb-branch tests."""
     return TrainConfig(
-        training=TrainingParams(num_epochs=1, lr=1e-4, grad_clip=1.0, accumulated_batch_size=2),
+        training=TrainingParams(
+            num_epochs=1, lr=1e-4, grad_clip=1.0, accumulated_token_budget=_BATCH_TOKENS
+        ),
         model=ModelParams(
             f_ref_dim=_F_REF_DIM,
             n_bins=_N_BINS,
@@ -257,7 +265,9 @@ def tcfg_wandb(tmp_path: pathlib.Path) -> TrainConfig:
 def tcfg_wandb_3ep(tmp_path: pathlib.Path) -> TrainConfig:
     """Provide a 3-epoch TrainConfig with W&B logging enabled for multi-epoch wandb tests."""
     return TrainConfig(
-        training=TrainingParams(num_epochs=3, lr=1e-4, grad_clip=1.0, accumulated_batch_size=2),
+        training=TrainingParams(
+            num_epochs=3, lr=1e-4, grad_clip=1.0, accumulated_token_budget=_BATCH_TOKENS
+        ),
         model=ModelParams(
             f_ref_dim=_F_REF_DIM,
             n_bins=_N_BINS,
@@ -279,7 +289,9 @@ def tcfg_wandb_3ep(tmp_path: pathlib.Path) -> TrainConfig:
 def tcfg_save(tmp_path: pathlib.Path) -> TrainConfig:
     """Provide a TrainConfig with save_every=1 to exercise the periodic epoch checkpoint path."""
     return TrainConfig(
-        training=TrainingParams(num_epochs=1, lr=1e-4, grad_clip=1.0, accumulated_batch_size=2),
+        training=TrainingParams(
+            num_epochs=1, lr=1e-4, grad_clip=1.0, accumulated_token_budget=_BATCH_TOKENS
+        ),
         model=ModelParams(
             f_ref_dim=_F_REF_DIM,
             n_bins=_N_BINS,
@@ -1519,7 +1531,9 @@ def test_train_resume_runs_remaining_epochs(
     """Resuming from a 1-epoch checkpoint with num_epochs=3 runs exactly 2 more epochs."""
     ckpt_path = str(tmp_path / "best.pt")
     tcfg_first = TrainConfig(
-        training=TrainingParams(num_epochs=1, lr=1e-4, grad_clip=1.0, accumulated_batch_size=2),
+        training=TrainingParams(
+            num_epochs=1, lr=1e-4, grad_clip=1.0, accumulated_token_budget=_BATCH_TOKENS
+        ),
         model=ModelParams(
             f_ref_dim=_F_REF_DIM,
             n_bins=_N_BINS,
@@ -1556,7 +1570,7 @@ def test_train_resume_runs_remaining_epochs(
             lr=1e-4,
             grad_clip=1.0,
             resume_checkpoint=ckpt_path,
-            accumulated_batch_size=2,
+            accumulated_token_budget=_BATCH_TOKENS,
         ),
         model=ModelParams(
             f_ref_dim=_F_REF_DIM,
@@ -1587,7 +1601,9 @@ def test_train_resume_restores_optimizer_state(
     """Optimizer state (exp_avg) loaded from checkpoint is non-zero after one resumed step."""
     ckpt_path = str(tmp_path / "opt.pt")
     tcfg_first = TrainConfig(
-        training=TrainingParams(num_epochs=1, lr=1e-4, grad_clip=1.0, accumulated_batch_size=2),
+        training=TrainingParams(
+            num_epochs=1, lr=1e-4, grad_clip=1.0, accumulated_token_budget=_BATCH_TOKENS
+        ),
         model=ModelParams(
             f_ref_dim=_F_REF_DIM,
             n_bins=_N_BINS,
@@ -1621,7 +1637,9 @@ def test_train_resume_restores_scheduler_state(
     """Scheduler last_epoch in saved checkpoint matches the epoch at which it was written."""
     ckpt_path = str(tmp_path / "sched.pt")
     tcfg_first = TrainConfig(
-        training=TrainingParams(num_epochs=1, lr=1e-4, grad_clip=1.0, accumulated_batch_size=2),
+        training=TrainingParams(
+            num_epochs=1, lr=1e-4, grad_clip=1.0, accumulated_token_budget=_BATCH_TOKENS
+        ),
         model=ModelParams(
             f_ref_dim=_F_REF_DIM,
             n_bins=_N_BINS,
@@ -1651,7 +1669,9 @@ def test_train_resume_checkpoint_epoch_and_step(
     """Saved checkpoint records the correct epoch number and global_step."""
     ckpt_path = str(tmp_path / "meta.pt")
     tcfg_first = TrainConfig(
-        training=TrainingParams(num_epochs=1, lr=1e-4, grad_clip=1.0, accumulated_batch_size=2),
+        training=TrainingParams(
+            num_epochs=1, lr=1e-4, grad_clip=1.0, accumulated_token_budget=_BATCH_TOKENS
+        ),
         model=ModelParams(
             f_ref_dim=_F_REF_DIM,
             n_bins=_N_BINS,
@@ -1743,9 +1763,11 @@ def test_train_one_epoch_with_bucketed_loader(
 
 @pytest.fixture
 def tcfg_accum(tmp_path: pathlib.Path) -> TrainConfig:
-    """TrainConfig with accumulated_batch_size=4, giving accum_steps=2 with batch_size=2."""
+    """TrainConfig with budget=2*_BATCH_TOKENS, requiring 2 micro-batches per optimizer step."""
     return TrainConfig(
-        training=TrainingParams(num_epochs=1, lr=1e-4, grad_clip=1.0, accumulated_batch_size=4),
+        training=TrainingParams(
+            num_epochs=1, lr=1e-4, grad_clip=1.0, accumulated_token_budget=2 * _BATCH_TOKENS
+        ),
         model=ModelParams(
             f_ref_dim=_F_REF_DIM,
             n_bins=_N_BINS,
@@ -1896,30 +1918,21 @@ def test_train_ddp_accumulation_full_window_updates_params(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True, reason="Requires Task 2: rename accumulated_batch_size → accumulated_token_budget"
-)
 def test_accumulated_token_budget_default() -> None:
     """accumulated_token_budget defaults to 2048."""
-    assert TrainingParams().accumulated_token_budget == 2048  # type: ignore[attr-defined]
+    assert TrainingParams().accumulated_token_budget == 2048
 
 
-@pytest.mark.xfail(
-    strict=True, reason="Requires Task 2: rename accumulated_batch_size → accumulated_token_budget"
-)
 def test_accumulated_token_budget_rejects_zero() -> None:
     """TrainingParams raises ValidationError when accumulated_token_budget is zero."""
     with pytest.raises(ValidationError):
-        TrainingParams(accumulated_token_budget=0)  # type: ignore[call-arg]
+        TrainingParams(accumulated_token_budget=0)
 
 
-@pytest.mark.xfail(
-    strict=True, reason="Requires Task 2: rename accumulated_batch_size → accumulated_token_budget"
-)
 def test_train_config_accepts_any_positive_token_budget() -> None:
     """TrainConfig no longer validates token budget against batch_size."""
-    cfg = TrainConfig(training=TrainingParams(accumulated_token_budget=1))  # type: ignore[call-arg]
-    assert cfg.training.accumulated_token_budget == 1  # type: ignore[attr-defined]
+    cfg = TrainConfig(training=TrainingParams(accumulated_token_budget=1))
+    assert cfg.training.accumulated_token_budget == 1
 
 
 # ---------------------------------------------------------------------------
@@ -1927,9 +1940,6 @@ def test_train_config_accepts_any_positive_token_budget() -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True, reason="Requires Task 2: _process_accum_window n_proteins_per_batch param"
-)
 def test_process_accum_window_protein_weighted_grad_scale(
     protein_batch: ProteinBatch,
     model: MainTrunk,
@@ -1961,7 +1971,7 @@ def test_process_accum_window_protein_weighted_grad_scale(
 
     _process_accum_window(
         micro_buffer=[protein_batch, protein_batch],
-        n_proteins_per_batch=[1, 3],  # type: ignore[call-arg]
+        n_proteins_per_batch=[1, 3],
         model=model,
         tcfg=tcfg,
         distogram_res=distogram_res,
@@ -1979,7 +1989,6 @@ def test_process_accum_window_protein_weighted_grad_scale(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason="Requires Task 2: token-budget accumulation loop")
 def test_train_token_budget_preflush_fires_before_oversized_batch(
     model: MainTrunk,
     distogram_res: Distogram,
@@ -2011,14 +2020,14 @@ def test_train_token_budget_preflush_fires_before_oversized_batch(
         dev: str,
     ) -> dict[str, float]:
         window_sizes.append(len(micro_buffer))
-        return _real_process(micro_buffer, n_proteins_per_batch, mdl, cfg, dr, da, dev)  # type: ignore[call-arg]
+        return _real_process(micro_buffer, n_proteins_per_batch, mdl, cfg, dr, da, dev)
 
     monkeypatch.setattr("train.train_loop._process_accum_window", _tracking_process)
 
     budget: int = _BATCH_TOKENS + _BATCH_TOKENS // 2  # 24: one batch (16) fits; two (32) don't
     tcfg_budget = TrainConfig(
         training=TrainingParams(
-            num_epochs=1, lr=1e-4, grad_clip=1.0, accumulated_token_budget=budget  # type: ignore[call-arg]
+            num_epochs=1, lr=1e-4, grad_clip=1.0, accumulated_token_budget=budget
         ),
         model=ModelParams(
             f_ref_dim=_F_REF_DIM,
