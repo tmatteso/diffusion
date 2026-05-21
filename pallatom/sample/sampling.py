@@ -27,9 +27,9 @@ from helpers.atom_utils import (
     rigid_group_atom_positions,
     to_pdb,
 )
-from helpers.data import _FileLogProcessor
 from helpers.featurize import Distogram, FeaturizedBatch, sinusoidal_encoding
 from jaxtyping import Bool, Float, Int, jaxtyped
+from train.train_loop import StructlogConfig
 
 log = structlog.get_logger()
 
@@ -588,118 +588,105 @@ if __name__ == "__main__":
     parser.add_argument("--log_file", required=True, help="path to write structured JSON log lines")
     args = parser.parse_args()
 
-    _processors = [
-        structlog.processors.TimeStamper(fmt="iso", utc=True),
-        structlog.stdlib.add_log_level,
-        structlog.processors.StackInfoRenderer(),
-        _FileLogProcessor(args.log_file),
-        structlog.dev.ConsoleRenderer(),
-    ]
-    structlog.configure(
-        processors=_processors,
-        wrapper_class=structlog.make_filtering_bound_logger(20),  # INFO level
-        context_class=dict,
-        logger_factory=structlog.PrintLoggerFactory(),
-    )
+    with StructlogConfig(is_rank_zero=True, log_file=args.log_file):
+        try:
+            device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
-    try:
-        device: str = "cuda" if torch.cuda.is_available() else "cpu"
-
-        scfg: SampleConfig = SampleConfig.model_validate(
-            _json.loads(_Path(args.config).read_text())
-        )
-        mp = scfg.model
-        noise = scfg.noise
-        sampler_p = scfg.sampler
-        gen = scfg.generation
-        log.info("config loaded", config=args.config, n_res=gen.n_res, n_samples=gen.n_samples)
-
-        model = MainTrunk(
-            f_ref_dim=mp.f_ref_dim,
-            n_bins=mp.n_bins,
-            c_atom=mp.c_atom,
-            c_pair=mp.c_pair,
-            c_res=mp.c_res,
-            c_atompair=mp.c_atompair,
-            K_unit=mp.K_unit,
-            sigma_data=noise.sigma_data,
-        ).to(device)
-        ckpt = torch.load(scfg.checkpoint.checkpoint_path, map_location=device)
-        model.load_state_dict(ckpt["model"])
-        model.eval()
-        log.info("model loaded", checkpoint=scfg.checkpoint.checkpoint_path, device=device)
-
-        N_RES: int = gen.n_res
-        N_atom: int = N_RES * NATOM
-        B_SAMPLE: int = gen.n_samples
-
-        from helpers.featurize import Distogram as _Distogram
-
-        _atom_disto = _Distogram(n_bins=22, min_dist=2.0, max_dist=22.0, overflow_bin=False).to(
-            device
-        )
-        _templ_disto = _Distogram(
-            n_bins=mp.n_bins - 1, min_dist=3.25, max_dist=50.75, overflow_bin=True
-        ).to(device)
-        context: FeaturizedBatch = build_sampling_context(
-            atom_positions=torch.zeros(N_RES, 37, 3, device=device),
-            atom_mask=torch.ones(N_RES, 37, device=device),
-            residue_index=torch.arange(N_RES, dtype=torch.float, device=device),
-            seq="A" * N_RES,
-            pdb_files=[],
-            atom_distogram_fn=_atom_disto,
-            templ_distogram_fn=_templ_disto,
-            c_res=mp.c_res,
-            batch_size=B_SAMPLE,
-            device=device,
-        )
-        edm_precond: EDMPrecond = EDMPrecond(
-            model,
-            context,
-            sigma_min=noise.sigma_min,
-            sigma_max=noise.sigma_max,
-        ).to(device)
-        edm_precond.eval()
-
-        edm_sampler: EDMSampler = EDMSampler(
-            edm_precond,
-            sigma_min=noise.sigma_min,
-            sigma_max=noise.sigma_max,
-            rho=sampler_p.rho,
-            S_churn=sampler_p.S_churn,
-            S_tmin=sampler_p.S_tmin,
-            S_tmax=sampler_p.S_tmax,
-            S_noise=sampler_p.S_noise,
-        )
-
-        log.info("sampling", n_res=N_RES, n_samples=B_SAMPLE, ddim_steps=sampler_p.ddim_steps)
-        coords_batch: Float[torch.Tensor, "B N_atom 3"]
-        seq_logits_batch: Float[torch.Tensor, "B N_res n_amino"]
-        coords_batch, seq_logits_batch = edm_sampler.sample(
-            shape=(B_SAMPLE, N_atom, 3),
-            steps=sampler_p.ddim_steps,
-            device=device,
-        )
-        log.info("sampling complete", n_res=N_RES, n_samples=B_SAMPLE)
-
-        pdb_strings: list[str] = []
-        for b in range(B_SAMPLE):
-            coords_t: Float[torch.Tensor, "N_res 5 3"] = rearrange(
-                coords_batch[b].cpu(), "(n a) d -> n a d", n=N_RES, a=NATOM
+            scfg: SampleConfig = SampleConfig.model_validate(
+                _json.loads(_Path(args.config).read_text())
             )
-            x_37, mask_37 = atom5_to_atom37(coords_t)
-            prot = Protein(
-                atom_positions=x_37.numpy(),
-                atom_mask=mask_37.numpy(),
-                residue_index=np.arange(N_RES, dtype=np.intp),
-                aatype=np.zeros(N_RES, dtype=np.intp),
-                chain_index=np.zeros(N_RES, dtype=np.intp),
-                b_factors=np.ones((N_RES, 37), dtype=np.float64),
-            )
-            pdb_strings.append(to_pdb(prot))
+            mp = scfg.model
+            noise = scfg.noise
+            sampler_p = scfg.sampler
+            gen = scfg.generation
+            log.info("config loaded", config=args.config, n_res=gen.n_res, n_samples=gen.n_samples)
 
-        _Path(scfg.output.output_path).write_text(_json.dumps(pdb_strings))
-        log.info("output written", path=scfg.output.output_path, n_structures=B_SAMPLE)
-    except Exception as _exc:
-        log.exception("fatal", error=str(_exc), traceback=_tb.format_exc())
-        raise SystemExit(1) from _exc
+            model = MainTrunk(
+                f_ref_dim=mp.f_ref_dim,
+                n_bins=mp.n_bins,
+                c_atom=mp.c_atom,
+                c_pair=mp.c_pair,
+                c_res=mp.c_res,
+                c_atompair=mp.c_atompair,
+                K_unit=mp.K_unit,
+                sigma_data=noise.sigma_data,
+            ).to(device)
+            ckpt = torch.load(scfg.checkpoint.checkpoint_path, map_location=device)
+            model.load_state_dict(ckpt["model"])
+            model.eval()
+            log.info("model loaded", checkpoint=scfg.checkpoint.checkpoint_path, device=device)
+
+            N_RES: int = gen.n_res
+            N_atom: int = N_RES * NATOM
+            B_SAMPLE: int = gen.n_samples
+
+            from helpers.featurize import Distogram as _Distogram
+
+            _atom_disto = _Distogram(n_bins=22, min_dist=2.0, max_dist=22.0, overflow_bin=False).to(
+                device
+            )
+            _templ_disto = _Distogram(
+                n_bins=mp.n_bins - 1, min_dist=3.25, max_dist=50.75, overflow_bin=True
+            ).to(device)
+            context: FeaturizedBatch = build_sampling_context(
+                atom_positions=torch.zeros(N_RES, 37, 3, device=device),
+                atom_mask=torch.ones(N_RES, 37, device=device),
+                residue_index=torch.arange(N_RES, dtype=torch.float, device=device),
+                seq="A" * N_RES,
+                pdb_files=[],
+                atom_distogram_fn=_atom_disto,
+                templ_distogram_fn=_templ_disto,
+                c_res=mp.c_res,
+                batch_size=B_SAMPLE,
+                device=device,
+            )
+            edm_precond: EDMPrecond = EDMPrecond(
+                model,
+                context,
+                sigma_min=noise.sigma_min,
+                sigma_max=noise.sigma_max,
+            ).to(device)
+            edm_precond.eval()
+
+            edm_sampler: EDMSampler = EDMSampler(
+                edm_precond,
+                sigma_min=noise.sigma_min,
+                sigma_max=noise.sigma_max,
+                rho=sampler_p.rho,
+                S_churn=sampler_p.S_churn,
+                S_tmin=sampler_p.S_tmin,
+                S_tmax=sampler_p.S_tmax,
+                S_noise=sampler_p.S_noise,
+            )
+
+            log.info("sampling", n_res=N_RES, n_samples=B_SAMPLE, ddim_steps=sampler_p.ddim_steps)
+            coords_batch: Float[torch.Tensor, "B N_atom 3"]
+            seq_logits_batch: Float[torch.Tensor, "B N_res n_amino"]
+            coords_batch, seq_logits_batch = edm_sampler.sample(
+                shape=(B_SAMPLE, N_atom, 3),
+                steps=sampler_p.ddim_steps,
+                device=device,
+            )
+            log.info("sampling complete", n_res=N_RES, n_samples=B_SAMPLE)
+
+            pdb_strings: list[str] = []
+            for b in range(B_SAMPLE):
+                coords_t: Float[torch.Tensor, "N_res 5 3"] = rearrange(
+                    coords_batch[b].cpu(), "(n a) d -> n a d", n=N_RES, a=NATOM
+                )
+                x_37, mask_37 = atom5_to_atom37(coords_t)
+                prot = Protein(
+                    atom_positions=x_37.numpy(),
+                    atom_mask=mask_37.numpy(),
+                    residue_index=np.arange(N_RES, dtype=np.intp),
+                    aatype=np.zeros(N_RES, dtype=np.intp),
+                    chain_index=np.zeros(N_RES, dtype=np.intp),
+                    b_factors=np.ones((N_RES, 37), dtype=np.float64),
+                )
+                pdb_strings.append(to_pdb(prot))
+
+            _Path(scfg.output.output_path).write_text(_json.dumps(pdb_strings))
+            log.info("output written", path=scfg.output.output_path, n_structures=B_SAMPLE)
+        except Exception as _exc:
+            log.exception("fatal", error=str(_exc), traceback=_tb.format_exc())
+            raise SystemExit(1) from _exc

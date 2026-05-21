@@ -3,9 +3,7 @@
 import argparse
 import contextlib
 import math
-import os
 import time
-import traceback
 from typing import cast
 
 import structlog
@@ -25,8 +23,8 @@ from beartype import beartype
 from einops import rearrange
 from helpers.alignment import kabsch_align
 from helpers.bucketed_sampler import BucketedBatchSampler
+from helpers.context_managers import DistProcessGroup, FatalOnError, StructlogConfig
 from helpers.data import (
-    _FileLogProcessor,
     make_ddp_bucketed_data_loaders,
 )
 from helpers.featurize import Distogram, ProteinBatch, apply_conditioning_dropout, featurize_batch
@@ -311,6 +309,9 @@ def train_step(
     lp = tcfg.loss
 
     featurized_batch = featurize_batch(batch, tcfg, distogram_res, distogram_atom, device)
+    # Save original amino-acid indices before conditioning dropout replaces some with <MASK> (20).
+    orig_aa_indices: Int[torch.Tensor, "B N_res"] = featurized_batch.aa_indices.clone()
+
     featurized_batch = apply_conditioning_dropout(
         featurized_batch,
         p_distogram=tcfg.conditioning_dropout.p_distogram,
@@ -318,6 +319,14 @@ def train_step(
         p_seq=tcfg.conditioning_dropout.p_seq,
         device=device,
     )
+    # MLM-style CE targets: original amino acid at positions where dropout placed <MASK> (20),
+    # -100 (ignore_index) at positions the model can still see and at padding.
+    # This forces the model to predict sequence from structure, not copy visible conditioning.
+    mask_positions: Int[torch.Tensor, "B N_res"] = featurized_batch.aa_indices == 20
+    aa_targets: Int[torch.Tensor, "B N_res"] = orig_aa_indices.masked_fill(~mask_positions, -100)
+    # Flat targets reused for final and intermediate CE; count guards against p_seq=0 edge case.
+    flat_aa_targets: Int[torch.Tensor, "B_N_res"] = rearrange(aa_targets, "b n -> (b n)")
+    n_masked_aa: Int[torch.Tensor, ""] = (flat_aa_targets >= 0).sum().clamp(min=1)
 
     t0 = time.perf_counter()
     (
@@ -342,11 +351,20 @@ def train_step(
     for k_idx, intermediate_denoised_coord in enumerate(intermediate_denoised_coord_stack):
         intermediate_denoised_coord: Float[torch.Tensor, "B N_atom 3"]
         gamma_K_minus_k: float = lp.gamma ** (K_unit - k_idx - 1)
-        k_loss: Float[torch.Tensor, ""] = lp.lam * atom_loss(
-            intermediate_denoised_coord, featurized_batch.r_gt, featurized_batch.atom5_mask
-        ) + lp.alpha_0 * F.cross_entropy(
-            rearrange(intermediate_pred_aa_logit_stack[k_idx], "b n c -> (b n) c"),
-            rearrange(_mask_seq_target(featurized_batch.aa_indices), "b n -> (b n)"),
+        inter_ce: Float[torch.Tensor, ""] = (
+            F.cross_entropy(
+                rearrange(intermediate_pred_aa_logit_stack[k_idx], "b n c -> (b n) c"),
+                flat_aa_targets,
+                reduction="sum",
+            )
+            / n_masked_aa
+        )
+        k_loss: Float[torch.Tensor, ""] = (
+            lp.lam
+            * atom_loss(
+                intermediate_denoised_coord, featurized_batch.r_gt, featurized_batch.atom5_mask
+            )
+            + lp.alpha_0 * inter_ce
         )
         intermediate_med_loss = intermediate_med_loss + gamma_K_minus_k * k_loss
     intermediate_med_loss = (intermediate_med_loss / max(K_unit, 1)).mean()
@@ -686,7 +704,14 @@ def train(
 
             if global_step % lg.log_interval == 0:
                 pbar.set_postfix(
-                    loss=f"{window_metrics['total loss']:.4f}", gnorm=f"{grad_norm:.3f}"
+                    loss=f"{window_metrics['total loss']:.2f}",
+                    MSE_loss=f"{window_metrics['Kabsch aligned MSE loss']:.2f}",
+                    CE_loss=f"{window_metrics['Cross Entropy loss']:.2f}",
+                    smooth_lddt_loss=f"{window_metrics['smooth lddt']:.2f}",
+                    residue_distogram_loss=f"{window_metrics['Residue Distogram loss']:.2f}",
+                    atom_distogram_loss=f"{window_metrics['Atom Distogram loss']:.2f}",
+                    intermediate_loss=f"{window_metrics['Intermediate loss']:.2f}",
+                    gnorm=f"{grad_norm:.2f}",
                 )
 
         if micro_buffer:
@@ -809,7 +834,14 @@ def train_ddp(
 
             if rank == 0 and global_step % lg.log_interval == 0:
                 pbar.set_postfix(
-                    loss=f"{window_metrics['total loss']:.4f}", gnorm=f"{grad_norm:.3f}"
+                    loss=f"{window_metrics['total loss']:.2f}",
+                    MSE_loss=f"{window_metrics['Kabsch aligned MSE loss']:.2f}",
+                    CE_loss=f"{window_metrics['Cross Entropy loss']:.2f}",
+                    smooth_lddt_loss=f"{window_metrics['smooth lddt']:.2f}",
+                    residue_distogram_loss=f"{window_metrics['Residue Distogram loss']:.2f}",
+                    atom_distogram_loss=f"{window_metrics['Atom Distogram loss']:.2f}",
+                    intermediate_loss=f"{window_metrics['Intermediate loss']:.2f}",
+                    gnorm=f"{grad_norm:.2f}",
                 )
 
         if micro_buffer and rank == 0:
@@ -838,104 +870,74 @@ def train_ddp(
         )
 
 
+def main(args: argparse.Namespace, tcfg: TrainConfig) -> None:
+    """Entry point for DDP training."""
+    with (
+        DistProcessGroup("nccl") as dpg,
+        StructlogConfig(dpg.is_rank_zero, args.log_file),
+        FatalOnError(),
+    ):
+        train_loader, val_loader, _ = make_ddp_bucketed_data_loaders(
+            tcfg,
+            args.data,
+            args.splits,
+            rank=dpg.rank,
+            world_size=dpg.world_size,
+            num_workers=args.num_workers,
+        )
+
+        mp = tcfg.model
+        model = MainTrunk(
+            f_ref_dim=mp.f_ref_dim,
+            n_bins=mp.n_bins,
+            n_atom_bins=tcfg.distogram_atom.n_bins,
+            c_atom=mp.c_atom,
+            c_pair=mp.c_pair,
+            c_res=mp.c_res,
+            c_atompair=mp.c_atompair,
+            K_unit=mp.K_unit,
+            sigma_data=tcfg.noise.sigma_data,
+        ).to(dpg.device)
+
+        dr = tcfg.distogram_res
+        da = tcfg.distogram_atom
+        distogram_res = Distogram(
+            n_bins=dr.n_bins, min_dist=dr.min_dist, max_dist=dr.max_dist, overflow_bin=True
+        ).to(dpg.device)
+        distogram_atom = Distogram(
+            n_bins=da.n_bins, min_dist=da.min_dist, max_dist=da.max_dist, overflow_bin=False
+        ).to(dpg.device)
+
+        if tcfg.training.pretrained_weights is not None:
+            ckpt = torch.load(tcfg.training.pretrained_weights, map_location=dpg.device)
+            model.load_state_dict(ckpt["model"])
+            if dpg.is_rank_zero:
+                log.info("loaded pretrained weights", path=tcfg.training.pretrained_weights)
+
+        if dpg.is_rank_zero and tcfg.logging.use_wandb:
+            wandb.init(project=tcfg.logging.wandb_project, config=tcfg.model_dump())
+
+        train_ddp(
+            rank=dpg.rank,
+            local_rank=dpg.local_rank,
+            world_size=dpg.world_size,
+            model=model,
+            tcfg=tcfg,
+            train_loader=train_loader,
+            test_loader=val_loader,
+            distogram_res=distogram_res,
+            distogram_atom=distogram_atom,
+        )
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train PallAtom (DDP)")
     parser.add_argument("--data", required=True, help="path to proteins.jsonl")
     parser.add_argument("--splits", required=True, help="path to splits.json")
-    parser.add_argument(
-        "--config", default=None, help="path to TrainConfig JSON (omit for defaults)"
-    )
+    parser.add_argument("--config", help="path to TrainConfig JSON (omit for defaults)")
     parser.add_argument("--log_file", default=None, help="path to write structured JSON log lines")
     parser.add_argument("--num_workers", type=int, default=4)
     args = parser.parse_args()
-
-    dist.init_process_group(backend="nccl")
-    try:
-        rank = dist.get_rank()
-        local_rank = int(os.environ["LOCAL_RANK"])
-        world_size = dist.get_world_size()
-        device = f"cuda:{local_rank}"
-        torch.cuda.set_device(local_rank)
-
-        _processors = [
-            structlog.processors.TimeStamper(fmt="iso", utc=True),
-            structlog.stdlib.add_log_level,
-            structlog.processors.StackInfoRenderer(),
-        ]
-        if rank == 0:
-            _processors.append(structlog.dev.ConsoleRenderer())
-
-        with contextlib.ExitStack() as _stack:
-            if args.log_file and rank == 0:
-                _processors.insert(-1, _stack.enter_context(_FileLogProcessor(args.log_file)))
-
-            structlog.configure(
-                processors=_processors,
-                wrapper_class=structlog.make_filtering_bound_logger(20),
-                context_class=dict,
-                logger_factory=structlog.PrintLoggerFactory(),
-            )
-
-            try:
-                if args.config is not None:
-                    with open(args.config) as _f:
-                        tcfg = TrainConfig.model_validate_json(_f.read())
-                else:
-                    tcfg = TrainConfig()
-
-                train_loader, val_loader, _ = make_ddp_bucketed_data_loaders(
-                    tcfg,
-                    args.data,
-                    args.splits,
-                    rank=rank,
-                    world_size=world_size,
-                    num_workers=args.num_workers,
-                )
-
-                mp = tcfg.model
-                model = MainTrunk(
-                    f_ref_dim=mp.f_ref_dim,
-                    n_bins=mp.n_bins,
-                    n_atom_bins=tcfg.distogram_atom.n_bins,
-                    c_atom=mp.c_atom,
-                    c_pair=mp.c_pair,
-                    c_res=mp.c_res,
-                    c_atompair=mp.c_atompair,
-                    K_unit=mp.K_unit,
-                    sigma_data=tcfg.noise.sigma_data,
-                ).to(device)
-
-                dr = tcfg.distogram_res
-                da = tcfg.distogram_atom
-                distogram_res = Distogram(
-                    n_bins=dr.n_bins, min_dist=dr.min_dist, max_dist=dr.max_dist, overflow_bin=True
-                ).to(device)
-                distogram_atom = Distogram(
-                    n_bins=da.n_bins, min_dist=da.min_dist, max_dist=da.max_dist, overflow_bin=False
-                ).to(device)
-
-                if tcfg.training.pretrained_weights is not None:
-                    ckpt = torch.load(tcfg.training.pretrained_weights, map_location=device)
-                    model.load_state_dict(ckpt["model"])
-                    if rank == 0:
-                        log.info("loaded pretrained weights", path=tcfg.training.pretrained_weights)
-
-                if rank == 0 and tcfg.logging.use_wandb:
-                    wandb.init(project=tcfg.logging.wandb_project, config=tcfg.model_dump())
-
-                train_ddp(
-                    rank=rank,
-                    local_rank=local_rank,
-                    world_size=world_size,
-                    model=model,
-                    tcfg=tcfg,
-                    train_loader=train_loader,
-                    test_loader=val_loader,
-                    distogram_res=distogram_res,
-                    distogram_atom=distogram_atom,
-                )
-            except Exception as _exc:
-                log.exception("fatal", error=str(_exc), traceback=traceback.format_exc())
-                raise SystemExit(1) from _exc
-    finally:
-        dist.destroy_process_group()
+    with open(args.config) as _f:
+        tcfg = TrainConfig.model_validate_json(_f.read())
+    main(args, tcfg)

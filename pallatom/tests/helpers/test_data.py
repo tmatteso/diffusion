@@ -2,7 +2,6 @@
 
 import json
 import math
-import os
 import pathlib
 import pickle
 from collections.abc import Mapping
@@ -15,7 +14,6 @@ from helpers.bucketed_sampler import BucketedBatchSampler
 from helpers.data import (
     ClusteredProteinDataset,
     ProteinDataset,
-    _FileLogProcessor,
     _to_protein_batch_dynamic,
     make_bucketed_data_loaders,
     make_data_loaders,
@@ -407,73 +405,6 @@ def test_make_ddp_data_loaders_train_sampler_world_size(
     train_loader, _, _ = make_ddp_data_loaders(cfg, jsonl_path, splits_path, rank=0, world_size=2)
     assert isinstance(train_loader.sampler, DistributedSampler)
     assert train_loader.sampler.num_replicas == 2
-
-
-# ---------------------------------------------------------------------------
-# _FileLogProcessor
-# ---------------------------------------------------------------------------
-
-
-def test_file_log_processor_creates_file(tmp_path: pathlib.Path):
-    """_FileLogProcessor creates the log file on disk when constructed."""
-    path = str(tmp_path / "run.jsonl")
-    _FileLogProcessor(path)
-    assert os.path.exists(path)
-
-
-def test_file_log_processor_returns_event_dict(tmp_path: pathlib.Path):
-    """_FileLogProcessor.__call__ returns the event dict unchanged (pass-through)."""
-    path = str(tmp_path / "run.jsonl")
-    proc = _FileLogProcessor(path)
-    event = {"event": "test", "value": 1}
-    returned = proc(None, None, event)
-    assert returned is event
-
-
-def test_file_log_processor_writes_json_line(tmp_path: pathlib.Path):
-    """_FileLogProcessor serialises each event dict as a JSON line in the log file."""
-    path = str(tmp_path / "run.jsonl")
-    proc = _FileLogProcessor(path)
-    event = {"event": "train", "loss": 0.5}
-    proc(None, None, event)
-    with open(path) as fh:
-        written = json.loads(fh.readline())
-    assert written == event
-
-
-def test_file_log_processor_writes_multiple_lines(tmp_path: pathlib.Path):
-    """_FileLogProcessor writes one JSON line per event when called multiple times."""
-    path = str(tmp_path / "run.jsonl")
-    proc = _FileLogProcessor(path)
-    events = [{"event": "a", "x": 1}, {"event": "b", "x": 2}]
-    for ev in events:
-        proc(None, None, ev)
-    with open(path) as fh:
-        lines = fh.readlines()
-    assert len(lines) == 2
-    assert [json.loads(line) for line in lines] == events
-
-
-def test_file_log_processor_truncates_existing_file(tmp_path: pathlib.Path):
-    """_FileLogProcessor truncates a pre-existing log file rather than appending."""
-    path = str(tmp_path / "run.jsonl")
-    with open(path, "w") as fh:
-        fh.write('{"stale": true}\n' * 5)
-    proc = _FileLogProcessor(path)
-    proc(None, None, {"event": "fresh"})
-    with open(path) as fh:
-        lines = fh.readlines()
-    assert len(lines) == 1
-    assert json.loads(lines[0]) == {"event": "fresh"}
-
-
-def test_file_log_processor_context_manager_closes_file(tmp_path: pathlib.Path):
-    """_FileLogProcessor.__exit__ closes the underlying file handle."""
-    path = str(tmp_path / "run.jsonl")
-    proc = _FileLogProcessor(path)
-    with proc:
-        proc(None, None, {"event": "inside"})
-    assert proc._f.closed
 
 
 # ---------------------------------------------------------------------------

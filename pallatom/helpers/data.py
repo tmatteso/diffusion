@@ -598,33 +598,3 @@ def make_ddp_bucketed_data_loaders(
         ]""",
         (train_loader, val_loader, test_loader),
     )
-
-
-class _FileLogProcessor:
-    """Structlog processor that appends JSON lines to a file, then passes the event dict through.
-
-    Opens the log file with line-buffering (buffering=1) on construction so each line is flushed
-    to disk immediately — critical for long runs where buffered writes could be lost on a crash.
-
-    Context manager (__enter__ / __exit__): closes the file when the with-block ends. Use via
-    contextlib.ExitStack so the file is closed even if the caller raises.
-
-    Structlog processor (__call__): serializes the event dict to JSON and appends it, then
-    returns the dict unchanged so downstream processors (e.g. ConsoleRenderer) still run.
-    Insert before ConsoleRenderer so the raw dict reaches disk before it is colorized.
-    """
-
-    def __init__(self, path: str) -> None:
-        self._f = open(path, "w", buffering=1)  # noqa: SIM115
-
-    def __enter__(self) -> "_FileLogProcessor":
-        return self
-
-    def __exit__(self, *_: object) -> None:
-        self._f.close()
-
-    def __call__(
-        self, _logger: object, _method: str | None, event_dict: dict[str, object]
-    ) -> dict[str, object]:
-        self._f.write(json.dumps(event_dict) + "\n")
-        return event_dict

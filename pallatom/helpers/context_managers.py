@@ -122,6 +122,7 @@ class StructlogConfig:
         exc_val: BaseException | None,
         exc_tb: TracebackType | None,
     ) -> None:
-        """Close the log file if one was opened."""
+        """Close the log file and reset structlog to a no-op configuration."""
         if self._f is not None:
             self._f.close()
+        structlog.reset_defaults()
