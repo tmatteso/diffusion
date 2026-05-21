@@ -769,6 +769,7 @@ def train(  # noqa: PLR0915
     tp = tcfg.training
     lg = tcfg.logging
     per_rank_token_budget: int = tp.accumulated_token_budget
+    log.info("training with DDP", DDP=False)
     log.info(
         "gradient_accumulation",
         token_budget_per_rank=per_rank_token_budget,
@@ -808,8 +809,10 @@ def train(  # noqa: PLR0915
             n_proteins: int = batch.atom_positions.shape[0]
             max_seq_len: int = batch.atom_positions.shape[1]
             log.info(
-                f"batch token count={n_tokens}, batch size={n_proteins},"
-                f" max seq len in batch={max_seq_len}"
+                "batch statistics",
+                batch_token_count=n_tokens,
+                batch_size=n_proteins,
+                max_seq_len_in_batch=max_seq_len,
             )
 
             # Pre-flush: if adding this batch would push tokens over the budget, flush first.
@@ -889,7 +892,7 @@ def train(  # noqa: PLR0915
         )
 
 
-def train_ddp(
+def train_ddp(  # noqa: PLR0915
     rank: int,
     local_rank: int,
     world_size: int,
@@ -931,6 +934,7 @@ def train_ddp(
     lg = tcfg.logging
     per_rank_token_budget: int = max(1, tp.accumulated_token_budget // world_size)
     if rank == 0:
+        log.info("training with DDP", DDP=True)
         log.info(
             "gradient_accumulation",
             token_budget_per_rank=per_rank_token_budget,
@@ -969,6 +973,14 @@ def train_ddp(
         for batch in pbar:
             n_tokens: int = int(batch.atom_mask.any(dim=-1).sum().item())
             n_proteins: int = batch.atom_positions.shape[0]
+            max_seq_len: int = batch.atom_positions.shape[1]
+            if rank == 0:
+                log.info(
+                    "batch statistics",
+                    batch_token_count=n_tokens,
+                    batch_size=n_proteins,
+                    max_seq_len_in_batch=max_seq_len,
+                )
 
             # Pre-flush: if adding this batch would push tokens over the budget, flush first.
             if micro_buffer and accum_tokens + n_tokens > per_rank_token_budget:
