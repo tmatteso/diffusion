@@ -806,6 +806,11 @@ def train(
         for batch in pbar:
             n_tokens: int = int(batch.atom_mask.any(dim=-1).sum().item())
             n_proteins: int = batch.atom_positions.shape[0]
+            max_seq_len: int = batch.atom_positions.shape[1]
+            log.info(
+                f"batch token count={n_tokens}, batch size={n_proteins},"
+                f" max seq len in batch={max_seq_len}"
+            )
 
             # Pre-flush: if adding this batch would push tokens over the budget, flush first.
             if micro_buffer and accum_tokens + n_tokens > per_rank_token_budget:
@@ -844,8 +849,8 @@ def train(
             n_proteins_buffer.append(n_proteins)
             accum_tokens += n_tokens
 
-        # Flush any window that reached the budget at epoch end.
-        if micro_buffer and accum_tokens >= per_rank_token_budget:
+        # Flush any remaining micro-batches at epoch end, regardless of token count.
+        if micro_buffer:
             _, _, _, global_step = _optimizer_step(
                 micro_buffer,
                 n_proteins_buffer,
@@ -860,8 +865,6 @@ def train(
             )
             n_batches += 1
             micro_buffer = []
-        elif micro_buffer:
-            log.warning("dropped_partial_window", n_dropped=len(micro_buffer))
 
         if n_batches > 0:
             scheduler.step()
@@ -1008,8 +1011,8 @@ def train_ddp(
             n_proteins_buffer.append(n_proteins)
             accum_tokens += n_tokens
 
-        # Flush any window that reached the budget at epoch end.
-        if micro_buffer and accum_tokens >= per_rank_token_budget:
+        # Flush any remaining micro-batches at epoch end, regardless of token count.
+        if micro_buffer:
             window_metrics, _, _, global_step = _optimizer_step(
                 micro_buffer,
                 n_proteins_buffer,
@@ -1029,8 +1032,6 @@ def train_ddp(
                     nan_components=[k for k, v in window_metrics.items() if math.isnan(v)],
                 )
             n_batches, micro_buffer = n_batches + 1, []
-        elif micro_buffer and rank == 0:
-            log.warning("dropped_partial_window", n_dropped=len(micro_buffer))
 
         scheduler.step()
 

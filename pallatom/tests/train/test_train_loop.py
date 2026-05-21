@@ -1785,7 +1785,7 @@ def tcfg_accum(tmp_path: pathlib.Path) -> TrainConfig:
     )
 
 
-def test_train_partial_window_does_not_update_params(
+def test_train_partial_window_at_epoch_end_updates_params(
     model: MainTrunk,
     loader: torch.utils.data.DataLoader[ProteinBatch],
     tcfg_accum: TrainConfig,
@@ -1793,13 +1793,19 @@ def test_train_partial_window_does_not_update_params(
     distogram_atom: Distogram,
     log: FilteringBoundLogger,
 ) -> None:
-    """Partial accum window dropped (accum_steps=2, loader has 1 batch): params stay unchanged."""
+    """Partial window flushed at epoch end even when budget is not reached (budget=2x batch size).
+
+    With 1 batch of _BATCH_TOKENS tokens and budget=2*_BATCH_TOKENS, no pre-flush fires during
+    the epoch, but the remaining buffer is always flushed at epoch end so params must change.
+    """
     params_before = [p.clone().detach() for p in model.parameters()]
     train(model, tcfg_accum, loader, loader, distogram_res, distogram_atom, "cpu", log)
-    assert all(torch.equal(b, a) for b, a in zip(params_before, model.parameters(), strict=False))
+    assert any(
+        not torch.equal(b, a) for b, a in zip(params_before, model.parameters(), strict=False)
+    )
 
 
-def test_train_ddp_partial_window_does_not_update_params(
+def test_train_ddp_partial_window_at_epoch_end_updates_params(
     model: MainTrunk,
     ddp_loader: torch.utils.data.DataLoader[ProteinBatch],
     tcfg_accum: TrainConfig,
@@ -1807,9 +1813,10 @@ def test_train_ddp_partial_window_does_not_update_params(
     distogram_atom: Distogram,
     log: FilteringBoundLogger,
 ) -> None:
-    """With accum_steps=2 and only 1 batch, train_ddp() drops the partial window.
+    """Partial window flushed at epoch end in train_ddp even when budget is not reached.
 
-    Params must remain unchanged when no full accumulation window completes.
+    With 1 batch of _BATCH_TOKENS tokens and budget=2*_BATCH_TOKENS, the buffer is flushed
+    at epoch end, so params must change.
     """
     params_before = [p.clone().detach() for p in model.parameters()]
     train_ddp(
@@ -1825,7 +1832,9 @@ def test_train_ddp_partial_window_does_not_update_params(
         log,
         device="cpu",
     )
-    assert all(torch.equal(b, a) for b, a in zip(params_before, model.parameters(), strict=False))
+    assert any(
+        not torch.equal(b, a) for b, a in zip(params_before, model.parameters(), strict=False)
+    )
 
 
 @pytest.fixture
@@ -1911,6 +1920,114 @@ def test_train_ddp_accumulation_full_window_updates_params(
     assert any(
         not torch.equal(b, a) for b, a in zip(params_before, model.parameters(), strict=False)
     )
+
+
+# ---------------------------------------------------------------------------
+# Regression: train metrics must be non-zero when budget exceeds total tokens
+# ---------------------------------------------------------------------------
+
+
+def test_train_metrics_nonzero_when_budget_exceeds_total_tokens(
+    model: MainTrunk,
+    loader: torch.utils.data.DataLoader[ProteinBatch],
+    distogram_res: Distogram,
+    distogram_atom: Distogram,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    log: FilteringBoundLogger,
+) -> None:
+    """Train metrics logged to W&B are non-zero when the entire dataset fits below the budget.
+
+    Regression test: with a large token budget, no pre-flush fires during the epoch, so the
+    only optimizer step is the end-of-epoch flush. If that flush is silently dropped,
+    train/total loss is logged as 0.0 — the model is never updated.
+    """
+    large_budget = 10 * _BATCH_TOKENS  # far larger than the 1-batch loader's token count
+    tcfg_large = TrainConfig(
+        training=TrainingParams(
+            num_epochs=1, lr=1e-4, grad_clip=1.0, accumulated_token_budget=large_budget
+        ),
+        model=ModelParams(
+            f_ref_dim=_F_REF_DIM,
+            n_bins=_N_BINS,
+            c_atom=_C_ATOM,
+            c_pair=_C_PAIR,
+            c_res=_C_RES,
+            c_atompair=_C_ATOMPAIR,
+            K_unit=_K_UNIT,
+        ),
+        checkpoint=CheckpointParams(
+            checkpoint_path=str(tmp_path / "best_large.pt"), save_every=100
+        ),
+        logging=LoggingParams(use_wandb=True, log_interval=1),
+    )
+    payloads: list[dict[str, object]] = []
+    monkeypatch.setattr("train.train_loop.wandb.log", lambda data, **_: payloads.append(data))
+    train(model, tcfg_large, loader, loader, distogram_res, distogram_atom, "cpu", log)
+
+    assert len(payloads) == 1
+    train_total_loss = payloads[0]["train/total loss"]
+    assert isinstance(train_total_loss, float)
+    assert (
+        train_total_loss > 0.0
+    ), "train/total loss is 0.0 — end-of-epoch flush was dropped so no training occurred"
+
+
+def test_train_ddp_metrics_nonzero_when_budget_exceeds_total_tokens(
+    model: MainTrunk,
+    ddp_loader: torch.utils.data.DataLoader[ProteinBatch],
+    distogram_res: Distogram,
+    distogram_atom: Distogram,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    log: FilteringBoundLogger,
+) -> None:
+    """train_ddp train metrics are non-zero when the entire dataset fits below the budget.
+
+    Same regression as test_train_metrics_nonzero_when_budget_exceeds_total_tokens but for
+    the DDP path.
+    """
+    large_budget = 10 * _BATCH_TOKENS
+    tcfg_large = TrainConfig(
+        training=TrainingParams(
+            num_epochs=1, lr=1e-4, grad_clip=1.0, accumulated_token_budget=large_budget
+        ),
+        model=ModelParams(
+            f_ref_dim=_F_REF_DIM,
+            n_bins=_N_BINS,
+            c_atom=_C_ATOM,
+            c_pair=_C_PAIR,
+            c_res=_C_RES,
+            c_atompair=_C_ATOMPAIR,
+            K_unit=_K_UNIT,
+        ),
+        checkpoint=CheckpointParams(
+            checkpoint_path=str(tmp_path / "best_large_ddp.pt"), save_every=100
+        ),
+        logging=LoggingParams(use_wandb=True, log_interval=1),
+    )
+    payloads: list[dict[str, object]] = []
+    monkeypatch.setattr("train.train_loop.wandb.log", lambda data, **_: payloads.append(data))
+    train_ddp(
+        0,
+        0,
+        1,
+        model,
+        tcfg_large,
+        ddp_loader,
+        ddp_loader,
+        distogram_res,
+        distogram_atom,
+        log,
+        device="cpu",
+    )
+
+    assert len(payloads) == 1
+    train_total_loss = payloads[0]["train/total loss"]
+    assert isinstance(train_total_loss, float)
+    assert (
+        train_total_loss > 0.0
+    ), "train/total loss is 0.0 — end-of-epoch flush was dropped so no training occurred"
 
 
 # ---------------------------------------------------------------------------
@@ -2002,10 +2119,9 @@ def test_train_token_budget_preflush_fires_before_oversized_batch(
 
     mini_batch has _BATCH_TOKENS=16 tokens. With budget=24 and a 2-batch loader:
     - batch1 (16 tokens): added, held (16 < 24)
-    - batch2 (16 tokens): 16+16=32 > 24 → pre-flush batch1 alone, then batch2
-      added (post-add: 16<24).
-    Result: _process_accum_window called exactly once (window of size 1); batch2
-    is partial, dropped.
+    - batch2 (16 tokens): 16+16=32 > 24 → pre-flush batch1 alone, then batch2 added (16<24)
+    - epoch end: batch2 still in buffer → flushed as a second window.
+    Result: _process_accum_window called twice, each with window size 1.
     """
     window_sizes: list[int] = []
     _real_process = _process_accum_window
@@ -2046,4 +2162,4 @@ def test_train_token_budget_preflush_fires_before_oversized_batch(
     loader_2b = torch.utils.data.DataLoader(_ListDataset([mini_batch, mini_batch]), batch_size=None)
     train(model, tcfg_budget, loader_2b, loader_2b, distogram_res, distogram_atom, "cpu", log)
 
-    assert window_sizes == [1]  # pre-flush with batch1 alone; batch2 stays partial, is dropped
+    assert window_sizes == [1, 1]  # pre-flush with batch1; batch2 flushed at epoch end
