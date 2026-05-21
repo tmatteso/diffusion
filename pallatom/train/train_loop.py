@@ -807,19 +807,26 @@ def train(  # noqa: PLR0915
         pbar = tqdm(train_loader, desc=f"Epoch {epoch:03d}/{tp.num_epochs}", leave=False)
 
         for batch in pbar:
-            n_tokens: int = int(batch.atom_mask.any(dim=-1).sum().item())
+            n_non_pad_tokens: int = int(batch.atom_mask.any(dim=-1).sum().item())
             n_proteins: int = batch.atom_positions.shape[0]
             max_seq_len: int = batch.atom_positions.shape[1]
+            n_all_tokens: int = n_proteins * max_seq_len
+            token_pack_rate: float = n_non_pad_tokens / n_all_tokens
             log.info(
                 "batch statistics",
-                batch_token_count=n_tokens,
+                batch_token_count=n_all_tokens,
                 batch_size=n_proteins,
                 max_seq_len_in_batch=max_seq_len,
+                token_pack_rate=token_pack_rate,
             )
 
             # Pre-flush: if adding this batch would push tokens over the budget, flush first.
-            if micro_buffer and accum_tokens + n_tokens > per_rank_token_budget:
-                log.info(f"Too many tokens in batch, given budget {per_rank_token_budget}.")
+            if micro_buffer and accum_tokens + n_all_tokens > per_rank_token_budget:
+                log.info(
+                    "Too many tokens in batch",
+                    batch_token_count=n_all_tokens,
+                    budget=per_rank_token_budget,
+                )
                 window_metrics, component_norms, grad_norm, global_step = _optimizer_step(
                     micro_buffer,
                     n_proteins_buffer,
@@ -853,7 +860,7 @@ def train(  # noqa: PLR0915
 
             micro_buffer.append(batch)
             n_proteins_buffer.append(n_proteins)
-            accum_tokens += n_tokens
+            accum_tokens += n_all_tokens
 
         # Flush any remaining micro-batches at epoch end, regardless of token count.
         if micro_buffer:
@@ -973,19 +980,22 @@ def train_ddp(  # noqa: PLR0915
         )
 
         for batch in pbar:
-            n_tokens: int = int(batch.atom_mask.any(dim=-1).sum().item())
+            n_non_pad_tokens: int = int(batch.atom_mask.any(dim=-1).sum().item())
             n_proteins: int = batch.atom_positions.shape[0]
             max_seq_len: int = batch.atom_positions.shape[1]
+            n_all_tokens: int = n_proteins * max_seq_len
+            token_pack_rate: float = n_non_pad_tokens / n_all_tokens
             if rank == 0:
                 log.info(
                     "batch statistics",
-                    batch_token_count=n_tokens,
+                    batch_token_count=n_all_tokens,
                     batch_size=n_proteins,
                     max_seq_len_in_batch=max_seq_len,
+                    token_pack_rate=token_pack_rate,
                 )
 
             # Pre-flush: if adding this batch would push tokens over the budget, flush first.
-            if micro_buffer and accum_tokens + n_tokens > per_rank_token_budget:
+            if micro_buffer and accum_tokens + n_all_tokens > per_rank_token_budget:
                 window_metrics, component_norms, grad_norm, global_step = _optimizer_step(
                     micro_buffer,
                     n_proteins_buffer,
@@ -1025,7 +1035,7 @@ def train_ddp(  # noqa: PLR0915
 
             micro_buffer.append(batch)
             n_proteins_buffer.append(n_proteins)
-            accum_tokens += n_tokens
+            accum_tokens += n_all_tokens
 
         # Flush any remaining micro-batches at epoch end, regardless of token count.
         if micro_buffer:
