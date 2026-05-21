@@ -25,13 +25,14 @@ from pydantic import ValidationError
 from structlog.typing import FilteringBoundLogger
 from train.train_config import (
     CheckpointParams,
-    LoaderConfig,
     LoggingParams,
     ModelParams,
     TrainConfig,
     TrainingParams,
 )
 from train.train_loop import (
+    _METRIC_KEYS,
+    _process_accum_window,
     evaluate,
     evaluate_ddp,
     train,
@@ -50,6 +51,7 @@ _F_REF_DIM = 35
 _N_BINS = 8
 _N_ATOM_BINS = 5
 _K_UNIT = 1
+_BATCH_TOKENS: int = _N_KEEP  # atom_mask=ones → every residue is a valid token
 
 EXPECTED_EVAL_KEYS = frozenset(
     {
@@ -1739,34 +1741,6 @@ def test_train_one_epoch_with_bucketed_loader(
     assert result is None
 
 
-# ---------------------------------------------------------------------------
-# TrainingParams.accumulated_batch_size and TrainConfig cross-config validator
-# ---------------------------------------------------------------------------
-
-
-def test_training_params_accumulated_batch_size_default() -> None:
-    """accumulated_batch_size defaults to 32."""
-    assert TrainingParams().accumulated_batch_size == 32
-
-
-def test_train_config_validator_rejects_accum_lt_batch_size() -> None:
-    """TrainConfig raises ValidationError when accumulated_batch_size < train_loader.batch_size."""
-    with pytest.raises(ValidationError, match="accumulated_batch_size"):
-        TrainConfig(
-            training=TrainingParams(accumulated_batch_size=1),
-            train_loader=LoaderConfig(batch_size=2),
-        )
-
-
-def test_train_config_validator_accepts_accum_eq_batch_size() -> None:
-    """TrainConfig accepts accumulated_batch_size == train_loader.batch_size."""
-    cfg = TrainConfig(
-        training=TrainingParams(accumulated_batch_size=2),
-        train_loader=LoaderConfig(batch_size=2),
-    )
-    assert cfg.training.accumulated_batch_size == 2
-
-
 @pytest.fixture
 def tcfg_accum(tmp_path: pathlib.Path) -> TrainConfig:
     """TrainConfig with accumulated_batch_size=4, giving accum_steps=2 with batch_size=2."""
@@ -1915,3 +1889,152 @@ def test_train_ddp_accumulation_full_window_updates_params(
     assert any(
         not torch.equal(b, a) for b, a in zip(params_before, model.parameters(), strict=False)
     )
+
+
+# ---------------------------------------------------------------------------
+# accumulated_token_budget config
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.xfail(
+    strict=True, reason="Requires Task 2: rename accumulated_batch_size → accumulated_token_budget"
+)
+def test_accumulated_token_budget_default() -> None:
+    """accumulated_token_budget defaults to 2048."""
+    assert TrainingParams().accumulated_token_budget == 2048  # type: ignore[attr-defined]
+
+
+@pytest.mark.xfail(
+    strict=True, reason="Requires Task 2: rename accumulated_batch_size → accumulated_token_budget"
+)
+def test_accumulated_token_budget_rejects_zero() -> None:
+    """TrainingParams raises ValidationError when accumulated_token_budget is zero."""
+    with pytest.raises(ValidationError):
+        TrainingParams(accumulated_token_budget=0)  # type: ignore[call-arg]
+
+
+@pytest.mark.xfail(
+    strict=True, reason="Requires Task 2: rename accumulated_batch_size → accumulated_token_budget"
+)
+def test_train_config_accepts_any_positive_token_budget() -> None:
+    """TrainConfig no longer validates token budget against batch_size."""
+    cfg = TrainConfig(training=TrainingParams(accumulated_token_budget=1))  # type: ignore[call-arg]
+    assert cfg.training.accumulated_token_budget == 1  # type: ignore[attr-defined]
+
+
+# ---------------------------------------------------------------------------
+# _process_accum_window — protein-weighted grad_scale
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.xfail(
+    strict=True, reason="Requires Task 2: _process_accum_window n_proteins_per_batch param"
+)
+def test_process_accum_window_protein_weighted_grad_scale(
+    protein_batch: ProteinBatch,
+    model: MainTrunk,
+    tcfg: TrainConfig,
+    distogram_res: Distogram,
+    distogram_atom: Distogram,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_process_accum_window passes protein-count-weighted grad_scale to each train_step call.
+
+    Two micro-batches with n_proteins_per_batch=[1, 3] → total_proteins=4.
+    Expected grad_scale: 4/1=4.0 for the first, 4/3≈1.333 for the second.
+    """
+    captured_scales: list[float] = []
+
+    def _mock_train_step(
+        _batch: ProteinBatch,
+        _mdl: nn.Module,
+        _cfg: TrainConfig,
+        _dr: Distogram,
+        _da: Distogram,
+        _device: str,
+        grad_scale: float = 1.0,
+    ) -> dict[str, float]:
+        captured_scales.append(grad_scale)
+        return dict.fromkeys(_METRIC_KEYS, 0.0)
+
+    monkeypatch.setattr("train.train_loop.train_step", _mock_train_step)
+
+    _process_accum_window(
+        micro_buffer=[protein_batch, protein_batch],
+        n_proteins_per_batch=[1, 3],  # type: ignore[call-arg]
+        model=model,
+        tcfg=tcfg,
+        distogram_res=distogram_res,
+        distogram_atom=distogram_atom,
+        device="cpu",
+    )
+
+    assert len(captured_scales) == 2
+    assert abs(captured_scales[0] - 4.0) < 1e-6  # total=4, n=1 → 4/1
+    assert abs(captured_scales[1] - 4.0 / 3.0) < 1e-6  # total=4, n=3 → 4/3
+
+
+# ---------------------------------------------------------------------------
+# token-based accumulation — pre-flush behavior
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.xfail(strict=True, reason="Requires Task 2: token-budget accumulation loop")
+def test_train_token_budget_preflush_fires_before_oversized_batch(
+    model: MainTrunk,
+    distogram_res: Distogram,
+    distogram_atom: Distogram,
+    mini_batch: Mapping[str, Float[torch.Tensor, "..."] | list[str]],
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    log: FilteringBoundLogger,
+) -> None:
+    """Pre-flush fires for batch1 when batch2 would push tokens over the budget.
+
+    mini_batch has _BATCH_TOKENS=16 tokens. With budget=24 and a 2-batch loader:
+    - batch1 (16 tokens): added, held (16 < 24)
+    - batch2 (16 tokens): 16+16=32 > 24 → pre-flush batch1 alone, then batch2
+      added (post-add: 16<24).
+    Result: _process_accum_window called exactly once (window of size 1); batch2
+    is partial, dropped.
+    """
+    window_sizes: list[int] = []
+    _real_process = _process_accum_window
+
+    def _tracking_process(
+        micro_buffer: list[ProteinBatch],
+        n_proteins_per_batch: list[int],
+        mdl: nn.Module,
+        cfg: TrainConfig,
+        dr: Distogram,
+        da: Distogram,
+        dev: str,
+    ) -> dict[str, float]:
+        window_sizes.append(len(micro_buffer))
+        return _real_process(micro_buffer, n_proteins_per_batch, mdl, cfg, dr, da, dev)  # type: ignore[call-arg]
+
+    monkeypatch.setattr("train.train_loop._process_accum_window", _tracking_process)
+
+    budget: int = _BATCH_TOKENS + _BATCH_TOKENS // 2  # 24: one batch (16) fits; two (32) don't
+    tcfg_budget = TrainConfig(
+        training=TrainingParams(
+            num_epochs=1, lr=1e-4, grad_clip=1.0, accumulated_token_budget=budget  # type: ignore[call-arg]
+        ),
+        model=ModelParams(
+            f_ref_dim=_F_REF_DIM,
+            n_bins=_N_BINS,
+            c_atom=_C_ATOM,
+            c_pair=_C_PAIR,
+            c_res=_C_RES,
+            c_atompair=_C_ATOMPAIR,
+            K_unit=_K_UNIT,
+        ),
+        checkpoint=CheckpointParams(
+            checkpoint_path=str(tmp_path / "best_flush.pt"), save_every=100
+        ),
+        logging=LoggingParams(use_wandb=False, log_interval=1),
+    )
+    loader_2b = torch.utils.data.DataLoader(_ListDataset([mini_batch, mini_batch]), batch_size=None)
+    train(model, tcfg_budget, loader_2b, loader_2b, distogram_res, distogram_atom, "cpu", log)
+
+    assert window_sizes == [1]  # pre-flush with batch1 alone; batch2 stays partial, is dropped
