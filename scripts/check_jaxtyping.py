@@ -44,11 +44,36 @@ def _collect_bare_tensors(node: ast.expr, out: list[tuple[int, int]]) -> None:
         _collect_bare_tensors(node.right, out)
 
 
+def _has_jaxtyped_decorator(
+    node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef,
+) -> bool:
+    """Return True if the node has @jaxtyped(typechecker=beartype) in its decorator list."""
+    for dec in node.decorator_list:
+        if not isinstance(dec, ast.Call):
+            continue
+        func = dec.func
+        if not (isinstance(func, ast.Name) and func.id == "jaxtyped"):
+            continue
+        for kw in dec.keywords:
+            if (
+                kw.arg == "typechecker"
+                and isinstance(kw.value, ast.Name)
+                and kw.value.id == "beartype"
+            ):
+                return True
+    return False
+
+
 class _AnnotationVisitor(ast.NodeVisitor):
-    """Collect (line, col, description) for every bare Tensor annotation."""
+    """Collect (line, col, description) for every bare Tensor annotation.
+
+    Only annotations inside functions/classes decorated with
+    @jaxtyped(typechecker=beartype) are checked.
+    """
 
     def __init__(self) -> None:
         self.violations: list[tuple[int, int, str]] = []
+        self._jaxtyped_depth: int = 0
 
     def _check(self, annotation: ast.expr | None, description: str) -> None:
         if annotation is None:
@@ -59,15 +84,20 @@ class _AnnotationVisitor(ast.NodeVisitor):
             self.violations.append((line, col, description))
 
     def _visit_function(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
-        all_args = node.args.posonlyargs + node.args.args + node.args.kwonlyargs
-        for arg in all_args:
-            self._check(arg.annotation, f"argument '{arg.arg}'")
-        if node.args.vararg:
-            self._check(node.args.vararg.annotation, f"argument '*{node.args.vararg.arg}'")
-        if node.args.kwarg:
-            self._check(node.args.kwarg.annotation, f"argument '**{node.args.kwarg.arg}'")
-        self._check(node.returns, "return type")
+        has_jaxtyped = _has_jaxtyped_decorator(node)
+        if has_jaxtyped:
+            all_args = node.args.posonlyargs + node.args.args + node.args.kwonlyargs
+            for arg in all_args:
+                self._check(arg.annotation, f"argument '{arg.arg}'")
+            if node.args.vararg:
+                self._check(node.args.vararg.annotation, f"argument '*{node.args.vararg.arg}'")
+            if node.args.kwarg:
+                self._check(node.args.kwarg.annotation, f"argument '**{node.args.kwarg.arg}'")
+            self._check(node.returns, "return type")
+            self._jaxtyped_depth += 1
         self.generic_visit(node)
+        if has_jaxtyped:
+            self._jaxtyped_depth -= 1
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         """Visit a synchronous function definition."""
@@ -77,8 +107,19 @@ class _AnnotationVisitor(ast.NodeVisitor):
         """Visit an asynchronous function definition."""
         self._visit_function(node)
 
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        """Visit a class definition."""
+        has_jaxtyped = _has_jaxtyped_decorator(node)
+        if has_jaxtyped:
+            self._jaxtyped_depth += 1
+        self.generic_visit(node)
+        if has_jaxtyped:
+            self._jaxtyped_depth -= 1
+
     def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
-        self._check(node.annotation, "variable annotation")
+        """Visit a variable annotation."""
+        if self._jaxtyped_depth > 0:
+            self._check(node.annotation, "variable annotation")
         self.generic_visit(node)
 
 

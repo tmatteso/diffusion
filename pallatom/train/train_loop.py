@@ -29,13 +29,12 @@ from helpers.data import (
 )
 from helpers.featurize import Distogram, ProteinBatch, apply_conditioning_dropout, featurize_batch
 from jaxtyping import Float, Int, jaxtyped
+from structlog.typing import FilteringBoundLogger
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import Adam
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from tqdm import tqdm
 from train.train_config import TrainConfig
-
-log = structlog.get_logger()
 
 
 def _mask_seq_target(aa_indices: Int[torch.Tensor, "B N_res"]) -> Int[torch.Tensor, "B N_res"]:
@@ -436,6 +435,7 @@ def log_epoch(
     scheduler: CosineAnnealingLR,
     tcfg: TrainConfig,
     best_val_loss: float,
+    log: FilteringBoundLogger,
     *,
     do_log: bool = True,
 ) -> float:
@@ -451,7 +451,21 @@ def log_epoch(
     global step, and best validation loss so training can be resumed exactly via
     ``TrainingParams.resume_checkpoint``.
 
-    Returns the (possibly updated) best validation loss.
+    Args:
+        epoch: Current epoch number (1-indexed).
+        global_step: Total optimizer steps taken so far.
+        avg_train: Per-metric average training losses for this epoch.
+        avg_val: Per-metric average validation losses for this epoch.
+        model: The model (plain or DDP-wrapped) being trained.
+        optimizer: Adam optimizer used for this run.
+        scheduler: Cosine annealing scheduler for this run.
+        tcfg: Training configuration supplying logging and checkpoint settings.
+        best_val_loss: Best validation loss seen before this epoch.
+        log: Bound structlog logger.
+        do_log: If ``False``, skip all I/O (use on non-rank-0 workers).
+
+    Returns:
+        The (possibly updated) best validation loss.
     """
     if not do_log:
         return best_val_loss
@@ -508,6 +522,7 @@ def _load_ddp_checkpoint(
     scheduler: CosineAnnealingLR,
     device: str,
     rank: int,
+    log: FilteringBoundLogger,
 ) -> tuple[float, int, int]:
     """Load a DDP checkpoint and restore all mutable training state.
 
@@ -518,6 +533,7 @@ def _load_ddp_checkpoint(
         scheduler: Cosine annealing scheduler whose state will be restored.
         device: Target device for ``torch.load``.
         rank: Current process rank; info log emitted only on rank 0.
+        log: Bound structlog logger.
 
     Returns:
         A ``(best_val_loss, global_step, start_epoch)`` triple.
@@ -546,6 +562,51 @@ _METRIC_KEYS: list[str] = [
     "residues_per_sec",
     "atoms_per_sec",
 ]
+
+
+# (model attribute name, short pbar key) for per-component gradient norm tracking.
+_COMPONENT_NAMES: list[tuple[str, str]] = [
+    ("template_embedder", "gn_templ"),
+    ("atom_encoder", "gn_enc"),
+    ("atom_decoders", "gn_dec"),
+    ("residue_distogram_head", "gn_rdist"),
+    ("atom_distogram_head", "gn_adist"),
+    ("inter_proj_seq", "gn_iproj"),
+    ("inter_seq_logits", "gn_ilogit"),
+    ("proj_seq", "gn_proj"),
+    ("seq_logits", "gn_logit"),
+]
+
+
+def _component_grad_norms(model: nn.Module) -> dict[str, float]:
+    """Return gradient L2 norm for each named MainTrunk sub-module.
+
+    Computes per-component norms from pre-clip gradients.  Call this after the
+    backward pass and before ``clip_grad_norm_``.
+
+    Args:
+        model: Plain ``MainTrunk`` or DDP-wrapped model; ``.module`` is unwrapped
+            automatically.
+
+    Returns:
+        Dict mapping the short pbar key (from ``_COMPONENT_NAMES``) to the L2 norm
+        of all gradients in that sub-module (0.0 when no grads exist).
+    """
+    inner: nn.Module = model.module if isinstance(model, DDP) else model
+    norms: dict[str, float] = {}
+    for attr, key in _COMPONENT_NAMES:
+        sub: nn.Module = getattr(inner, attr)
+        grad_norms: list[torch.Tensor] = [
+            torch.linalg.vector_norm(p.grad.detach(), 2.0)
+            for p in sub.parameters()
+            if p.grad is not None
+        ]
+        norms[key] = (
+            float(torch.linalg.vector_norm(torch.stack(grad_norms), 2.0).item())
+            if grad_norms
+            else 0.0
+        )
+    return norms
 
 
 def _process_accum_window(
@@ -602,7 +663,6 @@ def _process_accum_window(
     return window_metrics
 
 
-@jaxtyped(typechecker=beartype)
 def train(
     model: MainTrunk,
     tcfg: TrainConfig,
@@ -611,6 +671,7 @@ def train(
     distogram_res: Distogram,
     distogram_atom: Distogram,
     device: str,
+    log: FilteringBoundLogger,
 ) -> None:
     """Single-GPU training loop for the MainTrunk diffusion model.
 
@@ -643,6 +704,7 @@ def train(
         distogram_res: Callable producing Cβ residue-level distograms.
         distogram_atom: Callable producing atom-level distograms.
         device: PyTorch device string (e.g. ``"cuda:0"`` or ``"cpu"``).
+        log: Bound structlog logger.
     """
     tp = tcfg.training
     lg = tcfg.logging
@@ -687,6 +749,7 @@ def train(
             window_metrics = _process_accum_window(
                 micro_buffer, model, tcfg, distogram_res, distogram_atom, device
             )
+            component_norms = _component_grad_norms(model)
             grad_norm: float = float(
                 nn.utils.clip_grad_norm_(
                     model.parameters(),
@@ -704,14 +767,17 @@ def train(
 
             if global_step % lg.log_interval == 0:
                 pbar.set_postfix(
-                    loss=f"{window_metrics['total loss']:.2f}",
-                    MSE_loss=f"{window_metrics['Kabsch aligned MSE loss']:.2f}",
-                    CE_loss=f"{window_metrics['Cross Entropy loss']:.2f}",
-                    smooth_lddt_loss=f"{window_metrics['smooth lddt']:.2f}",
-                    residue_distogram_loss=f"{window_metrics['Residue Distogram loss']:.2f}",
-                    atom_distogram_loss=f"{window_metrics['Atom Distogram loss']:.2f}",
-                    intermediate_loss=f"{window_metrics['Intermediate loss']:.2f}",
-                    gnorm=f"{grad_norm:.2f}",
+                    {
+                        "loss": f"{window_metrics['total loss']:.2f}",
+                        "MSE_loss": f"{window_metrics['Kabsch aligned MSE loss']:.2f}",
+                        "CE_loss": f"{window_metrics['Cross Entropy loss']:.2f}",
+                        "smooth_lddt_loss": f"{window_metrics['smooth lddt']:.2f}",
+                        "residue_distogram_loss": f"{window_metrics['Residue Distogram loss']:.2f}",
+                        "atom_distogram_loss": f"{window_metrics['Atom Distogram loss']:.2f}",
+                        "intermediate_loss": f"{window_metrics['Intermediate loss']:.2f}",
+                        "gnorm": f"{grad_norm:.2f}",
+                        **{k: f"{v:.2f}" for k, v in component_norms.items()},
+                    }
                 )
 
         if micro_buffer:
@@ -724,7 +790,16 @@ def train(
         model.train()
 
         best_val_loss = log_epoch(
-            epoch, global_step, avg_train, avg_val, model, optimizer, scheduler, tcfg, best_val_loss
+            epoch,
+            global_step,
+            avg_train,
+            avg_val,
+            model,
+            optimizer,
+            scheduler,
+            tcfg,
+            best_val_loss,
+            log,
         )
 
 
@@ -738,6 +813,7 @@ def train_ddp(
     test_loader: torch.utils.data.DataLoader[ProteinBatch],
     distogram_res: Distogram,
     distogram_atom: Distogram,
+    log: FilteringBoundLogger,
     device: str | None = None,
 ) -> None:
     """DDP training loop for the MainTrunk diffusion model.
@@ -759,6 +835,7 @@ def train_ddp(
         test_loader: DataLoader for evaluation batches.
         distogram_res: Callable producing Cβ residue-level distograms.
         distogram_atom: Callable producing atom-level distograms.
+        log: Bound structlog logger injected by the DDP launcher.
         device: Device string override; defaults to ``"cuda:<local_rank>"``.
     """
     device = device or f"cuda:{local_rank}"
@@ -785,7 +862,7 @@ def train_ddp(
 
     if tp.resume_checkpoint is not None:
         best_val_loss, global_step, start_epoch = _load_ddp_checkpoint(
-            tp.resume_checkpoint, ddp_model, optimizer, scheduler, device, rank
+            tp.resume_checkpoint, ddp_model, optimizer, scheduler, device, rank, log
         )
 
     for epoch in range(start_epoch, tp.num_epochs + 1):
@@ -817,6 +894,7 @@ def train_ddp(
                 if rank == 0:
                     log.warning("nan_loss", step=global_step, nan_components=nan_keys)
 
+            component_norms = _component_grad_norms(ddp_model)
             grad_norm: float = float(
                 nn.utils.clip_grad_norm_(
                     ddp_model.parameters(),
@@ -834,14 +912,17 @@ def train_ddp(
 
             if rank == 0 and global_step % lg.log_interval == 0:
                 pbar.set_postfix(
-                    loss=f"{window_metrics['total loss']:.2f}",
-                    MSE_loss=f"{window_metrics['Kabsch aligned MSE loss']:.2f}",
-                    CE_loss=f"{window_metrics['Cross Entropy loss']:.2f}",
-                    smooth_lddt_loss=f"{window_metrics['smooth lddt']:.2f}",
-                    residue_distogram_loss=f"{window_metrics['Residue Distogram loss']:.2f}",
-                    atom_distogram_loss=f"{window_metrics['Atom Distogram loss']:.2f}",
-                    intermediate_loss=f"{window_metrics['Intermediate loss']:.2f}",
-                    gnorm=f"{grad_norm:.2f}",
+                    {
+                        "loss": f"{window_metrics['total loss']:.2f}",
+                        "MSE_loss": f"{window_metrics['Kabsch aligned MSE loss']:.2f}",
+                        "CE_loss": f"{window_metrics['Cross Entropy loss']:.2f}",
+                        "smooth_lddt_loss": f"{window_metrics['smooth lddt']:.2f}",
+                        "residue_distogram_loss": f"{window_metrics['Residue Distogram loss']:.2f}",
+                        "atom_distogram_loss": f"{window_metrics['Atom Distogram loss']:.2f}",
+                        "intermediate_loss": f"{window_metrics['Intermediate loss']:.2f}",
+                        "gnorm": f"{grad_norm:.2f}",
+                        **{k: f"{v:.2f}" for k, v in component_norms.items()},
+                    }
                 )
 
         if micro_buffer and rank == 0:
@@ -866,10 +947,12 @@ def train_ddp(
             scheduler,
             tcfg,
             best_val_loss,
+            log,
             do_log=(rank == 0),
         )
 
 
+# still missing the queue
 def main(args: argparse.Namespace, tcfg: TrainConfig) -> None:
     """Entry point for DDP training."""
     with (
@@ -877,6 +960,7 @@ def main(args: argparse.Namespace, tcfg: TrainConfig) -> None:
         StructlogConfig(dpg.is_rank_zero, args.log_file),
         FatalOnError(),
     ):
+        log = structlog.get_logger()
         train_loader, val_loader, _ = make_ddp_bucketed_data_loaders(
             tcfg,
             args.data,
@@ -927,6 +1011,7 @@ def main(args: argparse.Namespace, tcfg: TrainConfig) -> None:
             test_loader=val_loader,
             distogram_res=distogram_res,
             distogram_atom=distogram_atom,
+            log=log,
         )
 
 

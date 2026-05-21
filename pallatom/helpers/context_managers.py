@@ -9,6 +9,7 @@ from types import TracebackType
 import structlog
 import torch
 import torch.distributed as dist
+from structlog.typing import EventDict, Processor, WrappedLogger
 
 log = structlog.get_logger()
 
@@ -90,9 +91,9 @@ class StructlogConfig:
 
     def __enter__(self) -> "StructlogConfig":
         """Configure structlog and open the log file if requested."""
-        processors = [
+        processors: list[Processor] = [
             structlog.processors.TimeStamper(fmt="iso", utc=True),
-            structlog.stdlib.add_log_level,
+            structlog.processors.add_log_level,
             structlog.processors.StackInfoRenderer(),
         ]
         if self._log_file and self._is_rank_zero:
@@ -109,8 +110,8 @@ class StructlogConfig:
         return self
 
     def _write_log_line(
-        self, _logger: object, _method: str | None, event_dict: dict[str, object]
-    ) -> dict[str, object]:
+        self, _logger: WrappedLogger, _method: str | None, event_dict: EventDict
+    ) -> EventDict:
         """Structlog processor: write the event dict as a JSON line and pass it through."""
         if self._f is not None:
             self._f.write(json.dumps(event_dict) + "\n")

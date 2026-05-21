@@ -10,6 +10,7 @@ from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
+import structlog
 import torch
 import torch.distributed as dist_module
 import torch.nn as nn
@@ -21,6 +22,7 @@ from helpers.data import _to_protein_batch, make_bucketed_data_loaders
 from helpers.featurize import Distogram, ProteinBatch, apply_conditioning_dropout, featurize_batch
 from jaxtyping import Float, TypeCheckError
 from pydantic import ValidationError
+from structlog.typing import FilteringBoundLogger
 from train.train_config import (
     CheckpointParams,
     LoaderConfig,
@@ -529,6 +531,12 @@ def test_evaluate_uses_no_grad(
         assert p.grad is None
 
 
+@pytest.fixture
+def log() -> FilteringBoundLogger:
+    """Provide a structlog logger for training loop tests."""
+    return structlog.get_logger()
+
+
 # ---------------------------------------------------------------------------
 # train
 # ---------------------------------------------------------------------------
@@ -540,9 +548,10 @@ def test_train_returns_none(
     tcfg: TrainConfig,
     distogram_res: Distogram,
     distogram_atom: Distogram,
+    log: FilteringBoundLogger,
 ) -> None:
     """Ensures train returns None (the function is side-effect-only)."""
-    assert train(model, tcfg, loader, loader, distogram_res, distogram_atom, "cpu") is None
+    assert train(model, tcfg, loader, loader, distogram_res, distogram_atom, "cpu", log) is None
 
 
 def test_train_saves_best_checkpoint(
@@ -551,9 +560,10 @@ def test_train_saves_best_checkpoint(
     tcfg: TrainConfig,
     distogram_res: Distogram,
     distogram_atom: Distogram,
+    log: FilteringBoundLogger,
 ) -> None:
     """Ensures train writes a checkpoint file at the path configured in tcfg.checkpoint."""
-    train(model, tcfg, loader, loader, distogram_res, distogram_atom, "cpu")
+    train(model, tcfg, loader, loader, distogram_res, distogram_atom, "cpu", log)
     assert os.path.exists(tcfg.checkpoint.checkpoint_path)
 
 
@@ -563,9 +573,10 @@ def test_train_checkpoint_is_valid_state_dict(
     tcfg: TrainConfig,
     distogram_res: Distogram,
     distogram_atom: Distogram,
+    log: FilteringBoundLogger,
 ) -> None:
     """The checkpoint written by train contains model, optimizer, scheduler, and training state."""
-    train(model, tcfg, loader, loader, distogram_res, distogram_atom, "cpu")
+    train(model, tcfg, loader, loader, distogram_res, distogram_atom, "cpu", log)
     ckpt = torch.load(tcfg.checkpoint.checkpoint_path, weights_only=True)
     assert isinstance(ckpt, dict)
     assert ckpt.keys() >= EXPECTED_CHECKPOINT_KEYS
@@ -577,10 +588,11 @@ def test_train_updates_model_parameters(
     tcfg: TrainConfig,
     distogram_res: Distogram,
     distogram_atom: Distogram,
+    log: FilteringBoundLogger,
 ) -> None:
     """Ensures train modifies at least one model parameter via gradient descent."""
     params_before = [p.clone().detach() for p in model.parameters()]
-    train(model, tcfg, loader, loader, distogram_res, distogram_atom, "cpu")
+    train(model, tcfg, loader, loader, distogram_res, distogram_atom, "cpu", log)
     params_after = list(model.parameters())
     assert any(not torch.equal(b, a) for b, a in zip(params_before, params_after, strict=False))
 
@@ -591,10 +603,11 @@ def test_train_model_in_train_mode_after(
     tcfg: TrainConfig,
     distogram_res: Distogram,
     distogram_atom: Distogram,
+    log: FilteringBoundLogger,
 ) -> None:
     """Ensures train leaves the model in train mode after the last epoch completes."""
     model.eval()
-    train(model, tcfg, loader, loader, distogram_res, distogram_atom, "cpu")
+    train(model, tcfg, loader, loader, distogram_res, distogram_atom, "cpu", log)
     assert model.training
 
 
@@ -605,6 +618,7 @@ def test_train_runs_all_epochs(
     distogram_res: Distogram,
     distogram_atom: Distogram,
     monkeypatch: pytest.MonkeyPatch,
+    log: FilteringBoundLogger,
 ) -> None:
     """Ensures train calls evaluate once per epoch and produces finite losses for all epochs."""
     losses: list[float] = []
@@ -623,7 +637,7 @@ def test_train_runs_all_epochs(
         return result
 
     monkeypatch.setattr("train.train_loop.evaluate", _patched_evaluate)
-    train(model, tcfg_multi, loader, loader, distogram_res, distogram_atom, "cpu")
+    train(model, tcfg_multi, loader, loader, distogram_res, distogram_atom, "cpu", log)
 
     assert len(losses) == 3
     # math.isfinite returns False if the value is NaN or Infinity
@@ -636,9 +650,10 @@ def test_train_no_grad_clip_runs(
     tcfg_no_clip: TrainConfig,
     distogram_res: Distogram,
     distogram_atom: Distogram,
+    log: FilteringBoundLogger,
 ) -> None:
     """Ensures train completes without error when grad_clip is None (gradient clipping disabled)."""
-    result = train(model, tcfg_no_clip, loader, loader, distogram_res, distogram_atom, "cpu")
+    result = train(model, tcfg_no_clip, loader, loader, distogram_res, distogram_atom, "cpu", log)
     assert result is None
 
 
@@ -648,9 +663,10 @@ def test_train_no_grad_clip_saves_checkpoint(
     tcfg_no_clip: TrainConfig,
     distogram_res: Distogram,
     distogram_atom: Distogram,
+    log: FilteringBoundLogger,
 ) -> None:
     """Ensures train writes a checkpoint even when grad_clip is None."""
-    train(model, tcfg_no_clip, loader, loader, distogram_res, distogram_atom, "cpu")
+    train(model, tcfg_no_clip, loader, loader, distogram_res, distogram_atom, "cpu", log)
     assert os.path.exists(tcfg_no_clip.checkpoint.checkpoint_path)
 
 
@@ -662,10 +678,11 @@ def test_train_save_every_creates_epoch_checkpoint(
     distogram_atom: Distogram,
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
+    log: FilteringBoundLogger,
 ) -> None:
     """Ensures train writes a per-epoch checkpoint file when save_every=1."""
     monkeypatch.chdir(tmp_path)
-    train(model, tcfg_save, loader, loader, distogram_res, distogram_atom, "cpu")
+    train(model, tcfg_save, loader, loader, distogram_res, distogram_atom, "cpu", log)
     assert os.path.exists(tmp_path / "checkpoint_epoch_001.pt")
 
 
@@ -677,10 +694,11 @@ def test_train_save_every_checkpoint_is_valid_state_dict(
     distogram_atom: Distogram,
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
+    log: FilteringBoundLogger,
 ) -> None:
     """Per-epoch checkpoint contains model, optimizer, scheduler, and training state."""
     monkeypatch.chdir(tmp_path)
-    train(model, tcfg_save, loader, loader, distogram_res, distogram_atom, "cpu")
+    train(model, tcfg_save, loader, loader, distogram_res, distogram_atom, "cpu", log)
     ckpt = torch.load(tmp_path / "checkpoint_epoch_001.pt", weights_only=True)
     assert isinstance(ckpt, dict)
     assert ckpt.keys() >= EXPECTED_CHECKPOINT_KEYS
@@ -731,11 +749,12 @@ def test_train_calls_wandb_log_when_enabled(
     distogram_res: Distogram,
     distogram_atom: Distogram,
     monkeypatch: pytest.MonkeyPatch,
+    log: FilteringBoundLogger,
 ) -> None:
     """Train calls wandb.log exactly once per epoch when use_wandb=True."""
     logged: list[dict[str, float]] = []
     monkeypatch.setattr("train.train_loop.wandb.log", lambda data, **_: logged.append(data))
-    train(model, tcfg_wandb, loader, loader, distogram_res, distogram_atom, "cpu")
+    train(model, tcfg_wandb, loader, loader, distogram_res, distogram_atom, "cpu", log)
     assert len(logged) == 1
 
 
@@ -746,11 +765,12 @@ def test_train_wandb_log_not_called_when_disabled(
     distogram_res: Distogram,
     distogram_atom: Distogram,
     monkeypatch: pytest.MonkeyPatch,
+    log: FilteringBoundLogger,
 ) -> None:
     """Train does not call wandb.log when use_wandb=False."""
     mock_log = MagicMock()
     monkeypatch.setattr("train.train_loop.wandb.log", mock_log)
-    train(model, tcfg, loader, loader, distogram_res, distogram_atom, "cpu")
+    train(model, tcfg, loader, loader, distogram_res, distogram_atom, "cpu", log)
     mock_log.assert_not_called()
 
 
@@ -761,11 +781,12 @@ def test_train_wandb_log_payload_has_epoch_key(
     distogram_res: Distogram,
     distogram_atom: Distogram,
     monkeypatch: pytest.MonkeyPatch,
+    log: FilteringBoundLogger,
 ) -> None:
     """The W&B payload logged by train includes an 'epoch' key set to the current epoch number."""
     payloads: list[Mapping[str, object]] = []
     monkeypatch.setattr("train.train_loop.wandb.log", lambda data, **_: payloads.append(data))
-    train(model, tcfg_wandb, loader, loader, distogram_res, distogram_atom, "cpu")
+    train(model, tcfg_wandb, loader, loader, distogram_res, distogram_atom, "cpu", log)
     assert "epoch" in payloads[0]
     assert payloads[0]["epoch"] == 1
 
@@ -777,11 +798,12 @@ def test_train_wandb_log_payload_has_train_keys(
     distogram_res: Distogram,
     distogram_atom: Distogram,
     monkeypatch: pytest.MonkeyPatch,
+    log: FilteringBoundLogger,
 ) -> None:
     """The W&B payload logged by train contains at least one key prefixed with 'train/'."""
     payloads: list[Mapping[str, object]] = []
     monkeypatch.setattr("train.train_loop.wandb.log", lambda data, **_: payloads.append(data))
-    train(model, tcfg_wandb, loader, loader, distogram_res, distogram_atom, "cpu")
+    train(model, tcfg_wandb, loader, loader, distogram_res, distogram_atom, "cpu", log)
     assert any(k.startswith("train/") for k in payloads[0])
 
 
@@ -792,11 +814,12 @@ def test_train_wandb_log_payload_has_val_keys(
     distogram_res: Distogram,
     distogram_atom: Distogram,
     monkeypatch: pytest.MonkeyPatch,
+    log: FilteringBoundLogger,
 ) -> None:
     """The W&B payload logged by train contains at least one key prefixed with 'val/'."""
     payloads: list[Mapping[str, object]] = []
     monkeypatch.setattr("train.train_loop.wandb.log", lambda data, **_: payloads.append(data))
-    train(model, tcfg_wandb, loader, loader, distogram_res, distogram_atom, "cpu")
+    train(model, tcfg_wandb, loader, loader, distogram_res, distogram_atom, "cpu", log)
     assert any(k.startswith("val/") for k in payloads[0])
 
 
@@ -807,6 +830,7 @@ def test_train_wandb_log_step_is_positive(
     distogram_res: Distogram,
     distogram_atom: Distogram,
     monkeypatch: pytest.MonkeyPatch,
+    log: FilteringBoundLogger,
 ) -> None:
     """The global_step passed to wandb.log is at least 1 after the first training step."""
     steps: list[int] = []
@@ -816,7 +840,7 @@ def test_train_wandb_log_step_is_positive(
         steps.append(step)
 
     monkeypatch.setattr("train.train_loop.wandb.log", _log)
-    train(model, tcfg_wandb, loader, loader, distogram_res, distogram_atom, "cpu")
+    train(model, tcfg_wandb, loader, loader, distogram_res, distogram_atom, "cpu", log)
     assert steps[0] >= 1
 
 
@@ -827,11 +851,12 @@ def test_train_wandb_log_called_once_per_epoch(
     distogram_res: Distogram,
     distogram_atom: Distogram,
     monkeypatch: pytest.MonkeyPatch,
+    log: FilteringBoundLogger,
 ) -> None:
     """Train calls wandb.log exactly once per epoch for a 3-epoch run."""
     logged: list[dict[str, float]] = []
     monkeypatch.setattr("train.train_loop.wandb.log", lambda data, **_: logged.append(data))
-    train(model, tcfg_wandb_3ep, loader, loader, distogram_res, distogram_atom, "cpu")
+    train(model, tcfg_wandb_3ep, loader, loader, distogram_res, distogram_atom, "cpu", log)
     assert len(logged) == 3
 
 
@@ -842,11 +867,12 @@ def test_train_wandb_log_epoch_increments(
     distogram_res: Distogram,
     distogram_atom: Distogram,
     monkeypatch: pytest.MonkeyPatch,
+    log: FilteringBoundLogger,
 ) -> None:
     """The epoch number in W&B payloads increments from 1 to 3 across a 3-epoch run."""
     payloads: list[Mapping[str, object]] = []
     monkeypatch.setattr("train.train_loop.wandb.log", lambda data, **_: payloads.append(data))
-    train(model, tcfg_wandb_3ep, loader, loader, distogram_res, distogram_atom, "cpu")
+    train(model, tcfg_wandb_3ep, loader, loader, distogram_res, distogram_atom, "cpu", log)
     epochs = [p["epoch"] for p in payloads]
     assert epochs == [1, 2, 3]
 
@@ -858,11 +884,12 @@ def test_train_wandb_log_train_total_loss_is_float(
     distogram_res: Distogram,
     distogram_atom: Distogram,
     monkeypatch: pytest.MonkeyPatch,
+    log: FilteringBoundLogger,
 ) -> None:
     """The 'train/total loss' value logged to W&B is a Python float."""
     payloads: list[Mapping[str, object]] = []
     monkeypatch.setattr("train.train_loop.wandb.log", lambda data, **_: payloads.append(data))
-    train(model, tcfg_wandb, loader, loader, distogram_res, distogram_atom, "cpu")
+    train(model, tcfg_wandb, loader, loader, distogram_res, distogram_atom, "cpu", log)
     assert isinstance(payloads[0]["train/total loss"], float)
 
 
@@ -873,11 +900,12 @@ def test_train_wandb_log_val_total_loss_is_float(
     distogram_res: Distogram,
     distogram_atom: Distogram,
     monkeypatch: pytest.MonkeyPatch,
+    log: FilteringBoundLogger,
 ) -> None:
     """The 'val/total loss' value logged to W&B is a Python float."""
     payloads: list[Mapping[str, object]] = []
     monkeypatch.setattr("train.train_loop.wandb.log", lambda data, **_: payloads.append(data))
-    train(model, tcfg_wandb, loader, loader, distogram_res, distogram_atom, "cpu")
+    train(model, tcfg_wandb, loader, loader, distogram_res, distogram_atom, "cpu", log)
     assert isinstance(payloads[0]["val/total loss"], float)
 
 
@@ -888,6 +916,7 @@ def test_train_wandb_log_steps_increase_across_epochs(
     distogram_res: Distogram,
     distogram_atom: Distogram,
     monkeypatch: pytest.MonkeyPatch,
+    log: FilteringBoundLogger,
 ) -> None:
     """Global steps passed to wandb.log are strictly increasing and unique across epochs."""
     steps: list[int] = []
@@ -897,7 +926,7 @@ def test_train_wandb_log_steps_increase_across_epochs(
         steps.append(step)
 
     monkeypatch.setattr("train.train_loop.wandb.log", _capture_step)
-    train(model, tcfg_wandb_3ep, loader, loader, distogram_res, distogram_atom, "cpu")
+    train(model, tcfg_wandb_3ep, loader, loader, distogram_res, distogram_atom, "cpu", log)
     assert steps == sorted(steps)
     assert len(set(steps)) == 3
 
@@ -1113,6 +1142,7 @@ def test_train_ddp_returns_none(
     tcfg: TrainConfig,
     distogram_res: Distogram,
     distogram_atom: Distogram,
+    log: FilteringBoundLogger,
 ) -> None:
     """Ensures train_ddp returns None (side-effect-only function)."""
     result = train_ddp(
@@ -1125,6 +1155,7 @@ def test_train_ddp_returns_none(
         ddp_loader,
         distogram_res,
         distogram_atom,
+        log,
         device="cpu",
     )
     assert result is None
@@ -1136,6 +1167,7 @@ def test_train_ddp_rank0_saves_checkpoint(
     tcfg: TrainConfig,
     distogram_res: Distogram,
     distogram_atom: Distogram,
+    log: FilteringBoundLogger,
 ) -> None:
     """Ensures train_ddp writes a checkpoint when rank=0."""
     train_ddp(
@@ -1148,6 +1180,7 @@ def test_train_ddp_rank0_saves_checkpoint(
         ddp_loader,
         distogram_res,
         distogram_atom,
+        log,
         device="cpu",
     )
     assert os.path.exists(tcfg.checkpoint.checkpoint_path)
@@ -1159,6 +1192,7 @@ def test_train_ddp_checkpoint_has_correct_keys(
     tcfg: TrainConfig,
     distogram_res: Distogram,
     distogram_atom: Distogram,
+    log: FilteringBoundLogger,
 ) -> None:
     """train_ddp checkpoint contains model, optimizer, scheduler, and training state."""
     train_ddp(
@@ -1171,6 +1205,7 @@ def test_train_ddp_checkpoint_has_correct_keys(
         ddp_loader,
         distogram_res,
         distogram_atom,
+        log,
         device="cpu",
     )
     ckpt = torch.load(tcfg.checkpoint.checkpoint_path, weights_only=True)
@@ -1183,6 +1218,7 @@ def test_train_ddp_rank1_does_not_save_checkpoint(
     tcfg: TrainConfig,
     distogram_res: Distogram,
     distogram_atom: Distogram,
+    log: FilteringBoundLogger,
 ) -> None:
     """Ensures train_ddp does not write a checkpoint when rank != 0."""
     train_ddp(
@@ -1195,6 +1231,7 @@ def test_train_ddp_rank1_does_not_save_checkpoint(
         ddp_loader,
         distogram_res,
         distogram_atom,
+        log,
         device="cpu",
     )
     assert not os.path.exists(tcfg.checkpoint.checkpoint_path)
@@ -1206,6 +1243,7 @@ def test_train_ddp_calls_set_epoch_each_epoch(
     tcfg_multi: TrainConfig,
     distogram_res: Distogram,
     distogram_atom: Distogram,
+    log: FilteringBoundLogger,
 ) -> None:
     """Ensures train_ddp calls sampler.set_epoch(epoch) once per epoch in ascending order."""
     train_ddp(
@@ -1218,6 +1256,7 @@ def test_train_ddp_calls_set_epoch_each_epoch(
         ddp_loader,
         distogram_res,
         distogram_atom,
+        log,
         device="cpu",
     )
     assert cast("_MockSampler", ddp_loader.batch_sampler).set_epoch_calls == [1, 2, 3]
@@ -1229,6 +1268,7 @@ def test_train_ddp_updates_model_parameters(
     tcfg: TrainConfig,
     distogram_res: Distogram,
     distogram_atom: Distogram,
+    log: FilteringBoundLogger,
 ) -> None:
     """Ensures train_ddp modifies at least one model parameter via gradient descent."""
     params_before = [p.clone().detach() for p in model.parameters()]
@@ -1242,6 +1282,7 @@ def test_train_ddp_updates_model_parameters(
         ddp_loader,
         distogram_res,
         distogram_atom,
+        log,
         device="cpu",
     )
     changed = (
@@ -1257,6 +1298,7 @@ def test_train_ddp_wandb_not_called_when_disabled(
     distogram_res: Distogram,
     distogram_atom: Distogram,
     monkeypatch: pytest.MonkeyPatch,
+    log: FilteringBoundLogger,
 ) -> None:
     """Ensures train_ddp does not call wandb.log when use_wandb=False."""
     mock_log = MagicMock()
@@ -1271,6 +1313,7 @@ def test_train_ddp_wandb_not_called_when_disabled(
         ddp_loader,
         distogram_res,
         distogram_atom,
+        log,
         device="cpu",
     )
     mock_log.assert_not_called()
@@ -1283,6 +1326,7 @@ def test_train_ddp_wandb_called_when_rank0_and_enabled(
     distogram_res: Distogram,
     distogram_atom: Distogram,
     monkeypatch: pytest.MonkeyPatch,
+    log: FilteringBoundLogger,
 ) -> None:
     """Ensures train_ddp calls wandb.log when rank=0 and use_wandb=True."""
     logged = []
@@ -1297,6 +1341,7 @@ def test_train_ddp_wandb_called_when_rank0_and_enabled(
         ddp_loader,
         distogram_res,
         distogram_atom,
+        log,
         device="cpu",
     )
     assert len(logged) == 1
@@ -1309,6 +1354,7 @@ def test_train_ddp_wandb_not_called_when_rank_nonzero(
     distogram_res: Distogram,
     distogram_atom: Distogram,
     monkeypatch: pytest.MonkeyPatch,
+    log: FilteringBoundLogger,
 ) -> None:
     """Ensures train_ddp does not call wandb.log when rank != 0 even if use_wandb=True."""
     mock_log = MagicMock()
@@ -1323,6 +1369,7 @@ def test_train_ddp_wandb_not_called_when_rank_nonzero(
         ddp_loader,
         distogram_res,
         distogram_atom,
+        log,
         device="cpu",
     )
     mock_log.assert_not_called()
@@ -1446,10 +1493,11 @@ def test_train_wrong_device_type(
     tcfg: TrainConfig,
     distogram_res: Distogram,
     distogram_atom: Distogram,
+    log: FilteringBoundLogger,
 ) -> None:
     """Non-str device triggers TypeCheckError for train."""
     with pytest.raises(TypeCheckError):
-        train(model, tcfg, loader, loader, distogram_res, distogram_atom, 42)  # type: ignore[arg-type]
+        train(model, tcfg, loader, loader, distogram_res, distogram_atom, 42, log)  # type: ignore[arg-type]
 
 
 # ---------------------------------------------------------------------------
@@ -1464,6 +1512,7 @@ def test_train_resume_runs_remaining_epochs(
     distogram_atom: Distogram,
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
+    log: FilteringBoundLogger,
 ) -> None:
     """Resuming from a 1-epoch checkpoint with num_epochs=3 runs exactly 2 more epochs."""
     ckpt_path = str(tmp_path / "best.pt")
@@ -1481,7 +1530,7 @@ def test_train_resume_runs_remaining_epochs(
         checkpoint=CheckpointParams(checkpoint_path=ckpt_path, save_every=100),
         logging=LoggingParams(use_wandb=False, log_interval=1),
     )
-    train(model, tcfg_first, loader, loader, distogram_res, distogram_atom, "cpu")
+    train(model, tcfg_first, loader, loader, distogram_res, distogram_atom, "cpu", log)
 
     eval_epochs: list[int] = []
     _real_evaluate = evaluate
@@ -1521,7 +1570,7 @@ def test_train_resume_runs_remaining_epochs(
         ),
         logging=LoggingParams(use_wandb=False, log_interval=1),
     )
-    train(model, tcfg_resume, loader, loader, distogram_res, distogram_atom, "cpu")
+    train(model, tcfg_resume, loader, loader, distogram_res, distogram_atom, "cpu", log)
     assert len(eval_epochs) == 2
 
 
@@ -1531,6 +1580,7 @@ def test_train_resume_restores_optimizer_state(
     distogram_res: Distogram,
     distogram_atom: Distogram,
     tmp_path: pathlib.Path,
+    log: FilteringBoundLogger,
 ) -> None:
     """Optimizer state (exp_avg) loaded from checkpoint is non-zero after one resumed step."""
     ckpt_path = str(tmp_path / "opt.pt")
@@ -1548,7 +1598,7 @@ def test_train_resume_restores_optimizer_state(
         checkpoint=CheckpointParams(checkpoint_path=ckpt_path, save_every=100),
         logging=LoggingParams(use_wandb=False, log_interval=1),
     )
-    train(model, tcfg_first, loader, loader, distogram_res, distogram_atom, "cpu")
+    train(model, tcfg_first, loader, loader, distogram_res, distogram_atom, "cpu", log)
 
     saved_ckpt = torch.load(ckpt_path, weights_only=True)
     opt_state = saved_ckpt["optimizer"]["state"]
@@ -1564,6 +1614,7 @@ def test_train_resume_restores_scheduler_state(
     distogram_res: Distogram,
     distogram_atom: Distogram,
     tmp_path: pathlib.Path,
+    log: FilteringBoundLogger,
 ) -> None:
     """Scheduler last_epoch in saved checkpoint matches the epoch at which it was written."""
     ckpt_path = str(tmp_path / "sched.pt")
@@ -1581,7 +1632,7 @@ def test_train_resume_restores_scheduler_state(
         checkpoint=CheckpointParams(checkpoint_path=ckpt_path, save_every=100),
         logging=LoggingParams(use_wandb=False, log_interval=1),
     )
-    train(model, tcfg_first, loader, loader, distogram_res, distogram_atom, "cpu")
+    train(model, tcfg_first, loader, loader, distogram_res, distogram_atom, "cpu", log)
 
     saved_ckpt = torch.load(ckpt_path, weights_only=True)
     assert saved_ckpt["scheduler"]["last_epoch"] == 1
@@ -1593,6 +1644,7 @@ def test_train_resume_checkpoint_epoch_and_step(
     distogram_res: Distogram,
     distogram_atom: Distogram,
     tmp_path: pathlib.Path,
+    log: FilteringBoundLogger,
 ) -> None:
     """Saved checkpoint records the correct epoch number and global_step."""
     ckpt_path = str(tmp_path / "meta.pt")
@@ -1610,7 +1662,7 @@ def test_train_resume_checkpoint_epoch_and_step(
         checkpoint=CheckpointParams(checkpoint_path=ckpt_path, save_every=100),
         logging=LoggingParams(use_wandb=False, log_interval=1),
     )
-    train(model, tcfg_first, loader, loader, distogram_res, distogram_atom, "cpu")
+    train(model, tcfg_first, loader, loader, distogram_res, distogram_atom, "cpu", log)
 
     saved_ckpt = torch.load(ckpt_path, weights_only=True)
     assert saved_ckpt["epoch"] == 1
@@ -1670,6 +1722,7 @@ def test_train_one_epoch_with_bucketed_loader(
     distogram_atom: Distogram,
     jsonl_path: str,
     splits_path: str,
+    log: FilteringBoundLogger,
 ) -> None:
     """train() runs one epoch with a bucketed DataLoader without error."""
     train_loader, val_loader, _ = make_bucketed_data_loaders(
@@ -1682,7 +1735,7 @@ def test_train_one_epoch_with_bucketed_loader(
     sampler = train_loader.batch_sampler
     assert isinstance(sampler, BucketedBatchSampler)
     sampler.set_epoch(0)
-    result = train(model, tcfg, train_loader, val_loader, distogram_res, distogram_atom, "cpu")
+    result = train(model, tcfg, train_loader, val_loader, distogram_res, distogram_atom, "cpu", log)
     assert result is None
 
 
@@ -1742,10 +1795,11 @@ def test_train_partial_window_does_not_update_params(
     tcfg_accum: TrainConfig,
     distogram_res: Distogram,
     distogram_atom: Distogram,
+    log: FilteringBoundLogger,
 ) -> None:
     """Partial accum window dropped (accum_steps=2, loader has 1 batch): params stay unchanged."""
     params_before = [p.clone().detach() for p in model.parameters()]
-    train(model, tcfg_accum, loader, loader, distogram_res, distogram_atom, "cpu")
+    train(model, tcfg_accum, loader, loader, distogram_res, distogram_atom, "cpu", log)
     assert all(torch.equal(b, a) for b, a in zip(params_before, model.parameters(), strict=False))
 
 
@@ -1755,6 +1809,7 @@ def test_train_ddp_partial_window_does_not_update_params(
     tcfg_accum: TrainConfig,
     distogram_res: Distogram,
     distogram_atom: Distogram,
+    log: FilteringBoundLogger,
 ) -> None:
     """With accum_steps=2 and only 1 batch, train_ddp() drops the partial window.
 
@@ -1771,6 +1826,7 @@ def test_train_ddp_partial_window_does_not_update_params(
         ddp_loader,
         distogram_res,
         distogram_atom,
+        log,
         device="cpu",
     )
     assert all(torch.equal(b, a) for b, a in zip(params_before, model.parameters(), strict=False))
@@ -1815,10 +1871,13 @@ def test_train_accumulation_full_window_updates_params(
     tcfg_accum: TrainConfig,
     distogram_res: Distogram,
     distogram_atom: Distogram,
+    log: FilteringBoundLogger,
 ) -> None:
     """With accum_steps=2 and a 2-batch loader, train() completes one window and updates params."""
     params_before = [p.clone().detach() for p in model.parameters()]
-    train(model, tcfg_accum, loader_2batch, loader_2batch, distogram_res, distogram_atom, "cpu")
+    train(
+        model, tcfg_accum, loader_2batch, loader_2batch, distogram_res, distogram_atom, "cpu", log
+    )
     assert any(
         not torch.equal(b, a) for b, a in zip(params_before, model.parameters(), strict=False)
     )
@@ -1830,6 +1889,7 @@ def test_train_ddp_accumulation_full_window_updates_params(
     distogram_res: Distogram,
     distogram_atom: Distogram,
     mini_batch: Mapping[str, Float[torch.Tensor, "..."] | list[str]],
+    log: FilteringBoundLogger,
 ) -> None:
     """With accum_steps=2 and a 2-batch DDP loader, train_ddp() updates params after one window."""
     sampler = _MockSampler([mini_batch, mini_batch])
@@ -1849,6 +1909,7 @@ def test_train_ddp_accumulation_full_window_updates_params(
         test_loader=ddp_loader_2batch,
         distogram_res=distogram_res,
         distogram_atom=distogram_atom,
+        log=log,
         device="cpu",
     )
     assert any(
