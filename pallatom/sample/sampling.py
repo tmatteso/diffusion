@@ -27,9 +27,9 @@ from helpers.atom_utils import (
     rigid_group_atom_positions,
     to_pdb,
 )
+from helpers.context_managers import StructlogConfig
 from helpers.featurize import Distogram, FeaturizedBatch, sinusoidal_encoding
 from jaxtyping import Bool, Float, Int, jaxtyped
-from train.train_loop import StructlogConfig
 
 log = structlog.get_logger()
 
