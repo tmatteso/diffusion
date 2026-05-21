@@ -25,6 +25,7 @@ from helpers.alignment import kabsch_align
 from helpers.bucketed_sampler import BucketedBatchSampler
 from helpers.context_managers import DistProcessGroup, FatalOnError, StructlogConfig
 from helpers.data import (
+    make_bucketed_data_loaders,
     make_ddp_bucketed_data_loaders,
 )
 from helpers.featurize import Distogram, ProteinBatch, apply_conditioning_dropout, featurize_batch
@@ -954,74 +955,134 @@ def train_ddp(
 
 # still missing the queue
 def main(args: argparse.Namespace, tcfg: TrainConfig) -> None:
-    """Entry point for DDP training."""
-    with (
-        DistProcessGroup("nccl") as dpg,
-        StructlogConfig(dpg.is_rank_zero, args.log_file),
-        FatalOnError(),
-    ):
-        log = structlog.get_logger()
-        train_loader, val_loader, _ = make_ddp_bucketed_data_loaders(
-            tcfg,
-            args.data,
-            args.splits,
-            rank=dpg.rank,
-            world_size=dpg.world_size,
-            num_workers=args.num_workers,
-        )
+    """Entry point for training; dispatches to DDP or single-device based on args.ddp."""
+    if args.ddp:
+        with (
+            DistProcessGroup("nccl") as dpg,
+            StructlogConfig(dpg.is_rank_zero, args.log_file),
+            FatalOnError(),
+        ):
+            log = structlog.get_logger()
+            train_loader, val_loader, _ = make_ddp_bucketed_data_loaders(
+                tcfg,
+                args.data,
+                args.splits,
+                rank=dpg.rank,
+                world_size=dpg.world_size,
+                num_workers=args.num_workers,
+            )
 
-        mp = tcfg.model
-        model = MainTrunk(
-            f_ref_dim=mp.f_ref_dim,
-            n_bins=mp.n_bins,
-            n_atom_bins=tcfg.distogram_atom.n_bins,
-            c_atom=mp.c_atom,
-            c_pair=mp.c_pair,
-            c_res=mp.c_res,
-            c_atompair=mp.c_atompair,
-            K_unit=mp.K_unit,
-            sigma_data=tcfg.noise.sigma_data,
-        ).to(dpg.device)
+            mp = tcfg.model
+            model = MainTrunk(
+                f_ref_dim=mp.f_ref_dim,
+                n_bins=mp.n_bins,
+                n_atom_bins=tcfg.distogram_atom.n_bins,
+                c_atom=mp.c_atom,
+                c_pair=mp.c_pair,
+                c_res=mp.c_res,
+                c_atompair=mp.c_atompair,
+                K_unit=mp.K_unit,
+                sigma_data=tcfg.noise.sigma_data,
+            ).to(dpg.device)
 
-        dr = tcfg.distogram_res
-        da = tcfg.distogram_atom
-        distogram_res = Distogram(
-            n_bins=dr.n_bins, min_dist=dr.min_dist, max_dist=dr.max_dist, overflow_bin=True
-        ).to(dpg.device)
-        distogram_atom = Distogram(
-            n_bins=da.n_bins, min_dist=da.min_dist, max_dist=da.max_dist, overflow_bin=False
-        ).to(dpg.device)
+            dr = tcfg.distogram_res
+            da = tcfg.distogram_atom
+            distogram_res = Distogram(
+                n_bins=dr.n_bins, min_dist=dr.min_dist, max_dist=dr.max_dist, overflow_bin=True
+            ).to(dpg.device)
+            distogram_atom = Distogram(
+                n_bins=da.n_bins, min_dist=da.min_dist, max_dist=da.max_dist, overflow_bin=False
+            ).to(dpg.device)
 
-        if tcfg.training.pretrained_weights is not None:
-            ckpt = torch.load(tcfg.training.pretrained_weights, map_location=dpg.device)
-            model.load_state_dict(ckpt["model"])
-            if dpg.is_rank_zero:
+            if tcfg.training.pretrained_weights is not None:
+                ckpt = torch.load(tcfg.training.pretrained_weights, map_location=dpg.device)
+                model.load_state_dict(ckpt["model"])
+                if dpg.is_rank_zero:
+                    log.info("loaded pretrained weights", path=tcfg.training.pretrained_weights)
+
+            if dpg.is_rank_zero and tcfg.logging.use_wandb:
+                wandb.init(project=tcfg.logging.wandb_project, config=tcfg.model_dump())
+
+            train_ddp(
+                rank=dpg.rank,
+                local_rank=dpg.local_rank,
+                world_size=dpg.world_size,
+                model=model,
+                tcfg=tcfg,
+                train_loader=train_loader,
+                test_loader=val_loader,
+                distogram_res=distogram_res,
+                distogram_atom=distogram_atom,
+                log=log,
+            )
+    else:
+        with (
+            StructlogConfig(is_rank_zero=True, log_file=args.log_file),
+            FatalOnError(),
+        ):
+            log = structlog.get_logger()
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            train_loader, val_loader, _ = make_bucketed_data_loaders(
+                cfg=tcfg,
+                jsonl_path=args.data,
+                splits_path=args.splits,
+                num_workers=args.num_workers,
+                debug_run=args.debug_run,
+            )
+
+            mp = tcfg.model
+            model = MainTrunk(
+                f_ref_dim=mp.f_ref_dim,
+                n_bins=mp.n_bins,
+                n_atom_bins=tcfg.distogram_atom.n_bins,
+                c_atom=mp.c_atom,
+                c_pair=mp.c_pair,
+                c_res=mp.c_res,
+                c_atompair=mp.c_atompair,
+                K_unit=mp.K_unit,
+                sigma_data=tcfg.noise.sigma_data,
+            ).to(device)
+
+            dr = tcfg.distogram_res
+            da = tcfg.distogram_atom
+            distogram_res = Distogram(
+                n_bins=dr.n_bins, min_dist=dr.min_dist, max_dist=dr.max_dist, overflow_bin=True
+            ).to(device)
+            distogram_atom = Distogram(
+                n_bins=da.n_bins, min_dist=da.min_dist, max_dist=da.max_dist, overflow_bin=False
+            ).to(device)
+
+            if tcfg.training.pretrained_weights is not None:
+                ckpt = torch.load(tcfg.training.pretrained_weights, map_location=device)
+                model.load_state_dict(ckpt["model"])
                 log.info("loaded pretrained weights", path=tcfg.training.pretrained_weights)
 
-        if dpg.is_rank_zero and tcfg.logging.use_wandb:
-            wandb.init(project=tcfg.logging.wandb_project, config=tcfg.model_dump())
+            if tcfg.logging.use_wandb:
+                wandb.init(project=tcfg.logging.wandb_project, config=tcfg.model_dump())
 
-        train_ddp(
-            rank=dpg.rank,
-            local_rank=dpg.local_rank,
-            world_size=dpg.world_size,
-            model=model,
-            tcfg=tcfg,
-            train_loader=train_loader,
-            test_loader=val_loader,
-            distogram_res=distogram_res,
-            distogram_atom=distogram_atom,
-            log=log,
-        )
+            train(
+                model=model,
+                tcfg=tcfg,
+                train_loader=train_loader,
+                test_loader=val_loader,
+                distogram_res=distogram_res,
+                distogram_atom=distogram_atom,
+                device=device,
+                log=log,
+            )
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train PallAtom (DDP)")
+    parser = argparse.ArgumentParser(description="Train PallAtom")
     parser.add_argument("--data", required=True, help="path to proteins.jsonl")
     parser.add_argument("--splits", required=True, help="path to splits.json")
     parser.add_argument("--config", help="path to TrainConfig JSON (omit for defaults)")
     parser.add_argument("--log_file", default=None, help="path to write structured JSON log lines")
     parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--ddp", action="store_true", help="use DistributedDataParallel training")
+    parser.add_argument(
+        "--debug_run", action="store_true", help="restrict to 252 proteins for fast iteration"
+    )
     args = parser.parse_args()
     with open(args.config) as _f:
         tcfg = TrainConfig.model_validate_json(_f.read())
