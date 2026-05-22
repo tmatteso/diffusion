@@ -825,7 +825,7 @@ def train(  # noqa: PLR0915
                 log.info(
                     "Too many tokens in batch",
                     batch_token_count=n_all_tokens,
-                    budget=per_rank_token_budget,
+                    budget=tcfg.train_loader.token_budget,
                 )
                 window_metrics, component_norms, grad_norm, global_step = _optimizer_step(
                     micro_buffer,
