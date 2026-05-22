@@ -28,7 +28,7 @@ def test_batch_plan_respects_token_budget() -> None:
     n = 200
     flat_to_cluster = [0] * n  # all in cluster 0, rep_len=8
     rep_lens = _rep_lens()
-    batches = _compute_batch_plan(flat_to_cluster, rep_lens, n, 512, 16, seed=0)
+    batches = _compute_batch_plan(flat_to_cluster, rep_lens, n, 512, 16, seed=0, max_seq_len=512)
     for batch in batches:
         total = sum(rep_lens[flat_to_cluster[i]] for i in batch)
         assert total <= 512, f"Batch budget exceeded: {total}"
@@ -39,18 +39,30 @@ def test_batch_plan_covers_all_proteins() -> None:
     n = 100
     flat_to_cluster = list(range(64)) * (n // 64) + list(range(n % 64))
     rep_lens = _rep_lens()
-    batches = _compute_batch_plan(flat_to_cluster, rep_lens, n, 512, 16, seed=0)
+    batches = _compute_batch_plan(flat_to_cluster, rep_lens, n, 512, 16, seed=0, max_seq_len=512)
     all_indices = sorted(i for batch in batches for i in batch)
     assert all_indices == list(range(n))
 
 
-def test_batch_plan_overflow_is_singleton() -> None:
-    """A protein in the overflow cluster is always a singleton batch."""
-    flat_to_cluster = [64]  # one overflow protein
+def test_batch_plan_overflow_is_singleton_without_truncation() -> None:
+    """Overflow proteins become singleton batches when max_seq_len exceeds token_budget."""
+    flat_to_cluster = [64]  # one overflow protein, rep_len = 513
     rep_lens = _rep_lens()
-    batches = _compute_batch_plan(flat_to_cluster, rep_lens, 1, 512, 16, seed=0)
+    batches = _compute_batch_plan(flat_to_cluster, rep_lens, 1, 512, 16, seed=0, max_seq_len=513)
     assert len(batches) == 1
     assert batches[0] == [0]
+
+
+def test_batch_plan_overflow_packs_when_truncated() -> None:
+    """Overflow proteins are packed together when max_seq_len caps them below token_budget."""
+    # 4 overflow proteins; each truncates to 128, so 4 * 128 = 512 fits exactly.
+    flat_to_cluster = [64, 64, 64, 64]
+    rep_lens = _rep_lens()  # rep_lens[64] = 513
+    batches = _compute_batch_plan(flat_to_cluster, rep_lens, 4, 512, 16, seed=0, max_seq_len=128)
+    assert sum(len(b) for b in batches) == 4
+    assert all(len(b) >= 1 for b in batches)
+    # All four should fit in a single batch (4 * 128 = 512 <= 512).
+    assert len(batches) == 1
 
 
 def test_batch_plan_different_seeds_differ() -> None:
@@ -58,8 +70,8 @@ def test_batch_plan_different_seeds_differ() -> None:
     n = 200
     flat_to_cluster = [0] * n
     rep_lens = _rep_lens()
-    batches_a = _compute_batch_plan(flat_to_cluster, rep_lens, n, 512, 16, seed=0)
-    batches_b = _compute_batch_plan(flat_to_cluster, rep_lens, n, 512, 16, seed=1)
+    batches_a = _compute_batch_plan(flat_to_cluster, rep_lens, n, 512, 16, seed=0, max_seq_len=512)
+    batches_b = _compute_batch_plan(flat_to_cluster, rep_lens, n, 512, 16, seed=1, max_seq_len=512)
     indices_a = [i for batch in batches_a for i in batch]
     indices_b = [i for batch in batches_b for i in batch]
     assert indices_a != indices_b
@@ -100,7 +112,9 @@ def small_cluster_index(tmp_path: pathlib.Path) -> ClusterIndex:
 
 def test_sampler_covers_all_proteins(small_cluster_index: ClusterIndex) -> None:
     """Every protein index appears exactly once per epoch."""
-    sampler = BucketedBatchSampler(small_cluster_index, token_budget=512, seed=0, prefetch_epochs=1)
+    sampler = BucketedBatchSampler(
+        small_cluster_index, token_budget=512, max_seq_len=512, seed=0, prefetch_epochs=1
+    )
     sampler.set_epoch(0)
     all_indices = sorted(i for batch in sampler for i in batch)
     assert all_indices == list(range(len(small_cluster_index)))
@@ -108,7 +122,9 @@ def test_sampler_covers_all_proteins(small_cluster_index: ClusterIndex) -> None:
 
 def test_sampler_respects_token_budget(small_cluster_index: ClusterIndex) -> None:
     """No batch exceeds the token budget (by representative lengths)."""
-    sampler = BucketedBatchSampler(small_cluster_index, token_budget=512, seed=0, prefetch_epochs=1)
+    sampler = BucketedBatchSampler(
+        small_cluster_index, token_budget=512, max_seq_len=512, seed=0, prefetch_epochs=1
+    )
     sampler.set_epoch(0)
     for batch in sampler:
         total = sum(
@@ -121,10 +137,22 @@ def test_sampler_respects_token_budget(small_cluster_index: ClusterIndex) -> Non
 def test_sampler_ddp_equal_length(small_cluster_index: ClusterIndex) -> None:
     """Both DDP ranks receive the same number of batches per epoch."""
     sampler_r0 = BucketedBatchSampler(
-        small_cluster_index, token_budget=512, world_size=2, rank=0, seed=0, prefetch_epochs=1
+        small_cluster_index,
+        token_budget=512,
+        max_seq_len=512,
+        world_size=2,
+        rank=0,
+        seed=0,
+        prefetch_epochs=1,
     )
     sampler_r1 = BucketedBatchSampler(
-        small_cluster_index, token_budget=512, world_size=2, rank=1, seed=0, prefetch_epochs=1
+        small_cluster_index,
+        token_budget=512,
+        max_seq_len=512,
+        world_size=2,
+        rank=1,
+        seed=0,
+        prefetch_epochs=1,
     )
     sampler_r0.set_epoch(0)
     sampler_r1.set_epoch(0)
@@ -133,7 +161,9 @@ def test_sampler_ddp_equal_length(small_cluster_index: ClusterIndex) -> None:
 
 def test_sampler_set_epoch_reshuffles(small_cluster_index: ClusterIndex) -> None:
     """Different epochs produce different batch orderings."""
-    sampler = BucketedBatchSampler(small_cluster_index, token_budget=512, seed=0, prefetch_epochs=3)
+    sampler = BucketedBatchSampler(
+        small_cluster_index, token_budget=512, max_seq_len=512, seed=0, prefetch_epochs=3
+    )
     sampler.set_epoch(0)
     batches_e0 = [batch[:] for batch in sampler]
     sampler.set_epoch(1)
@@ -143,6 +173,8 @@ def test_sampler_set_epoch_reshuffles(small_cluster_index: ClusterIndex) -> None
 
 def test_sampler_len_after_set_epoch(small_cluster_index: ClusterIndex) -> None:
     """__len__ returns the correct batch count after set_epoch."""
-    sampler = BucketedBatchSampler(small_cluster_index, token_budget=512, seed=0, prefetch_epochs=1)
+    sampler = BucketedBatchSampler(
+        small_cluster_index, token_budget=512, max_seq_len=512, seed=0, prefetch_epochs=1
+    )
     sampler.set_epoch(0)
     assert len(sampler) == len(list(sampler))

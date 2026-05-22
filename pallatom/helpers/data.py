@@ -478,6 +478,7 @@ def make_bucketed_data_loaders(
     train_sampler = BucketedBatchSampler(
         train_set.cluster_index,
         token_budget=cfg.train_loader.token_budget,
+        max_seq_len=cfg.train_loader.max_seq_length,
     )
 
     train_loader = torch.utils.data.DataLoader(
@@ -566,6 +567,7 @@ def make_ddp_bucketed_data_loaders(
     train_sampler = BucketedBatchSampler(
         train_set.cluster_index,
         token_budget=cfg.train_loader.token_budget,
+        max_seq_len=cfg.train_loader.max_seq_length,
         world_size=world_size,
         rank=rank,
     )

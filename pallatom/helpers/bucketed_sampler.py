@@ -19,6 +19,7 @@ def _compute_batch_plan(
     token_budget: int,
     chunk_multiplier: int,
     seed: int,
+    max_seq_len: int,
 ) -> list[list[int]]:
     """Compute one epoch's batch plan using sortish sampling and greedy token packing.
 
@@ -30,7 +31,8 @@ def _compute_batch_plan(
         2. Split into chunks of chunk_size = chunk_multiplier * (token_budget // median_rep_len).
         3. Sort each chunk ascending by cluster_rep_len (shortest first).
         4. Greedy pack: accumulate proteins until adding the next would exceed token_budget.
-           Overflow proteins (rep_len > token_budget) always become singleton batches.
+           Each protein's budget contribution is min(rep_len, max_seq_len); proteins that
+           exceed the budget even after capping become singleton batches.
 
     Args:
         flat_to_cluster:  Cluster id for each global protein index.
@@ -39,6 +41,8 @@ def _compute_batch_plan(
         token_budget:     Maximum cumulative rep_len per batch.
         chunk_multiplier: Controls sortish-window width (default 16 ~= 16 full batches).
         seed:             RNG seed; use seed + epoch to get per-epoch shuffles.
+        max_seq_len:      Dataset truncation cap; rep_len is capped at this value for
+                          budget accounting so truncated proteins pack correctly.
 
     Returns:
         List of batches; each batch is a list of flat protein indices.
@@ -65,19 +69,20 @@ def _compute_batch_plan(
 
         for i in chunk:
             rep_len = cluster_rep_len[flat_to_cluster[i]]
-            if rep_len > token_budget:
+            effective_len = min(rep_len, max_seq_len)
+            if effective_len > token_budget:
                 if current_batch:
                     batches.append(current_batch)
                     current_batch = []
                     current_budget = 0
                 batches.append([i])
-            elif current_budget + rep_len > token_budget:
+            elif current_budget + effective_len > token_budget:
                 batches.append(current_batch)
                 current_batch = [i]
-                current_budget = rep_len
+                current_budget = effective_len
             else:
                 current_batch.append(i)
-                current_budget += rep_len
+                current_budget += effective_len
 
         if current_batch:
             batches.append(current_batch)
@@ -112,6 +117,9 @@ class BucketedBatchSampler(torch.utils.data.Sampler[list[int]]):
     Args:
         cluster_index:    ClusterIndex exposing flat_to_cluster and cluster_rep_len.
         token_budget:     Maximum cumulative representative length per batch.
+        max_seq_len:      Dataset truncation cap passed to _compute_batch_plan so that
+                          proteins whose rep_len exceeds it are packed at their truncated
+                          length rather than as singletons.
         chunk_multiplier: Sortish window width in multiples of avg proteins per batch.
         world_size:       Number of DDP processes. Default 1 (single GPU).
         rank:             This process's DDP rank. Default 0.
@@ -124,6 +132,7 @@ class BucketedBatchSampler(torch.utils.data.Sampler[list[int]]):
         self,
         cluster_index: ClusterIndex,
         token_budget: int,
+        max_seq_len: int,
         chunk_multiplier: int = 16,
         world_size: int = 1,
         rank: int = 0,
@@ -132,6 +141,7 @@ class BucketedBatchSampler(torch.utils.data.Sampler[list[int]]):
     ) -> None:
         self._cluster_index = cluster_index
         self._token_budget = token_budget
+        self._max_seq_len = max_seq_len
         self._chunk_multiplier = chunk_multiplier
         self._world_size = world_size
         self._rank = rank
@@ -166,6 +176,7 @@ class BucketedBatchSampler(torch.utils.data.Sampler[list[int]]):
             self._token_budget,
             self._chunk_multiplier,
             seed,
+            self._max_seq_len,
         )
 
     def set_epoch(self, epoch: int) -> None:
