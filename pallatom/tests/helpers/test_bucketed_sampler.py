@@ -24,14 +24,36 @@ def _rep_lens(n_clusters: int = 64, token_budget: int = 512) -> list[int]:
 
 
 def test_batch_plan_respects_token_budget() -> None:
-    """No batch in the plan exceeds the token budget (using representative lengths)."""
+    """No batch's padded token count exceeds the token budget."""
     n = 200
     flat_to_cluster = [0] * n  # all in cluster 0, rep_len=8
     rep_lens = _rep_lens()
     batches = _compute_batch_plan(flat_to_cluster, rep_lens, n, 512, 16, seed=0, max_seq_len=512)
     for batch in batches:
-        total = sum(rep_lens[flat_to_cluster[i]] for i in batch)
-        assert total <= 512, f"Batch budget exceeded: {total}"
+        max_rep = max(rep_lens[flat_to_cluster[i]] for i in batch)
+        padded_total = len(batch) * max_rep
+        assert padded_total <= 512, f"Padded batch cost exceeded budget: {padded_total}"
+
+
+def test_batch_plan_no_padding_blowup() -> None:
+    """Adding a long protein to a batch of short proteins does not cause padding blowup.
+
+    Before the padded-cost fix the sum-of-rep-lens check allowed a batch like
+    [64,64,64,64,64,128] (sum=448≤512) whose actual padded cost is 6*128=768.
+    """
+    # Two cluster ids: cluster 7 with rep_len=64, cluster 15 with rep_len=128.
+    # Lay out proteins sorted ascending (as _compute_batch_plan will sort them):
+    # 5 short proteins followed by 1 long one.
+    rep_lens = _rep_lens()  # bin_width=8; rep_lens[7]=64, rep_lens[15]=128
+    # Proteins 0-4 → cluster 7 (rep_len=64), protein 5 → cluster 15 (rep_len=128)
+    flat_to_cluster = [7, 7, 7, 7, 7, 15]
+    batches = _compute_batch_plan(flat_to_cluster, rep_lens, 6, 512, 16, seed=0, max_seq_len=512)
+    for batch in batches:
+        max_rep = max(rep_lens[flat_to_cluster[i]] for i in batch)
+        padded_total = len(batch) * max_rep
+        assert (
+            padded_total <= 512
+        ), f"Padding blowup: {len(batch)} proteins * {max_rep} = {padded_total}"
 
 
 def test_batch_plan_covers_all_proteins() -> None:

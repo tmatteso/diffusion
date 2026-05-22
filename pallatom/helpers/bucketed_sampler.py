@@ -30,9 +30,11 @@ def _compute_batch_plan(
         1. Shuffle all indices with Random(seed).
         2. Split into chunks of chunk_size = chunk_multiplier * (token_budget // median_rep_len).
         3. Sort each chunk ascending by cluster_rep_len (shortest first).
-        4. Greedy pack: accumulate proteins until adding the next would exceed token_budget.
-           Each protein's budget contribution is min(rep_len, max_seq_len); proteins that
-           exceed the budget even after capping become singleton batches.
+        4. Greedy pack: accumulate proteins until the padded batch cost would exceed
+           token_budget. Because the chunk is sorted ascending, each new protein has the
+           largest effective_len seen so far, so the padded cost is simply
+           (batch_size + 1) * effective_len. Proteins whose effective_len alone exceeds
+           the budget become singleton batches.
 
     Args:
         flat_to_cluster:  Cluster id for each global protein index.
@@ -65,7 +67,6 @@ def _compute_batch_plan(
         chunk.sort(key=lambda i: cluster_rep_len[flat_to_cluster[i]])
 
         current_batch: list[int] = []
-        current_budget = 0
 
         for i in chunk:
             rep_len = cluster_rep_len[flat_to_cluster[i]]
@@ -74,15 +75,14 @@ def _compute_batch_plan(
                 if current_batch:
                     batches.append(current_batch)
                     current_batch = []
-                    current_budget = 0
                 batches.append([i])
-            elif current_budget + effective_len > token_budget:
+            elif (len(current_batch) + 1) * effective_len > token_budget:
+                # Chunk is sorted ascending, so effective_len is the new batch max.
+                # Check padded cost rather than sum to prevent padding blowup.
                 batches.append(current_batch)
                 current_batch = [i]
-                current_budget = effective_len
             else:
                 current_batch.append(i)
-                current_budget += effective_len
 
         if current_batch:
             batches.append(current_batch)

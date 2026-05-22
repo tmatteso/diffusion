@@ -823,9 +823,10 @@ def train(  # noqa: PLR0915
             # Pre-flush: if adding this batch would push tokens over the budget, flush first.
             if micro_buffer and accum_tokens + n_all_tokens > per_rank_token_budget:
                 log.info(
-                    "Too many tokens in batch",
-                    batch_token_count=n_all_tokens,
-                    budget=tcfg.train_loader.token_budget,
+                    "accumulation termination",
+                    current_batch_token_count=n_all_tokens,
+                    tokens_in_accumulation_from_previous_batches=accum_tokens,
+                    budget=per_rank_token_budget,
                 )
                 window_metrics, component_norms, grad_norm, global_step = _optimizer_step(
                     micro_buffer,
