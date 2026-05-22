@@ -767,7 +767,6 @@ def train(  # noqa: PLR0915
         log: Bound structlog logger.
     """
     tp = tcfg.training
-    lg = tcfg.logging
     per_rank_token_budget: int = tp.accumulated_token_budget
     log.info("training with DDP", DDP=False)
     log.info(
@@ -842,22 +841,18 @@ def train(  # noqa: PLR0915
                 )
                 n_batches += 1
                 micro_buffer, n_proteins_buffer, accum_tokens = [], [], 0
-                if global_step % lg.log_interval == 0:
-                    pbar.set_postfix(
-                        {
-                            "loss": f"{window_metrics['total loss']:.2f}",
-                            "MSE_loss": f"{window_metrics['Kabsch aligned MSE loss']:.2f}",
-                            "CE_loss": f"{window_metrics['Cross Entropy loss']:.2f}",
-                            "smooth_lddt_loss": f"{window_metrics['smooth lddt']:.2f}",
-                            "residue_distogram_loss": (
-                                f"{window_metrics['Residue Distogram loss']:.2f}"
-                            ),
-                            "atom_distogram_loss": f"{window_metrics['Atom Distogram loss']:.2f}",
-                            "intermediate_loss": f"{window_metrics['Intermediate loss']:.2f}",
-                            "gnorm": f"{grad_norm:.2f}",
-                            **{k: f"{v:.2f}" for k, v in component_norms.items()},
-                        }
-                    )
+                log.info(
+                    "accumulated batch statistics",
+                    loss=f"{window_metrics['total loss']:.2f}",
+                    MSE_loss=f"{window_metrics['Kabsch aligned MSE loss']:.2f}",
+                    CE_loss=f"{window_metrics['Cross Entropy loss']:.2f}",
+                    smooth_lddt_loss=f"{window_metrics['smooth lddt']:.2f}",
+                    residue_distogram_loss=f"{window_metrics['Residue Distogram loss']:.2f}",
+                    atom_distogram_loss=f"{window_metrics['Atom Distogram loss']:.2f}",
+                    intermediate_loss=f"{window_metrics['Intermediate loss']:.2f}",
+                    gnorm=f"{grad_norm:.2f}",
+                    **{k: f"{v:.2f}" for k, v in component_norms.items()},
+                )
 
             micro_buffer.append(batch)
             n_proteins_buffer.append(n_proteins)
