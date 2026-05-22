@@ -121,7 +121,7 @@ class LoaderConfig(BaseModel):
 
     max_seq_length: int = Field(default=128, gt=0)  # was 256
     batch_size: int = Field(default=2, gt=0)  # was 2
-    token_budget: int = Field(default=1024, gt=0)
+    token_budget: int = Field(default=512, gt=0)
 
 
 TrainLoaderConfig = LoaderConfig

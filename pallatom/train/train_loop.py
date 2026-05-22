@@ -806,7 +806,15 @@ def train(  # noqa: PLR0915
 
         if isinstance(train_loader.batch_sampler, BucketedBatchSampler):
             train_loader.batch_sampler.set_epoch(epoch)
-        pbar = tqdm(desc=f"Epoch {epoch:03d}/{tp.num_epochs}", leave=False, unit="step")
+        estimated_steps: int = math.ceil(
+            len(train_loader) * tcfg.train_loader.max_seq_length / per_rank_token_budget
+        )
+        pbar = tqdm(
+            desc=f"Epoch {epoch:03d}/{tp.num_epochs}",
+            total=estimated_steps,
+            leave=False,
+            unit="step",
+        )
 
         for batch in train_loader:
             n_non_pad_tokens: int = int(batch.atom_mask.any(dim=-1).sum().item())
