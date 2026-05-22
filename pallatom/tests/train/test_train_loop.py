@@ -2035,11 +2035,6 @@ def test_train_ddp_metrics_nonzero_when_budget_exceeds_total_tokens(
 # ---------------------------------------------------------------------------
 
 
-def test_accumulated_token_budget_default() -> None:
-    """accumulated_token_budget defaults to 2048."""
-    assert TrainingParams().accumulated_token_budget == 2048
-
-
 def test_accumulated_token_budget_rejects_zero() -> None:
     """TrainingParams raises ValidationError when accumulated_token_budget is zero."""
     with pytest.raises(ValidationError):

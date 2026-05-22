@@ -767,6 +767,7 @@ def train(  # noqa: PLR0915
         log: Bound structlog logger.
     """
     tp = tcfg.training
+    lg = tcfg.logging
     per_rank_token_budget: int = tp.accumulated_token_budget
     log.info("training with DDP", DDP=False)
     log.info(
@@ -798,35 +799,24 @@ def train(  # noqa: PLR0915
         n_batches = 0
         micro_buffer: list[ProteinBatch] = []
         n_proteins_buffer: list[int] = []
+        max_seq_len_buffer: list[int] = []
+        token_pack_rate_buffer: list[float] = []
         accum_tokens: int = 0
         optimizer.zero_grad()
 
         if isinstance(train_loader.batch_sampler, BucketedBatchSampler):
             train_loader.batch_sampler.set_epoch(epoch)
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch:03d}/{tp.num_epochs}", leave=False)
+        pbar = tqdm(desc=f"Epoch {epoch:03d}/{tp.num_epochs}", leave=False, unit="step")
 
-        for batch in pbar:
+        for batch in train_loader:
             n_non_pad_tokens: int = int(batch.atom_mask.any(dim=-1).sum().item())
             n_proteins: int = batch.atom_positions.shape[0]
             max_seq_len: int = batch.atom_positions.shape[1]
             n_all_tokens: int = n_proteins * max_seq_len
             token_pack_rate: float = n_non_pad_tokens / n_all_tokens
-            log.info(
-                "batch statistics",
-                batch_token_count=n_all_tokens,
-                batch_size=n_proteins,
-                max_seq_len_in_batch=max_seq_len,
-                token_pack_rate=token_pack_rate,
-            )
 
             # Pre-flush: if adding this batch would push tokens over the budget, flush first.
             if micro_buffer and accum_tokens + n_all_tokens > per_rank_token_budget:
-                log.info(
-                    "accumulation termination",
-                    current_batch_token_count=n_all_tokens,
-                    tokens_in_accumulation_from_previous_batches=accum_tokens,
-                    budget=per_rank_token_budget,
-                )
                 window_metrics, component_norms, grad_norm, global_step = _optimizer_step(
                     micro_buffer,
                     n_proteins_buffer,
@@ -840,22 +830,42 @@ def train(  # noqa: PLR0915
                     global_step,
                 )
                 n_batches += 1
+                n_micro = len(micro_buffer)
+                avg_batch_token_count = accum_tokens / n_micro
+                avg_batch_size = sum(n_proteins_buffer) / n_micro
+                avg_max_seq_len = sum(max_seq_len_buffer) / n_micro
+                avg_token_pack_rate = sum(token_pack_rate_buffer) / n_micro
                 micro_buffer, n_proteins_buffer, accum_tokens = [], [], 0
+                max_seq_len_buffer, token_pack_rate_buffer = [], []
                 log.info(
                     "accumulated batch statistics",
-                    loss=f"{window_metrics['total loss']:.2f}",
-                    MSE_loss=f"{window_metrics['Kabsch aligned MSE loss']:.2f}",
-                    CE_loss=f"{window_metrics['Cross Entropy loss']:.2f}",
-                    smooth_lddt_loss=f"{window_metrics['smooth lddt']:.2f}",
-                    residue_distogram_loss=f"{window_metrics['Residue Distogram loss']:.2f}",
-                    atom_distogram_loss=f"{window_metrics['Atom Distogram loss']:.2f}",
-                    intermediate_loss=f"{window_metrics['Intermediate loss']:.2f}",
+                    avg_batch_token_count=f"{avg_batch_token_count:.1f}",
+                    avg_batch_size=f"{avg_batch_size:.1f}",
+                    avg_max_seq_len_in_batch=f"{avg_max_seq_len:.1f}",
+                    avg_token_pack_rate=f"{avg_token_pack_rate:.3f}",
                     gnorm=f"{grad_norm:.2f}",
                     **{k: f"{v:.2f}" for k, v in component_norms.items()},
                 )
+                pbar.update(1)
+                if global_step % lg.log_interval == 0:
+                    pbar.set_postfix(
+                        {
+                            "loss": f"{window_metrics['total loss']:.2f}",
+                            "MSE_loss": f"{window_metrics['Kabsch aligned MSE loss']:.2f}",
+                            "CE_loss": f"{window_metrics['Cross Entropy loss']:.2f}",
+                            "smooth_lddt_loss": f"{window_metrics['smooth lddt']:.2f}",
+                            "residue_distogram_loss": (
+                                f"{window_metrics['Residue Distogram loss']:.2f}"
+                            ),
+                            "atom_distogram_loss": f"{window_metrics['Atom Distogram loss']:.2f}",
+                            "intermediate_loss": f"{window_metrics['Intermediate loss']:.2f}",
+                        }
+                    )
 
             micro_buffer.append(batch)
             n_proteins_buffer.append(n_proteins)
+            max_seq_len_buffer.append(max_seq_len)
+            token_pack_rate_buffer.append(token_pack_rate)
             accum_tokens += n_all_tokens
 
         # Flush any remaining micro-batches at epoch end, regardless of token count.
@@ -875,6 +885,9 @@ def train(  # noqa: PLR0915
             )
             n_batches += 1
             micro_buffer = []
+            pbar.update(1)
+
+        pbar.close()
 
         if n_batches > 0:
             scheduler.step()

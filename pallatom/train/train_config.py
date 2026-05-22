@@ -14,7 +14,7 @@ class TrainingParams(BaseModel):
     grad_clip: float | None = Field(default=2.0, gt=0)
     pretrained_weights: str | None = None
     resume_checkpoint: str | None = None
-    accumulated_token_budget: int = Field(default=2048, gt=0)
+    accumulated_token_budget: int = Field(default=4096, gt=0)
 
 
 class ModelParams(BaseModel):
@@ -121,7 +121,7 @@ class LoaderConfig(BaseModel):
 
     max_seq_length: int = Field(default=128, gt=0)  # was 256
     batch_size: int = Field(default=2, gt=0)  # was 2
-    token_budget: int = Field(default=512, gt=0)
+    token_budget: int = Field(default=1024, gt=0)
 
 
 TrainLoaderConfig = LoaderConfig
