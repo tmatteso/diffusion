@@ -134,20 +134,24 @@ class ClusteredProteinDataset(
     re-opened lazily inside each worker process.
 
     Args:
-        jsonl_path:   Path to the source JSONL protein dataset.
-        names:        List of entry names to include.
-        token_budget: Hard truncation ceiling; proteins longer than this are truncated.
-                      Default 512.
-        n_clusters:   Number of regular length clusters. Default 64.
+        jsonl_path:     Path to the source JSONL protein dataset.
+        names:          List of entry names to include.
+        max_seq_length: Per-protein hard truncation ceiling; proteins longer than this
+                        are truncated at load time. Default 256.
+        token_budget:   Packing budget passed to ClusterIndex; defines bin widths and
+                        the overflow cluster boundary. Default 512.
+        n_clusters:     Number of regular length clusters. Default 64.
     """
 
     def __init__(
         self,
         jsonl_path: str | Path,
         names: list[str],
+        max_seq_length: int = 256,
         token_budget: int = 512,
         n_clusters: int = 64,
     ) -> None:
+        self.max_seq_length = max_seq_length
         self.token_budget = token_budget
         self.cluster_index = ClusterIndex(jsonl_path, names, token_budget, n_clusters)
         self._files: list[io.BufferedReader | None] = [None] * (n_clusters + 1)
@@ -194,13 +198,13 @@ class ClusteredProteinDataset(
 
         np_example = make_np_example(entry["coords"])  # type: ignore[arg-type]
         center_positions(np_example)
-        truncate_to_length(np_example, self.token_budget)
+        truncate_to_length(np_example, self.max_seq_length)
 
         sample: dict[str, Float[torch.Tensor, "..."] | str] = {
             k: torch.tensor(v, dtype=torch.float32) for k, v in np_example.items()
         }
         seq = cast(str, entry["seq"])
-        sample["seq"] = seq[: self.token_budget]
+        sample["seq"] = seq[: self.max_seq_length]
         return sample
 
 
@@ -457,6 +461,7 @@ def make_bucketed_data_loaders(
     train_set = ClusteredProteinDataset(
         jsonl_path,
         train_names,
+        max_seq_length=cfg.train_loader.max_seq_length,
         token_budget=cfg.train_loader.token_budget,
     )
     val_set = ProteinDataset(
@@ -544,6 +549,7 @@ def make_ddp_bucketed_data_loaders(
     train_set = ClusteredProteinDataset(
         jsonl_path,
         splits["train"],
+        max_seq_length=cfg.train_loader.max_seq_length,
         token_budget=cfg.train_loader.token_budget,
     )
     val_set = ProteinDataset(

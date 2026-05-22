@@ -459,12 +459,12 @@ def test_clustered_dataset_variable_lengths(tmp_path: pathlib.Path) -> None:
     assert lengths == {8, 16, 32}
 
 
-def test_clustered_dataset_truncates_to_budget(tmp_path: pathlib.Path) -> None:
-    """Proteins longer than token_budget are truncated to token_budget."""
+def test_clustered_dataset_truncates_to_max_seq_length(tmp_path: pathlib.Path) -> None:
+    """Proteins longer than max_seq_length are truncated to max_seq_length."""
     entries = [_make_entry("p1", 600)]
     _write_jsonl(tmp_path / "p.jsonl", entries)
-    ds = ClusteredProteinDataset(tmp_path / "p.jsonl", ["p1"], token_budget=512)
-    assert cast(torch.Tensor, ds[0]["atom_positions"]).shape[0] == 512
+    ds = ClusteredProteinDataset(tmp_path / "p.jsonl", ["p1"], max_seq_length=128, token_budget=512)
+    assert cast(torch.Tensor, ds[0]["atom_positions"]).shape[0] == 128
 
 
 def test_clustered_dataset_pickles(tmp_path: pathlib.Path) -> None:
