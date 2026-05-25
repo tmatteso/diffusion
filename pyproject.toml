@@ -131,43 +131,20 @@ known-first-party = ["diffusion"]
 [tool.pyright]
 extraPaths = ["pallatom"]
 pythonVersion = "3.10"
-typeCheckingMode = "standard"           # baseline: enables ~30 fundamental checks
+typeCheckingMode = "strict"
 
 reportInvalidTypeForm = "none" # allows shape strings for jaxtyping compatibility.
 reportIndexIssue = "none" # allows complex pytorch tensor indexing patterns.
-reportConstantRedefinition = "error" # Final enforcement — error if a Final variable is reassigned
-
-# No Any
-# reportUnknownVariableType = "warning" # does not play well with jaxtyping
-# reportUnknownParameterType = "warning" # contamination from untyped libraries
-# reportUnknownMemberType = "warning" # contamination from untyped libraries
+reportUnknownVariableType = "none" # does not play well with jaxtyping
 reportUnnecessaryTypeIgnoreComment = "error" # aren't ignoring type errors without a specific reason.
-
-strictParameterNoneValue = true # prevents accessing attributes that might not exist at runtime.
 reportUninitializedInstanceVariable = "error" # class attributes are initialized in __init__.
-reportUnnecessaryCast = "error" # enforces pytorch cast() calls are actually doing work.
-
-# Enforce variance safety (e.g., dict vs Mapping)
-reportIncompatibleMethodOverride = "error"
-reportIncompatibleVariableOverride = "error"
-
-# Ensures that if you use a generic like dict[], the inner types are also validated
-# This is key for catching things like dict[str, Any] which bypasses variance checks
-reportUnknownArgumentType = "warning"
-reportUnknownLambdaType = "warning"
 
 # Google Style / Strictness: prevent mixing positional and keyword-only args
 # in ways that break covariance in callbacks.
 reportCallInDefaultInitializer = "error"
 
-# Google style: all public APIs must be fully annotated.
-reportMissingParameterType = "error"
-reportMissingTypeArgument = "error"
 # Google style: don't reach into private members from outside their class/module.
 reportPrivateImportUsage = "none" # not sure I agree with this one
-
-reportDeprecated = "warning"   # catches deprecated PyTorch/CUDA API usage early
-reportReturnType = "error"     # all public functions must have explicit return type annotations
 
 
 [tool.pytest.ini_options]

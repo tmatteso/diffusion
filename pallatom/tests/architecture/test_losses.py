@@ -4,19 +4,20 @@ import pytest
 import torch
 import torch.nn.functional as F
 from architecture.losses import (
-    _pairwise_dist,
     atom_loss,
     distogram_loss_atom,
     distogram_loss_residue,
     med_loss,
     med_loss_per_block,
+    pairwise_dist,
     smooth_lddt_loss,
 )
 from beartype import beartype
 from einops import einsum, rearrange, repeat
+from helpers.useful_objects import manual_seed
 from jaxtyping import Bool, Float, Int, TypeCheckError, jaxtyped
 
-torch.manual_seed(42)
+manual_seed(42)
 
 B, N = 4, 50
 K = 6
@@ -118,7 +119,7 @@ def half_mask() -> Bool[torch.Tensor, "B N_atoms"]:
 @pytest.fixture
 def rotation() -> Float[torch.Tensor, "3 3"]:
     """A random 3 by 3 orthogonal rotation matrix obtained via QR decomposition."""
-    R, _ = torch.linalg.qr(torch.randn(3, 3))
+    R, _ = torch.qr(torch.randn(3, 3))
     return R
 
 
@@ -248,16 +249,15 @@ def test_atom_loss_increases_with_noise_level(coords: Float[torch.Tensor, "B N_a
 def test_atom_loss_gradient_flows_through_pred():
     """The loss is differentiable with respect to the predicted coordinates."""
     r_pred = torch.randn(N, 3, requires_grad=True)
-    atom_loss(r_pred, torch.randn(N, 3)).backward()
-    assert r_pred.grad is not None
-    assert torch.isfinite(r_pred.grad).all()
+    (grad,) = torch.autograd.grad(atom_loss(r_pred, torch.randn(N, 3)), r_pred)
+    assert torch.isfinite(grad).all()
 
 
 def test_atom_loss_gt_receives_no_gradient():
     """Ground-truth coordinates are treated as constants — no gradient should flow through them."""
     r_pred = torch.randn(N, 3, requires_grad=True)
     r_gt = torch.randn(N, 3, requires_grad=True)
-    atom_loss(r_pred, r_gt).backward()
+    torch.autograd.backward([atom_loss(r_pred, r_gt)])
     assert r_gt.grad is None
 
 
@@ -356,17 +356,19 @@ def test_med_loss_gradient_flows_to_first_block(
     r0 = torch.randn(N, 3, requires_grad=True)
     r_blocks_g = [r0] + [torch.randn(N, 3) for _ in range(K - 1)]
     aa_blocks_g = [torch.randn(N, VOCAB) for _ in range(K)]
-    med_loss(
-        r_blocks_g,
-        r_gt[0],
-        aa_blocks_g,
-        aa_gt[0],
-        lam=LAM,
-        alpha_0=ALPHA,
-        gamma=GAMMA,
-    ).backward()
-    assert r0.grad is not None
-    assert torch.isfinite(r0.grad).all()
+    (grad,) = torch.autograd.grad(
+        med_loss(
+            r_blocks_g,
+            r_gt[0],
+            aa_blocks_g,
+            aa_gt[0],
+            lam=LAM,
+            alpha_0=ALPHA,
+            gamma=GAMMA,
+        ),
+        r0,
+    )
+    assert torch.isfinite(grad).all()
 
 
 def test_med_loss_lam_zero_less_than_lam_positive(
@@ -434,9 +436,8 @@ def test_smooth_lddt_gradient_flows():
     """The smooth-lDDT loss is differentiable with respect to the predicted coordinates."""
     r_true = torch.randn(N, 3)
     r_pred = torch.randn(N, 3, requires_grad=True)
-    smooth_lddt_loss(r_pred, r_true).backward()
-    assert r_pred.grad is not None
-    assert torch.isfinite(r_pred.grad).all()
+    (grad,) = torch.autograd.grad(smooth_lddt_loss(r_pred, r_true), r_pred)
+    assert torch.isfinite(grad).all()
 
 
 def test_smooth_lddt_pairwise_sq_dist_matches_einsum():
@@ -495,9 +496,8 @@ def test_distogram_residue_batched_output_shape(
 def test_distogram_residue_gradient_flows(res_onehot: Float[torch.Tensor, "B L_res L_res B_res"]):
     """The residue distogram loss is differentiable with respect to the logits."""
     logits_g = torch.randn(L_RES, L_RES, B_RES, requires_grad=True)
-    distogram_loss_residue(logits_g, res_onehot[0]).backward()
-    assert logits_g.grad is not None
-    assert torch.isfinite(logits_g.grad).all()
+    (grad,) = torch.autograd.grad(distogram_loss_residue(logits_g, res_onehot[0]), logits_g)
+    assert torch.isfinite(grad).all()
 
 
 def test_distogram_residue_ce_einsum_matches(
@@ -559,9 +559,10 @@ def test_distogram_atom_gradient_flows(
 ):
     """The atom distogram loss is differentiable with respect to the logits."""
     logits_g = torch.randn(N_ATOMS, N_ATOMS, B_ATOM, requires_grad=True)
-    distogram_loss_atom(logits_g, atom_onehot[0], atom_local_mask[0]).backward()
-    assert logits_g.grad is not None
-    assert torch.isfinite(logits_g.grad).all()
+    (grad,) = torch.autograd.grad(
+        distogram_loss_atom(logits_g, atom_onehot[0], atom_local_mask[0]), logits_g
+    )
+    assert torch.isfinite(grad).all()
 
 
 def test_distogram_atom_local_mask_shape_diagonal():
@@ -620,11 +621,11 @@ def test_med_loss_per_block_wrong_shape() -> None:
         med_loss_per_block(r_bad, r_gt, logits, aa_gt, LAM, ALPHA)
 
 
-def test_pairwise_dist_wrong_shape() -> None:
+def testpairwise_dist_wrong_shape() -> None:
     """Wrong last dim (4 instead of 3) triggers TypeCheckError."""
     x_bad = torch.zeros(10, 4)  # last dim must be 3
     with pytest.raises(TypeCheckError):
-        _pairwise_dist(x_bad)
+        pairwise_dist(x_bad)
 
 
 def test_smooth_lddt_loss_wrong_shape() -> None:

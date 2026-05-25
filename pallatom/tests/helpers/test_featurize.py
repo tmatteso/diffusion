@@ -1,6 +1,7 @@
 """Tests for featurization utilities."""
 
 import dataclasses
+import math
 
 import pytest
 import torch
@@ -12,19 +13,19 @@ from helpers.featurize import (
     FeaturizedBatch,
     FeaturizedItem,
     ProteinBatch,
-    _ref_pos_for_residue,
     apply_conditioning_dropout,
     featurize_batch,
     featurize_single_item,
+    ref_pos_for_residue,
     sinusoidal_encoding,
 )
-from helpers.useful_objects import ModelSetup
+from helpers.useful_objects import ModelSetup, manual_seed
 from jaxtyping import Bool, Float, TypeCheckError
 from torch.optim import Adam
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from train.train_config import TrainConfig
 
-torch.manual_seed(42)
+manual_seed(42)
 
 B = 2
 N_RES = 12
@@ -229,7 +230,7 @@ def test_distogram_exact_bin_for_known_interior_distance(disto: Distogram) -> No
     expected_bin = 5
     with torch.no_grad():
         f, _ = disto(c)
-    assert f[0, 1, expected_bin].item() == pytest.approx(1.0)
+    assert math.isclose(f[0, 1, expected_bin].item(), 1.0)
     assert f[0, 1, :expected_bin].abs().max().item() < 1e-6
     assert f[0, 1, expected_bin + 1 :].abs().max().item() < 1e-6
 
@@ -312,7 +313,7 @@ def featurized_batch(
     Sets a fixed random seed so that the log-normal noise sample lands within
     [sigma_min, sigma_max], keeping t_normalized in [0, 1] regardless of prior RNG state.
     """
-    torch.manual_seed(1)
+    manual_seed(1)
     return featurize_batch(
         batch=protein_batch,
         tcfg=model_params.tcfg,
@@ -492,7 +493,7 @@ def test_conditioning_dropout_p0_is_noop(featurized_batch: FeaturizedBatch) -> N
 
 def test_conditioning_dropout_distogram_symmetric(featurized_batch: FeaturizedBatch) -> None:
     """Distogram dropout zeros both the row and column for each dropped residue."""
-    torch.manual_seed(0)
+    manual_seed(0)
     out = apply_conditioning_dropout(
         featurized_batch, p_distogram=0.5, p_atom=0.0, p_seq=0.0, device="cpu"
     )
@@ -516,7 +517,7 @@ def test_conditioning_dropout_respects_residue_mask(featurized_batch: Featurized
 
 
 # ---------------------------------------------------------------------------
-# sinusoidal_encoding, _ref_pos_for_residue, featurize_single_item, FeaturizedItem
+# sinusoidal_encoding, ref_pos_for_residue, featurize_single_item, FeaturizedItem
 # ---------------------------------------------------------------------------
 
 
@@ -534,15 +535,15 @@ def test_sinusoidal_encoding_output_finite() -> None:
     assert torch.isfinite(out).all()
 
 
-def test_ref_pos_for_residue_output_shape() -> None:
-    """_ref_pos_for_residue returns a (5, 3) tensor of reference atom positions."""
-    pos = _ref_pos_for_residue("ALA")
+def testref_pos_for_residue_output_shape() -> None:
+    """ref_pos_for_residue returns a (5, 3) tensor of reference atom positions."""
+    pos = ref_pos_for_residue("ALA")
     assert pos.shape == (5, 3)
 
 
-def test_ref_pos_for_residue_output_finite() -> None:
-    """_ref_pos_for_residue returns finite coordinates for a standard amino acid."""
-    pos = _ref_pos_for_residue("ALA")
+def testref_pos_for_residue_output_finite() -> None:
+    """ref_pos_for_residue returns finite coordinates for a standard amino acid."""
+    pos = ref_pos_for_residue("ALA")
     assert torch.isfinite(pos).all()
 
 
@@ -551,7 +552,7 @@ def test_featurize_single_item_returns_featurized_item(c_beta_distogram_fn: Dist
     atom37_positions = torch.randn(N_RES, 37, 3)
     atom37_mask = torch.ones(N_RES, 37)
     index = torch.arange(N_RES).float()
-    ala_ref_pos = _ref_pos_for_residue("ALA")
+    ala_ref_pos = ref_pos_for_residue("ALA")
     ala_ref_elem = torch.zeros(5, 4)
     ala_ref_elem[:, 0] = 1.0  # C element for all atoms
     item = featurize_single_item(
@@ -588,10 +589,10 @@ def test_sinusoidal_encoding_wrong_shape() -> None:
         sinusoidal_encoding(positions_bad)
 
 
-def test_ref_pos_for_residue_wrong_type() -> None:
+def testref_pos_for_residue_wrong_type() -> None:
     """Non-str resname triggers TypeCheckError."""
     with pytest.raises(TypeCheckError):
-        _ref_pos_for_residue(42)  # type: ignore[arg-type]
+        ref_pos_for_residue(42)  # type: ignore[arg-type]
 
 
 def test_protein_batch_wrong_shape() -> None:
@@ -651,7 +652,7 @@ def test_featurized_item_wrong_shape() -> None:
 
 def test_featurize_single_item_wrong_shape(disto: Distogram) -> None:
     """Wrong atom37_positions last dim (4 instead of 3) triggers TypeCheckError."""
-    ala_ref_pos = _ref_pos_for_residue("ALA")
+    ala_ref_pos = ref_pos_for_residue("ALA")
     ala_ref_elem = torch.zeros(5, 4)
     positions_bad = torch.zeros(N_RES, 37, 4)  # last dim must be 3
     atom37_mask = torch.ones(N_RES, 37)

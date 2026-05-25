@@ -24,7 +24,7 @@ from torch.utils.data.distributed import DistributedSampler
 from train.train_config import TrainConfig
 
 
-def _to_protein_batch(
+def to_protein_batch(
     samples: list[Mapping[str, Float[torch.Tensor, "..."] | str]],
 ) -> ProteinBatch:
     """Collate a list of per-protein dicts into a ProteinBatch."""
@@ -209,7 +209,7 @@ class ClusteredProteinDataset(
         return sample
 
 
-def _to_protein_batch_dynamic(
+def to_protein_batch_dynamic(
     samples: list[Mapping[str, Float[torch.Tensor, "..."] | str]],
 ) -> ProteinBatch:
     """Collate variable-length protein samples into a ProteinBatch, padding to batch max.
@@ -264,6 +264,7 @@ def make_bucketed_data_loaders(
     torch.utils.data.DataLoader[ProteinBatch],
     torch.utils.data.DataLoader[ProteinBatch],
     torch.utils.data.DataLoader[ProteinBatch],
+    BucketedBatchSampler,
 ]:
     """Build bucketed train loader and val/test loaders; auto-detects DDP.
 
@@ -280,7 +281,7 @@ def make_bucketed_data_loaders(
         debug_run:   If True, restrict training to the first 252 protein names.
 
     Returns:
-        Tuple of (train_loader, val_loader, test_loader).
+        Tuple of (train_loader, val_loader, test_loader, train_sampler).
     """
     is_ddp: bool = dist.is_initialized()
     rank: int = dist.get_rank() if is_ddp else 0
@@ -321,7 +322,7 @@ def make_bucketed_data_loaders(
         batch_sampler=train_sampler,
         num_workers=num_workers,
         pin_memory=True,
-        collate_fn=_to_protein_batch_dynamic,
+        collate_fn=to_protein_batch_dynamic,
     )
 
     if is_ddp:
@@ -335,7 +336,7 @@ def make_bucketed_data_loaders(
             sampler=val_sampler,
             num_workers=num_workers,
             pin_memory=True,
-            collate_fn=_to_protein_batch,
+            collate_fn=to_protein_batch,
         )
         test_loader = torch.utils.data.DataLoader(
             test_set,
@@ -343,7 +344,7 @@ def make_bucketed_data_loaders(
             sampler=test_sampler,
             num_workers=num_workers,
             pin_memory=True,
-            collate_fn=_to_protein_batch,
+            collate_fn=to_protein_batch,
         )
     else:
         val_loader = torch.utils.data.DataLoader(
@@ -352,7 +353,7 @@ def make_bucketed_data_loaders(
             shuffle=False,
             num_workers=num_workers,
             pin_memory=True,
-            collate_fn=_to_protein_batch,
+            collate_fn=to_protein_batch,
         )
         test_loader = torch.utils.data.DataLoader(
             test_set,
@@ -360,14 +361,15 @@ def make_bucketed_data_loaders(
             shuffle=False,
             num_workers=num_workers,
             pin_memory=True,
-            collate_fn=_to_protein_batch,
+            collate_fn=to_protein_batch,
         )
 
     return cast(
         """tuple[
             torch.utils.data.DataLoader[ProteinBatch],
             torch.utils.data.DataLoader[ProteinBatch],
-            torch.utils.data.DataLoader[ProteinBatch]
+            torch.utils.data.DataLoader[ProteinBatch],
+            BucketedBatchSampler
         ]""",
-        (train_loader, val_loader, test_loader),
+        (train_loader, val_loader, test_loader, train_sampler),
     )

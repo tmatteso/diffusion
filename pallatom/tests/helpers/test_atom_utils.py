@@ -26,12 +26,12 @@ from helpers.atom_utils import (
     RNA_RESTYPE_ORDER,
     RNA_RESTYPES,
     Protein,
-    _chain_end,
-    _classify_mol_type,
     atom37_to_atom5,
     atom37_to_cb,
     atom_types,
     center_positions,
+    chain_end,
+    classify_mol_type,
     get_cb_coords,
     make_fixed_size,
     make_np_example,
@@ -41,9 +41,10 @@ from helpers.atom_utils import (
     to_pdb,
     truncate_to_length,
 )
+from helpers.useful_objects import manual_seed
 from jaxtyping import Float, TypeCheckError
 
-torch.manual_seed(42)
+manual_seed(42)
 
 B = 2
 N_RES = 10
@@ -591,19 +592,19 @@ def test_center_positions_modifies_in_place(
 
 
 # ---------------------------------------------------------------------------
-# _chain_end
+# chain_end
 # ---------------------------------------------------------------------------
 
 
-def test_chain_end_starts_with_ter():
-    """_chain_end returns a PDB-formatted line beginning with the TER record type."""
-    result = _chain_end(100, "ALA", "A", 10)
+def testchain_end_starts_with_ter():
+    """chain_end returns a PDB-formatted line beginning with the TER record type."""
+    result = chain_end(100, "ALA", "A", 10)
     assert result.startswith("TER")
 
 
-def test_chain_end_contains_resname_and_chain():
-    """_chain_end embeds the residue name and chain ID in the returned TER record."""
-    result = _chain_end(100, "GLY", "B", 42)
+def testchain_end_contains_resname_and_chain():
+    """chain_end embeds the residue name and chain ID in the returned TER record."""
+    result = chain_end(100, "GLY", "B", 42)
     assert "GLY" in result
     assert "B" in result
 
@@ -831,56 +832,56 @@ def test_rna_restype_mappings_are_immutable() -> None:
 
 
 # ---------------------------------------------------------------------------
-# _classify_mol_type
+# classify_mol_type
 # ---------------------------------------------------------------------------
 
 
-def test_classify_mol_type_protein() -> None:
-    """_classify_mol_type returns MOL_TYPE_PROTEIN for amino-acid residue names."""
-    assert _classify_mol_type("ALA", frozenset()) == MOL_TYPE_PROTEIN
-    assert _classify_mol_type("GLY", frozenset()) == MOL_TYPE_PROTEIN
-    assert _classify_mol_type("VAL", frozenset()) == MOL_TYPE_PROTEIN
+def testclassify_mol_type_protein() -> None:
+    """classify_mol_type returns MOL_TYPE_PROTEIN for amino-acid residue names."""
+    assert classify_mol_type("ALA", frozenset()) == MOL_TYPE_PROTEIN
+    assert classify_mol_type("GLY", frozenset()) == MOL_TYPE_PROTEIN
+    assert classify_mol_type("VAL", frozenset()) == MOL_TYPE_PROTEIN
 
 
-def test_classify_mol_type_dna_canonical() -> None:
-    """_classify_mol_type returns MOL_TYPE_DNA for D-prefix nucleotide names."""
-    assert _classify_mol_type("DA", frozenset()) == MOL_TYPE_DNA
-    assert _classify_mol_type("DC", frozenset()) == MOL_TYPE_DNA
-    assert _classify_mol_type("DG", frozenset()) == MOL_TYPE_DNA
-    assert _classify_mol_type("DT", frozenset()) == MOL_TYPE_DNA
+def testclassify_mol_type_dna_canonical() -> None:
+    """classify_mol_type returns MOL_TYPE_DNA for D-prefix nucleotide names."""
+    assert classify_mol_type("DA", frozenset()) == MOL_TYPE_DNA
+    assert classify_mol_type("DC", frozenset()) == MOL_TYPE_DNA
+    assert classify_mol_type("DG", frozenset()) == MOL_TYPE_DNA
+    assert classify_mol_type("DT", frozenset()) == MOL_TYPE_DNA
 
 
-def test_classify_mol_type_dna_bare_t() -> None:
-    """_classify_mol_type returns MOL_TYPE_DNA for bare T (D-prefix-less thymine)."""
-    assert _classify_mol_type("T", frozenset()) == MOL_TYPE_DNA
-    assert _classify_mol_type("T", frozenset({"C1'", "C2'"})) == MOL_TYPE_DNA
+def testclassify_mol_type_dna_bare_t() -> None:
+    """classify_mol_type returns MOL_TYPE_DNA for bare T (D-prefix-less thymine)."""
+    assert classify_mol_type("T", frozenset()) == MOL_TYPE_DNA
+    assert classify_mol_type("T", frozenset({"C1'", "C2'"})) == MOL_TYPE_DNA
 
 
-def test_classify_mol_type_rna_u() -> None:
-    """_classify_mol_type returns MOL_TYPE_RNA for U regardless of atoms present."""
-    assert _classify_mol_type("U", frozenset()) == MOL_TYPE_RNA
-    assert _classify_mol_type("U", frozenset({"C1'"})) == MOL_TYPE_RNA
+def testclassify_mol_type_rna_u() -> None:
+    """classify_mol_type returns MOL_TYPE_RNA for U regardless of atoms present."""
+    assert classify_mol_type("U", frozenset()) == MOL_TYPE_RNA
+    assert classify_mol_type("U", frozenset({"C1'"})) == MOL_TYPE_RNA
 
 
-def test_classify_mol_type_rna_via_o2prime() -> None:
-    """_classify_mol_type returns MOL_TYPE_RNA for A/C/G when O2' atom is present."""
-    assert _classify_mol_type("A", frozenset({"O2'", "C1'"})) == MOL_TYPE_RNA
-    assert _classify_mol_type("C", frozenset({"O2'"})) == MOL_TYPE_RNA
-    assert _classify_mol_type("G", frozenset({"O2'"})) == MOL_TYPE_RNA
+def testclassify_mol_type_rna_via_o2prime() -> None:
+    """classify_mol_type returns MOL_TYPE_RNA for A/C/G when O2' atom is present."""
+    assert classify_mol_type("A", frozenset({"O2'", "C1'"})) == MOL_TYPE_RNA
+    assert classify_mol_type("C", frozenset({"O2'"})) == MOL_TYPE_RNA
+    assert classify_mol_type("G", frozenset({"O2'"})) == MOL_TYPE_RNA
 
 
-def test_classify_mol_type_dna_no_prefix_no_o2prime() -> None:
-    """_classify_mol_type returns MOL_TYPE_DNA for A/C/G when no O2' atom is present."""
-    assert _classify_mol_type("A", frozenset({"C1'", "C2'"})) == MOL_TYPE_DNA
-    assert _classify_mol_type("C", frozenset()) == MOL_TYPE_DNA
-    assert _classify_mol_type("G", frozenset({"P"})) == MOL_TYPE_DNA
+def testclassify_mol_type_dna_no_prefix_no_o2prime() -> None:
+    """classify_mol_type returns MOL_TYPE_DNA for A/C/G when no O2' atom is present."""
+    assert classify_mol_type("A", frozenset({"C1'", "C2'"})) == MOL_TYPE_DNA
+    assert classify_mol_type("C", frozenset()) == MOL_TYPE_DNA
+    assert classify_mol_type("G", frozenset({"P"})) == MOL_TYPE_DNA
 
 
-def test_classify_mol_type_unknown_defaults_protein() -> None:
-    """_classify_mol_type returns MOL_TYPE_PROTEIN for unrecognised residue names."""
-    assert _classify_mol_type("UNK", frozenset()) == MOL_TYPE_PROTEIN
-    assert _classify_mol_type("MSE", frozenset()) == MOL_TYPE_PROTEIN
-    assert _classify_mol_type("", frozenset()) == MOL_TYPE_PROTEIN
+def testclassify_mol_type_unknown_defaults_protein() -> None:
+    """classify_mol_type returns MOL_TYPE_PROTEIN for unrecognised residue names."""
+    assert classify_mol_type("UNK", frozenset()) == MOL_TYPE_PROTEIN
+    assert classify_mol_type("MSE", frozenset()) == MOL_TYPE_PROTEIN
+    assert classify_mol_type("", frozenset()) == MOL_TYPE_PROTEIN
 
 
 # ---------------------------------------------------------------------------

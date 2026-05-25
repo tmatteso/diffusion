@@ -22,7 +22,7 @@ from jaxtyping import Float  # noqa: E402
 from pydantic import ValidationError  # noqa: E402
 from train.train_config import ModelParams, NoiseScheduleParams  # noqa: E402
 
-from REST_APIs.api import SampleRequest, _AppState, _run_sampling  # noqa: E402
+from REST_APIs.api import AppState, SampleRequest, run_sampling  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # SampleRequest validation
@@ -112,7 +112,7 @@ def test_sample_request_defaults() -> None:
 
 
 # ---------------------------------------------------------------------------
-# _run_sampling integration tests (mocked model, no checkpoint required)
+# run_sampling integration tests (mocked model, no checkpoint required)
 # ---------------------------------------------------------------------------
 
 N_RES_TEST = 4
@@ -139,10 +139,10 @@ def _make_trunk_mock() -> MagicMock:
     return mock
 
 
-def _make_mock_state() -> _AppState:
+def _make_mock_state() -> AppState:
     mp = ModelParams()
     noise = NoiseScheduleParams()
-    return _AppState(
+    return AppState(
         semaphore=asyncio.Semaphore(1),
         model=_make_trunk_mock(),
         mp=mp,
@@ -174,7 +174,7 @@ def _run(req_kwargs: MutableMapping[str, object]) -> list[str]:
     req_kwargs.setdefault("ddim_steps", 2)
     req = SampleRequest.model_validate(req_kwargs)
     mock_state = _make_mock_state()
-    return _run_sampling(req, mock_state)
+    return run_sampling(req, mock_state)
 
 
 def test_run_sampling_unconditional_returns_pdb_strings() -> None:

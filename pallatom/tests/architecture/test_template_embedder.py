@@ -7,9 +7,10 @@ from architecture.pairformer_stack import PairformerStack
 from architecture.template_embedder import TemplateEmbedder
 from beartype import beartype
 from einops import einsum, rearrange, reduce
+from helpers.useful_objects import manual_seed
 from jaxtyping import Float, TypeCheckError, jaxtyped
 
-torch.manual_seed(42)
+manual_seed(42)
 
 B = 2
 N_RES = 6

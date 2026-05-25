@@ -9,7 +9,7 @@ import numpy as np
 import numpy.typing as npt
 import torch
 from beartype import beartype
-from einops import rearrange
+from einops import rearrange, reduce
 from jaxtyping import Bool, Float, Int, jaxtyped
 
 # Data utils
@@ -488,7 +488,7 @@ class Protein:
     b_factors: Float[npt.NDArray[np.float64], "num_res num_atom_type"]
 
 
-def _classify_mol_type(resname: str, atom_names: frozenset[str]) -> int:
+def classify_mol_type(resname: str, atom_names: frozenset[str]) -> int:
     """Return the molecule-type constant for a PDB residue.
 
     Uses residue name first; falls back to 2'-OH atom presence for the
@@ -616,7 +616,7 @@ def protein_from_pdb(pdb_path: str) -> "Protein":
         _residue_index[_i] = _key[1]
         _one = restype_3to1.get(_residue_name[_key], "X")
         _aatype[_i] = restype_order.get(_one, 20)
-        _mol = _classify_mol_type(
+        _mol = classify_mol_type(
             _residue_name[_key],
             frozenset(_residue_atoms[_key].keys()),
         )
@@ -637,7 +637,18 @@ def protein_from_pdb(pdb_path: str) -> "Protein":
     )
 
 
-def _chain_end(atom_index: int, end_resname: str, chain_name: str, residue_index: int) -> str:
+def chain_end(atom_index: int, end_resname: str, chain_name: str, residue_index: int) -> str:
+    """Formats a PDB TER record marking the end of a chain.
+
+    Args:
+        atom_index: Serial number for the TER record.
+        end_resname: Residue name of the last residue in the chain.
+        chain_name: Single-character chain identifier.
+        residue_index: Sequence number of the last residue.
+
+    Returns:
+        Formatted PDB TER line string.
+    """
     chain_end = "TER"
     return f"{chain_end:<6}{atom_index:>5}      {end_resname:>3} {chain_name:>1}{residue_index:>4}"
 
@@ -682,7 +693,7 @@ def to_pdb(prot: Protein) -> str:
     def res_1to3(r: int) -> str:
         return restype_1to3.get(restypes[r], "UNK")
 
-    pdb_lines = []
+    pdb_lines: list[str] = []
 
     atom_mask = prot.atom_mask
     aatype = prot.aatype
@@ -695,11 +706,11 @@ def to_pdb(prot: Protein) -> str:
         raise ValueError("Invalid aatypes.")
 
     # Construct a mapping from chain integer indices to chain ID strings.
-    chain_ids = {}
+    chain_ids: dict[int, str] = {}
     for i in np.unique(chain_index):  # np.unique gives sorted output.
         if i >= PDB_MAX_CHAINS:
             raise ValueError(f"The PDB format supports at most {PDB_MAX_CHAINS} chains.")
-        chain_ids[i] = PDB_CHAIN_IDS[i]
+        chain_ids[int(i)] = PDB_CHAIN_IDS[int(i)]
 
     pdb_lines.append("MODEL     1")
     atom_index = 1
@@ -709,10 +720,10 @@ def to_pdb(prot: Protein) -> str:
         # Close the previous chain if in a multichain PDB.
         if last_chain_index != chain_index[i]:
             pdb_lines.append(
-                _chain_end(
+                chain_end(
                     atom_index,
                     res_1to3(aatype[i - 1]),
-                    chain_ids[chain_index[i - 1]],
+                    chain_ids[int(chain_index[i - 1])],
                     residue_index[i - 1],
                 )
             )
@@ -747,7 +758,9 @@ def to_pdb(prot: Protein) -> str:
 
     # Close the final chain.
     pdb_lines.append(
-        _chain_end(atom_index, res_1to3(aatype[-1]), chain_ids[chain_index[-1]], residue_index[-1])
+        chain_end(
+            atom_index, res_1to3(aatype[-1]), chain_ids[int(chain_index[-1])], residue_index[-1]
+        )
     )
     pdb_lines.append("ENDMDL")
     pdb_lines.append("END")
@@ -794,10 +807,14 @@ def pseudo_cb(
     """
     b = ca - n
     d = c - ca
-    bc = b / (torch.linalg.norm(b, dim=-1, keepdim=True) + 1e-8)
-    dc = d / (torch.linalg.norm(d, dim=-1, keepdim=True) + 1e-8)
-    n_vec = torch.cross(bc, dc, dim=-1)
-    n_vec = n_vec / (torch.linalg.norm(n_vec, dim=-1, keepdim=True) + 1e-8)
+    bc: Float[torch.Tensor, "... 3"] = b / (
+        torch.sqrt(reduce(b**2, "... d -> ... 1", "sum")) + 1e-8
+    )
+    dc: Float[torch.Tensor, "... 3"] = d / (
+        torch.sqrt(reduce(d**2, "... d -> ... 1", "sum")) + 1e-8
+    )
+    n_vec: Float[torch.Tensor, "... 3"] = torch.cross(bc, dc, dim=-1)
+    n_vec = n_vec / (torch.sqrt(reduce(n_vec**2, "... d -> ... 1", "sum")) + 1e-8)
 
     # Ideal Cβ placement constants (Hs or N→C→C alpha geometry)
     # values from Havel (1998) / AlphaFold2 supplementary

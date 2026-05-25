@@ -7,6 +7,7 @@ import math
 from pathlib import Path
 
 import numpy as np
+import numpy.typing as npt
 import structlog
 import torch
 import torch.nn as nn
@@ -95,10 +96,10 @@ class EDMPrecond(nn.Module):
             t_hat=t_hat,
             t_normalized=t_normalized,
         )
-        r_denoised: Float[torch.Tensor, "B N_atom 3"]
-        seq_logits: Float[torch.Tensor, "B N_res n_amino"]
-        r_denoised, seq_logits, *_ = self.model(batch)
-        return r_denoised, seq_logits
+        predicted_outputs = self.model(batch)
+        # predicted_outputs.r_denoised: Float[torch.Tensor, "B N_atom 3"]
+        # predicted_outputs.seq_logits: Float[torch.Tensor, "B N_res n_amino"]
+        return predicted_outputs.r_denoised, predicted_outputs.seq_logits
 
 
 @jaxtyped(typechecker=beartype)
@@ -478,7 +479,7 @@ class EDMSampler:
         self.S_noise = S_noise
 
     @jaxtyped(typechecker=beartype)
-    def _sigma_schedule(
+    def sigma_schedule(
         self,
         steps: int,
         device: torch.device | str,
@@ -506,7 +507,7 @@ class EDMSampler:
         device: torch.device | str = "cpu",
     ) -> tuple[Float[torch.Tensor, "B N_atom 3"], Float[torch.Tensor, "B N_res n_amino"]]:
         """Run the Heun ODE sampler and return (denoised_coords, seq_logits) from the final step."""
-        sigmas: Float[torch.Tensor, "S"] = self._sigma_schedule(steps, device)
+        sigmas: Float[torch.Tensor, "S"] = self.sigma_schedule(steps, device)
 
         # pure noise initialised at sigma_max — independent per batch item
         z: Float[torch.Tensor, "B N_atom 3"] = torch.randn(shape, device=device) * sigmas[0]
@@ -654,11 +655,16 @@ def main(args: argparse.Namespace, scfg: SampleConfig, device: str) -> None:
                 coords_batch[b].cpu(), "(n a) d -> n a d", n=N_RES, a=NATOM
             )
             x_37, mask_37 = atom5_to_atom37(coords_t)
+            atom_positions: npt.NDArray[np.float64] = np.asarray(x_37, dtype=np.float64)
+            atom_mask: npt.NDArray[np.float64] = np.asarray(mask_37, dtype=np.float64)
+            aatype: npt.NDArray[np.intp] = np.asarray(
+                seq_logits_batch[b].argmax(dim=-1).cpu(), dtype=np.intp
+            )
             prot = Protein(
-                atom_positions=x_37.numpy(),
-                atom_mask=mask_37.numpy(),
+                atom_positions=atom_positions,
+                atom_mask=atom_mask,
                 residue_index=np.arange(N_RES, dtype=np.intp),
-                aatype=seq_logits_batch[b].argmax(dim=-1).cpu().numpy().astype(np.intp),  # greedy
+                aatype=aatype,
                 chain_index=np.zeros(N_RES, dtype=np.intp),  # obvious problem
                 b_factors=np.ones((N_RES, 37), dtype=np.float64),
             )

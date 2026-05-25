@@ -8,7 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from architecture.atom_transformers import WINDOW_SIZE, build_sparse_pairs
 from beartype import beartype
-from einops import rearrange, repeat
+from einops import rearrange, reduce, repeat
 from helpers.atom_utils import (
     ATOM5_ELEMENTS,
     ATOM5_NAMES,
@@ -68,8 +68,9 @@ class Distogram(nn.Module):
         self.min_dist = min_dist
         self.max_dist = max_dist
         self.overflow_bin = overflow_bin
+        self.edges: Float[torch.Tensor, "n_bins_plus_1"]
 
-        edges = torch.linspace(min_dist, max_dist, n_bins + 1)
+        edges: Float[torch.Tensor, "n_bins_plus_1"] = torch.linspace(min_dist, max_dist, n_bins + 1)
         self.register_buffer("edges", edges)
 
     # ------------------------------------------------------------------
@@ -107,11 +108,17 @@ class Distogram(nn.Module):
                          overflow_bin=False: valid atom pairs AND dist <= max_dist.
         """
         # ---- 1. Pairwise distances (..., total_atom_count, total_atom_count) ------------------
-        diff = rearrange(coords, "... n d -> ... n 1 d") - rearrange(coords, "... n d -> ... 1 n d")
-        dist = diff.norm(dim=-1)
+        diff: Float[torch.Tensor, "... total_atom_count total_atom_count 3"] = rearrange(
+            coords, "... n d -> ... n 1 d"
+        ) - rearrange(coords, "... n d -> ... 1 n d")
+        dist: Float[torch.Tensor, "... total_atom_count total_atom_count"] = torch.sqrt(
+            reduce(diff**2, "... n m d -> ... n m", "sum").clamp(min=1e-8)
+        )
 
         # ---- 2. Bin assignment & one-hot (n_bins[+1]) ----
-        bin_idx = torch.bucketize(dist, self.edges[1:])
+        bin_idx: Int[torch.Tensor, "... total_atom_count total_atom_count"] = torch.bucketize(
+            dist, self.edges[1:]
+        )
         if self.overflow_bin:
             bin_idx = bin_idx.clamp(min=0)
             n_classes = self.n_bins + 1
@@ -154,7 +161,16 @@ def sinusoidal_encoding(
 
 
 @jaxtyped(typechecker=beartype)
-def _ref_pos_for_residue(resname: str) -> Float[torch.Tensor, "5 3"]:
+def ref_pos_for_residue(resname: str) -> Float[torch.Tensor, "5 3"]:
+    """Return reference atom positions for the 5 ATOM5 atoms of a residue.
+
+    Args:
+        resname: Three-letter residue name (e.g. "ALA", "GLY").
+
+    Returns:
+        Tensor of shape (5, 3) with XYZ coordinates for each ATOM5 atom;
+        atoms absent from rigid_group_atom_positions default to (0, 0, 0).
+    """
     pos_by_name = {name: pos for name, _, pos in rigid_group_atom_positions[resname]}
     return torch.tensor(
         [pos_by_name.get(name, (0.0, 0.0, 0.0)) for name in ATOM5_NAMES],
@@ -297,7 +313,7 @@ def featurize_batch(
     )
 
     # ── Shared helpers reused across all items ────────────────────────────────
-    ala_ref_pos = _ref_pos_for_residue("ALA").to(device)  # (5, 3)
+    ala_ref_pos = ref_pos_for_residue("ALA").to(device)  # (5, 3)
     ala_ref_elem = ATOM5_ELEMENTS.float().to(device)  # (5, 4)
 
     # ── Per-item featurization ────────────────────────────────────────────────

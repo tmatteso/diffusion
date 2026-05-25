@@ -13,9 +13,9 @@ import structlog
 import torch
 import torch.nn as nn
 from architecture.main_trunk import MainTrunk
-from einops import rearrange
+from einops import rearrange, reduce
 from helpers.bucketed_sampler import BucketedBatchSampler
-from helpers.data import _to_protein_batch, make_bucketed_data_loaders
+from helpers.data import make_bucketed_data_loaders, to_protein_batch
 from helpers.featurize import Distogram, ProteinBatch
 from helpers.useful_objects import (
     ComponentNorms,
@@ -23,6 +23,7 @@ from helpers.useful_objects import (
     LossMetrics,
     ModelSetup,
     ThroughputStatistics,
+    manual_seed,
 )
 from jaxtyping import Float
 from pydantic import ValidationError
@@ -38,23 +39,24 @@ from train.train_config import (
     TrainingParams,
 )
 from train.train_loop import (
-    _mask_seq_target,
-    _wavg,
-    _wavg_component_norms,
-    _wavg_loss_metrics,
-    _wavg_throughput_stats,
     component_grad_norms,
     evaluate,
     load_checkpoint,
     log_epoch,
+    mask_seq_target,
     optimizer_step,
     process_accum_window,
     save_checkpoint,
     take_step,
     train,
+    wavg,
+    wavg_component_norms,
+    wavg_loss_metrics,
+    wavg_throughput_stats,
 )
 
-torch.manual_seed(42)
+manual_seed(42)
+
 
 _N_KEEP = 16
 _C_RES = 32
@@ -336,7 +338,7 @@ def model_params(
 
 @pytest.fixture
 def single_sample() -> Mapping[str, Float[torch.Tensor, "..."] | str]:
-    """Provide a single unbatched protein sample for _to_protein_batch tests."""
+    """Provide a single unbatched protein sample for to_protein_batch tests."""
     return {
         "atom_positions": torch.randn(_N_KEEP, 37, 3),
         "atom_mask": torch.ones(_N_KEEP, 37),
@@ -385,122 +387,147 @@ def mock_loader(
 
 
 @pytest.fixture
+def mock_sampler(
+    mini_batch: Mapping[str, Float[torch.Tensor, "..."] | list[str]],
+) -> BucketedBatchSampler:
+    """Provide a BucketedBatchSampler-typed mock sampler for train() call sites."""
+    _, sampler = _make_mock_loader(mini_batch)
+    return cast(BucketedBatchSampler, sampler)
+
+
+@pytest.fixture
 def log() -> FilteringBoundLogger:
     """Provide a structlog logger for training loop tests."""
     return structlog.get_logger()
 
 
+@pytest.fixture
+def wandb_payloads(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, object]]:
+    """Patch wandb.log and return the list of captured payload dicts."""
+    captured: list[dict[str, object]] = []
+    monkeypatch.setattr("train.train_loop.wandb.log", captured.append)
+    return captured
+
+
+@pytest.fixture
+def wandb_call_counter(monkeypatch: pytest.MonkeyPatch) -> list[object]:
+    """Patch wandb.log and return a list that grows by one entry per call."""
+    called: list[object] = []
+    monkeypatch.setattr("train.train_loop.wandb.log", called.append)
+    return called
+
+
 # ---------------------------------------------------------------------------
-# _to_protein_batch
+# to_protein_batch
 # ---------------------------------------------------------------------------
 
 
-def test_to_protein_batch_returns_protein_batch(
+def testto_protein_batch_returns_protein_batch(
     single_sample: Mapping[str, Float[torch.Tensor, "..."] | str],
 ) -> None:
-    """_to_protein_batch returns a ProteinBatch dataclass instance."""
-    assert isinstance(_to_protein_batch([single_sample]), ProteinBatch)
+    """to_protein_batch returns a ProteinBatch dataclass instance."""
+    assert isinstance(to_protein_batch([single_sample]), ProteinBatch)
 
 
-def test_to_protein_batch_atom_positions_shape(
+def testto_protein_batch_atom_positions_shape(
     single_sample: Mapping[str, Float[torch.Tensor, "..."] | str],
 ) -> None:
-    """_to_protein_batch stacks atom_positions into a batched tensor with a leading batch dim."""
-    result = _to_protein_batch([single_sample])
+    """to_protein_batch stacks atom_positions into a batched tensor with a leading batch dim."""
+    result = to_protein_batch([single_sample])
     assert result.atom_positions.shape == torch.Size(
         [1, *cast("torch.Tensor", single_sample["atom_positions"]).shape]
     )
 
 
-def test_to_protein_batch_atom_mask_shape(
+def testto_protein_batch_atom_mask_shape(
     single_sample: Mapping[str, Float[torch.Tensor, "..."] | str],
 ) -> None:
-    """_to_protein_batch stacks atom_mask into a batched tensor with a leading batch dim."""
-    result = _to_protein_batch([single_sample])
+    """to_protein_batch stacks atom_mask into a batched tensor with a leading batch dim."""
+    result = to_protein_batch([single_sample])
     assert result.atom_mask.shape == torch.Size(
         [1, *cast("torch.Tensor", single_sample["atom_mask"]).shape]
     )
 
 
-def test_to_protein_batch_residue_index_shape(
+def testto_protein_batch_residue_index_shape(
     single_sample: Mapping[str, Float[torch.Tensor, "..."] | str],
 ) -> None:
-    """_to_protein_batch stacks residue_index into a batched tensor with a leading batch dim."""
-    result = _to_protein_batch([single_sample])
+    """to_protein_batch stacks residue_index into a batched tensor with a leading batch dim."""
+    result = to_protein_batch([single_sample])
     assert result.residue_index.shape == torch.Size(
         [1, *cast("torch.Tensor", single_sample["residue_index"]).shape]
     )
 
 
-def test_to_protein_batch_seq_is_list(
+def testto_protein_batch_seq_is_list(
     single_sample: Mapping[str, Float[torch.Tensor, "..."] | str],
 ) -> None:
-    """_to_protein_batch wraps the sequence field into a Python list."""
-    result = _to_protein_batch([single_sample])
+    """to_protein_batch wraps the sequence field into a Python list."""
+    result = to_protein_batch([single_sample])
     assert isinstance(result.seq, list)
 
 
-def test_to_protein_batch_seq_elements_are_strings(
+def testto_protein_batch_seq_elements_are_strings(
     single_sample: Mapping[str, Float[torch.Tensor, "..."] | str],
 ) -> None:
-    """_to_protein_batch seq list contains only str elements."""
-    result = _to_protein_batch([single_sample])
+    """to_protein_batch seq list contains only str elements."""
+    result = to_protein_batch([single_sample])
     assert all(isinstance(s, str) for s in result.seq)
 
 
-def test_to_protein_batch_seq_length_matches_batch_size(
+def testto_protein_batch_seq_length_matches_batch_size(
     single_sample: Mapping[str, Float[torch.Tensor, "..."] | str],
 ) -> None:
-    """_to_protein_batch seq list has one entry per sample passed in."""
-    result = _to_protein_batch([single_sample])
+    """to_protein_batch seq list has one entry per sample passed in."""
+    result = to_protein_batch([single_sample])
     assert len(result.seq) == 1
 
 
 # ---------------------------------------------------------------------------
-# _mask_seq_target
+# mask_seq_target
 # ---------------------------------------------------------------------------
 
 
-def test_mask_seq_target_replaces_20_with_minus100() -> None:
-    """_mask_seq_target maps mask token (20) to -100 (the CE ignore_index)."""
+def testmask_seq_target_replaces_20_with_minus100() -> None:
+    """mask_seq_target maps mask token (20) to -100 (the CE ignore_index)."""
     aa = torch.tensor([[0, 20, 5, 20]])
-    out = _mask_seq_target(aa)
+    out = mask_seq_target(aa)
     assert out[0, 1].item() == -100
     assert out[0, 3].item() == -100
 
 
-def test_mask_seq_target_preserves_non_mask_tokens() -> None:
-    """_mask_seq_target leaves all indices other than 20 unchanged."""
+def testmask_seq_target_preserves_non_mask_tokens() -> None:
+    """mask_seq_target leaves all indices other than 20 unchanged."""
     aa = torch.tensor([[0, 1, 19, 5]])
-    out = _mask_seq_target(aa)
-    assert out.tolist() == [[0, 1, 19, 5]]
+    out = mask_seq_target(aa)
+    assert torch.equal(out, torch.tensor([[0, 1, 19, 5]]))
 
 
-def test_mask_seq_target_preserves_shape() -> None:
-    """_mask_seq_target does not change the shape of the input tensor."""
+def testmask_seq_target_preserves_shape() -> None:
+    """mask_seq_target does not change the shape of the input tensor."""
     aa = torch.randint(0, 20, (3, _N_KEEP))
-    assert _mask_seq_target(aa).shape == aa.shape
+    assert mask_seq_target(aa).shape == aa.shape
 
 
 # ---------------------------------------------------------------------------
-# _wavg / _wavg_loss_metrics / _wavg_throughput_stats / _wavg_component_norms
+# wavg / wavg_loss_metrics / wavg_throughput_stats / wavg_component_norms
 # ---------------------------------------------------------------------------
 
 
-def test_wavg_equal_weights_is_simple_mean() -> None:
-    """_wavg with equal protein counts returns the simple mean."""
+def testwavg_equal_weights_is_simple_mean() -> None:
+    """Wavg with equal protein counts returns the simple mean."""
     vals = [torch.tensor(2.0), torch.tensor(4.0)]
-    assert abs(_wavg(vals, [1, 1]).item() - 3.0) < 1e-5
+    assert abs(wavg(vals, [1, 1]).item() - 3.0) < 1e-5
 
 
-def test_wavg_unequal_weights_biases_toward_larger_count() -> None:
-    """_wavg with unequal counts biases the result toward the larger-count value."""
+def testwavg_unequal_weights_biases_toward_larger_count() -> None:
+    """Wavg with unequal counts biases the result toward the larger-count value."""
     vals = [torch.tensor(0.0), torch.tensor(10.0)]
-    assert abs(_wavg(vals, [1, 9]).item() - 9.0) < 1e-4
+    assert abs(wavg(vals, [1, 9]).item() - 9.0) < 1e-4
 
 
-def test_wavg_loss_metrics_equal_weights_is_mean() -> None:
-    """_wavg_loss_metrics with equal counts returns simple mean per field."""
+def testwavg_loss_metrics_equal_weights_is_mean() -> None:
+    """wavg_loss_metrics with equal counts returns simple mean per field."""
     z2 = torch.tensor(2.0)
     z4 = torch.tensor(4.0)
     a = LossMetrics(
@@ -523,12 +550,12 @@ def test_wavg_loss_metrics_equal_weights_is_mean() -> None:
         intermediate_loss=z4,
         RMSD=z4,
     )
-    result = _wavg_loss_metrics([a, b], [1, 1])
+    result = wavg_loss_metrics([a, b], [1, 1])
     assert abs(result.total_loss.item() - 3.0) < 1e-5
 
 
-def test_wavg_throughput_stats_equal_weights_is_mean() -> None:
-    """_wavg_throughput_stats with equal counts returns simple mean per field."""
+def testwavg_throughput_stats_equal_weights_is_mean() -> None:
+    """wavg_throughput_stats with equal counts returns simple mean per field."""
     a = ThroughputStatistics(
         avg_batch_size=torch.tensor(2.0),
         token_pack_rate=torch.tensor(2.0),
@@ -541,12 +568,12 @@ def test_wavg_throughput_stats_equal_weights_is_mean() -> None:
         residues_per_sec=torch.tensor(6.0),
         atoms_per_sec=torch.tensor(6.0),
     )
-    result = _wavg_throughput_stats([a, b], [1, 1])
+    result = wavg_throughput_stats([a, b], [1, 1])
     assert abs(result.residues_per_sec.item() - 4.0) < 1e-5
 
 
-def test_wavg_component_norms_equal_weights_is_mean() -> None:
-    """_wavg_component_norms with equal counts returns simple mean per field."""
+def testwavg_component_norms_equal_weights_is_mean() -> None:
+    """wavg_component_norms with equal counts returns simple mean per field."""
     a = ComponentNorms(
         template_embedder=torch.tensor(1.0),
         atom_encoder=torch.tensor(1.0),
@@ -569,7 +596,7 @@ def test_wavg_component_norms_equal_weights_is_mean() -> None:
         proj_seq=torch.tensor(3.0),
         seq_logits=torch.tensor(3.0),
     )
-    result = _wavg_component_norms([a, b], [1, 1])
+    result = wavg_component_norms([a, b], [1, 1])
     assert abs(result.atom_encoder.item() - 2.0) < 1e-5
 
 
@@ -660,22 +687,26 @@ def test_take_step_grad_scale_halves_gradient_norm(
     """grad_scale=2 yields approximately half the gradient L2 norm of grad_scale=1."""
     model_params.model.train()
 
-    torch.manual_seed(0)
+    manual_seed(0)
     model_params.model.zero_grad()
     take_step(batch=protein_batch, model_params=model_params, train=True, grad_scale=1.0)
     norm1: float = (
         sum(
-            p.grad.norm().item() ** 2 for p in model_params.model.parameters() if p.grad is not None
+            cast(float, reduce(p.grad**2, "... -> ", "sum").item())
+            for p in model_params.model.parameters()
+            if p.grad is not None
         )
         ** 0.5
     )
 
-    torch.manual_seed(0)
+    manual_seed(0)
     model_params.model.zero_grad()
     take_step(batch=protein_batch, model_params=model_params, train=True, grad_scale=2.0)
     norm2: float = (
         sum(
-            p.grad.norm().item() ** 2 for p in model_params.model.parameters() if p.grad is not None
+            cast(float, reduce(p.grad**2, "... -> ", "sum").item())
+            for p in model_params.model.parameters()
+            if p.grad is not None
         )
         ** 0.5
     )
@@ -992,88 +1023,76 @@ def _tcfg_with_wandb(*, base: TrainConfig, use_wandb: bool) -> TrainConfig:
 def test_log_epoch_do_log_false_skips_wandb(
     model_params: ModelSetup,
     log: FilteringBoundLogger,
-    monkeypatch: pytest.MonkeyPatch,
+    wandb_call_counter: list[object],
 ) -> None:
     """log_epoch with do_log=False does not call wandb.log even if use_wandb=True."""
     mp = dataclasses.replace(
         model_params, tcfg=_tcfg_with_wandb(base=model_params.tcfg, use_wandb=True)
     )
-    called: list[int] = []
-    monkeypatch.setattr("train.train_loop.wandb.log", lambda *_a, **_kw: called.append(1))
     log_epoch(epoch_metrics=_make_epoch_metrics(), model_params=mp, log=log, do_log=False)
-    assert len(called) == 0
+    assert len(wandb_call_counter) == 0
 
 
 def test_log_epoch_wandb_disabled_skips_call(
     model_params: ModelSetup,
     log: FilteringBoundLogger,
-    monkeypatch: pytest.MonkeyPatch,
+    wandb_call_counter: list[object],
 ) -> None:
     """log_epoch with use_wandb=False does not call wandb.log even if do_log=True."""
-    called: list[int] = []
-    monkeypatch.setattr("train.train_loop.wandb.log", lambda *_a, **_kw: called.append(1))
     log_epoch(epoch_metrics=_make_epoch_metrics(), model_params=model_params, log=log, do_log=True)
-    assert len(called) == 0
+    assert len(wandb_call_counter) == 0
 
 
 def test_log_epoch_wandb_enabled_calls_once(
     model_params: ModelSetup,
     log: FilteringBoundLogger,
-    monkeypatch: pytest.MonkeyPatch,
+    wandb_payloads: list[dict[str, object]],
 ) -> None:
     """log_epoch with do_log=True and use_wandb=True calls wandb.log exactly once."""
     mp = dataclasses.replace(
         model_params, tcfg=_tcfg_with_wandb(base=model_params.tcfg, use_wandb=True)
     )
-    logged: list[dict[str, object]] = []
-    monkeypatch.setattr("train.train_loop.wandb.log", lambda data, **_: logged.append(data))
     log_epoch(epoch_metrics=_make_epoch_metrics(epoch=3), model_params=mp, log=log, do_log=True)
-    assert len(logged) == 1
+    assert len(wandb_payloads) == 1
 
 
 def test_log_epoch_wandb_payload_has_correct_epoch(
     model_params: ModelSetup,
     log: FilteringBoundLogger,
-    monkeypatch: pytest.MonkeyPatch,
+    wandb_payloads: list[dict[str, object]],
 ) -> None:
     """log_epoch W&B payload 'epoch' key equals the epoch embedded in EpochMetrics."""
     mp = dataclasses.replace(
         model_params, tcfg=_tcfg_with_wandb(base=model_params.tcfg, use_wandb=True)
     )
-    payloads: list[dict[str, object]] = []
-    monkeypatch.setattr("train.train_loop.wandb.log", lambda data, **_: payloads.append(data))
     log_epoch(epoch_metrics=_make_epoch_metrics(epoch=7), model_params=mp, log=log, do_log=True)
-    assert payloads[0]["epoch"] == 7
+    assert wandb_payloads[0]["epoch"] == 7
 
 
 def test_log_epoch_wandb_payload_has_train_prefix(
     model_params: ModelSetup,
     log: FilteringBoundLogger,
-    monkeypatch: pytest.MonkeyPatch,
+    wandb_payloads: list[dict[str, object]],
 ) -> None:
     """log_epoch W&B payload contains at least one key prefixed with 'train/'."""
     mp = dataclasses.replace(
         model_params, tcfg=_tcfg_with_wandb(base=model_params.tcfg, use_wandb=True)
     )
-    payloads: list[dict[str, object]] = []
-    monkeypatch.setattr("train.train_loop.wandb.log", lambda data, **_: payloads.append(data))
     log_epoch(epoch_metrics=_make_epoch_metrics(), model_params=mp, log=log, do_log=True)
-    assert any(k.startswith("train/") for k in payloads[0])
+    assert any(k.startswith("train/") for k in wandb_payloads[0])
 
 
 def test_log_epoch_wandb_payload_has_val_prefix(
     model_params: ModelSetup,
     log: FilteringBoundLogger,
-    monkeypatch: pytest.MonkeyPatch,
+    wandb_payloads: list[dict[str, object]],
 ) -> None:
     """log_epoch W&B payload contains at least one key prefixed with 'val/'."""
     mp = dataclasses.replace(
         model_params, tcfg=_tcfg_with_wandb(base=model_params.tcfg, use_wandb=True)
     )
-    payloads: list[dict[str, object]] = []
-    monkeypatch.setattr("train.train_loop.wandb.log", lambda data, **_: payloads.append(data))
     log_epoch(epoch_metrics=_make_epoch_metrics(), model_params=mp, log=log, do_log=True)
-    assert any(k.startswith("val/") for k in payloads[0])
+    assert any(k.startswith("val/") for k in wandb_payloads[0])
 
 
 # ---------------------------------------------------------------------------
@@ -1084,12 +1103,14 @@ def test_log_epoch_wandb_payload_has_val_prefix(
 def test_train_returns_none(
     model_params: ModelSetup,
     mock_loader: torch.utils.data.DataLoader[ProteinBatch],
+    mock_sampler: BucketedBatchSampler,
     log: FilteringBoundLogger,
 ) -> None:
     """Train returns None (side-effect-only function)."""
     result = train(
         best_val_loss=torch.tensor(float("inf")),
         train_loader=mock_loader,
+        train_sampler=mock_sampler,
         test_loader=mock_loader,
         model_params=model_params,
         log=log,
@@ -1100,12 +1121,14 @@ def test_train_returns_none(
 def test_train_saves_checkpoint_when_val_improves(
     model_params: ModelSetup,
     mock_loader: torch.utils.data.DataLoader[ProteinBatch],
+    mock_sampler: BucketedBatchSampler,
     log: FilteringBoundLogger,
 ) -> None:
     """Train writes a checkpoint file at the configured path when val loss improves."""
     train(
         best_val_loss=torch.tensor(float("inf")),
         train_loader=mock_loader,
+        train_sampler=mock_sampler,
         test_loader=mock_loader,
         model_params=model_params,
         log=log,
@@ -1116,12 +1139,14 @@ def test_train_saves_checkpoint_when_val_improves(
 def test_train_checkpoint_has_expected_keys(
     model_params: ModelSetup,
     mock_loader: torch.utils.data.DataLoader[ProteinBatch],
+    mock_sampler: BucketedBatchSampler,
     log: FilteringBoundLogger,
 ) -> None:
     """Checkpoint written by train has model, optimizer, scheduler, best_val_loss."""
     train(
         best_val_loss=torch.tensor(float("inf")),
         train_loader=mock_loader,
+        train_sampler=mock_sampler,
         test_loader=mock_loader,
         model_params=model_params,
         log=log,
@@ -1133,6 +1158,7 @@ def test_train_checkpoint_has_expected_keys(
 def test_train_updates_model_parameters(
     model_params: ModelSetup,
     mock_loader: torch.utils.data.DataLoader[ProteinBatch],
+    mock_sampler: BucketedBatchSampler,
     log: FilteringBoundLogger,
 ) -> None:
     """Train modifies at least one model parameter via gradient descent."""
@@ -1140,6 +1166,7 @@ def test_train_updates_model_parameters(
     train(
         best_val_loss=torch.tensor(float("inf")),
         train_loader=mock_loader,
+        train_sampler=mock_sampler,
         test_loader=mock_loader,
         model_params=model_params,
         log=log,
@@ -1172,6 +1199,7 @@ def test_train_calls_set_epoch_each_epoch(
     train(
         best_val_loss=torch.tensor(float("inf")),
         train_loader=loader,
+        train_sampler=cast(BucketedBatchSampler, sampler),
         test_loader=loader,
         model_params=mp3,
         log=log,
@@ -1198,7 +1226,7 @@ def test_train_runs_all_epochs(
         logging=LoggingParams(use_wandb=False),
     )
     mp3 = _make_model_params(model_params.model, tcfg3, distogram_res, distogram_atom)
-    loader, _ = _make_mock_loader(mini_batch)
+    loader, _sampler3 = _make_mock_loader(mini_batch)
     eval_calls: list[int] = []
     _real_evaluate = evaluate
 
@@ -1214,6 +1242,7 @@ def test_train_runs_all_epochs(
     train(
         best_val_loss=torch.tensor(float("inf")),
         train_loader=loader,
+        train_sampler=cast(BucketedBatchSampler, _sampler3),
         test_loader=loader,
         model_params=mp3,
         log=log,
@@ -1239,11 +1268,12 @@ def test_train_no_grad_clip_completes(
         logging=LoggingParams(use_wandb=False),
     )
     mp_nc = _make_model_params(model_params.model, tcfg_nc, distogram_res, distogram_atom)
-    loader, _ = _make_mock_loader(mini_batch)
+    loader, _sampler_nc = _make_mock_loader(mini_batch)
     assert (
         train(
             best_val_loss=torch.tensor(float("inf")),
             train_loader=loader,
+            train_sampler=cast(BucketedBatchSampler, _sampler_nc),
             test_loader=loader,
             model_params=mp_nc,
             log=log,
@@ -1274,11 +1304,12 @@ def test_train_partial_window_at_epoch_end_updates_params(
         logging=LoggingParams(use_wandb=False),
     )
     mp_acc = _make_model_params(model_params.model, tcfg_acc, distogram_res, distogram_atom)
-    loader, _ = _make_mock_loader(mini_batch)
+    loader, _sampler_acc = _make_mock_loader(mini_batch)
     params_before = [p.clone().detach() for p in mp_acc.model.parameters()]
     train(
         best_val_loss=torch.tensor(float("inf")),
         train_loader=loader,
+        train_sampler=cast(BucketedBatchSampler, _sampler_acc),
         test_loader=loader,
         model_params=mp_acc,
         log=log,
@@ -1329,10 +1360,11 @@ def test_train_token_budget_preflush_fires_before_oversized_batch(
         logging=LoggingParams(use_wandb=False),
     )
     mp_b = _make_model_params(model_params.model, tcfg_b, distogram_res, distogram_atom)
-    loader, _ = _make_mock_loader(mini_batch, n_copies=2)
+    loader, _sampler_b = _make_mock_loader(mini_batch, n_copies=2)
     train(
         best_val_loss=torch.tensor(float("inf")),
         train_loader=loader,
+        train_sampler=cast(BucketedBatchSampler, _sampler_b),
         test_loader=loader,
         model_params=mp_b,
         log=log,
@@ -1346,7 +1378,7 @@ def test_train_wandb_called_once_per_epoch_when_enabled(
     distogram_res: Distogram,
     distogram_atom: Distogram,
     log: FilteringBoundLogger,
-    monkeypatch: pytest.MonkeyPatch,
+    wandb_payloads: list[dict[str, object]],
     tmp_path: pathlib.Path,
 ) -> None:
     """Train calls wandb.log exactly once per epoch when use_wandb=True."""
@@ -1359,36 +1391,35 @@ def test_train_wandb_called_once_per_epoch_when_enabled(
         logging=LoggingParams(use_wandb=True),
     )
     mp_w = _make_model_params(model_params.model, tcfg_w, distogram_res, distogram_atom)
-    logged: list[dict[str, object]] = []
-    monkeypatch.setattr("train.train_loop.wandb.log", lambda data, **_: logged.append(data))
-    loader, _ = _make_mock_loader(mini_batch)
+    loader, _sampler_w = _make_mock_loader(mini_batch)
     train(
         best_val_loss=torch.tensor(float("inf")),
         train_loader=loader,
+        train_sampler=cast(BucketedBatchSampler, _sampler_w),
         test_loader=loader,
         model_params=mp_w,
         log=log,
     )
-    assert len(logged) == 1
+    assert len(wandb_payloads) == 1
 
 
 def test_train_wandb_not_called_when_disabled(
     model_params: ModelSetup,
     mock_loader: torch.utils.data.DataLoader[ProteinBatch],
+    mock_sampler: BucketedBatchSampler,
     log: FilteringBoundLogger,
-    monkeypatch: pytest.MonkeyPatch,
+    wandb_call_counter: list[object],
 ) -> None:
     """Train does not call wandb.log when use_wandb=False."""
-    called: list[int] = []
-    monkeypatch.setattr("train.train_loop.wandb.log", lambda *_a, **_kw: called.append(1))
     train(
         best_val_loss=torch.tensor(float("inf")),
         train_loader=mock_loader,
+        train_sampler=mock_sampler,
         test_loader=mock_loader,
         model_params=model_params,
         log=log,
     )
-    assert len(called) == 0
+    assert len(wandb_call_counter) == 0
 
 
 def test_train_metrics_nonzero_when_budget_exceeds_total_tokens(
@@ -1397,7 +1428,7 @@ def test_train_metrics_nonzero_when_budget_exceeds_total_tokens(
     distogram_res: Distogram,
     distogram_atom: Distogram,
     log: FilteringBoundLogger,
-    monkeypatch: pytest.MonkeyPatch,
+    wandb_payloads: list[dict[str, object]],
     tmp_path: pathlib.Path,
 ) -> None:
     """train/total_loss logged to W&B is non-zero when the dataset fits under the token budget.
@@ -1413,18 +1444,17 @@ def test_train_metrics_nonzero_when_budget_exceeds_total_tokens(
         logging=LoggingParams(use_wandb=True),
     )
     mp_large = _make_model_params(model_params.model, tcfg_large, distogram_res, distogram_atom)
-    payloads: list[dict[str, object]] = []
-    monkeypatch.setattr("train.train_loop.wandb.log", lambda data, **_: payloads.append(data))
-    loader, _ = _make_mock_loader(mini_batch)
+    loader, _sampler_large = _make_mock_loader(mini_batch)
     train(
         best_val_loss=torch.tensor(float("inf")),
         train_loader=loader,
+        train_sampler=cast(BucketedBatchSampler, _sampler_large),
         test_loader=loader,
         model_params=mp_large,
         log=log,
     )
-    assert len(payloads) == 1
-    train_loss = payloads[0]["train/total_loss"]
+    assert len(wandb_payloads) == 1
+    train_loss = wandb_payloads[0]["train/total_loss"]
     assert isinstance(train_loss, float)
     assert train_loss > 0.0, "train/total_loss is 0 — end-of-epoch flush was dropped"
 
@@ -1498,17 +1528,18 @@ def test_train_one_epoch_with_bucketed_loader(
     log: FilteringBoundLogger,
 ) -> None:
     """train() completes one epoch with a real BucketedBatchSampler DataLoader."""
-    train_loader, val_loader, _ = make_bucketed_data_loaders(
+    train_loader, val_loader, _, train_sampler = make_bucketed_data_loaders(
         cfg=model_params.tcfg,
         jsonl_path=jsonl_path,
         splits_path=splits_path,
         num_workers=0,
         debug_run=False,
     )
-    assert isinstance(train_loader.batch_sampler, BucketedBatchSampler)
+    assert isinstance(train_sampler, BucketedBatchSampler)
     result = train(
         best_val_loss=torch.tensor(float("inf")),
         train_loader=train_loader,
+        train_sampler=train_sampler,
         test_loader=val_loader,
         model_params=model_params,
         log=log,
@@ -1525,6 +1556,7 @@ def test_train_accum_full_window_updates_params(
     tmp_path: pathlib.Path,
 ) -> None:
     """With accum budget=2x batch tokens and a 2-batch loader, train completes one window."""
+    manual_seed(0)
     tcfg_acc = TrainConfig(
         training=TrainingParams(
             num_epochs=1, lr=1e-4, grad_clip=1.0, accumulated_token_budget=2 * _BATCH_TOKENS
@@ -1536,11 +1568,12 @@ def test_train_accum_full_window_updates_params(
         logging=LoggingParams(use_wandb=False),
     )
     mp_acc = _make_model_params(model_params.model, tcfg_acc, distogram_res, distogram_atom)
-    loader, _ = _make_mock_loader(mini_batch, n_copies=2)
+    loader, _sampler_acc2 = _make_mock_loader(mini_batch, n_copies=2)
     params_before = [p.clone().detach() for p in mp_acc.model.parameters()]
     train(
         best_val_loss=torch.tensor(float("inf")),
         train_loader=loader,
+        train_sampler=cast(BucketedBatchSampler, _sampler_acc2),
         test_loader=loader,
         model_params=mp_acc,
         log=log,
@@ -1554,12 +1587,14 @@ def test_train_accum_full_window_updates_params(
 def test_train_optimizer_state_non_zero_after_one_step(
     model_params: ModelSetup,
     mock_loader: torch.utils.data.DataLoader[ProteinBatch],
+    mock_sampler: BucketedBatchSampler,
     log: FilteringBoundLogger,
 ) -> None:
     """Adam exp_avg in the saved checkpoint is non-zero after one training step."""
     train(
         best_val_loss=torch.tensor(float("inf")),
         train_loader=mock_loader,
+        train_sampler=mock_sampler,
         test_loader=mock_loader,
         model_params=model_params,
         log=log,
@@ -1575,12 +1610,14 @@ def test_train_optimizer_state_non_zero_after_one_step(
 def test_train_scheduler_state_reflects_completed_epoch(
     model_params: ModelSetup,
     mock_loader: torch.utils.data.DataLoader[ProteinBatch],
+    mock_sampler: BucketedBatchSampler,
     log: FilteringBoundLogger,
 ) -> None:
     """Scheduler last_epoch in checkpoint equals the number of epochs completed."""
     train(
         best_val_loss=torch.tensor(float("inf")),
         train_loader=mock_loader,
+        train_sampler=mock_sampler,
         test_loader=mock_loader,
         model_params=model_params,
         log=log,
@@ -1595,7 +1632,7 @@ def test_train_wandb_epoch_increments_across_epochs(
     distogram_res: Distogram,
     distogram_atom: Distogram,
     log: FilteringBoundLogger,
-    monkeypatch: pytest.MonkeyPatch,
+    wandb_payloads: list[dict[str, object]],
     tmp_path: pathlib.Path,
 ) -> None:
     """W&B epoch values logged across a 3-epoch run are [1, 2, 3]."""
@@ -1608,17 +1645,16 @@ def test_train_wandb_epoch_increments_across_epochs(
         logging=LoggingParams(use_wandb=True),
     )
     mp3 = _make_model_params(model_params.model, tcfg3, distogram_res, distogram_atom)
-    payloads: list[dict[str, object]] = []
-    monkeypatch.setattr("train.train_loop.wandb.log", lambda data, **_: payloads.append(data))
-    loader, _ = _make_mock_loader(mini_batch)
+    loader, _sampler_w3 = _make_mock_loader(mini_batch)
     train(
         best_val_loss=torch.tensor(float("inf")),
         train_loader=loader,
+        train_sampler=cast(BucketedBatchSampler, _sampler_w3),
         test_loader=loader,
         model_params=mp3,
         log=log,
     )
-    assert [p["epoch"] for p in payloads] == [1, 2, 3]
+    assert [p["epoch"] for p in wandb_payloads] == [1, 2, 3]
 
 
 def test_integration_gradient_flow_through_all_submodules(
@@ -1648,7 +1684,7 @@ def test_train_wandb_global_step_in_payload(
     distogram_res: Distogram,
     distogram_atom: Distogram,
     log: FilteringBoundLogger,
-    monkeypatch: pytest.MonkeyPatch,
+    wandb_payloads: list[dict[str, object]],
     tmp_path: pathlib.Path,
 ) -> None:
     """W&B payload contains a 'global_step' key that is at least 1 after the first epoch."""
@@ -1661,14 +1697,13 @@ def test_train_wandb_global_step_in_payload(
         logging=LoggingParams(use_wandb=True),
     )
     mp_w = _make_model_params(model_params.model, tcfg_w, distogram_res, distogram_atom)
-    payloads: list[dict[str, object]] = []
-    monkeypatch.setattr("train.train_loop.wandb.log", lambda data, **_: payloads.append(data))
-    loader, _ = _make_mock_loader(mini_batch)
+    loader, _sampler_gs = _make_mock_loader(mini_batch)
     train(
         best_val_loss=torch.tensor(float("inf")),
         train_loader=loader,
+        train_sampler=cast(BucketedBatchSampler, _sampler_gs),
         test_loader=loader,
         model_params=mp_w,
         log=log,
     )
-    assert int(cast(int, payloads[0]["global_step"])) >= 1
+    assert int(cast(int, wandb_payloads[0]["global_step"])) >= 1

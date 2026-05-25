@@ -18,7 +18,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from architecture.layers import LinearNoBias
 from beartype import beartype
-from einops import einsum, rearrange
+from einops import einsum, rearrange, reduce
 from jaxtyping import Float, jaxtyped
 
 # ---------------------------------------------------------------------------
@@ -73,7 +73,7 @@ class TriangleAttentionStartingNodeWithBias(nn.Module):
         self.n_heads = n_heads
         self.head_dim = c_pair // n_heads
 
-        self.norm = nn.LayerNorm(c_pair)
+        self.layer_norm = nn.LayerNorm(c_pair)
         self.to_q = LinearNoBias(c_pair, c_pair)
         self.to_k = LinearNoBias(c_pair, c_pair)
         self.to_v = LinearNoBias(c_pair, c_pair)
@@ -87,7 +87,7 @@ class TriangleAttentionStartingNodeWithBias(nn.Module):
         b: Float[torch.Tensor, "B N_res N_res n_heads"],
     ) -> Float[torch.Tensor, "B N_res N_res c_pair"]:
         """Apply row-wise gated self-attention biased by b to update pair embeddings."""
-        zn: Float[torch.Tensor, "B N_res N_res c_pair"] = self.norm(z)
+        zn: Float[torch.Tensor, "B N_res N_res c_pair"] = self.layer_norm(z)
         q: Float[torch.Tensor, "B N_res N_res n_heads head_dim"] = rearrange(
             self.to_q(zn),
             "B n_i n_j (n_heads head_dim) -> B n_i n_j n_heads head_dim",
@@ -141,7 +141,7 @@ class TriangleAttentionEndingNodeWithBias(nn.Module):
         self.n_heads = n_heads
         self.head_dim = c_pair // n_heads
 
-        self.norm = nn.LayerNorm(c_pair)
+        self.layer_norm = nn.LayerNorm(c_pair)
         self.to_q = LinearNoBias(c_pair, c_pair)
         self.to_k = LinearNoBias(c_pair, c_pair)
         self.to_v = LinearNoBias(c_pair, c_pair)
@@ -155,7 +155,7 @@ class TriangleAttentionEndingNodeWithBias(nn.Module):
         b: Float[torch.Tensor, "B N_res N_res n_heads"],
     ) -> Float[torch.Tensor, "B N_res N_res c_pair"]:
         """Apply column-wise gated self-attention biased by b to update pair embeddings."""
-        zn: Float[torch.Tensor, "B N_res N_res c_pair"] = self.norm(z)
+        zn: Float[torch.Tensor, "B N_res N_res c_pair"] = self.layer_norm(z)
         # Transpose to column-first so ending node j leads
         q: Float[torch.Tensor, "B N_res N_res n_heads head_dim"] = rearrange(
             self.to_q(zn), "b n_i n_j (h d) -> b n_j n_i h d", h=self.n_heads
@@ -200,7 +200,7 @@ class Transition(nn.Module):
 
     def __init__(self, c: int, expansion: int = 4) -> None:
         super().__init__()
-        self.norm = nn.LayerNorm(c)
+        self.layer_norm = nn.LayerNorm(c)
         self.x_to_a = LinearNoBias(c, c * expansion)
         self.x_to_b = LinearNoBias(c, c * expansion)
         self.hidden_to_out = LinearNoBias(c * expansion, c)
@@ -208,7 +208,7 @@ class Transition(nn.Module):
     def forward(self, x: Float[torch.Tensor, "..."]) -> Float[torch.Tensor, "..."]:
         """Apply two-layer FFN with ReLU activation to any leading-dim tensor."""
         # Works for any leading dims (B N_res N_res c) or (B N_res c)
-        x = self.norm(x)
+        x = self.layer_norm(x)
         a = self.x_to_a(x)
         b = self.x_to_b(x)
         hidden = F.silu(a) * b
@@ -306,7 +306,9 @@ class PairUpdate(nn.Module):
         diff: Float[torch.Tensor, "B N_res N_res 3"] = rearrange(
             r_center, "b n d -> b n 1 d"
         ) - rearrange(r_center, "b n d -> b 1 n d")
-        d_ij: Float[torch.Tensor, "B N_res N_res"] = diff.norm(dim=-1)
+        d_ij: Float[torch.Tensor, "B N_res N_res"] = torch.sqrt(
+            reduce(diff**2, "b n m d -> b n m", "sum").clamp(min=1e-8)
+        )
 
         # ------------------------------------------------------------------
         # Step 2: b_ij = LinearNoBias(Transform_RBF(d_ij))

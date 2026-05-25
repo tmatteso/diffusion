@@ -1,10 +1,10 @@
-"""Tests for _compute_batch_plan and BucketedBatchSampler."""
+"""Tests for compute_batch_plan and BucketedBatchSampler."""
 
 import json
 import pathlib
 
 import pytest
-from helpers.bucketed_sampler import BucketedBatchSampler, _compute_batch_plan
+from helpers.bucketed_sampler import BucketedBatchSampler, compute_batch_plan
 from helpers.cluster_index import ClusterIndex
 
 # ---------------------------------------------------------------------------
@@ -19,7 +19,7 @@ def _rep_lens(n_clusters: int = 64, token_budget: int = 512) -> list[int]:
 
 
 # ---------------------------------------------------------------------------
-# _compute_batch_plan
+# compute_batch_plan
 # ---------------------------------------------------------------------------
 
 
@@ -28,7 +28,7 @@ def test_batch_plan_respects_token_budget() -> None:
     n = 200
     flat_to_cluster = [0] * n  # all in cluster 0, rep_len=8
     rep_lens = _rep_lens()
-    batches = _compute_batch_plan(flat_to_cluster, rep_lens, n, 512, 16, seed=0, max_seq_len=512)
+    batches = compute_batch_plan(flat_to_cluster, rep_lens, n, 512, 16, seed=0, max_seq_len=512)
     for batch in batches:
         max_rep = max(rep_lens[flat_to_cluster[i]] for i in batch)
         padded_total = len(batch) * max_rep
@@ -42,12 +42,12 @@ def test_batch_plan_no_padding_blowup() -> None:
     [64,64,64,64,64,128] (sum=448≤512) whose actual padded cost is 6*128=768.
     """
     # Two cluster ids: cluster 7 with rep_len=64, cluster 15 with rep_len=128.
-    # Lay out proteins sorted ascending (as _compute_batch_plan will sort them):
+    # Lay out proteins sorted ascending (as compute_batch_plan will sort them):
     # 5 short proteins followed by 1 long one.
     rep_lens = _rep_lens()  # bin_width=8; rep_lens[7]=64, rep_lens[15]=128
     # Proteins 0-4 → cluster 7 (rep_len=64), protein 5 → cluster 15 (rep_len=128)
     flat_to_cluster = [7, 7, 7, 7, 7, 15]
-    batches = _compute_batch_plan(flat_to_cluster, rep_lens, 6, 512, 16, seed=0, max_seq_len=512)
+    batches = compute_batch_plan(flat_to_cluster, rep_lens, 6, 512, 16, seed=0, max_seq_len=512)
     for batch in batches:
         max_rep = max(rep_lens[flat_to_cluster[i]] for i in batch)
         padded_total = len(batch) * max_rep
@@ -61,7 +61,7 @@ def test_batch_plan_covers_all_proteins() -> None:
     n = 100
     flat_to_cluster = list(range(64)) * (n // 64) + list(range(n % 64))
     rep_lens = _rep_lens()
-    batches = _compute_batch_plan(flat_to_cluster, rep_lens, n, 512, 16, seed=0, max_seq_len=512)
+    batches = compute_batch_plan(flat_to_cluster, rep_lens, n, 512, 16, seed=0, max_seq_len=512)
     all_indices = sorted(i for batch in batches for i in batch)
     assert all_indices == list(range(n))
 
@@ -70,7 +70,7 @@ def test_batch_plan_overflow_is_singleton_without_truncation() -> None:
     """Overflow proteins become singleton batches when max_seq_len exceeds token_budget."""
     flat_to_cluster = [64]  # one overflow protein, rep_len = 513
     rep_lens = _rep_lens()
-    batches = _compute_batch_plan(flat_to_cluster, rep_lens, 1, 512, 16, seed=0, max_seq_len=513)
+    batches = compute_batch_plan(flat_to_cluster, rep_lens, 1, 512, 16, seed=0, max_seq_len=513)
     assert len(batches) == 1
     assert batches[0] == [0]
 
@@ -80,7 +80,7 @@ def test_batch_plan_overflow_packs_when_truncated() -> None:
     # 4 overflow proteins; each truncates to 128, so 4 * 128 = 512 fits exactly.
     flat_to_cluster = [64, 64, 64, 64]
     rep_lens = _rep_lens()  # rep_lens[64] = 513
-    batches = _compute_batch_plan(flat_to_cluster, rep_lens, 4, 512, 16, seed=0, max_seq_len=128)
+    batches = compute_batch_plan(flat_to_cluster, rep_lens, 4, 512, 16, seed=0, max_seq_len=128)
     assert sum(len(b) for b in batches) == 4
     assert all(len(b) >= 1 for b in batches)
     # All four should fit in a single batch (4 * 128 = 512 <= 512).
@@ -92,8 +92,8 @@ def test_batch_plan_different_seeds_differ() -> None:
     n = 200
     flat_to_cluster = [0] * n
     rep_lens = _rep_lens()
-    batches_a = _compute_batch_plan(flat_to_cluster, rep_lens, n, 512, 16, seed=0, max_seq_len=512)
-    batches_b = _compute_batch_plan(flat_to_cluster, rep_lens, n, 512, 16, seed=1, max_seq_len=512)
+    batches_a = compute_batch_plan(flat_to_cluster, rep_lens, n, 512, 16, seed=0, max_seq_len=512)
+    batches_b = compute_batch_plan(flat_to_cluster, rep_lens, n, 512, 16, seed=1, max_seq_len=512)
     indices_a = [i for batch in batches_a for i in batch]
     indices_b = [i for batch in batches_b for i in batch]
     assert indices_a != indices_b

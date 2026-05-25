@@ -2,9 +2,12 @@
 
 import json
 import pathlib
+from collections.abc import Mapping, Sequence
 
 import pytest
 from helpers.cluster_index import ClusterIndex
+
+_Entry = Mapping[str, str | Mapping[str, list[list[float]]]]
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -16,7 +19,10 @@ def _make_coords(n: int) -> dict[str, list[list[float]]]:
     return {atom: [[0.0, 0.0, 0.0]] * n for atom in ("N", "CA", "C", "O")}
 
 
-def _write_jsonl(path: pathlib.Path, entries: list[dict[str, object]]) -> None:
+def _write_jsonl(
+    path: pathlib.Path,
+    entries: Sequence[Mapping[str, str | Mapping[str, list[list[float]]]]],
+) -> None:
     """Write entries as JSONL to path."""
     with open(path, "w") as f:
         for entry in entries:
@@ -84,7 +90,7 @@ def test_cluster_rep_len_overflow(tmp_path: pathlib.Path) -> None:
 
 def test_cluster_index_creates_cluster_dir(tmp_path: pathlib.Path) -> None:
     """ClusterIndex creates the cluster directory and 65 JSONL files."""
-    entries = [
+    entries: list[_Entry] = [
         {"name": "p1", "seq": "A" * 8, "coords": _make_coords(8)},
         {"name": "p2", "seq": "A" * 16, "coords": _make_coords(16)},
     ]
@@ -98,7 +104,7 @@ def test_cluster_index_creates_cluster_dir(tmp_path: pathlib.Path) -> None:
 
 def test_cluster_index_flat_to_cluster_correct(tmp_path: pathlib.Path) -> None:
     """flat_to_cluster assigns each protein to the expected bucket."""
-    entries = [
+    entries: list[_Entry] = [
         {"name": "p1", "seq": "A" * 8, "coords": _make_coords(8)},  # → cluster 0
         {"name": "p2", "seq": "A" * 9, "coords": _make_coords(9)},  # → cluster 1
         {"name": "p3", "seq": "A" * 513, "coords": _make_coords(513)},  # → overflow 64
@@ -111,7 +117,7 @@ def test_cluster_index_flat_to_cluster_correct(tmp_path: pathlib.Path) -> None:
 
 def test_cluster_index_len(tmp_path: pathlib.Path) -> None:
     """__len__ returns the total number of included proteins."""
-    entries = [
+    entries: list[_Entry] = [
         {"name": f"p{i}", "seq": "A" * (i + 1), "coords": _make_coords(i + 1)} for i in range(10)
     ]
     _write_jsonl(tmp_path / "proteins.jsonl", entries)
@@ -121,7 +127,7 @@ def test_cluster_index_len(tmp_path: pathlib.Path) -> None:
 
 def test_cluster_index_name_filter(tmp_path: pathlib.Path) -> None:
     """Only names in the provided list are included."""
-    entries = [
+    entries: list[_Entry] = [
         {"name": "p1", "seq": "A" * 8, "coords": _make_coords(8)},
         {"name": "p2", "seq": "A" * 8, "coords": _make_coords(8)},
         {"name": "p3", "seq": "A" * 8, "coords": _make_coords(8)},
@@ -138,7 +144,7 @@ def test_cluster_index_name_filter(tmp_path: pathlib.Path) -> None:
 
 def test_cluster_index_cache_hit_same_result(tmp_path: pathlib.Path) -> None:
     """Second construction from the same path reads cache and produces identical arrays."""
-    entries = [
+    entries: list[_Entry] = [
         {"name": "p1", "seq": "A" * 8, "coords": _make_coords(8)},
         {"name": "p2", "seq": "A" * 16, "coords": _make_coords(16)},
     ]

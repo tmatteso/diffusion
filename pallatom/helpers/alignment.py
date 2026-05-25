@@ -58,12 +58,11 @@ def kabsch_rotation(
     else:
         h = einsum(mobile, reference, "... n i, ... n j -> ... i j")
 
-    # SVD:  H = U S V^T
-    u, _, v_h = torch.linalg.svd(h)  # (...,3,3), (...,3), (...,3,3)
-    v = v_h.mH  # V = Vh^H (conjugate transpose)
+    # SVD:  H = U S V^T  (torch.svd returns V directly, not Vh)
+    u, _, v = torch.svd(h)  # (...,3,3), (...,3), (...,3,3)
 
     # Correct for improper rotation (reflection) when det < 0
-    det = torch.linalg.det(einsum(v, u.mH, "... i j, ... j k -> ... i k"))
+    det: Float[torch.Tensor, "..."] = einsum(v, u.mH, "... i j, ... j k -> ... i k").det()
     sign = torch.ones_like(det)
     sign[det < 0] = -1.0
 

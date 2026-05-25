@@ -41,7 +41,9 @@ DEVICE: str = "cuda" if torch.cuda.is_available() else "cpu"
 
 
 @dataclass(frozen=True)
-class _AppState:
+class AppState:
+    """Immutable application state shared across requests."""
+
     semaphore: asyncio.Semaphore
     model: MainTrunk
     mp: ModelParams
@@ -88,7 +90,7 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
     templ_disto = Distogram(
         n_bins=mp.n_bins - 1, min_dist=3.25, max_dist=50.75, overflow_bin=True
     ).to(DEVICE)
-    _app.state.loaded = _AppState(
+    _app.state.loaded = AppState(
         semaphore=asyncio.Semaphore(1),
         model=model,
         mp=mp,
@@ -208,10 +210,10 @@ def coords_to_pdb_strings(
     for b in range(B):
         coords_tensor = rearrange(coords_batch[b].cpu(), "(n a) d -> n a d", n=N_res, a=NATOM)
         x_37, mask_37 = atom5_to_atom37(coords_tensor)
-        aatype = seq_logits[b].argmax(dim=-1).cpu().numpy().astype(np.intp)
+        aatype = np.array(seq_logits[b].argmax(dim=-1).cpu()).astype(np.intp)
         prot_out = Protein(
-            atom_positions=x_37.numpy(),
-            atom_mask=mask_37.numpy(),
+            atom_positions=np.array(x_37).astype(np.float64),
+            atom_mask=np.array(mask_37).astype(np.float64),
             residue_index=np.arange(N_res, dtype=np.intp),
             aatype=aatype,
             chain_index=np.zeros(N_res, dtype=np.intp),
@@ -221,7 +223,16 @@ def coords_to_pdb_strings(
     return pdb_strings
 
 
-def _run_sampling(req: SampleRequest, state: _AppState) -> list[str]:
+def run_sampling(req: SampleRequest, state: AppState) -> list[str]:
+    """Run the diffusion sampling loop and return PDB strings for each sample.
+
+    Args:
+        req: Sampling request containing residue count, sample count, and optional conditioning.
+        state: Shared application state holding the model and noise schedule.
+
+    Returns:
+        List of PDB-formatted strings, one per requested sample.
+    """
     model: MainTrunk = state.model
     mp: ModelParams = state.mp
     noise: NoiseScheduleParams = state.noise
@@ -320,7 +331,7 @@ def _run_sampling(req: SampleRequest, state: _AppState) -> list[str]:
 @app.get("/health")
 async def health(request: Request) -> Mapping[str, str | bool]:
     """Return service health status, compute device, and whether a model is loaded."""
-    state: _AppState | None = request.app.state.loaded
+    state: AppState | None = request.app.state.loaded
     return {"status": "ok", "device": DEVICE, "model_loaded": bool(state)}
 
 
@@ -331,13 +342,13 @@ async def sample(request: Request, req: SampleRequest) -> SampleResponse:
     Returns one PDB string per requested sample.
     Requests are serialised (one sampling job runs at a time).
     """
-    state: _AppState | None = request.app.state.loaded
+    state: AppState | None = request.app.state.loaded
     if state is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
     async with state.semaphore:
         loop = asyncio.get_event_loop()
         try:
-            pdb_strings = await loop.run_in_executor(None, partial(_run_sampling, req, state))
+            pdb_strings = await loop.run_in_executor(None, partial(run_sampling, req, state))
         except Exception as exc:
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 

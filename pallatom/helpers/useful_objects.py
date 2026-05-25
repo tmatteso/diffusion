@@ -15,6 +15,18 @@ from tqdm import tqdm
 from train.train_config import TrainConfig
 
 
+def manual_seed(seed: int) -> torch.Generator:
+    """Set the seed for generating random numbers.
+
+    Args:
+        seed: The desired seed.
+
+    Returns:
+        A torch.Generator whose state is set.
+    """
+    return torch.manual_seed(seed)  # type: ignore[reportUnknownMemberType]
+
+
 @dataclasses.dataclass(frozen=True)
 class ModelSetup:
     """Frozen bundle of all mutable training objects passed through the training loop.

@@ -13,9 +13,10 @@ from architecture.pair_update import (
 )
 from beartype import beartype
 from einops import einsum, rearrange, reduce
+from helpers.useful_objects import manual_seed
 from jaxtyping import Float, TypeCheckError, jaxtyped
 
-torch.manual_seed(42)
+manual_seed(42)
 
 N_RES = 8
 C = 32
@@ -42,13 +43,13 @@ def compute_dij(
 ) -> Float[torch.Tensor, "B N_res N_res"]:
     """Compute the (B, N_res, N_res) Euclidean pairwise distance matrix."""
     diff = rearrange(r, "b n d -> b n 1 d") - rearrange(r, "b n d -> b 1 n d")
-    return diff.norm(dim=-1)
+    return torch.sqrt(reduce(diff**2, "b n m d -> b n m", "sum").clamp(min=1e-8))
 
 
 @jaxtyped(typechecker=beartype)
 def random_rotation() -> Float[torch.Tensor, "3 3"]:
     """Generate a uniformly random proper rotation matrix (det = +1)."""
-    Q, _ = torch.linalg.qr(torch.randn(3, 3))
+    Q, _ = torch.qr(torch.randn(3, 3))
     if Q.det() < 0:
         Q[:, 0] = -Q[:, 0]
     return Q
@@ -120,7 +121,7 @@ def d() -> Float[torch.Tensor, "B N_res N_res"]:
     """Euclidean pairwise distance matrix [B, N_RES, N_RES] from random residue positions."""
     pos = torch.randn(B, N_RES, 3)
     diff = rearrange(pos, "b n c -> b n 1 c") - rearrange(pos, "b n c -> b 1 n c")
-    return diff.norm(dim=-1)
+    return torch.sqrt(reduce(diff**2, "b n m c -> b n m", "sum").clamp(min=1e-8))
 
 
 @pytest.fixture
@@ -352,7 +353,7 @@ def test_dropout_rowwise_train_preserves_shape(
 def test_dropout_rowwise_train_zeroes_entire_rows() -> None:
     """DropoutRowwise drops entire rows at once — row in output is either all-zero or all-ones."""
     # Use a ones input so a dropped row is all-zero and a kept row is all-ones.
-    torch.manual_seed(0)
+    manual_seed(0)
     x = torch.ones(B, N_RES, N_RES, C)
     drop = DropoutRowwise(p=0.5)
     drop.train()
@@ -391,7 +392,7 @@ def test_dropout_columnwise_train_preserves_shape(
 
 def test_dropout_columnwise_train_zeroes_entire_cols() -> None:
     """DropoutColumnwise drops entire columns at once — column in output either all zero or ones."""
-    torch.manual_seed(0)
+    manual_seed(0)
     x = torch.ones(B, N_RES, N_RES, C)
     drop = DropoutColumnwise(p=0.5)
     drop.train()

@@ -198,7 +198,7 @@ def med_loss(
 
 
 @jaxtyped(typechecker=beartype)
-def _pairwise_dist(
+def pairwise_dist(
     x: Float[torch.Tensor, "... N_atom 3"],
 ) -> Float[torch.Tensor, "... N_atom N_atom"]:
     """||x_i - x_j|| for all pairs via einsum — numerically stable."""
@@ -247,8 +247,8 @@ def smooth_lddt_loss(
     Returns:
         Scalar loss = 1 - lddt_smooth  (averaged over batch).
     """
-    dr_pred: Float[torch.Tensor, "... N_atom N_atom"] = _pairwise_dist(r_pred)
-    dr_true: Float[torch.Tensor, "... N_atom N_atom"] = _pairwise_dist(r_true)
+    dr_pred: Float[torch.Tensor, "... N_atom N_atom"] = pairwise_dist(r_pred)
+    dr_true: Float[torch.Tensor, "... N_atom N_atom"] = pairwise_dist(r_true)
 
     # Absolute distance difference δ_lm
     delta: Float[torch.Tensor, "... N_atom N_atom"] = (dr_true - dr_pred).abs()
@@ -321,7 +321,10 @@ def distogram_loss_residue(
         )
     else:
         # integer class indices → gather along bin dim
-        ce = -log_p.gather(-1, y.long().unsqueeze(-1)).squeeze(-1)
+        ce = -rearrange(
+            log_p.gather(-1, rearrange(y.long(), "... l m -> ... l m 1")),
+            "... l m 1 -> ... l m",
+        )
 
     if mask is not None:
         m: Float[torch.Tensor, "... N_res"] = mask.float()
@@ -366,7 +369,10 @@ def distogram_loss_atom(
         )
     else:
         # integer class indices → gather along bin dim
-        ce = -log_q.gather(-1, y.long().unsqueeze(-1)).squeeze(-1)
+        ce = -rearrange(
+            log_q.gather(-1, rearrange(y.long(), "... n m -> ... n m 1")),
+            "... n m 1 -> ... n m",
+        )
 
     if local_mask is not None:
         m: Float[torch.Tensor, "... N_atom K"] = local_mask.float()

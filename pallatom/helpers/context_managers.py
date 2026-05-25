@@ -87,7 +87,7 @@ class StructlogConfig:
         """
         self._is_rank_zero = is_rank_zero
         self._log_file = log_file
-        self._f: io.TextIOWrapper | None = None
+        self.f: io.TextIOWrapper | None = None
 
     def __enter__(self) -> "StructlogConfig":
         """Configure structlog and open the log file if requested."""
@@ -97,8 +97,8 @@ class StructlogConfig:
             structlog.processors.StackInfoRenderer(),
         ]
         if self._log_file and self._is_rank_zero:
-            self._f = open(self._log_file, "w", buffering=1)
-            processors.append(self._write_log_line)
+            self.f = open(self._log_file, "w", buffering=1)
+            processors.append(self.write_log_line)
         if self._is_rank_zero:
             processors.append(structlog.dev.ConsoleRenderer())
         structlog.configure(
@@ -109,12 +109,12 @@ class StructlogConfig:
         )
         return self
 
-    def _write_log_line(
+    def write_log_line(
         self, _logger: WrappedLogger, _method: str | None, event_dict: EventDict
     ) -> EventDict:
         """Structlog processor: write the event dict as a JSON line and pass it through."""
-        if self._f is not None:
-            self._f.write(json.dumps(event_dict) + "\n")
+        if self.f is not None:
+            self.f.write(json.dumps(event_dict) + "\n")
         return event_dict
 
     def __exit__(
@@ -124,8 +124,8 @@ class StructlogConfig:
         exc_tb: TracebackType | None,
     ) -> None:
         """Close the log file and reset structlog to a no-op configuration."""
-        if self._f is not None:
-            self._f.close()
+        if self.f is not None:
+            self.f.close()
         structlog.reset_defaults()
 
 

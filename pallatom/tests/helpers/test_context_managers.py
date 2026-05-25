@@ -23,7 +23,7 @@ def test_structlog_config_write_log_line_returns_event_dict(tmp_path: pathlib.Pa
     cfg = StructlogConfig(is_rank_zero=True, log_file=path)
     with cfg:
         event: dict[str, object] = {"event": "test", "value": 1}
-        returned = cfg._write_log_line(None, None, event)
+        returned = cfg.write_log_line(None, None, event)
     assert returned is event
 
 
@@ -33,7 +33,7 @@ def test_structlog_config_writes_json_line(tmp_path: pathlib.Path) -> None:
     cfg = StructlogConfig(is_rank_zero=True, log_file=path)
     with cfg:
         event: dict[str, object] = {"event": "train", "loss": 0.5}
-        cfg._write_log_line(None, None, event)
+        cfg.write_log_line(None, None, event)
     with open(path) as fh:
         written = json.loads(fh.readline())
     assert written == event
@@ -46,7 +46,7 @@ def test_structlog_config_writes_multiple_lines(tmp_path: pathlib.Path) -> None:
     events: list[dict[str, object]] = [{"event": "a", "x": 1}, {"event": "b", "x": 2}]
     with cfg:
         for ev in events:
-            cfg._write_log_line(None, None, ev)
+            cfg.write_log_line(None, None, ev)
     with open(path) as fh:
         lines = fh.readlines()
     assert len(lines) == 2
@@ -60,7 +60,7 @@ def test_structlog_config_truncates_existing_file(tmp_path: pathlib.Path) -> Non
         fh.write('{"stale": true}\n' * 5)
     cfg = StructlogConfig(is_rank_zero=True, log_file=path)
     with cfg:
-        cfg._write_log_line(None, None, {"event": "fresh"})
+        cfg.write_log_line(None, None, {"event": "fresh"})
     with open(path) as fh:
         lines = fh.readlines()
     assert len(lines) == 1
@@ -72,9 +72,9 @@ def test_structlog_config_exit_closes_file(tmp_path: pathlib.Path) -> None:
     path = str(tmp_path / "run.jsonl")
     cfg = StructlogConfig(is_rank_zero=True, log_file=path)
     with cfg:
-        cfg._write_log_line(None, None, {"event": "inside"})
-    assert cfg._f is not None
-    assert cfg._f.closed
+        cfg.write_log_line(None, None, {"event": "inside"})
+    assert cfg.f is not None
+    assert cfg.f.closed
 
 
 def test_structlog_config_no_file_when_not_rank_zero(tmp_path: pathlib.Path) -> None:
@@ -86,10 +86,10 @@ def test_structlog_config_no_file_when_not_rank_zero(tmp_path: pathlib.Path) -> 
 
 
 def test_structlog_config_f_is_none_before_enter(tmp_path: pathlib.Path) -> None:
-    """StructlogConfig._f is None immediately after construction, before entering the context."""
+    """StructlogConfig.f is None immediately after construction, before entering the context."""
     path = str(tmp_path / "run.jsonl")
     cfg = StructlogConfig(is_rank_zero=True, log_file=path)
-    assert cfg._f is None
+    assert cfg.f is None
 
 
 def test_structlog_config_enter_returns_self(tmp_path: pathlib.Path) -> None:
@@ -101,17 +101,17 @@ def test_structlog_config_enter_returns_self(tmp_path: pathlib.Path) -> None:
 
 
 def test_structlog_config_no_file_opened_when_log_file_none() -> None:
-    """StructlogConfig._f stays None when log_file is None, even for rank zero."""
+    """StructlogConfig.f stays None when log_file is None, even for rank zero."""
     cfg = StructlogConfig(is_rank_zero=True, log_file=None)
     with cfg:
-        assert cfg._f is None
+        assert cfg.f is None
 
 
 def test_structlog_config_write_log_line_safe_when_f_is_none() -> None:
     """_write_log_line returns the event dict without error when no file is open."""
     cfg = StructlogConfig(is_rank_zero=True, log_file=None)
     event: dict[str, object] = {"event": "no_file", "step": 0}
-    result = cfg._write_log_line(None, None, event)
+    result = cfg.write_log_line(None, None, event)
     assert result is event
 
 
@@ -130,16 +130,16 @@ def test_structlog_config_file_closed_on_exception(tmp_path: pathlib.Path) -> No
     with pytest.raises(RuntimeError):  # noqa: SIM117
         with cfg:
             raise RuntimeError("abort")
-    assert cfg._f is not None
-    assert cfg._f.closed
+    assert cfg.f is not None
+    assert cfg.f.closed
 
 
 def test_structlog_config_f_is_none_rank_zero_false_no_log_file() -> None:
-    """StructlogConfig._f stays None with is_rank_zero=False and no log_file."""
+    """StructlogConfig.f stays None with is_rank_zero=False and no log_file."""
     cfg = StructlogConfig(is_rank_zero=False, log_file=None)
     with cfg:
         pass
-    assert cfg._f is None
+    assert cfg.f is None
 
 
 def test_structlog_config_processors_include_console_renderer_rank_zero(
@@ -167,7 +167,7 @@ def test_structlog_config_write_log_line_in_processors_with_file(
     cfg = StructlogConfig(is_rank_zero=True, log_file=path)
     with cfg:
         processors = structlog.get_config()["processors"]
-    assert cfg._write_log_line in processors
+    assert cfg.write_log_line in processors
 
 
 def test_structlog_config_write_log_line_not_in_processors_without_file() -> None:
@@ -175,7 +175,7 @@ def test_structlog_config_write_log_line_not_in_processors_without_file() -> Non
     cfg = StructlogConfig(is_rank_zero=True, log_file=None)
     with cfg:
         processors = structlog.get_config()["processors"]
-    assert cfg._write_log_line not in processors
+    assert cfg.write_log_line not in processors
 
 
 def test_structlog_config_processor_count_rank_zero_with_file(tmp_path: pathlib.Path) -> None:
@@ -211,5 +211,5 @@ def test_structlog_config_file_is_line_buffered(tmp_path: pathlib.Path) -> None:
     path = str(tmp_path / "run.jsonl")
     cfg = StructlogConfig(is_rank_zero=True, log_file=path)
     with cfg:
-        assert cfg._f is not None
-        assert cfg._f.line_buffering
+        assert cfg.f is not None
+        assert cfg.f.line_buffering

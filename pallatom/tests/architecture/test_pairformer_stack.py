@@ -10,9 +10,10 @@ from architecture.pairformer_stack import (
 )
 from beartype import beartype
 from einops import rearrange, reduce
+from helpers.useful_objects import manual_seed
 from jaxtyping import Float, TypeCheckError, jaxtyped
 
-torch.manual_seed(42)
+manual_seed(42)
 
 B = 1
 N_RES = 8
@@ -200,7 +201,7 @@ def test_pairformer_stack_gradient_flows(
 
 def test_pairformer_stack_single_block_matches_pairformer_block() -> None:
     """Single-block PairformerStack with identical weights produces PairformerBlock exact output."""
-    torch.manual_seed(0)
+    manual_seed(0)
     v = torch.randn(B, N_RES, N_RES, C)
     block = PairformerBlock(c_pair=C, c_res=None, n_heads=N_HEADS).eval()
     stack = PairformerStack(c=C, c_res=None, n_blocks=1, n_heads=N_HEADS).eval()
@@ -425,7 +426,7 @@ def test_tmo_differs_from_incoming_for_asymmetric_input() -> None:
     Incoming:  Σ_k a[k,i] ⊙ b[j,k]
     These are not equal when z is not spatially symmetric.
     """
-    torch.manual_seed(3)
+    manual_seed(3)
     outgoing = TriangleMultiplicationOutgoing(c=_C, c_hidden=_C_HIDDEN).eval()
     incoming = TriangleMultiplicationIncoming(c=_C, c_hidden=_C_HIDDEN).eval()
     incoming.load_state_dict(outgoing.state_dict())
@@ -448,7 +449,7 @@ def test_tmo_equals_incoming_for_symmetric_input_with_shared_weights(
     which equals the outgoing sum.  The outer gate g[i,j] = sigmoid(gate(z[i,j]))
     is identical for both since they share weights and receive the same z.
     """
-    torch.manual_seed(5)
+    manual_seed(5)
     outgoing = TriangleMultiplicationOutgoing(c=_C, c_hidden=_C_HIDDEN).eval()
     incoming = TriangleMultiplicationIncoming(c=_C, c_hidden=_C_HIDDEN).eval()
     incoming.load_state_dict(outgoing.state_dict())
@@ -470,7 +471,7 @@ def test_tmo_output_row_i_changes_when_row_i_of_z_is_perturbed(
     tmo: TriangleMultiplicationOutgoing,
 ) -> None:
     """Output at row i changes when z[i, :, :] is perturbed (a[i,k] changes for all k)."""
-    torch.manual_seed(7)
+    manual_seed(7)
     z = torch.randn(1, _N, _N, _C)
     z_pert = z.clone()
     z_pert[0, 0, :, :] = z_pert[0, 0, :, :] + 5.0
@@ -484,7 +485,7 @@ def test_tmo_output_col_j_changes_when_col_j_of_z_is_perturbed(
     tmo: TriangleMultiplicationOutgoing,
 ) -> None:
     """Output at column j changes when z[:, :, j, :] is perturbed (b[k,j] changes for all k)."""
-    torch.manual_seed(9)
+    manual_seed(9)
     z = torch.randn(1, _N, _N, _C)
     z_pert = z.clone()
     z_pert[0, :, 1, :] = z_pert[0, :, 1, :] + 5.0
@@ -507,7 +508,7 @@ def test_tmo_output_other_rows_change_when_row_i_of_z_is_perturbed(
     LayerNorm is invariant to uniform additive shifts across channels, which would
     leave zn — and therefore b — unchanged and make the test trivially pass.
     """
-    torch.manual_seed(11)
+    manual_seed(11)
     z = torch.randn(1, _N, _N, _C)
     z_pert = z.clone()
     # Channel-varying noise changes the relative channel distribution so LayerNorm
@@ -746,7 +747,7 @@ def test_tmi_differs_from_outgoing_for_asymmetric_input() -> None:
     Outgoing:  Σ_k a[i,k] ⊙ b[k,j]
     These are not equal when z is not spatially symmetric.
     """
-    torch.manual_seed(3)
+    manual_seed(3)
     incoming = TriangleMultiplicationIncoming(c=_C, c_hidden=_C_HIDDEN).eval()
     outgoing = TriangleMultiplicationOutgoing(c=_C, c_hidden=_C_HIDDEN).eval()
     outgoing.load_state_dict(incoming.state_dict())
@@ -767,7 +768,7 @@ def test_tmi_equals_outgoing_for_symmetric_input_with_shared_weights(
       Σ_k a[k,i] ⊙ b[j,k] = Σ_k a[i,k] ⊙ b[k,j]  (= outgoing sum).
     The outer gate g[i,j] is identical for both (shared weights, same z).
     """
-    torch.manual_seed(5)
+    manual_seed(5)
     incoming = TriangleMultiplicationIncoming(c=_C, c_hidden=_C_HIDDEN).eval()
     outgoing = TriangleMultiplicationOutgoing(c=_C, c_hidden=_C_HIDDEN).eval()
     outgoing.load_state_dict(incoming.state_dict())
@@ -790,19 +791,24 @@ def test_tmi_incoming_z_equals_outgoing_transposed_z_when_inner_gates_pinned() -
     inputs), the final outputs match exactly.  This test would fail if either
     contraction were implemented as the other.
     """
-    torch.manual_seed(13)
+    manual_seed(13)
     incoming = TriangleMultiplicationIncoming(c=_C, c_hidden=_C_HIDDEN).eval()
     outgoing = TriangleMultiplicationOutgoing(c=_C, c_hidden=_C_HIDDEN).eval()
     outgoing.load_state_dict(incoming.state_dict())
 
     with torch.no_grad():
-        for model in [incoming, outgoing]:
-            model.gate.weight.fill_(0.0)
-            model.gate.bias.fill_(100.0)
-            model.gate_a.weight.fill_(0.0)
-            model.gate_a.bias.fill_(100.0)
-            model.gate_b.weight.fill_(0.0)
-            model.gate_b.bias.fill_(100.0)
+        incoming.gate.weight.fill_(0.0)
+        incoming.gate.bias.fill_(100.0)
+        incoming.gate_a.weight.fill_(0.0)
+        incoming.gate_a.bias.fill_(100.0)
+        incoming.gate_b.weight.fill_(0.0)
+        incoming.gate_b.bias.fill_(100.0)
+        outgoing.gate.weight.fill_(0.0)
+        outgoing.gate.bias.fill_(100.0)
+        outgoing.gate_a.weight.fill_(0.0)
+        outgoing.gate_a.bias.fill_(100.0)
+        outgoing.gate_b.weight.fill_(0.0)
+        outgoing.gate_b.bias.fill_(100.0)
 
     z = torch.randn(1, _N, _N, _C)
     z_T = rearrange(z, "b i j c -> b j i c")
@@ -832,7 +838,7 @@ def test_tmi_output_first_dim_i_changes_when_column_i_of_z_is_perturbed(
     a[k, i] = f_a(zn[k, i]) depends on z[:, :, i, :] for all k.
     m[i, j] = Σ_k a[k, i] ⊙ b[j, k] therefore changes for all j.
     """
-    torch.manual_seed(7)
+    manual_seed(7)
     z = torch.randn(1, _N, _N, _C)
     z_pert = z.clone()
     z_pert[0, :, 0, :] = z_pert[0, :, 0, :] + 5.0
@@ -850,7 +856,7 @@ def test_tmi_output_second_dim_j_changes_when_row_j_of_z_is_perturbed(
     b[j, k] = f_b(zn[j, k]) depends on z[:, j, :, :] for all k.
     m[i, j] = Σ_k a[k, i] ⊙ b[j, k] therefore changes for all i.
     """
-    torch.manual_seed(9)
+    manual_seed(9)
     z = torch.randn(1, _N, _N, _C)
     z_pert = z.clone()
     z_pert[0, 1, :, :] = z_pert[0, 1, :, :] + 5.0
@@ -872,7 +878,7 @@ def test_tmi_output_other_first_dims_change_when_column_i_of_z_is_perturbed(
 
     A channel-varying perturbation is used so LayerNorm cannot cancel the shift.
     """
-    torch.manual_seed(11)
+    manual_seed(11)
     z = torch.randn(1, _N, _N, _C)
     z_pert = z.clone()
     z_pert[0, :, 0, :] = z_pert[0, :, 0, :] + torch.randn(_N, _C) * 5.0

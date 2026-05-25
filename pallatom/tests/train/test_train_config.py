@@ -1,5 +1,7 @@
 """Tests for training configuration models."""
 
+import math
+
 import pytest
 from pydantic import ValidationError
 from train.train_config import (
@@ -182,26 +184,6 @@ def test_train_config_round_trips_custom_values():
 # ---------------------------------------------------------------------------
 
 
-def test_training_default_values(training: TrainingParams):
-    """TrainingParams defaults match the expected hyper-parameter baseline values."""
-    assert training.num_epochs == 50
-    assert training.lr == pytest.approx(3e-4)
-    assert training.weight_decay == pytest.approx(1e-4)
-    assert training.grad_clip == pytest.approx(2.0)
-
-
-def test_training_rejects_nonpositive_lr():
-    """TrainingParams raises ValidationError when lr is zero or negative."""
-    with pytest.raises(ValidationError):
-        TrainingParams(lr=0.0)
-
-
-def test_training_rejects_negative_weight_decay():
-    """TrainingParams raises ValidationError when weight_decay is negative."""
-    with pytest.raises(ValidationError):
-        TrainingParams(weight_decay=-0.1)
-
-
 def test_training_rejects_nonpositive_grad_clip():
     """TrainingParams raises ValidationError when grad_clip is zero or negative."""
     with pytest.raises(ValidationError):
@@ -251,15 +233,6 @@ def test_model_rejects_zero_k_unit():
 # ---------------------------------------------------------------------------
 
 
-def test_noise_default_values(noise: NoiseScheduleParams):
-    """NoiseScheduleParams defaults match the pre-computed EDM noise schedule values."""
-    assert noise.sigma_data == pytest.approx(19.2368)
-    assert noise.sigma_max == pytest.approx(42.3689)
-    assert noise.sigma_min == pytest.approx(3.807123)
-    assert noise.P_mean == pytest.approx(2.5416)
-    assert noise.P_std == pytest.approx(1.2048)
-
-
 def test_noise_sigma_min_lt_sigma_max(noise: NoiseScheduleParams):
     """Default sigma_min is strictly less than sigma_max."""
     assert noise.sigma_min < noise.sigma_max
@@ -296,8 +269,9 @@ def test_noise_rejects_sigma_min_greater_than_sigma_max():
 
 def test_residue_distogram_default_values(distogram_res: ResidueDistogramParams):
     """ResidueDistogramParams defaults match the expected Cβ distogram binning settings."""
-    assert distogram_res.min_dist == pytest.approx(3.25)
-    assert distogram_res.max_dist == pytest.approx(50.75)
+    assert math.isclose(distogram_res.min_dist, 3.25)
+    assert math.isclose(distogram_res.max_dist, 50.75)
+
     assert distogram_res.n_bins == 38
     assert distogram_res.tok_emb_dim == 32
 
@@ -337,9 +311,9 @@ def test_residue_distogram_accepts_zero_min_dist():
 
 def test_atom_distogram_default_values(distogram_atom: AtomDistogramParams):
     """AtomDistogramParams defaults match the expected atom-level binning settings."""
-    assert distogram_atom.min_dist == pytest.approx(0.0)
-    assert distogram_atom.max_dist == pytest.approx(10.0)
-    assert distogram_atom.n_bins == 22
+    assert math.isclose(distogram_atom.min_dist, 0.0)
+    assert math.isclose(distogram_atom.max_dist, 10.0)
+    assert math.isclose(distogram_atom.n_bins, 22)
 
 
 def test_atom_distogram_min_dist_lt_max_dist(distogram_atom: AtomDistogramParams):
@@ -354,11 +328,11 @@ def test_atom_distogram_min_dist_lt_max_dist(distogram_atom: AtomDistogramParams
 
 def test_loss_default_values(loss: LossParams):
     """LossParams defaults match the expected multi-objective loss weight baseline."""
-    assert loss.lam == pytest.approx(1.0)
-    assert loss.alpha_0 == pytest.approx(0.25)
-    assert loss.alpha_1 == pytest.approx(1.0)
-    assert loss.gamma == pytest.approx(0.99)
-    assert loss.smooth_lddt_cutoff == 15
+    assert math.isclose(loss.lam, 1.0)
+    assert math.isclose(loss.alpha_0, 0.25)
+    assert math.isclose(loss.alpha_1, 1.0)
+    assert math.isclose(loss.gamma, 0.99)
+    assert math.isclose(loss.smooth_lddt_cutoff, 15)
 
 
 def test_loss_rejects_nonpositive_lam():

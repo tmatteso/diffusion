@@ -13,9 +13,10 @@ from architecture.atom_transformers import (
 )
 from beartype import beartype
 from einops import einsum, rearrange, reduce, repeat
+from helpers.useful_objects import manual_seed
 from jaxtyping import Bool, Float, Int, TypeCheckError, jaxtyped
 
-torch.manual_seed(42)
+manual_seed(42)
 
 N_RES = 8
 ATOMS_PER_RES = 3

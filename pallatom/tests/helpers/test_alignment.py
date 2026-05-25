@@ -5,9 +5,10 @@ import torch
 from architecture.losses import atom_loss
 from einops import einsum, rearrange
 from helpers.alignment import apply_transform, kabsch_align, kabsch_rmsd, kabsch_rotation, rmsd
+from helpers.useful_objects import manual_seed
 from jaxtyping import Float, TypeCheckError
 
-torch.manual_seed(42)
+manual_seed(42)
 N, B = 50, 8
 
 
@@ -20,16 +21,16 @@ def ref() -> Float[torch.Tensor, "N 3"]:
 @pytest.fixture
 def rigid_mobile(ref: Float[torch.Tensor, "N 3"]) -> Float[torch.Tensor, "N 3"]:
     """Provide ref after a random rigid rotation+translation (exact superimposition target)."""
-    Q, _ = torch.linalg.qr(torch.randn(3, 3))
-    if torch.linalg.det(Q) < 0:
-        Q[:, 0] *= -1
-    return einsum(ref, Q, "n d, e d -> n e") + torch.randn(1, 3)
+    q = torch.qr(torch.randn(3, 3)).Q
+    if q.det() < 0:
+        q[:, 0] *= -1
+    return einsum(ref, q, "n d, e d -> n e") + torch.randn(1, 3)
 
 
 @pytest.fixture
 def batch_ref() -> Float[torch.Tensor, "B N 3"]:
     """Provide batched random reference coordinates (B, N, 3)."""
-    torch.manual_seed(42)
+    manual_seed(42)
     return torch.randn(B, N, 3)
 
 
@@ -56,16 +57,16 @@ def test_rotation_translation_rmsd_near_zero(
 
 def test_kabsch_rmsd_batched_rigid_transforms_near_zero(batch_ref: Float[torch.Tensor, "B N 3"]):
     """Batched Kabsch RMSD is near zero for independently rigid-transformed structures."""
-    torch.manual_seed(0)
-    mobiles = []
+    manual_seed(0)
+    mobiles: list[Float[torch.Tensor, "N 3"]] = []
     for i in range(B):
-        Q, _ = torch.linalg.qr(torch.randn(3, 3))
-        if torch.linalg.det(Q) < 0:
-            Q[:, 0] *= -1
-        t = torch.randn(1, 3)
-        mobiles.append(einsum(batch_ref[i], Q, "n d, e d -> n e") + t)
-    mobiles = torch.stack(mobiles)
-    rmsds = kabsch_rmsd(mobiles, batch_ref)
+        q = torch.qr(torch.randn(3, 3)).Q
+        if q.det() < 0:
+            q[:, 0] *= -1
+        t: Float[torch.Tensor, "1 3"] = torch.randn(1, 3)
+        mobiles.append(einsum(batch_ref[i], q, "n d, e d -> n e") + t)
+    mobile_batch: Float[torch.Tensor, "B N 3"] = torch.stack(mobiles)
+    rmsds = kabsch_rmsd(mobile_batch, batch_ref)
     assert rmsds.shape == (B,)
     # Float32 Kabsch SVD residuals on random 50-atom clouds run ~2e-4; 1e-3 gives headroom
     assert (rmsds < 1e-3).all()

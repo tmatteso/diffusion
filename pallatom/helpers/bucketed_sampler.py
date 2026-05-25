@@ -12,7 +12,7 @@ import torch.utils.data
 from helpers.cluster_index import ClusterIndex
 
 
-def _compute_batch_plan(
+def compute_batch_plan(
     flat_to_cluster: list[int],
     cluster_rep_len: list[int],
     n_proteins: int,
@@ -117,14 +117,14 @@ class BucketedBatchSampler(torch.utils.data.Sampler[list[int]]):
     Args:
         cluster_index:    ClusterIndex exposing flat_to_cluster and cluster_rep_len.
         token_budget:     Maximum cumulative representative length per batch.
-        max_seq_len:      Dataset truncation cap passed to _compute_batch_plan so that
+        max_seq_len:      Dataset truncation cap passed to compute_batch_plan so that
                           proteins whose rep_len exceeds it are packed at their truncated
                           length rather than as singletons.
         chunk_multiplier: Sortish window width in multiples of avg proteins per batch.
         world_size:       Number of DDP processes. Default 1 (single GPU).
         rank:             This process's DDP rank. Default 0.
         seed:             Base RNG seed; epoch is added before each call to
-                          _compute_batch_plan for per-epoch diversity.
+                          compute_batch_plan for per-epoch diversity.
         prefetch_epochs:  Queue depth — how many future epochs to precompute. Default 2.
     """
 
@@ -169,7 +169,7 @@ class BucketedBatchSampler(torch.utils.data.Sampler[list[int]]):
             Future resolving to the batch plan (list of batches).
         """
         return self._executor.submit(
-            _compute_batch_plan,
+            compute_batch_plan,
             self._cluster_index.flat_to_cluster,
             self._cluster_index.cluster_rep_len,
             len(self._cluster_index),

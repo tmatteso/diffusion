@@ -7,9 +7,11 @@ from unittest.mock import MagicMock
 import numpy as np
 import pytest
 import torch
+from architecture.main_trunk import PredictedOutputs
 from einops import rearrange, reduce
 from helpers.atom_utils import Protein, restype_order, to_pdb
 from helpers.featurize import Distogram, FeaturizedBatch
+from helpers.useful_objects import manual_seed
 from jaxtyping import Float, TypeCheckError
 from sample.sampling import (
     ATOM5_TO_ATOM37,
@@ -24,7 +26,7 @@ from sample.sampling import (
     build_template_context,
 )
 
-torch.manual_seed(0)
+manual_seed(0)
 np.random.seed(0)
 
 N_RES = 4
@@ -42,41 +44,20 @@ def _make_trunk_mock() -> MagicMock:
     """MagicMock with identity denoiser behaviour: returns r_input unchanged."""
     mock = MagicMock()
 
-    def _forward(batch: FeaturizedBatch):
+    def _forward(batch: FeaturizedBatch) -> PredictedOutputs:
         B_local = batch.r_input.shape[0]
         n_atom = batch.r_input.shape[1]
         n_res = int(batch.tok_idx.max().item()) + 1
-        return (
-            batch.r_input.clone(),
-            torch.zeros(B_local, n_res, 20),
-            torch.zeros(B_local, n_res, n_res, 38),
-            torch.zeros(B_local, n_atom, 1, 38),
-            [],
-            [],
+        return PredictedOutputs(
+            r_denoised=batch.r_input.clone(),
+            seq_logits=torch.zeros(B_local, n_res, 20),
+            residue_distogram_logits=torch.zeros(B_local, n_res, n_res, 38),
+            atom_distogram_logits=torch.zeros(B_local, n_atom, 1, 38),
+            intermediate_denoised_coord_stack=[],
+            intermediate_pred_aa_logit_stack=[],
         )
 
     mock.side_effect = _forward
-    return mock
-
-
-def _make_zero_denoiser_mock() -> MagicMock:
-    """MagicMock denoiser that always returns zeros."""
-    mock = MagicMock()
-    mock.side_effect = lambda r, _sigma: (torch.zeros_like(r), torch.zeros(r.shape[0], 1, 20))
-    return mock
-
-
-def _make_identity_denoiser_mock() -> MagicMock:
-    """MagicMock denoiser that returns its input unchanged."""
-    mock = MagicMock()
-    mock.side_effect = lambda r, _sigma: (r.clone(), torch.zeros(r.shape[0], 1, 20))
-    return mock
-
-
-def _make_half_denoiser_mock() -> MagicMock:
-    """MagicMock denoiser that returns 0.5 by input (non-trivial, trajectory-dependent)."""
-    mock = MagicMock()
-    mock.side_effect = lambda r, _sigma: (r * 0.5, torch.zeros(r.shape[0], 1, 20))
     return mock
 
 
@@ -126,10 +107,55 @@ def edm_sampler(edm_precond: EDMPrecond) -> EDMSampler:
 
 
 @pytest.fixture
-def bare_sampler() -> EDMSampler:
+def zero_denoiser_mock() -> MagicMock:
+    """MagicMock denoiser that always returns zeros."""
+    mock = MagicMock()
+
+    def zero_side_effect(
+        r: Float[torch.Tensor, "B N_atom 3"], _sigma: float
+    ) -> tuple[Float[torch.Tensor, "B N_atom 3"], Float[torch.Tensor, "B 1 n_amino"]]:
+        """Return zero coordinates and zero sequence logits."""
+        return (torch.zeros_like(r), torch.zeros(r.shape[0], 1, 20))
+
+    mock.side_effect = zero_side_effect
+    return mock
+
+
+@pytest.fixture
+def identity_denoiser_mock() -> MagicMock:
+    """MagicMock denoiser that returns its input unchanged."""
+    mock = MagicMock()
+
+    def identity_side_effect(
+        r: Float[torch.Tensor, "B N_atom 3"], _sigma: float
+    ) -> tuple[Float[torch.Tensor, "B N_atom 3"], Float[torch.Tensor, "B 1 n_amino"]]:
+        """Return cloned input coordinates and zero sequence logits."""
+        return (r.clone(), torch.zeros(r.shape[0], 1, 20))
+
+    mock.side_effect = identity_side_effect
+    return mock
+
+
+@pytest.fixture
+def half_denoiser_mock() -> MagicMock:
+    """MagicMock denoiser that scales input by 0.5 (non-trivial, trajectory-dependent)."""
+    mock = MagicMock()
+
+    def half_side_effect(
+        r: Float[torch.Tensor, "B N_atom 3"], _sigma: float
+    ) -> tuple[Float[torch.Tensor, "B N_atom 3"], Float[torch.Tensor, "B 1 n_amino"]]:
+        """Return 0.5 * input coordinates and zero sequence logits."""
+        return (r * 0.5, torch.zeros(r.shape[0], 1, 20))
+
+    mock.side_effect = half_side_effect
+    return mock
+
+
+@pytest.fixture
+def bare_sampler(zero_denoiser_mock: MagicMock) -> EDMSampler:
     """EDMSampler with a zero denoiser; used for _sigma_schedule tests only."""
     return EDMSampler(
-        _make_zero_denoiser_mock(),
+        zero_denoiser_mock,
         sigma_min=SIGMA_MIN,
         sigma_max=SIGMA_MAX,
         rho=7.0,
@@ -159,10 +185,10 @@ def edm_precond_custom_sigmas(context: FeaturizedBatch) -> EDMPrecond:
 
 
 @pytest.fixture
-def identity_det_sampler() -> EDMSampler:
+def identity_det_sampler(identity_denoiser_mock: MagicMock) -> EDMSampler:
     """Provide a deterministic EDMSampler (S_churn=0) using the identity denoiser."""
     return EDMSampler(
-        _make_identity_denoiser_mock(),
+        identity_denoiser_mock,
         sigma_min=SIGMA_MIN,
         sigma_max=SIGMA_MAX,
         S_churn=0.0,
@@ -170,10 +196,10 @@ def identity_det_sampler() -> EDMSampler:
 
 
 @pytest.fixture
-def identity_stoch_sampler_tmin_high() -> EDMSampler:
+def identity_stoch_sampler_tmin_high(identity_denoiser_mock: MagicMock) -> EDMSampler:
     """Provide a stochastic EDMSampler with S_tmin set far above sigma_max to suppress injection."""
     return EDMSampler(
-        _make_identity_denoiser_mock(),
+        identity_denoiser_mock,
         sigma_min=SIGMA_MIN,
         sigma_max=SIGMA_MAX,
         S_churn=2.0,
@@ -530,7 +556,7 @@ def test_edm_precond_passes_t_hat_to_trunk(context: FeaturizedBatch):
     precond = EDMPrecond(mock, context, sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX)
     precond(torch.randn(1, N_ATOM, 3), t_hat=3.14)
     batch_seen = mock.call_args.args[0]
-    assert batch_seen.t_hat == pytest.approx(3.14)
+    assert math.isclose(batch_seen.t_hat, 3.14)
 
 
 def test_edm_precond_t_normalized_is_zero_at_sigma_min(context: FeaturizedBatch):
@@ -539,7 +565,7 @@ def test_edm_precond_t_normalized_is_zero_at_sigma_min(context: FeaturizedBatch)
     precond = EDMPrecond(mock, context, sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX)
     precond(torch.randn(1, N_ATOM, 3), t_hat=SIGMA_MIN)
     batch_seen = mock.call_args.args[0]
-    assert batch_seen.t_normalized == pytest.approx(0.0, abs=1e-5)
+    assert math.isclose(batch_seen.t_normalized, 0.0)
 
 
 def test_edm_precond_t_normalized_is_one_at_sigma_max(context: FeaturizedBatch):
@@ -548,7 +574,7 @@ def test_edm_precond_t_normalized_is_one_at_sigma_max(context: FeaturizedBatch):
     precond = EDMPrecond(mock, context, sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX)
     precond(torch.randn(1, N_ATOM, 3), t_hat=SIGMA_MAX)
     batch_seen = mock.call_args.args[0]
-    assert batch_seen.t_normalized == pytest.approx(1.0, abs=1e-5)
+    assert math.isclose(batch_seen.t_normalized, 1.0)
 
 
 def test_edm_precond_t_normalized_at_geometric_midpoint_is_half(context: FeaturizedBatch):
@@ -559,7 +585,7 @@ def test_edm_precond_t_normalized_at_geometric_midpoint_is_half(context: Featuri
     precond = EDMPrecond(mock, context, sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX)
     precond(torch.randn(1, N_ATOM, 3), t_hat=t_mid)
     batch_seen = mock.call_args.args[0]
-    assert batch_seen.t_normalized == pytest.approx(0.5, abs=1e-5)
+    assert math.isclose(batch_seen.t_normalized, 0.5)
 
 
 def test_edm_precond_trunk_called_exactly_once_per_forward(
@@ -594,48 +620,50 @@ def test_edm_precond_rejects_r_input_with_wrong_ndim(edm_precond: EDMPrecond):
 
 def test_sigma_schedule_length_is_steps_plus_one(bare_sampler: EDMSampler):
     """The schedule must have steps+1 entries: one sigma per predictor step plus terminal zero."""
-    sigmas = bare_sampler._sigma_schedule(10, "cpu")
+    sigmas = bare_sampler.sigma_schedule(10, "cpu")
     assert sigmas.shape == (11,)
 
 
 def test_sigma_schedule_first_value_equals_sigma_max(bare_sampler: EDMSampler):
     """Sampling starts from highest noise level, so first schedule entry must equal sigma_max."""
-    sigmas = bare_sampler._sigma_schedule(20, "cpu")
-    assert sigmas[0].item() == pytest.approx(SIGMA_MAX, rel=1e-4)
+    sigmas = bare_sampler.sigma_schedule(20, "cpu")
+    assert math.isclose(sigmas[0].item(), SIGMA_MAX, rel_tol=1e-5)
 
 
 def test_sigma_schedule_last_value_is_zero(bare_sampler: EDMSampler):
     """The terminal entry of the Karras schedule must be exactly zero (clean sample target)."""
-    sigmas = bare_sampler._sigma_schedule(20, "cpu")
-    assert sigmas[-1].item() == pytest.approx(0.0, abs=1e-8)
+    sigmas = bare_sampler.sigma_schedule(20, "cpu")
+    assert math.isclose(sigmas[-1].item(), 0.0)
 
 
 def test_sigma_schedule_is_monotonically_non_increasing(bare_sampler: EDMSampler):
     """Noise levels must never increase as the schedule progresses toward the clean sample."""
-    sigmas = bare_sampler._sigma_schedule(20, "cpu")
+    sigmas = bare_sampler.sigma_schedule(20, "cpu")
     diffs = sigmas[1:] - sigmas[:-1]
     assert (diffs <= 0).all()
 
 
 def test_sigma_schedule_strictly_decreasing(bare_sampler: EDMSampler):
     """Every consecutive pair in the schedule must be strictly ordered (no plateaus)."""
-    sigmas = bare_sampler._sigma_schedule(10, "cpu")
+    sigmas = bare_sampler.sigma_schedule(10, "cpu")
     diffs = sigmas[1:] - sigmas[:-1]
     assert (diffs < 0).all()
 
 
 def test_sigma_schedule_all_values_nonnegative(bare_sampler: EDMSampler):
     """No sigma in schedule may be negative; minimum physically meaningful noise level is zero."""
-    sigmas = bare_sampler._sigma_schedule(20, "cpu")
+    sigmas = bare_sampler.sigma_schedule(20, "cpu")
     assert (sigmas >= 0).all()
 
 
-def test_sigma_schedule_different_rho_gives_different_intermediate_values():
+def test_sigma_schedule_different_rho_gives_different_intermediate_values(
+    zero_denoiser_mock: MagicMock,
+):
     """Changing Karras rho hyperparameter must alter schedule values while preserving endpoints."""
-    s1 = EDMSampler(_make_zero_denoiser_mock(), sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX, rho=7.0)
-    s2 = EDMSampler(_make_zero_denoiser_mock(), sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX, rho=3.0)
-    sig1 = s1._sigma_schedule(10, "cpu")
-    sig2 = s2._sigma_schedule(10, "cpu")
+    s1 = EDMSampler(zero_denoiser_mock, sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX, rho=7.0)
+    s2 = EDMSampler(zero_denoiser_mock, sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX, rho=3.0)
+    sig1 = s1.sigma_schedule(10, "cpu")
+    sig2 = s2.sigma_schedule(10, "cpu")
     # Endpoints are the same; interior values must differ with different rho
     assert not torch.allclose(sig1[1:-1], sig2[1:-1])
 
@@ -645,30 +673,30 @@ def test_sigma_schedule_different_rho_gives_different_intermediate_values():
 # ---------------------------------------------------------------------------
 
 
-def test_edm_sampler_identity_denoiser_z_unchanged_across_step_counts():
+def test_edm_sampler_identity_denoiser_z_unchanged_across_step_counts(
+    identity_denoiser_mock: MagicMock,
+):
     """Identity denoiser, ODE drift zero, so final sample == init noise regardless of step count."""
     # D_θ(z, sigma) = z  ⟹  d = (z - z)/sigma = 0  ⟹  z_next = z for every step.
     # The output equals the initial noise regardless of how many steps are run.
     # (steps=1 is excluded: _sigma_schedule divides by steps-1, causing 0/0.)
 
     sampler = EDMSampler(
-        _make_identity_denoiser_mock(), sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX, S_churn=0.0
+        identity_denoiser_mock, sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX, S_churn=0.0
     )
-    torch.manual_seed(7)
+    manual_seed(7)
     z2, seq2 = sampler.sample((1, N_ATOM, 3), steps=2)
-    torch.manual_seed(7)
+    manual_seed(7)
     z6, seq6 = sampler.sample((1, N_ATOM, 3), steps=6)
     assert torch.allclose(z2, z6, atol=1e-5)
     assert torch.equal(seq2, seq6)
 
 
-def test_edm_sampler_zero_denoiser_output_is_zero():
+def test_edm_sampler_zero_denoiser_output_is_zero(zero_denoiser_mock: MagicMock):
     """With a zero denoiser the trajectory drives all coordinates to zero by the final step."""
     # D_θ(z, sigma) = 0  ⟹  d = z/sigma  ⟹  z scales by sigma_next/sigma_hat each step;
     # at the final step sigma_next = 0, so the trajectory converges exactly to 0.
-    sampler = EDMSampler(
-        _make_zero_denoiser_mock(), sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX, S_churn=0.0
-    )
+    sampler = EDMSampler(zero_denoiser_mock, sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX, S_churn=0.0)
     out, seq_out = sampler.sample((1, N_ATOM, 3), steps=5)
     assert torch.allclose(out, torch.zeros(1, N_ATOM, 3), atol=1e-5)
     assert torch.allclose(seq_out, torch.zeros_like(seq_out))
@@ -681,26 +709,26 @@ def test_edm_sampler_zero_denoiser_output_is_zero():
 
 def test_edm_sampler_deterministic_without_s_churn(edm_sampler: EDMSampler):
     """With S_churn=0, the same random seed must always produce the exact same output tensors."""
-    torch.manual_seed(3)
+    manual_seed(3)
     out1, seq_out1 = edm_sampler.sample((1, N_ATOM, 3), steps=3)
-    torch.manual_seed(3)
+    manual_seed(3)
     out2, seq_out2 = edm_sampler.sample((1, N_ATOM, 3), steps=3)
     assert torch.equal(out1, out2)
     assert torch.equal(seq_out1, seq_out2)
 
 
-def test_edm_sampler_s_churn_produces_different_result_than_deterministic():
+def test_edm_sampler_s_churn_produces_different_result_than_deterministic(
+    identity_denoiser_mock: MagicMock,
+):
     """Enabling S_churn must inject per-step noise that changes output relative to the ODE run."""
     # S_churn > 0 injects extra noise per step before the predictor.
     # With the identity denoiser (d = 0), z never moves during predictor/corrector,
     # so injected noise accumulates unfiltered → output diverges from the ODE run.
     # (Zero denoiser is unsuitable here: it drives z → 0 regardless of S_churn.)
-    torch.manual_seed(5)
-    det = EDMSampler(
-        _make_identity_denoiser_mock(), sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX, S_churn=0.0
-    )
+    manual_seed(5)
+    det = EDMSampler(identity_denoiser_mock, sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX, S_churn=0.0)
     stoch = EDMSampler(
-        _make_identity_denoiser_mock(), sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX, S_churn=2.0
+        identity_denoiser_mock, sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX, S_churn=2.0
     )
     out_det, seq_det = det.sample((1, N_ATOM, 3), steps=5)
     out_stoch, seq_stoch = stoch.sample((1, N_ATOM, 3), steps=5)
@@ -714,15 +742,14 @@ def test_edm_sampler_s_churn_produces_different_result_than_deterministic():
 # ---------------------------------------------------------------------------
 
 
-def test_edm_sampler_heun_corrector_call_count():
+def test_edm_sampler_heun_corrector_call_count(zero_denoiser_mock: MagicMock):
     """Heun requires 2·steps: one predictor per step plus one corrector except at terminal step."""
     # steps predictor calls + (steps - 1) corrector calls (skipped when sigma_next = 0)
     # Total = 2·steps - 1
-    counter = _make_zero_denoiser_mock()
     steps = 5
-    sampler = EDMSampler(counter, sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX, S_churn=0.0)
+    sampler = EDMSampler(zero_denoiser_mock, sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX, S_churn=0.0)
     sampler.sample((1, N_ATOM, 3), steps=steps)
-    assert counter.call_count == 2 * steps - 1
+    assert zero_denoiser_mock.call_count == 2 * steps - 1
 
 
 # ---------------------------------------------------------------------------
@@ -730,17 +757,15 @@ def test_edm_sampler_heun_corrector_call_count():
 # ---------------------------------------------------------------------------
 
 
-def test_edm_sampler_step_count_changes_output_for_nontrivial_denoiser():
+def test_edm_sampler_step_count_changes_output_for_nontrivial_denoiser(
+    half_denoiser_mock: MagicMock,
+):
     """Coarser sigma grid (fewer steps) must integrate differently and yield a different output."""
     # D_θ(z, sigma) = 0.5·z: trajectory depends on the sigma grid.
     # Coarser grid (fewer steps) integrates differently → different final output.
-    torch.manual_seed(9)
-    coarse = EDMSampler(
-        _make_half_denoiser_mock(), sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX, S_churn=0.0
-    )
-    fine = EDMSampler(
-        _make_half_denoiser_mock(), sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX, S_churn=0.0
-    )
+    manual_seed(9)
+    coarse = EDMSampler(half_denoiser_mock, sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX, S_churn=0.0)
+    fine = EDMSampler(half_denoiser_mock, sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX, S_churn=0.0)
     out_coarse, seq_coarse = coarse.sample((1, N_ATOM, 3), steps=2)
     out_fine, seq_fine = fine.sample((1, N_ATOM, 3), steps=10)
     assert not torch.allclose(out_coarse, out_fine)
@@ -832,7 +857,7 @@ def test_edm_precond_t_normalized_formula_at_arbitrary_sigma(
     edm_precond(torch.randn(1, N_ATOM, 3), t_hat=t_hat)
     batch_seen = trunk_mock.call_args.args[0]
     expected = (math.log(t_hat) - math.log(SIGMA_MIN)) / (math.log(SIGMA_MAX) - math.log(SIGMA_MIN))
-    assert batch_seen.t_normalized == pytest.approx(expected, abs=1e-5)
+    assert math.isclose(batch_seen.t_normalized, expected)
 
 
 def test_edm_precond_multiple_calls_are_independent(edm_precond: EDMPrecond):
@@ -856,8 +881,8 @@ def test_edm_precond_multiple_calls_are_independent(edm_precond: EDMPrecond):
 def test_sigma_schedule_penultimate_value_is_sigma_min(bare_sampler: EDMSampler):
     """The penultimate schedule entry must equal sigma_min; the final step then drops to zero."""
     # At i = steps-1 the Karras schedule formula collapses to sigma_min.
-    sigmas = bare_sampler._sigma_schedule(20, "cpu")
-    assert sigmas[-2].item() == pytest.approx(SIGMA_MIN, rel=1e-4)
+    sigmas = bare_sampler.sigma_schedule(20, "cpu")
+    assert math.isclose(sigmas[-2].item(), SIGMA_MIN, rel_tol=1e-5)
 
 
 # ---------------------------------------------------------------------------
@@ -878,9 +903,9 @@ def test_edm_sampler_s_tmin_above_sigma_max_disables_injection(
 ):
     """When S_tmin exceeds sigma_max no step satisfies condition, result identical to S_churn=0."""
     # S_tmin > sigma_max ⟹ S_tmin ≤ sigma_cur is never met ⟹ same as S_churn=0.
-    torch.manual_seed(5)
+    manual_seed(5)
     out_det, seq_det = identity_det_sampler.sample((1, N_ATOM, 3), steps=5)
-    torch.manual_seed(5)
+    manual_seed(5)
     out_stoch, seq_stoch = identity_stoch_sampler_tmin_high.sample((1, N_ATOM, 3), steps=5)
     assert torch.allclose(out_det, out_stoch)
     assert torch.equal(seq_det, seq_stoch)
@@ -1848,7 +1873,7 @@ def test_build_sampling_context_wrong_shape(
 def test_edm_sampler_sigma_schedule_wrong_type(bare_sampler: EDMSampler) -> None:
     """Non-int steps triggers TypeCheckError."""
     with pytest.raises(TypeCheckError):
-        bare_sampler._sigma_schedule(3.14, "cpu")  # type: ignore[arg-type]
+        bare_sampler.sigma_schedule(3.14, "cpu")  # type: ignore[arg-type]
 
 
 def test_edm_sampler_sample_wrong_type(edm_sampler: EDMSampler) -> None:

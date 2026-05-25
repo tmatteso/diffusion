@@ -5,9 +5,10 @@ import torch
 from architecture.node_update import AdaLN, AttentionPairBias, NodeUpdate
 from beartype import beartype
 from einops import reduce
+from helpers.useful_objects import manual_seed
 from jaxtyping import Float, Int, TypeCheckError, jaxtyped
 
-torch.manual_seed(42)
+manual_seed(42)
 
 N_RES = 8
 C_RES = 32
@@ -123,9 +124,8 @@ def test_attn_pair_bias_gradient_flows_to_s(
 ) -> None:
     """Gradient propagates from AttentionPairBias output back to s."""
     s_g = s.clone().requires_grad_(True)
-    scalar_sum(attn(s_g, t, z)).backward()
-    assert s_g.grad is not None
-    assert torch.isfinite(s_g.grad).all()
+    (grad,) = torch.autograd.grad(scalar_sum(attn(s_g, t, z)), s_g)
+    assert torch.isfinite(grad).all()
 
 
 def test_attn_pair_bias_time_conditioning_affects_output(
@@ -183,7 +183,7 @@ def test_attn_pair_bias_all_params_receive_gradients(
     silently skips the forward pass when the module is called with real s.
     """
     attn = AttentionPairBias(C_RES, C_PAIR, n_heads=N_HEADS)
-    scalar_sum(attn(s, t, z)).backward()
+    torch.autograd.backward([scalar_sum(attn(s, t, z))])
     for name, param in attn.named_parameters():
         assert param.grad is not None, f"parameter {name!r} has no gradient"
         assert torch.isfinite(param.grad).all(), f"parameter {name!r} has non-finite gradient"
@@ -199,7 +199,7 @@ def test_node_update_all_params_receive_gradients(
     Regression test for the DDP unused-parameter bug.
     """
     node = NodeUpdate(C_RES, C_PAIR, n_heads=N_HEADS, dropout=0.0)
-    scalar_sum(node(s, t, z)).backward()
+    torch.autograd.backward([scalar_sum(node(s, t, z))])
     for name, param in node.named_parameters():
         assert param.grad is not None, f"parameter {name!r} has no gradient"
         assert torch.isfinite(param.grad).all(), f"parameter {name!r} has non-finite gradient"
@@ -254,9 +254,8 @@ def test_node_update_gradient_flows_to_s(
 ) -> None:
     """Gradients flow back through NodeUpdate to the input single embedding s."""
     s_g = s.clone().requires_grad_(True)
-    scalar_sum(node_update(s_g, t, z)).backward()
-    assert s_g.grad is not None
-    assert torch.isfinite(s_g.grad).all()
+    (grad,) = torch.autograd.grad(scalar_sum(node_update(s_g, t, z)), s_g)
+    assert torch.isfinite(grad).all()
 
 
 def test_node_update_gradient_flows_to_t(
@@ -267,9 +266,8 @@ def test_node_update_gradient_flows_to_t(
 ) -> None:
     """Gradients flow back through NodeUpdate to the time-conditioning input t."""
     t_g = t.clone().requires_grad_(True)
-    scalar_sum(node_update(s, t_g, z)).backward()
-    assert t_g.grad is not None
-    assert torch.isfinite(t_g.grad).all()
+    (grad,) = torch.autograd.grad(scalar_sum(node_update(s, t_g, z)), t_g)
+    assert torch.isfinite(grad).all()
 
 
 def test_node_update_gradient_flows_to_z(
@@ -280,9 +278,8 @@ def test_node_update_gradient_flows_to_z(
 ) -> None:
     """Gradients flow back through NodeUpdate to the pair embedding z (via the attention bias)."""
     z_g = z.clone().requires_grad_(True)
-    scalar_sum(node_update(s, t, z_g)).backward()
-    assert z_g.grad is not None
-    assert torch.isfinite(z_g.grad).all()
+    (grad,) = torch.autograd.grad(scalar_sum(node_update(s, t, z_g)), z_g)
+    assert torch.isfinite(grad).all()
 
 
 def test_node_update_eval_is_deterministic(
@@ -416,9 +413,8 @@ def test_attn_pair_bias_sparse_gradient_flows(
     """Gradients flow through sparse attention back to the node embedding input."""
     a_g = a_large.clone().requires_grad_(True)
     out = attn_large(a_g, s_large, z_sparse, neighbor_idx=neighbor_idx_sparse)
-    reduce(out, "b n c -> ", "sum").backward()
-    assert a_g.grad is not None
-    assert torch.isfinite(a_g.grad).all()
+    (grad,) = torch.autograd.grad(reduce(out, "b n c -> ", "sum"), a_g)
+    assert torch.isfinite(grad).all()
 
 
 # ---------------------------------------------------------------------------

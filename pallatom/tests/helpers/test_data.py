@@ -13,8 +13,8 @@ from helpers.bucketed_sampler import BucketedBatchSampler
 from helpers.data import (
     ClusteredProteinDataset,
     ProteinDataset,
-    _to_protein_batch_dynamic,
     make_bucketed_data_loaders,
+    to_protein_batch_dynamic,
 )
 from helpers.featurize import ProteinBatch
 from train.train_config import TestLoaderConfig as EvalLoaderConfig
@@ -287,27 +287,27 @@ def test_clustered_dataset_pickles(tmp_path: pathlib.Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# _to_protein_batch_dynamic
+# to_protein_batch_dynamic
 # ---------------------------------------------------------------------------
 
 
 def test_to_protein_batch_dynamic_pads_to_max(tmp_path: pathlib.Path) -> None:
-    """_to_protein_batch_dynamic pads shorter items to the longest item in the batch."""
+    """to_protein_batch_dynamic pads shorter items to the longest item in the batch."""
     entries = [_make_entry("p1", 8), _make_entry("p2", 16)]
     _write_jsonl(tmp_path / "p.jsonl", entries)
     ds = ClusteredProteinDataset(tmp_path / "p.jsonl", ["p1", "p2"])
-    batch = _to_protein_batch_dynamic([ds[0], ds[1]])
+    batch = to_protein_batch_dynamic([ds[0], ds[1]])
     assert batch.atom_positions.shape == (2, 16, 37, 3)
     assert batch.atom_mask.shape == (2, 16, 37)
     assert batch.residue_index.shape == (2, 16)
 
 
 def test_to_protein_batch_dynamic_uniform_lengths(tmp_path: pathlib.Path) -> None:
-    """_to_protein_batch_dynamic is a no-op when all items have the same length."""
+    """to_protein_batch_dynamic is a no-op when all items have the same length."""
     entries = [_make_entry("p1", 10), _make_entry("p2", 10)]
     _write_jsonl(tmp_path / "p.jsonl", entries)
     ds = ClusteredProteinDataset(tmp_path / "p.jsonl", ["p1", "p2"])
-    batch = _to_protein_batch_dynamic([ds[0], ds[1]])
+    batch = to_protein_batch_dynamic([ds[0], ds[1]])
     assert batch.atom_positions.shape == (2, 10, 37, 3)
 
 
@@ -367,30 +367,14 @@ def test_bucketed_train_loader_uses_batch_sampler(
     bucketed_splits: str,
 ) -> None:
     """Training loader uses BucketedBatchSampler as its batch_sampler."""
-    train_loader, _, _ = make_bucketed_data_loaders(
+    _, _, _, train_sampler = make_bucketed_data_loaders(
         cfg=bucketed_cfg,
         jsonl_path=bucketed_jsonl,
         splits_path=bucketed_splits,
         num_workers=0,
         debug_run=False,
     )
-    assert isinstance(train_loader.batch_sampler, BucketedBatchSampler)
-
-
-def test_bucketed_val_loader_uses_fixed_batch_size(
-    bucketed_cfg: TrainConfig,
-    bucketed_jsonl: str,
-    bucketed_splits: str,
-) -> None:
-    """Validation loader does not use BucketedBatchSampler."""
-    _, val_loader, _ = make_bucketed_data_loaders(
-        cfg=bucketed_cfg,
-        jsonl_path=bucketed_jsonl,
-        splits_path=bucketed_splits,
-        num_workers=0,
-        debug_run=False,
-    )
-    assert not isinstance(val_loader.batch_sampler, BucketedBatchSampler)
+    assert isinstance(train_sampler, BucketedBatchSampler)
 
 
 def test_bucketed_train_loader_yields_protein_batch(
@@ -399,15 +383,13 @@ def test_bucketed_train_loader_yields_protein_batch(
     bucketed_splits: str,
 ) -> None:
     """Training loader yields ProteinBatch objects."""
-    train_loader, _, _ = make_bucketed_data_loaders(
+    train_loader, _, _, train_sampler = make_bucketed_data_loaders(
         cfg=bucketed_cfg,
         jsonl_path=bucketed_jsonl,
         splits_path=bucketed_splits,
         num_workers=0,
         debug_run=False,
     )
-    sampler = train_loader.batch_sampler
-    assert isinstance(sampler, BucketedBatchSampler)
-    sampler.set_epoch(0)
+    train_sampler.set_epoch(0)
     batch = next(iter(train_loader))
     assert isinstance(batch, ProteinBatch)

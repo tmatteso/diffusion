@@ -158,6 +158,9 @@ The following patterns are **banned** in non-comment Python lines and will fail 
 | `.unsqueeze(` | `einops.rearrange` |
 | `.squeeze(` | `einops.rearrange` |
 | `torch.einsum(` | `einops.einsum` |
+| `.norm(` | `torch.sqrt(einops.reduce(x**2, "... -> ", "sum"))` |
+| `torch.linalg.vector_norm(` | `torch.sqrt(einops.reduce(x**2, "... -> ", "sum"))` |
+| `torch.linalg.norm(` | `torch.sqrt(einops.reduce(x**2, "... -> ", "sum"))` |
 
 ---
 
@@ -198,8 +201,10 @@ Commit messages must follow Conventional Commits. Examples of valid prefixes:
 3. **Sort imports** with isort ordering: stdlib → third-party → first-party (no `pallatom.`
    prefix), alphabetical within each group. Black/ruff will flag violations.
 
-4. **Use `einops`** (`rearrange`, `reduce`, `repeat`, `einsum`) for all tensor reshaping and
-   contraction — no `.view`, `.reshape`, `.unsqueeze`, `torch.matmul`, or `@`.
+4. **Use `einops`** (`rearrange`, `reduce`, `repeat`, `einsum`) for all tensor reshaping,
+   contraction, and reduction — no `.view`, `.reshape`, `.unsqueeze`, `torch.matmul`, `@`,
+   `.norm(`, `torch.linalg.vector_norm(`, or `torch.linalg.norm(`. For L2 norm use
+   `torch.sqrt(reduce(x**2, "... -> ", "sum"))`.
 
 5. **Line length 100** — Black reformats automatically; keep manual line breaks at or under 100.
 

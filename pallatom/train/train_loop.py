@@ -6,6 +6,7 @@ import dataclasses
 import math
 import os
 import time
+from collections.abc import Mapping
 from typing import NoReturn, cast
 
 import structlog
@@ -51,7 +52,7 @@ from tqdm import tqdm
 from train.train_config import TrainConfig
 
 
-def _mask_seq_target(aa_indices: Int[torch.Tensor, "B N_res"]) -> Int[torch.Tensor, "B N_res"]:
+def mask_seq_target(aa_indices: Int[torch.Tensor, "B N_res"]) -> Int[torch.Tensor, "B N_res"]:
     """Replace mask-token index 20 with -100 so CE loss ignores dropped positions."""
     return aa_indices.masked_fill(aa_indices == 20, -100)
 
@@ -74,7 +75,9 @@ def load_checkpoint(
     path: str = model_params.tcfg.checkpoint.checkpoint_path
     ckpt = torch.load(path, map_location=model_params.device)
     if isinstance(model_params.model, DDP):
-        model_params.model.module.load_state_dict(ckpt["model"])
+        cast(MainTrunk, getattr(model_params.model, "module")).load_state_dict(  # noqa: B009
+            ckpt["model"]
+        )
     else:
         model_params.model.load_state_dict(ckpt["model"])
 
@@ -108,10 +111,11 @@ def save_checkpoint(
     path: str = model_params.tcfg.checkpoint.checkpoint_path
     if rank != 0:
         return
-    inner: nn.Module = (
-        model_params.model.module if isinstance(model_params.model, DDP) else model_params.model
-    )
-    ckpt = {
+    if isinstance(model_params.model, DDP):
+        inner = cast(MainTrunk, getattr(model_params.model, "module"))  # noqa: B009
+    else:
+        inner: MainTrunk = model_params.model
+    ckpt: Mapping[str, Mapping[str, Float[torch.Tensor, ""]] | Float[torch.Tensor, ""]] = {
         "model": inner.state_dict(),
         "optimizer": model_params.optimizer.state_dict(),
         "scheduler": model_params.scheduler.state_dict(),
@@ -206,7 +210,7 @@ def take_step(
                     rearrange(
                         pred_outputs.intermediate_pred_aa_logit_stack[k_idx], "b n c -> (b n) c"
                     ),
-                    rearrange(_mask_seq_target(featurized_batch.aa_indices), "b n -> (b n)"),
+                    rearrange(mask_seq_target(featurized_batch.aa_indices), "b n -> (b n)"),
                 )
 
             k_loss: Float[torch.Tensor, ""] = (
@@ -245,7 +249,7 @@ def take_step(
         )
         CE_loss: Float[torch.Tensor, ""] = F.cross_entropy(
             rearrange(pred_outputs.seq_logits, "b n c -> (b n) c"),
-            rearrange(_mask_seq_target(featurized_batch.aa_indices), "b n -> (b n)"),
+            rearrange(mask_seq_target(featurized_batch.aa_indices), "b n -> (b n)"),
         )
 
         total_loss: Float[torch.Tensor, ""] = (
@@ -257,7 +261,7 @@ def take_step(
             + lp.alpha_4 * intermediate_med_loss
         )
     if train:
-        (total_loss / grad_scale).backward()
+        torch.autograd.backward([total_loss / grad_scale])
 
     r_aligned: Float[torch.Tensor, "B N_atom 3"]
     (r_aligned,) = kabsch_align(
@@ -393,9 +397,9 @@ def evaluate(
 
     if isinstance(model_params.model, DDP):
         for t in loss_sums.values():
-            dist.all_reduce(t, op=dist.ReduceOp.SUM)
+            dist.all_reduce(t, op=dist.ReduceOp.SUM)  # pyright: ignore[reportUnknownMemberType]
         for t in tput_sums.values():
-            dist.all_reduce(t, op=dist.ReduceOp.SUM)
+            dist.all_reduce(t, op=dist.ReduceOp.SUM)  # pyright: ignore[reportUnknownMemberType]
         # shouldn't these then be divided by the worldsize?
 
     n = max(n_batches, 1)
@@ -419,16 +423,19 @@ def component_grad_norms(model: MainTrunk | DDP) -> ComponentNorms:
         ComponentNorms with the L2 norm of all gradients in each sub-module
         (0.0 when no grads exist).
     """
-    inner: nn.Module = model.module if isinstance(model, DDP) else model
+    if isinstance(model, DDP):
+        inner = cast(MainTrunk, getattr(model, "module"))  # noqa: B009
+    else:
+        inner: MainTrunk = model
 
     def _norm(attr: str) -> Float[torch.Tensor, ""]:
         sub_module: nn.Module = getattr(inner, attr)
         grad_norms: list[torch.Tensor] = [
-            torch.linalg.vector_norm(parameter.grad.detach(), 2.0)
+            torch.sqrt(reduce(parameter.grad.detach() ** 2, "... -> ", "sum"))
             for parameter in sub_module.parameters()
             if parameter.grad is not None
         ]
-        return torch.linalg.vector_norm(torch.stack(grad_norms), 2.0)
+        return torch.sqrt(reduce(torch.stack(grad_norms) ** 2, "n -> ", "sum"))
 
     return ComponentNorms(
         template_embedder=_norm("template_embedder"),
@@ -480,13 +487,13 @@ def optimizer_step(
         tp.grad_clip if tp.grad_clip is not None else float("inf"),
     )
 
-    model_params.optimizer.step()
+    model_params.optimizer.step()  # pyright: ignore[reportUnknownMemberType]
     model_params.optimizer.zero_grad()
     return loss_metrics, throughput_statistics, component_norms, global_step + 1
 
 
 @jaxtyped(typechecker=beartype)
-def _wavg(values: list[Float[torch.Tensor, ""]], n_proteins: list[int]) -> Float[torch.Tensor, ""]:
+def wavg(values: list[Float[torch.Tensor, ""]], n_proteins: list[int]) -> Float[torch.Tensor, ""]:
     """Protein-count-weighted average of scalar tensors.
 
     Args:
@@ -504,7 +511,7 @@ def _wavg(values: list[Float[torch.Tensor, ""]], n_proteins: list[int]) -> Float
     return reduce(stacked * weights, "N ->", "sum") / total
 
 
-def _wavg_loss_metrics(steps: list[LossMetrics], n_proteins: list[int]) -> LossMetrics:
+def wavg_loss_metrics(steps: list[LossMetrics], n_proteins: list[int]) -> LossMetrics:
     """Protein-count-weighted average of per-step LossMetrics.
 
     Args:
@@ -515,18 +522,18 @@ def _wavg_loss_metrics(steps: list[LossMetrics], n_proteins: list[int]) -> LossM
         Single LossMetrics with all fields weighted-averaged.
     """
     return LossMetrics(
-        total_loss=_wavg([m.total_loss for m in steps], n_proteins),
-        Kabsch_aligned_MSE_loss=_wavg([m.Kabsch_aligned_MSE_loss for m in steps], n_proteins),
-        CE_loss=_wavg([m.CE_loss for m in steps], n_proteins),
-        smooth_lddt_loss=_wavg([m.smooth_lddt_loss for m in steps], n_proteins),
-        res_distogram_loss=_wavg([m.res_distogram_loss for m in steps], n_proteins),
-        atom_distogram_loss=_wavg([m.atom_distogram_loss for m in steps], n_proteins),
-        intermediate_loss=_wavg([m.intermediate_loss for m in steps], n_proteins),
-        RMSD=_wavg([m.RMSD for m in steps], n_proteins),
+        total_loss=wavg([m.total_loss for m in steps], n_proteins),
+        Kabsch_aligned_MSE_loss=wavg([m.Kabsch_aligned_MSE_loss for m in steps], n_proteins),
+        CE_loss=wavg([m.CE_loss for m in steps], n_proteins),
+        smooth_lddt_loss=wavg([m.smooth_lddt_loss for m in steps], n_proteins),
+        res_distogram_loss=wavg([m.res_distogram_loss for m in steps], n_proteins),
+        atom_distogram_loss=wavg([m.atom_distogram_loss for m in steps], n_proteins),
+        intermediate_loss=wavg([m.intermediate_loss for m in steps], n_proteins),
+        RMSD=wavg([m.RMSD for m in steps], n_proteins),
     )
 
 
-def _wavg_throughput_stats(
+def wavg_throughput_stats(
     steps: list[ThroughputStatistics], n_proteins: list[int]
 ) -> ThroughputStatistics:
     """Protein-count-weighted average of per-step ThroughputStatistics.
@@ -539,14 +546,14 @@ def _wavg_throughput_stats(
         Single ThroughputStatistics with all fields weighted-averaged.
     """
     return ThroughputStatistics(
-        avg_batch_size=_wavg([m.avg_batch_size for m in steps], n_proteins),
-        token_pack_rate=_wavg([m.token_pack_rate for m in steps], n_proteins),
-        residues_per_sec=_wavg([m.residues_per_sec for m in steps], n_proteins),
-        atoms_per_sec=_wavg([m.atoms_per_sec for m in steps], n_proteins),
+        avg_batch_size=wavg([m.avg_batch_size for m in steps], n_proteins),
+        token_pack_rate=wavg([m.token_pack_rate for m in steps], n_proteins),
+        residues_per_sec=wavg([m.residues_per_sec for m in steps], n_proteins),
+        atoms_per_sec=wavg([m.atoms_per_sec for m in steps], n_proteins),
     )
 
 
-def _wavg_component_norms(steps: list[ComponentNorms], n_proteins: list[int]) -> ComponentNorms:
+def wavg_component_norms(steps: list[ComponentNorms], n_proteins: list[int]) -> ComponentNorms:
     """Protein-count-weighted average of per-step ComponentNorms.
 
     Args:
@@ -557,15 +564,15 @@ def _wavg_component_norms(steps: list[ComponentNorms], n_proteins: list[int]) ->
         Single ComponentNorms with all fields weighted-averaged.
     """
     return ComponentNorms(
-        template_embedder=_wavg([m.template_embedder for m in steps], n_proteins),
-        atom_encoder=_wavg([m.atom_encoder for m in steps], n_proteins),
-        atom_decoders=_wavg([m.atom_decoders for m in steps], n_proteins),
-        residue_distogram_head=_wavg([m.residue_distogram_head for m in steps], n_proteins),
-        atom_distogram_head=_wavg([m.atom_distogram_head for m in steps], n_proteins),
-        inter_proj_seq=_wavg([m.inter_proj_seq for m in steps], n_proteins),
-        inter_seq_logits=_wavg([m.inter_seq_logits for m in steps], n_proteins),
-        proj_seq=_wavg([m.proj_seq for m in steps], n_proteins),
-        seq_logits=_wavg([m.seq_logits for m in steps], n_proteins),
+        template_embedder=wavg([m.template_embedder for m in steps], n_proteins),
+        atom_encoder=wavg([m.atom_encoder for m in steps], n_proteins),
+        atom_decoders=wavg([m.atom_decoders for m in steps], n_proteins),
+        residue_distogram_head=wavg([m.residue_distogram_head for m in steps], n_proteins),
+        atom_distogram_head=wavg([m.atom_distogram_head for m in steps], n_proteins),
+        inter_proj_seq=wavg([m.inter_proj_seq for m in steps], n_proteins),
+        inter_seq_logits=wavg([m.inter_seq_logits for m in steps], n_proteins),
+        proj_seq=wavg([m.proj_seq for m in steps], n_proteins),
+        seq_logits=wavg([m.seq_logits for m in steps], n_proteins),
     )
 
 
@@ -669,7 +676,7 @@ def _flush_micro_buffer(
         log.error("nan_loss", step=new_global_step, **{k: f"{v:.2f}" for k, v in loss_dict.items()})
     step.pbar.update(1)
     if step.rank == 0:
-        step.pbar.set_postfix({k: f"{v:.2f}" for k, v in loss_dict.items()})
+        step.pbar.set_postfix({k: f"{v:.2f}" for k, v in loss_dict.items()})  # type: ignore[reportUnknownMemberType]
     step.step_loss_metrics.append(loss_metrics)
     step.step_throughput_stats.append(throughput_stats)
     step.step_component_norms.append(component_norms)
@@ -680,6 +687,7 @@ def _flush_micro_buffer(
 def train(
     best_val_loss: Float[torch.Tensor, ""],
     train_loader: torch.utils.data.DataLoader[ProteinBatch],
+    train_sampler: BucketedBatchSampler,
     test_loader: torch.utils.data.DataLoader[ProteinBatch],
     model_params: ModelSetup,
     log: FilteringBoundLogger,
@@ -698,8 +706,9 @@ def train(
     Args:
         best_val_loss: Incumbent best validation loss; updated and returned
             implicitly via ``log_epoch``.
-        train_loader: DataLoader for training batches; its
-            ``BucketedBatchSampler`` must support ``set_epoch``.
+        train_loader: DataLoader for training batches.
+        train_sampler: BucketedBatchSampler backing ``train_loader``; used to
+            call ``set_epoch`` each epoch for correct shuffling.
         test_loader: DataLoader for evaluation batches.
         model_params: Bundled model, optimizer, scheduler, and config.
         log: Bound structlog logger.
@@ -727,7 +736,7 @@ def train(
 
     for epoch in range(1, tp.num_epochs + 1):
         model_params.model.train()
-        cast(BucketedBatchSampler, train_loader.batch_sampler).set_epoch(epoch)
+        train_sampler.set_epoch(epoch)
         n_batches = 0
         micro_buffer: list[ProteinBatch] = []
         n_proteins_buffer: list[int] = []
@@ -784,11 +793,11 @@ def train(
         epoch_metrics = EpochMetrics(
             epoch=epoch,
             global_step=global_step,
-            train_loss_metrics=_wavg_loss_metrics(step.step_loss_metrics, step.step_n_proteins),
-            train_throughput_stats=_wavg_throughput_stats(
+            train_loss_metrics=wavg_loss_metrics(step.step_loss_metrics, step.step_n_proteins),
+            train_throughput_stats=wavg_throughput_stats(
                 step.step_throughput_stats, step.step_n_proteins
             ),
-            train_gradient_norms=_wavg_component_norms(
+            train_gradient_norms=wavg_component_norms(
                 step.step_component_norms, step.step_n_proteins
             ),
             val_loss_metrics=epoch_val_metrics,
@@ -833,7 +842,7 @@ def main(args: argparse.Namespace, tcfg: TrainConfig) -> None:
 
         log = structlog.get_logger()
 
-        train_loader, val_loader, _ = make_bucketed_data_loaders(
+        train_loader, val_loader, _, train_sampler = make_bucketed_data_loaders(
             cfg=tcfg,
             jsonl_path=args.data,
             splits_path=args.splits,
@@ -888,6 +897,7 @@ def main(args: argparse.Namespace, tcfg: TrainConfig) -> None:
         train(
             best_val_loss=best_val_loss,
             train_loader=train_loader,
+            train_sampler=train_sampler,
             test_loader=val_loader,
             model_params=model_params,
             log=log,

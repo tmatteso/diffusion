@@ -22,9 +22,8 @@ from architecture.main_trunk import (
 from beartype import beartype
 from einops import einsum, rearrange, reduce, repeat
 from helpers.featurize import FeaturizedBatch, sinusoidal_encoding
+from helpers.useful_objects import manual_seed
 from jaxtyping import Bool, Float, Int, TypeCheckError, jaxtyped
-
-torch.manual_seed(42)
 
 B = 2
 N_RES = 50
@@ -45,6 +44,12 @@ F_REF_DIM = ATOMS_PER_RES * (
     3 + E
 )  # encoder groups all sibling atoms: n_per_res*(pos_dim+elem_dim)
 
+manual_seed(42)
+
+# @pytest.fixture(autouse=True)
+# def _reset_seed() -> None:
+#     """Reset global RNG before every test so results are independent of test ordering."""
+#     manual_seed(42)
 
 # ---------------------------------------------------------------------------
 # Typed helpers
@@ -503,7 +508,7 @@ def test_integration_gradient_flow_composite_loss(
     total_loss = (
         kabsch_loss + ce_loss + lddt + res_distogram_loss + atom_distogram_loss + intermediate_loss
     )
-    total_loss.backward()
+    torch.autograd.backward([total_loss])
 
     _assert_submodule_grads(model)
 

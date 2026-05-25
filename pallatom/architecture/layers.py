@@ -13,4 +13,4 @@ class LinearNoBias(nn.Linear):
             in_features: Size of each input sample.
             out_features: Size of each output sample.
         """
-        super().__init__(in_features, out_features, bias=False)
+        super().__init__(in_features, out_features, bias=False)  # type: ignore[reportUnknownMemberType]
