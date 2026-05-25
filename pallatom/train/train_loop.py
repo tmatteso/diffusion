@@ -149,6 +149,8 @@ def take_step(
     )
     lp = model_params.tcfg.loss
 
+    flat_aa_targets: Int[torch.Tensor, "B_N_res"] = torch.zeros(0, dtype=torch.long)
+    n_masked_aa: Int[torch.Tensor, ""] = torch.tensor(1)
     if train:
         # Save orig amino-acid indices before conditioning dropout replaces some with <MASK> (20).
         orig_aa_indices: Int[torch.Tensor, "B N_res"] = featurized_batch.aa_indices.clone()
@@ -167,8 +169,8 @@ def take_step(
             ~mask_positions, -100
         )
         # Flat targets reused for final and intermediate CE; count guards against p_seq=0 edge case.
-        flat_aa_targets: Int[torch.Tensor, "B_N_res"] = rearrange(aa_targets, "b n -> (b n)")
-        n_masked_aa: Int[torch.Tensor, ""] = (flat_aa_targets >= 0).sum().clamp(min=1)
+        flat_aa_targets = rearrange(aa_targets, "b n -> (b n)")
+        n_masked_aa = (flat_aa_targets >= 0).sum().clamp(min=1)
 
     t0 = time.perf_counter()
 
@@ -805,8 +807,7 @@ def train(
                 rank=rank,
                 log=log,
             )
-
-    pbar.close()
+        pbar.close()
 
 
 def main(args: argparse.Namespace, tcfg: TrainConfig) -> None:

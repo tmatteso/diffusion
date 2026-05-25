@@ -131,7 +131,8 @@ known-first-party = ["diffusion"]
 [tool.pyright]
 extraPaths = ["pallatom"]
 pythonVersion = "3.10"
-typeCheckingMode = "basic"           # baseline: enables ~30 fundamental checks
+typeCheckingMode = "standard"           # baseline: enables ~30 fundamental checks
+
 reportInvalidTypeForm = "none" # allows shape strings for jaxtyping compatibility.
 reportIndexIssue = "none" # allows complex pytorch tensor indexing patterns.
 reportConstantRedefinition = "error" # Final enforcement — error if a Final variable is reassigned

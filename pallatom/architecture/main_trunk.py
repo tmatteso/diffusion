@@ -579,14 +579,15 @@ class MainTrunk(nn.Module):
             emb.tok_idx + rearrange(torch.arange(emb.B, device=emb.device), "b -> b 1") * emb.N_res
         )
 
+        q_update: Float[torch.Tensor, "B N_atom c_atom"] = emb.q_skip
+        p_update: Float[torch.Tensor, "B N_atom K c_atompair"] = emb.p_skip
+
         for k in range(self.K_unit):
 
             # Step 11: s_i = NodeUpdate(s_i, t_i, z_ij)    [B, N_res, c_res]
             s_i = self.node_updates[k](s_i, emb.t_i, z_ij)
 
             # Step 12: AtomAttentionDecoder
-            q_update: Float[torch.Tensor, "B N_atom c_atom"]
-            p_update: Float[torch.Tensor, "B N_atom K c_atompair"]
             r_update: Float[torch.Tensor, "B N_atom 3"]
 
             q_update, p_update, r_update, c_l = self.atom_decoders[k](

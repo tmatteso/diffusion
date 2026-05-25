@@ -511,7 +511,7 @@ class EDMSampler:
         # pure noise initialised at sigma_max — independent per batch item
         z: Float[torch.Tensor, "B N_atom 3"] = torch.randn(shape, device=device) * sigmas[0]
 
-        seq_logits: Float[torch.Tensor, "B N_res n_amino"]
+        seq_logits: Float[torch.Tensor, "B N_res n_amino"] = torch.empty(0, device=device)
         for i in range(steps):
             sigma_cur: Float[torch.Tensor, ""] = sigmas[i]
             sigma_next: Float[torch.Tensor, ""] = sigmas[i + 1]
