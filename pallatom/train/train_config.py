@@ -100,7 +100,7 @@ class CheckpointParams(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
-    checkpoint_path: str = "pallatom_best_best.pt"
+    checkpoint_path: str = "pallatom_best.pt"
     save_every: int = Field(default=1, ge=0)
 
 
@@ -108,8 +108,6 @@ class LoggingParams(BaseModel):
     """Logging frequency and W&B project configuration."""
 
     model_config = ConfigDict(frozen=True)
-
-    log_interval: int = Field(default=1, ge=1)
     use_wandb: bool = True
     wandb_project: str = "pallatom-training"
 

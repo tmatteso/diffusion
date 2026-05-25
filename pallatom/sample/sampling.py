@@ -658,7 +658,7 @@ def main(args: argparse.Namespace, scfg: SampleConfig, device: str) -> None:
                 atom_positions=x_37.numpy(),
                 atom_mask=mask_37.numpy(),
                 residue_index=np.arange(N_RES, dtype=np.intp),
-                aatype=np.zeros(N_RES, dtype=np.intp),  # obvious problem
+                aatype=seq_logits_batch[b].argmax(dim=-1).cpu().numpy().astype(np.intp),  # greedy
                 chain_index=np.zeros(N_RES, dtype=np.intp),  # obvious problem
                 b_factors=np.ones((N_RES, 37), dtype=np.float64),
             )

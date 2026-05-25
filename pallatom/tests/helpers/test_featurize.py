@@ -4,6 +4,7 @@ import dataclasses
 
 import pytest
 import torch
+from architecture.main_trunk import MainTrunk
 from einops import rearrange, reduce, repeat
 from helpers.atom_utils import restype_num, restype_order
 from helpers.featurize import (
@@ -17,7 +18,10 @@ from helpers.featurize import (
     featurize_single_item,
     sinusoidal_encoding,
 )
+from helpers.useful_objects import ModelSetup
 from jaxtyping import Bool, Float, TypeCheckError
+from torch.optim import Adam
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from train.train_config import TrainConfig
 
 torch.manual_seed(42)
@@ -271,11 +275,37 @@ def atom_distogram_fn(tcfg: TrainConfig) -> Distogram:
 
 
 @pytest.fixture
+def model_params(
+    tcfg: TrainConfig, c_beta_distogram_fn: Distogram, atom_distogram_fn: Distogram
+) -> ModelSetup:
+    """Provide a ModelSetup bundling a small CPU MainTrunk with the tcfg training configuration."""
+    trunk = MainTrunk(
+        f_ref_dim=tcfg.model.f_ref_dim,
+        n_bins=tcfg.model.n_bins,
+        n_atom_bins=tcfg.distogram_atom.n_bins,
+        c_atom=tcfg.model.c_atom,
+        c_pair=tcfg.model.c_pair,
+        c_res=tcfg.model.c_res,
+        c_atompair=tcfg.model.c_atompair,
+        K_unit=tcfg.model.K_unit,
+    ).eval()
+    optimizer = Adam(trunk.parameters(), lr=tcfg.training.lr)
+    scheduler = CosineAnnealingLR(optimizer, T_max=tcfg.training.num_epochs)
+    return ModelSetup(
+        model=trunk,
+        tcfg=tcfg,
+        distogram_res=c_beta_distogram_fn,
+        distogram_atom=atom_distogram_fn,
+        device="cpu",
+        optimizer=optimizer,
+        scheduler=scheduler,
+    )
+
+
+@pytest.fixture
 def featurized_batch(
     protein_batch: ProteinBatch,
-    tcfg: TrainConfig,
-    c_beta_distogram_fn: Distogram,
-    atom_distogram_fn: Distogram,
+    model_params: ModelSetup,
 ) -> FeaturizedBatch:
     """Provide a FeaturizedBatch produced by featurize_batch on the protein_batch fixture.
 
@@ -284,7 +314,10 @@ def featurized_batch(
     """
     torch.manual_seed(1)
     return featurize_batch(
-        protein_batch, tcfg, c_beta_distogram_fn, atom_distogram_fn, device="cpu"
+        batch=protein_batch,
+        tcfg=model_params.tcfg,
+        distogram_res=model_params.distogram_res,
+        distogram_atom=model_params.distogram_atom,
     )
 
 

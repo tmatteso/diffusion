@@ -127,3 +127,41 @@ class StructlogConfig:
         if self._f is not None:
             self._f.close()
         structlog.reset_defaults()
+
+
+class StepContext:
+    """Context manager that disables gradients and dropout for eval steps.
+
+    On entry, switches the module to eval mode and disables autograd when
+    ``train=False``.  On exit, restores the module's original training state
+    regardless of exceptions.
+    """
+
+    def __init__(self, *, model: torch.nn.Module, train: bool) -> None:
+        """Store the module and desired mode; no side-effects until __enter__.
+
+        Args:
+            model: The model to manage (plain ``nn.Module`` or DDP-wrapped).
+            train: Pass ``True`` for a training step, ``False`` for eval.
+        """
+        self.model = model
+        self._train = train  # desired state during the context.
+        self._was_training: bool = False  # state to restore to on exit
+
+    def __enter__(self) -> "StepContext":
+        """Switch model to eval mode and disable autograd if not training."""
+        self._was_training = self.model.training
+        if not self._train:
+            self.model.eval()
+        torch.set_grad_enabled(self._train)
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
+        """Restore the model's original training state and re-enable autograd."""
+        self.model.train(self._was_training)
+        torch.set_grad_enabled(True)

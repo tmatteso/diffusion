@@ -446,7 +446,7 @@ def test_make_np_example_backbone_atoms_masked(
 
 
 def test_make_np_example_nan_coords_zeroed(
-    coords_dict: Mapping[str, npt.NDArray[np.float64]]
+    coords_dict: Mapping[str, npt.NDArray[np.float64]],
 ) -> None:
     """make_np_example replaces NaN coordinate entries with zero to keep positions finite."""
     coords_dict["N"][0] = [float("nan"), float("nan"), float("nan")]
@@ -455,7 +455,7 @@ def test_make_np_example_nan_coords_zeroed(
 
 
 def test_make_np_example_nan_coords_zero_mask(
-    coords_dict: Mapping[str, npt.NDArray[np.float64]]
+    coords_dict: Mapping[str, npt.NDArray[np.float64]],
 ) -> None:
     """make_np_example sets atom_mask to 0 for residues whose coordinates were NaN."""
     coords_dict["N"][0] = [float("nan"), float("nan"), float("nan")]
@@ -522,7 +522,7 @@ def test_make_fixed_size_truncates_longer_sequence(
 
 
 def test_make_fixed_size_no_change_when_exact(
-    exact_np_example: Mapping[str, npt.NDArray[np.intp]]
+    exact_np_example: Mapping[str, npt.NDArray[np.intp]],
 ) -> None:
     """make_fixed_size leaves arrays unchanged when their length equals max_seq_length."""
     make_fixed_size(exact_np_example, max_seq_length=NP_MAX_LEN)
@@ -530,7 +530,7 @@ def test_make_fixed_size_no_change_when_exact(
 
 
 def test_make_fixed_size_padded_values_are_zero(
-    ones_np_example: Mapping[str, npt.NDArray[np.float64]]
+    ones_np_example: Mapping[str, npt.NDArray[np.float64]],
 ) -> None:
     """make_fixed_size fills the padding region with zeros, not the original values."""
     make_fixed_size(ones_np_example, max_seq_length=6)
@@ -565,7 +565,7 @@ def ca_only_np_example() -> Mapping[str, npt.NDArray[np.float64]]:
 
 
 def test_center_positions_ca_center_at_origin(
-    full_mask_np_example: Mapping[str, npt.NDArray[np.float64]]
+    full_mask_np_example: Mapping[str, npt.NDArray[np.float64]],
 ) -> None:
     """center_positions translates the structure so the mean CA position is at the origin."""
     center_positions(full_mask_np_example)
@@ -574,7 +574,7 @@ def test_center_positions_ca_center_at_origin(
 
 
 def test_center_positions_masked_atoms_remain_zero(
-    ca_only_np_example: Mapping[str, npt.NDArray[np.float64]]
+    ca_only_np_example: Mapping[str, npt.NDArray[np.float64]],
 ) -> None:
     """center_positions leaves zero-masked atom slots at zero after centering."""
     center_positions(ca_only_np_example)
@@ -582,7 +582,7 @@ def test_center_positions_masked_atoms_remain_zero(
 
 
 def test_center_positions_modifies_in_place(
-    full_mask_np_example: Mapping[str, npt.NDArray[np.float64]]
+    full_mask_np_example: Mapping[str, npt.NDArray[np.float64]],
 ) -> None:
     """center_positions mutates the input dict's atom_positions array rather than copying."""
     original = full_mask_np_example["atom_positions"].copy()

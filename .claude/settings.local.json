@@ -29,7 +29,28 @@
       "Bash(git commit *)",
       "Bash(python -m pytest pallatom/tests/helpers/test_featurize.py -k \"wrong_shape or wrong_type\" -v)",
       "Bash(python -m pytest pallatom/tests/sample/test_sampling.py -k \"wrong_shape or wrong_type\" -v)",
-      "Bash(python -m pytest pallatom/tests/train/test_train_loop.py -k \"wrong_device_type\" -v)"
+      "Bash(python -m pytest pallatom/tests/train/test_train_loop.py -k \"wrong_device_type\" -v)",
+      "Bash(python -m pytest pallatom/tests/helpers/test_atom_utils.py::test_mol_type_constants pallatom/tests/helpers/test_atom_utils.py::test_dna_restype_constants pallatom/tests/helpers/test_atom_utils.py::test_rna_restype_constants -v)",
+      "Bash(pytest pallatom/tests/helpers/test_atom_utils.py -v -k \"mol_type or dna_restype or rna_restype\")",
+      "Bash(python -m pytest pallatom/tests/helpers/test_atom_utils.py -v -k \"mol_type or dna_restype or rna_restype or immutable\")",
+      "Bash(python -c ' *)",
+      "Bash(git stash *)",
+      "Bash(pytest pallatom/tests/helpers/test_atom_utils.py -v -k \"mol_type or dna_restype or rna_restype or immutable\")",
+      "Bash(pytest pallatom/tests/helpers/test_atom_utils.py -k \"classify_mol_type\" -v)",
+      "Bash(python3 -m pytest pallatom/tests/helpers/test_atom_utils.py::test_classify_mol_type_protein pallatom/tests/helpers/test_atom_utils.py::test_classify_mol_type_dna_canonical pallatom/tests/helpers/test_atom_utils.py::test_classify_mol_type_dna_bare_t pallatom/tests/helpers/test_atom_utils.py::test_classify_mol_type_rna_u pallatom/tests/helpers/test_atom_utils.py::test_classify_mol_type_rna_via_o2prime pallatom/tests/helpers/test_atom_utils.py::test_classify_mol_type_dna_no_prefix_no_o2prime pallatom/tests/helpers/test_atom_utils.py::test_classify_mol_type_unknown_defaults_protein -v)",
+      "Bash(python -m pytest pallatom/tests/helpers/test_atom_utils.py -k \"protein_from_pdb\" -v)",
+      "Bash(python -m pytest pallatom/tests/helpers/test_atom_utils.py -v)",
+      "Bash(pytest pallatom/tests/helpers/test_atom_utils.py -k \"protein_from_pdb\" -v)",
+      "Bash(python3 -m ruff check pallatom/helpers/atom_utils.py)",
+      "Bash(python3 -m ruff check pallatom/tests/helpers/test_atom_utils.py)",
+      "Bash(python3 -m pytest pallatom/tests/helpers/test_atom_utils.py -k \"protein_from_pdb\" -v)",
+      "Bash(python3 -m pytest pallatom/tests/ -x -q)",
+      "Bash(python3 -c \"import torch; print\\(torch.__version__\\)\")",
+      "Bash(python3 -m pyright pallatom/tests/helpers/test_atom_utils.py)",
+      "Bash(pytest pallatom/tests/helpers/test_atom_utils.py -q)",
+      "Bash(python -m pytest pallatom/tests/helpers/test_atom_utils.py -q)",
+      "Bash(python -m pytest pallatom/tests/train/test_train_loop.py -x -q --tb=short)",
+      "Bash(python -m pytest pallatom/tests/train/test_train_loop.py::test_train_step_returns_expected_keys -v)"
     ]
   }
 }

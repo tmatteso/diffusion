@@ -14,6 +14,7 @@ from architecture.losses import (
 from architecture.main_trunk import (
     AtomDistogramHead,
     MainTrunk,
+    PredictedOutputs,
     ResidueDistogramHead,
     TimeFourierEmbedding,
     scatter_mean,
@@ -204,7 +205,8 @@ def featurized_batch(
     )
 
 
-def _forward(model: MainTrunk, batch: FeaturizedBatch):
+def _forward(model: MainTrunk, batch: FeaturizedBatch) -> PredictedOutputs:
+    """Run model forward pass under no_grad and return the PredictedOutputs dataclass."""
     with torch.no_grad():
         return model(batch)
 
@@ -328,54 +330,56 @@ def test_atom_distogram_head_mask_symmetric():
 
 def test_main_trunk_r_denoised_shape_finite(model: MainTrunk, featurized_batch: FeaturizedBatch):
     """The main trunk returns denoised atom coordinates [B, N_atom, 3] with no NaN or Inf."""
-    r_denoised, *_ = _forward(model, featurized_batch)
-    assert r_denoised.shape == (B, N_ATOM, 3)
-    assert torch.isfinite(r_denoised).all()
+    out = _forward(model, featurized_batch)
+    assert out.r_denoised.shape == (B, N_ATOM, 3)
+    assert torch.isfinite(out.r_denoised).all()
 
 
 def test_main_trunk_seq_logits_shape_finite(model: MainTrunk, featurized_batch: FeaturizedBatch):
     """The sequence prediction head returns [B, N_res, 20] amino-acid logits with no NaN or Inf."""
-    _, f_seq_logits, *_ = _forward(model, featurized_batch)
-    assert f_seq_logits.shape == (B, N_RES, 20)
-    assert torch.isfinite(f_seq_logits).all()
+    out = _forward(model, featurized_batch)
+    assert out.seq_logits.shape == (B, N_RES, 20)
+    assert torch.isfinite(out.seq_logits).all()
 
 
 def test_main_trunk_residue_distogram_shape_finite(
     model: MainTrunk, featurized_batch: FeaturizedBatch
 ):
     """The residue distogram head returns [B, N_res, N_res, N_bins] logits with no NaN or Inf."""
-    _, _, res_logits, *_ = _forward(model, featurized_batch)
-    assert res_logits.shape == (B, N_RES, N_RES, N_BINS)
-    assert torch.isfinite(res_logits).all()
+    out = _forward(model, featurized_batch)
+    assert out.residue_distogram_logits.shape == (B, N_RES, N_RES, N_BINS)
+    assert torch.isfinite(out.residue_distogram_logits).all()
 
 
 def test_main_trunk_atom_distogram_shape_finite(
     model: MainTrunk, featurized_batch: FeaturizedBatch
 ):
     """Atom distogram output shape is [B, N_ATOM, ..., N_ATOM_BINS]."""
-    _, _, _, atom_logits, *_ = _forward(model, featurized_batch)
-    assert atom_logits.ndim == 4
-    assert atom_logits.shape[0] == B
-    assert atom_logits.shape[1] == N_ATOM
-    assert atom_logits.shape[3] == N_ATOM_BINS
-    assert torch.isfinite(atom_logits).all()
+    out = _forward(model, featurized_batch)
+    assert out.atom_distogram_logits.ndim == 4
+    assert out.atom_distogram_logits.shape[0] == B
+    assert out.atom_distogram_logits.shape[1] == N_ATOM
+    assert out.atom_distogram_logits.shape[3] == N_ATOM_BINS
+    assert torch.isfinite(out.atom_distogram_logits).all()
 
 
 def test_main_trunk_atom_distogram_bins_match_ground_truth(
     model: MainTrunk, featurized_batch: FeaturizedBatch
 ):
     """Number of predicted atom distance bins matches bin count in ground-truth sparse tensor."""
-    _, _, _, atom_logits, *_ = _forward(model, featurized_batch)
-    assert atom_logits.shape[-1] == featurized_batch.gt_atom_distogram_sparse.shape[-1]
+    out = _forward(model, featurized_batch)
+    assert (
+        out.atom_distogram_logits.shape[-1] == featurized_batch.gt_atom_distogram_sparse.shape[-1]
+    )
 
 
 def test_main_trunk_distogram_loss_atom_computable(
     model: MainTrunk, featurized_batch: FeaturizedBatch
 ):
     """Atom distogram logits from trunk passed directly to distogram_loss_atom without errors."""
-    _, _, _, atom_logits, *_ = _forward(model, featurized_batch)
+    out = _forward(model, featurized_batch)
     loss = distogram_loss_atom(
-        atom_logits,
+        out.atom_distogram_logits,
         featurized_batch.gt_atom_distogram_sparse,
         featurized_batch.gt_atom_distogram_mask_sparse,
     ).mean()
@@ -385,17 +389,17 @@ def test_main_trunk_distogram_loss_atom_computable(
 
 def test_main_trunk_intermediate_stack_lengths(model: MainTrunk, featurized_batch: FeaturizedBatch):
     """The intermediate coordinate and amino-acid stacks each contain exactly K_unit entries."""
-    _, _, _, _, coord_stack, aa_stack = _forward(model, featurized_batch)
-    assert len(coord_stack) == K_UNIT
-    assert len(aa_stack) == K_UNIT
+    out = _forward(model, featurized_batch)
+    assert len(out.intermediate_denoised_coord_stack) == K_UNIT
+    assert len(out.intermediate_pred_aa_logit_stack) == K_UNIT
 
 
 def test_main_trunk_intermediate_coords_shape_finite(
     model: MainTrunk, featurized_batch: FeaturizedBatch
 ):
     """Every intermediate denoised coordinate tensor in stack has shape [B, N_atom, 3]."""
-    _, _, _, _, coord_stack, _ = _forward(model, featurized_batch)
-    for r in coord_stack:
+    out = _forward(model, featurized_batch)
+    for r in out.intermediate_denoised_coord_stack:
         assert r.shape == (B, N_ATOM, 3)
         assert torch.isfinite(r).all()
 
@@ -407,8 +411,8 @@ def test_main_trunk_gradient_flows_to_r_input(model: MainTrunk, featurized_batch
         **{k: v for k, v in featurized_batch.__dict__.items() if k != "r_input"},
         r_input=r_input_g,
     )
-    r_denoised, *_ = model(batch_g)
-    reduce(r_denoised, "b n d -> ", "sum").backward()
+    out = model(batch_g)
+    reduce(out.r_denoised, "b n d -> ", "sum").backward()
     assert r_input_g.grad is not None
     assert torch.isfinite(r_input_g.grad).all()
 
@@ -423,9 +427,9 @@ def test_main_trunk_forward_with_mask_token_aa_indices(
         aa_indices=torch.full((B, N_RES), 20, dtype=torch.long),
     )
     with torch.no_grad():
-        r_denoised, *_ = model(masked_batch)
-    assert r_denoised.shape == (B, N_ATOM, 3)
-    assert torch.isfinite(r_denoised).all()
+        out = model(masked_batch)
+    assert out.r_denoised.shape == (B, N_ATOM, 3)
+    assert torch.isfinite(out.r_denoised).all()
 
 
 # you need to add integration tests here. don't be afraid to use pytest mocks.
@@ -453,39 +457,38 @@ def test_integration_gradient_flow_composite_loss(
 ) -> None:
     """Composite 7-term training loss propagates finite nonzero grads to every submodule."""
     model.train()
-    (
-        r_denoised,
-        f_seq_logits,
-        residue_distogram_logits,
-        atom_distogram_logits,
-        intermediate_denoised_coord_stack,
-        intermediate_pred_aa_logit_stack,
-    ) = model(featurized_batch)
+    pred: PredictedOutputs = model(featurized_batch)
 
-    kabsch_loss = atom_loss(r_denoised, featurized_batch.r_gt, featurized_batch.atom5_mask).mean()
+    kabsch_loss = atom_loss(
+        pred.r_denoised, featurized_batch.r_gt, featurized_batch.atom5_mask
+    ).mean()
     ce_loss = F.cross_entropy(
-        rearrange(f_seq_logits, "b n c -> (b n) c"),
+        rearrange(pred.seq_logits, "b n c -> (b n) c"),
         rearrange(featurized_batch.aa_indices, "b n -> (b n)"),
     )
     lddt = smooth_lddt_loss(
-        r_denoised, featurized_batch.r_gt, featurized_batch.atom5_mask, cutoff=15.0
+        pred.r_denoised, featurized_batch.r_gt, featurized_batch.atom5_mask, cutoff=15.0
     )
     gt_res_bin_idx = featurized_batch.gt_res_distogram.argmax(dim=-1).clamp(
-        0, residue_distogram_logits.size(-1) - 1
+        0, pred.residue_distogram_logits.size(-1) - 1
     )
     res_distogram_loss = distogram_loss_residue(
-        residue_distogram_logits, gt_res_bin_idx, featurized_batch.residue_mask
+        pred.residue_distogram_logits, gt_res_bin_idx, featurized_batch.residue_mask
     ).mean()
     atom_distogram_loss = distogram_loss_atom(
-        atom_distogram_logits,
+        pred.atom_distogram_logits,
         featurized_batch.gt_atom_distogram_sparse,
         featurized_batch.gt_atom_distogram_mask_sparse,
     ).mean()
 
-    K_unit = len(intermediate_denoised_coord_stack)
+    K_unit = len(pred.intermediate_denoised_coord_stack)
     intermediate_loss = torch.tensor(0.0)
     for k_idx, (inter_coords, inter_logits) in enumerate(
-        zip(intermediate_denoised_coord_stack, intermediate_pred_aa_logit_stack, strict=False)
+        zip(
+            pred.intermediate_denoised_coord_stack,
+            pred.intermediate_pred_aa_logit_stack,
+            strict=False,
+        )
     ):
         gamma: float = 0.99 ** (K_unit - k_idx - 1)
         k_loss = atom_loss(

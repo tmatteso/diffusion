@@ -217,7 +217,7 @@ def test_atom5_to_atom37_each_slot_lands_at_correct_atom37_index():
 
 
 def test_atom5_to_atom37_unoccupied_atom37_slots_are_zero(
-    coords5: Float[torch.Tensor, "N_RES 5 3"]
+    coords5: Float[torch.Tensor, "N_RES 5 3"],
 ):
     """Assert that atom37 positions not covered by atom5 remain exactly zero after mapping."""
     x_37, _ = atom5_to_atom37(coords5)
@@ -235,7 +235,7 @@ def test_atom5_to_atom37_unoccupied_atom37_slots_are_zero(
 
 
 def test_atom5_to_atom37_mask_none_sets_occupied_slots_to_one(
-    coords5: Float[torch.Tensor, "N_RES 5 3"]
+    coords5: Float[torch.Tensor, "N_RES 5 3"],
 ):
     """When no explicit mask is given, all atom5-occupied slots in the atom37 mask must be 1."""
     _, mask_37 = atom5_to_atom37(coords5, mask_5=None)

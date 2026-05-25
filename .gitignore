@@ -7,8 +7,6 @@ htmlcov/
 wandb/
 # checkpoints
 checkpoint_*
-# logs 
-pallatom/train/*logs.jsonl
 # repo specific ignores
 dino_3d/
 pallatom/data/
@@ -31,3 +29,10 @@ __pycache__/
 dist/
 build/
 *.egg-info/
+# superpowers artefacts
+docs/superpowers/*
+# pytorch tensors
+*.pt
+# json / jsonl. these are configs and datafiles
+pallatom/train/*.json
+pallatom/train/*.jsonl

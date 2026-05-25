@@ -434,7 +434,7 @@ def truncate_to_length(
 
 
 def center_positions(
-    np_example: Mapping[str, npt.NDArray[np.float64] | npt.NDArray[np.intp]]
+    np_example: Mapping[str, npt.NDArray[np.float64] | npt.NDArray[np.intp]],
 ) -> None:
     """Center 'atom_positions' on CA center of mass."""
     atom_positions = np_example["atom_positions"]  # N, 37, 3

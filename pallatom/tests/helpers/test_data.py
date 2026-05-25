@@ -1,7 +1,6 @@
 """Tests for dataset and data loading utilities."""
 
 import json
-import math
 import pathlib
 import pickle
 from collections.abc import Mapping
@@ -16,11 +15,8 @@ from helpers.data import (
     ProteinDataset,
     _to_protein_batch_dynamic,
     make_bucketed_data_loaders,
-    make_data_loaders,
-    make_ddp_data_loaders,
 )
 from helpers.featurize import ProteinBatch
-from torch.utils.data.distributed import DistributedSampler
 from train.train_config import TestLoaderConfig as EvalLoaderConfig
 from train.train_config import TrainConfig, TrainLoaderConfig
 
@@ -187,61 +183,6 @@ def test_protein_dataset_picklable_after_open(train_dataset: ProteinDataset):
 
 
 # ---------------------------------------------------------------------------
-# make_data_loaders — loader counts and batch shapes
-# ---------------------------------------------------------------------------
-
-
-def test_make_data_loaders_returns_three_loaders(
-    cfg: TrainConfig, jsonl_path: str, splits_path: str
-):
-    """make_data_loaders returns a 3-tuple of (train, val, test) DataLoaders."""
-    assert (
-        len(
-            make_data_loaders(
-                cfg=cfg,
-                jsonl_path=jsonl_path,
-                splits_path=splits_path,
-                num_workers=0,
-                debug_run=True,
-            )
-        )
-        == 3
-    )
-
-
-def test_make_data_loaders_train_len(cfg: TrainConfig, jsonl_path: str, splits_path: str):
-    """make_data_loaders train loader length matches ceil(n_train / batch_size)."""
-    train_loader, _, _ = make_data_loaders(
-        cfg=cfg, jsonl_path=jsonl_path, splits_path=splits_path, num_workers=0, debug_run=False
-    )
-    expected = math.ceil(len(_TRAIN_NAMES) / cfg.train_loader.batch_size)
-    assert len(train_loader) == expected
-
-
-def test_make_data_loaders_batch_atom_positions_shape(
-    cfg: TrainConfig, jsonl_path: str, splits_path: str
-):
-    """make_data_loaders produces batch with atom_positions shape (batch_size, _MAX_SEQ, 37, 3)."""
-    train_loader, _, _ = make_data_loaders(
-        cfg=cfg, jsonl_path=jsonl_path, splits_path=splits_path, num_workers=0, debug_run=False
-    )
-    batch = next(iter(train_loader))
-    assert batch.atom_positions.shape == (cfg.train_loader.batch_size, _MAX_SEQ, 37, 3)
-
-
-def test_make_data_loaders_batch_seq_is_list_of_strings(
-    cfg: TrainConfig, jsonl_path: str, splits_path: str
-):
-    """make_data_loaders collates the seq field into a list of str, one per batch item."""
-    train_loader, _, _ = make_data_loaders(
-        cfg=cfg, jsonl_path=jsonl_path, splits_path=splits_path, num_workers=0, debug_run=False
-    )
-    batch = next(iter(train_loader))
-    assert isinstance(batch.seq, list)
-    assert all(isinstance(s, str) for s in batch.seq)
-
-
-# ---------------------------------------------------------------------------
 # make_data_loaders — debug_run=True
 # ---------------------------------------------------------------------------
 
@@ -273,138 +214,6 @@ def debug_splits_path(tmp_path: pathlib.Path) -> str:
     with open(path, "w") as f:
         json.dump({"train": names, "validation": names[:1], "test": names[:1]}, f)
     return str(path)
-
-
-def test_make_data_loaders_debug_train_len(
-    cfg: TrainConfig, debug_jsonl_path: str, debug_splits_path: str
-):
-    """Debug-mode train loader length equals ceil(_N_DEBUG / batch_size)."""
-    train_loader, _, _ = make_data_loaders(
-        cfg=cfg,
-        jsonl_path=debug_jsonl_path,
-        splits_path=debug_splits_path,
-        num_workers=0,
-        debug_run=True,
-    )
-    expected = math.ceil(_N_DEBUG / cfg.train_loader.batch_size)
-    assert len(train_loader) == expected
-
-
-def test_make_data_loaders_debug_batch_atom_positions_shape(
-    cfg: TrainConfig, debug_jsonl_path: str, debug_splits_path: str
-):
-    """Debug-mode batches have atom_positions shape (batch_size, _MAX_SEQ, 37, 3)."""
-    train_loader, _, _ = make_data_loaders(
-        cfg=cfg,
-        jsonl_path=debug_jsonl_path,
-        splits_path=debug_splits_path,
-        num_workers=0,
-        debug_run=True,
-    )
-    batch = next(iter(train_loader))
-    assert batch.atom_positions.shape == (cfg.train_loader.batch_size, _MAX_SEQ, 37, 3)
-
-
-def test_make_data_loaders_debug_batch_seq_is_list_of_strings(
-    cfg: TrainConfig, debug_jsonl_path: str, debug_splits_path: str
-):
-    """Debug-mode batches collate seq into a list of str, one per batch item."""
-    train_loader, _, _ = make_data_loaders(
-        cfg=cfg,
-        jsonl_path=debug_jsonl_path,
-        splits_path=debug_splits_path,
-        num_workers=0,
-        debug_run=True,
-    )
-    batch = next(iter(train_loader))
-    assert isinstance(batch.seq, list)
-    assert all(isinstance(s, str) for s in batch.seq)
-
-
-# ---------------------------------------------------------------------------
-# make_ddp_data_loaders
-# ---------------------------------------------------------------------------
-
-
-def test_make_ddp_data_loaders_returns_three_loaders(
-    cfg: TrainConfig, jsonl_path: str, splits_path: str
-):
-    """make_ddp_data_loaders returns non-None train, val, and test DataLoaders."""
-    train_loader, val_loader, test_loader = make_ddp_data_loaders(
-        cfg, jsonl_path, splits_path, rank=0, world_size=1
-    )
-    assert train_loader is not None
-    assert val_loader is not None
-    assert test_loader is not None
-
-
-def test_make_ddp_data_loaders_train_sampler_is_distributed(
-    cfg: TrainConfig, jsonl_path: str, splits_path: str
-):
-    """make_ddp_data_loaders wraps the train dataset in a DistributedSampler."""
-    train_loader, _, _ = make_ddp_data_loaders(cfg, jsonl_path, splits_path, rank=0, world_size=1)
-    assert isinstance(train_loader.sampler, DistributedSampler)
-
-
-def test_make_ddp_data_loaders_val_sampler_is_distributed(
-    cfg: TrainConfig, jsonl_path: str, splits_path: str
-):
-    """make_ddp_data_loaders wraps the validation dataset in a DistributedSampler."""
-    _, val_loader, _ = make_ddp_data_loaders(cfg, jsonl_path, splits_path, rank=0, world_size=1)
-    assert isinstance(val_loader.sampler, DistributedSampler)
-
-
-def test_make_ddp_data_loaders_test_sampler_is_distributed(
-    cfg: TrainConfig, jsonl_path: str, splits_path: str
-):
-    """make_ddp_data_loaders wraps the test dataset in a DistributedSampler."""
-    _, _, test_loader = make_ddp_data_loaders(cfg, jsonl_path, splits_path, rank=0, world_size=1)
-    assert isinstance(test_loader.sampler, DistributedSampler)
-
-
-def test_make_ddp_data_loaders_train_sampler_shuffle_true(
-    cfg: TrainConfig, jsonl_path: str, splits_path: str
-):
-    """make_ddp_data_loaders sets shuffle=True on the train DistributedSampler."""
-    train_loader, _, _ = make_ddp_data_loaders(cfg, jsonl_path, splits_path, rank=0, world_size=1)
-    assert isinstance(train_loader.sampler, DistributedSampler)
-    assert train_loader.sampler.shuffle is True
-
-
-def test_make_ddp_data_loaders_val_sampler_shuffle_false(
-    cfg: TrainConfig, jsonl_path: str, splits_path: str
-):
-    """make_ddp_data_loaders sets shuffle=False on the validation DistributedSampler."""
-    _, val_loader, _ = make_ddp_data_loaders(cfg, jsonl_path, splits_path, rank=0, world_size=1)
-    assert isinstance(val_loader.sampler, DistributedSampler)
-    assert val_loader.sampler.shuffle is False
-
-
-def test_make_ddp_data_loaders_test_sampler_shuffle_false(
-    cfg: TrainConfig, jsonl_path: str, splits_path: str
-):
-    """make_ddp_data_loaders sets shuffle=False on the test DistributedSampler."""
-    _, _, test_loader = make_ddp_data_loaders(cfg, jsonl_path, splits_path, rank=0, world_size=1)
-    assert isinstance(test_loader.sampler, DistributedSampler)
-    assert test_loader.sampler.shuffle is False
-
-
-def test_make_ddp_data_loaders_train_sampler_rank(
-    cfg: TrainConfig, jsonl_path: str, splits_path: str
-):
-    """make_ddp_data_loaders propagates rank=0 to the train DistributedSampler."""
-    train_loader, _, _ = make_ddp_data_loaders(cfg, jsonl_path, splits_path, rank=0, world_size=2)
-    assert isinstance(train_loader.sampler, DistributedSampler)
-    assert train_loader.sampler.rank == 0
-
-
-def test_make_ddp_data_loaders_train_sampler_world_size(
-    cfg: TrainConfig, jsonl_path: str, splits_path: str
-):
-    """make_ddp_data_loaders propagates world_size=2 to the train DistributedSampler."""
-    train_loader, _, _ = make_ddp_data_loaders(cfg, jsonl_path, splits_path, rank=0, world_size=2)
-    assert isinstance(train_loader.sampler, DistributedSampler)
-    assert train_loader.sampler.num_replicas == 2
 
 
 # ---------------------------------------------------------------------------

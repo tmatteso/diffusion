@@ -49,7 +49,7 @@ class SampleConfig(BaseModel):
 
     model: ModelParams = Field(default_factory=ModelParams)
     noise: NoiseScheduleParams = Field(default_factory=NoiseScheduleParams)
-    sampler: SamplerParams = Field(default_factory=lambda: SamplerParams())
-    generation: GenerationParams = Field(default_factory=lambda: GenerationParams())
+    sampler: SamplerParams = Field(default_factory=SamplerParams)
+    generation: GenerationParams = Field(default_factory=GenerationParams)
     checkpoint: SampleCheckpointParams = Field(default_factory=SampleCheckpointParams)
     output: SampleOutputParams = Field(default_factory=SampleOutputParams)

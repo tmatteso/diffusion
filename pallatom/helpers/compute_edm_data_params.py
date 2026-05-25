@@ -6,7 +6,7 @@ from collections.abc import Mapping
 import numpy as np
 import torch
 from einops import rearrange, reduce
-from helpers.data import make_data_loaders
+from helpers.data import make_bucketed_data_loaders
 from helpers.featurize import ProteinBatch
 from jaxtyping import Float
 from train.train_config import TrainConfig
@@ -100,7 +100,7 @@ if __name__ == "__main__":
     else:
         tcfg = TrainConfig()
 
-    train_loader, _, _ = make_data_loaders(
+    train_loader, _, _ = make_bucketed_data_loaders(
         cfg=tcfg,
         jsonl_path=args.data,
         splits_path=args.splits,

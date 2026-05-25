@@ -398,7 +398,7 @@ def test_loss_rejects_nonpositive_smooth_lddt_cutoff():
 
 def test_checkpoint_default_values(checkpoint: CheckpointParams):
     """CheckpointParams defaults match the expected path and save-frequency settings."""
-    assert checkpoint.checkpoint_path == "pallatom_best_best.pt"
+    assert checkpoint.checkpoint_path == "pallatom_best.pt"
     assert checkpoint.save_every == 1
 
 
@@ -420,15 +420,8 @@ def test_checkpoint_rejects_negative_save_every():
 
 def test_logging_default_values(logging_: LoggingParams):
     """LoggingParams defaults match the expected logging frequency and W&B settings."""
-    assert logging_.log_interval == 1
     assert logging_.use_wandb is True
     assert logging_.wandb_project == "pallatom-training"
-
-
-def test_logging_rejects_zero_log_interval():
-    """LoggingParams raises ValidationError when log_interval is zero."""
-    with pytest.raises(ValidationError):
-        LoggingParams(log_interval=0)
 
 
 def test_logging_accepts_wandb_enabled():

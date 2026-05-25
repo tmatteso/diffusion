@@ -28,9 +28,48 @@ from architecture.node_update import NodeUpdate
 from architecture.pair_update import PairUpdate
 from architecture.template_embedder import TemplateEmbedder
 from beartype import beartype
-from einops import rearrange
-from helpers.featurize import FeaturizedBatch  # re-exported for callers
+from einops import rearrange, repeat
+from helpers.batch_types import FeaturizedBatch
 from jaxtyping import Bool, Float, Int, jaxtyped
+
+# ---------------------------------------------------------------------------
+# EmbeddedInputs — output of MainTrunk.embed_inputs (steps 1-8)
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class EmbeddedInputs:
+    """Initial embeddings produced by MainTrunk.embed_inputs before the decoder loop."""
+
+    s_i: Float[torch.Tensor, "B N_res c_res"]
+    t_i: Float[torch.Tensor, "B N_res c_res"]
+    z_ij: Float[torch.Tensor, "B N_res N_res c_pair"]
+    q_skip: Float[torch.Tensor, "B N_atom c_atom"]
+    c_skip: Float[torch.Tensor, "B N_atom c_atom"]
+    p_skip: Float[torch.Tensor, "B N_atom K c_atompair"]
+    c_l: Float[torch.Tensor, "B N_atom c_atom"]
+    r_input: Float[torch.Tensor, "B N_atom 3"]
+    tok_idx: Int[torch.Tensor, "B N_atom"]
+    center_uid: Int[torch.Tensor, "B N_res"]
+    t_hat: float
+    B: int
+    N_atom: int
+    N_res: int
+    device: torch.device
+    denom: float
+
+
+@jaxtyped(typechecker=beartype)
+@dataclasses.dataclass(frozen=True)
+class PredictedOutputs:
+    """Batched outputs from a single forward pass of MainTrunk."""
+
+    r_denoised: Float[torch.Tensor, "B N_atom 3"]
+    seq_logits: Float[torch.Tensor, "B N_res n_amino"]
+    residue_distogram_logits: Float[torch.Tensor, "B N_res N_res n_bins"]
+    atom_distogram_logits: Float[torch.Tensor, "B N_atom K n_atom_bins"]
+    intermediate_denoised_coord_stack: list[Float[torch.Tensor, "B N_atom 3"]]
+    intermediate_pred_aa_logit_stack: list[Float[torch.Tensor, "B N_res n_amino"]]
 
 
 @jaxtyped(typechecker=beartype)
@@ -53,11 +92,11 @@ def scatter_mean(
     flat_src: Float[torch.Tensor, "BN_src C"] = rearrange(src, "b n c -> (b n) c")
 
     sum_flat: Float[torch.Tensor, "BN_target C"] = torch.zeros(num_segments, C, device=device)
-    sum_flat.scatter_add_(0, flat_index.unsqueeze(1).expand(-1, C), flat_src)
+    sum_flat.scatter_add_(0, repeat(flat_index, "n -> n c", c=C), flat_src)
 
     cnt_flat: Float[torch.Tensor, "BN_target 1"] = torch.zeros(num_segments, 1, device=device)
     cnt_flat.scatter_add_(
-        0, flat_index.unsqueeze(1), torch.ones(flat_index.size(0), 1, device=device)
+        0, rearrange(flat_index, "n -> n 1"), torch.ones(flat_index.size(0), 1, device=device)
     )
 
     result: Float[torch.Tensor, "B N_target C"] = rearrange(
@@ -93,7 +132,7 @@ class TimeFourierEmbedding(nn.Module):
             Projected Fourier embedding of shape (*x.shape, c_res).
         """
         # x: any leading shape; last dim expanded to c_res
-        angles = 2 * math.pi * x.unsqueeze(-1) * self.freqs  # (..., c_res//2)
+        angles = 2 * math.pi * rearrange(x, "... -> ... 1") * self.freqs  # (..., c_res//2)
         emb = torch.cat([torch.sin(angles), torch.cos(angles)], dim=-1)
         return self.proj(emb)
 
@@ -129,7 +168,7 @@ class RelativePositionEncoding(nn.Module):
             Pair embedding of shape (N_token, N_token, c_pair).
         """
         idx = torch.arange(N_token, device=device)
-        diff = idx.unsqueeze(1) - idx.unsqueeze(0)  # (N, N)
+        diff = rearrange(idx, "n -> n 1") - rearrange(idx, "n -> 1 n")  # (N, N)
         diff = diff.clamp(-self.max_rel, self.max_rel) + self.max_rel  # shift to [0, 2R]
         n_bins = 2 * self.max_rel + 1
         onehot = F.one_hot(diff, num_classes=n_bins).float()  # (N, N, n_bins)
@@ -193,8 +232,8 @@ class ResidueDistogramHead(nn.Module):
         """Convenience: compute cross-entropy loss against ground-truth positions."""
         logits = self.forward(z)
         return F.cross_entropy(
-            logits.reshape(-1, self.n_bins),
-            targets.reshape(-1, self.n_bins),
+            rearrange(logits, "b n1 n2 k -> (b n1 n2) k"),
+            rearrange(targets, "b n1 n2 k -> (b n1 n2) k"),
         )
 
 
@@ -243,7 +282,7 @@ class AtomDistogramHead(nn.Module):
     def _local_mask(self, N_atom: int, device: torch.device) -> Bool[torch.Tensor, "N_atom N_atom"]:
         """Boolean mask (N_atom, N_atom): True where |i-j| <= window//2."""
         idx = torch.arange(N_atom, device=device)
-        dist = (idx.unsqueeze(0) - idx.unsqueeze(1)).abs()  # (N, N)
+        dist = (rearrange(idx, "n -> 1 n") - rearrange(idx, "n -> n 1")).abs()  # (N, N)
         return dist <= (self.window // 2)  # (N, N) bool
 
     def forward(
@@ -277,33 +316,6 @@ class AtomDistogramHead(nn.Module):
         targets_local = targets[mask]  # (M, n_bins)
 
         return F.cross_entropy(logits_local, targets_local)
-
-
-# ---------------------------------------------------------------------------
-# EmbeddedInputs — output of MainTrunk.embed_inputs (steps 1-8)
-# ---------------------------------------------------------------------------
-
-
-@dataclasses.dataclass(frozen=True)
-class EmbeddedInputs:
-    """Initial embeddings produced by MainTrunk.embed_inputs before the decoder loop."""
-
-    s_i: Float[torch.Tensor, "B N_res c_res"]
-    t_i: Float[torch.Tensor, "B N_res c_res"]
-    z_ij: Float[torch.Tensor, "B N_res N_res c_pair"]
-    q_skip: Float[torch.Tensor, "B N_atom c_atom"]
-    c_skip: Float[torch.Tensor, "B N_atom c_atom"]
-    p_skip: Float[torch.Tensor, "B N_atom K c_atompair"]
-    c_l: Float[torch.Tensor, "B N_atom c_atom"]
-    r_input: Float[torch.Tensor, "B N_atom 3"]
-    tok_idx: Int[torch.Tensor, "B N_atom"]
-    center_uid: Int[torch.Tensor, "B N_res"]
-    t_hat: float
-    B: int
-    N_atom: int
-    N_res: int
-    device: torch.device
-    denom: float
 
 
 # ---------------------------------------------------------------------------
@@ -481,8 +493,8 @@ class MainTrunk(nn.Module):
         # expanded to [B, N_res, N_res, c_pair]
         # ------------------------------------------------------------------
         z_ij_base: Float[torch.Tensor, "N_res N_res c_pair"] = self.rel_pos_enc(N_res, device)
-        z_ij: Float[torch.Tensor, "B N_res N_res c_pair"] = z_ij_base.unsqueeze(0).expand(
-            B, -1, -1, -1
+        z_ij: Float[torch.Tensor, "B N_res N_res c_pair"] = repeat(
+            z_ij_base, "n1 n2 c -> b n1 n2 c", b=B
         )
 
         # ------------------------------------------------------------------
@@ -540,14 +552,7 @@ class MainTrunk(nn.Module):
 
     # ----------------------------------------------------------------------
     @jaxtyped(typechecker=beartype)
-    def forward(self, batch: FeaturizedBatch) -> tuple[
-        Float[torch.Tensor, "B N_atom 3"],
-        Float[torch.Tensor, "B N_res n_amino"],
-        Float[torch.Tensor, "B N_res N_res n_bins"],
-        Float[torch.Tensor, "B N_atom K n_atom_bins"],
-        list[Float[torch.Tensor, "B N_atom 3"]],
-        list[Float[torch.Tensor, "B N_res n_amino"]],
-    ]:
+    def forward(self, batch: FeaturizedBatch) -> PredictedOutputs:
         """Run full denoising trunk and return predicted coords, sequence and distogram logits."""
         emb = self.embed_inputs(batch)
         s_i = emb.s_i
@@ -571,7 +576,7 @@ class MainTrunk(nn.Module):
 
         # Vectorized tok_idx offset base (reused for every scatter in the loop)
         tok_offset_base: Int[torch.Tensor, "B N_atom"] = (
-            emb.tok_idx + torch.arange(emb.B, device=emb.device).unsqueeze(1) * emb.N_res
+            emb.tok_idx + rearrange(torch.arange(emb.B, device=emb.device), "b -> b 1") * emb.N_res
         )
 
         for k in range(self.K_unit):
@@ -642,11 +647,11 @@ class MainTrunk(nn.Module):
         # Step 19: f_seq_logits = LinearNoBias(a_i)             [B, N_res, n_amino]
         f_seq_logits: Float[torch.Tensor, "B N_res n_amino"] = self.seq_logits(a_i)
 
-        return (
-            r_denoised,
-            f_seq_logits,
-            residue_distogram_logits,
-            atom_distogram_logits,
-            intermediate_denoised_coord_stack,
-            intermediate_pred_aa_logit_stack,
+        return PredictedOutputs(
+            r_denoised=r_denoised,
+            seq_logits=f_seq_logits,
+            residue_distogram_logits=residue_distogram_logits,
+            atom_distogram_logits=atom_distogram_logits,
+            intermediate_denoised_coord_stack=intermediate_denoised_coord_stack,
+            intermediate_pred_aa_logit_stack=intermediate_pred_aa_logit_stack,
         )

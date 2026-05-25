@@ -14,7 +14,7 @@ from typing import Literal, overload
 
 import torch
 from beartype import beartype
-from einops import rearrange, reduce
+from einops import einsum, rearrange, reduce
 from jaxtyping import Bool, Float, jaxtyped
 
 # ---------------------------------------------------------------------------
@@ -52,26 +52,28 @@ def kabsch_rotation(
     """
     if weights is not None:
         w = weights / (reduce(weights, "... n -> ... 1", "sum") + 1e-8)
-        h = torch.einsum("...ni,...nj->...ij", mobile * rearrange(w, "... n -> ... n 1"), reference)
+        h = einsum(
+            mobile * rearrange(w, "... n -> ... n 1"), reference, "... n i, ... n j -> ... i j"
+        )
     else:
-        h = torch.einsum("...ni,...nj->...ij", mobile, reference)
+        h = einsum(mobile, reference, "... n i, ... n j -> ... i j")
 
     # SVD:  H = U S V^T
-    u, s, v_h = torch.linalg.svd(h)  # (...,3,3), (...,3), (...,3,3)
+    u, _, v_h = torch.linalg.svd(h)  # (...,3,3), (...,3), (...,3,3)
     v = v_h.mH  # V = Vh^H (conjugate transpose)
 
     # Correct for improper rotation (reflection) when det < 0
-    det = torch.linalg.det(torch.einsum("...ij,...jk->...ik", v, u.mH))
+    det = torch.linalg.det(einsum(v, u.mH, "... i j, ... j k -> ... i k"))
     sign = torch.ones_like(det)
     sign[det < 0] = -1.0
 
     # Build diagonal correction matrix: diag(1, 1, sign)
     ones = torch.ones(*sign.shape, 2, device=mobile.device, dtype=mobile.dtype)
-    diag_vals = torch.cat([ones, sign.unsqueeze(-1)], dim=-1)  # (..., 3)
+    diag_vals = torch.cat([ones, rearrange(sign, "... -> ... 1")], dim=-1)  # (..., 3)
     diag = torch.diag_embed(diag_vals)  # (..., 3, 3)
 
-    v_diag = torch.einsum("...ij,...jk->...ik", v, diag)
-    return torch.einsum("...ij,...jk->...ik", v_diag, u.mH)  # (..., 3, 3)
+    v_diag = einsum(v, diag, "... i j, ... j k -> ... i k")
+    return einsum(v_diag, u.mH, "... i j, ... j k -> ... i k")  # (..., 3, 3)
 
 
 @overload
@@ -155,7 +157,7 @@ def kabsch_align(
 
     # ---- 4. Apply transform -------------------------------------------
     # aligned = P @ R^T + c_target
-    aligned = torch.einsum("...ni,...ij->...nj", P, R.mH) + c_target
+    aligned = einsum(P, R.mH, "... n i, ... i j -> ... n j") + c_target
 
     if return_transform:
         return aligned, R, c_mobile, c_target
@@ -262,4 +264,4 @@ def apply_transform(
     Returns:
         (..., M, 3) — transformed coordinates.
     """
-    return torch.einsum("...mi,...ij->...mj", coords - t_from, R.mH) + t_to
+    return einsum(coords - t_from, R.mH, "... m i, ... i j -> ... m j") + t_to
