@@ -116,6 +116,27 @@ weight, making sequence-local attention equivalent to independent self-attention
 within each rectangular diagonal block. This rules out silent cross-block information
 leakage from buggy beta computation.
 
+**`test_atom_transformer_gradient_isolation`**
+
+**Setup:** Same as above (`n_queries = n_keys = 4`, `N = 8`, dense `neighbor_idx`,
+all-True `valid_mask`).
+
+**Procedure:**
+
+1. Create `q` with `requires_grad=True`, `c` with `requires_grad=True`.
+2. Run `AtomTransformer.forward` → `out` of shape `[B, N, C_atom]`.
+3. Backprop only from block-0 outputs: `out[:, :4, :].sum().backward()`.
+4. Assert `q.grad[:, 4:, :].abs().max() == 0` and `c.grad[:, 4:, :].abs().max() == 0`.
+
+**What it proves:** The backward pass also respects block boundaries. For `q.grad[m]`
+to be non-zero, there must be a path from `q[m]` (block 1) to the loss (block 0
+outputs). Both candidate paths are closed: the softmax gradient for a cross-block
+pair is `s_{lm}(δ − s_{lm}) = 0` when `s_{lm} = 0` exactly (float32 underflow);
+and `ConditionedTransitionBlock` is pointwise, coupling no atoms across positions.
+This test catches bugs that the forward invariance test cannot — for example, an
+accidental all-atom LayerNorm would leave forward outputs approximately unchanged
+but would couple gradients across blocks.
+
 ---
 
 ## Non-goals
