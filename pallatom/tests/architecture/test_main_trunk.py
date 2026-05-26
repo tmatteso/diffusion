@@ -9,6 +9,7 @@ from architecture.losses import (
     atom_loss,
     distogram_loss_atom,
     distogram_loss_residue,
+    seq_ce_loss,
     smooth_lddt_loss,
 )
 from architecture.main_trunk import (
@@ -174,6 +175,8 @@ def gt_atom_distogram_mask_sparse() -> Bool[torch.Tensor, "B N_atom K_sparse"]:
 # ---------------------------------------------------------------------------
 
 
+# absolute garbage. this is a fixturized function. it should yield an
+# output object for use in tests with no given input
 @pytest.fixture
 def featurized_batch(
     ref_pos: Float[torch.Tensor, "B N_atom 3"],
@@ -340,13 +343,6 @@ def test_main_trunk_r_denoised_shape_finite(model: MainTrunk, featurized_batch: 
     assert torch.isfinite(out.r_denoised).all()
 
 
-def test_main_trunk_seq_logits_shape_finite(model: MainTrunk, featurized_batch: FeaturizedBatch):
-    """The sequence prediction head returns [B, N_res, 20] amino-acid logits with no NaN or Inf."""
-    out = _forward(model, featurized_batch)
-    assert out.seq_logits.shape == (B, N_RES, 20)
-    assert torch.isfinite(out.seq_logits).all()
-
-
 def test_main_trunk_residue_distogram_shape_finite(
     model: MainTrunk, featurized_batch: FeaturizedBatch
 ):
@@ -392,11 +388,21 @@ def test_main_trunk_distogram_loss_atom_computable(
     assert torch.isfinite(loss)
 
 
-def test_main_trunk_intermediate_stack_lengths(model: MainTrunk, featurized_batch: FeaturizedBatch):
-    """The intermediate coordinate and amino-acid stacks each contain exactly K_unit entries."""
+def test_main_trunk_sequence_head_shapes_and_vocab_bound(
+    model: MainTrunk, featurized_batch: FeaturizedBatch
+) -> None:
+    """Sequence head output has correct shape, is finite, and never predicts the X/null slot."""
     out = _forward(model, featurized_batch)
+
+    assert out.seq_logits.shape == (B, N_RES, 20)
+    assert torch.isfinite(out.seq_logits).all()
+    assert out.seq_logits.argmax(dim=-1).max() < 20  # X is never the argmax
+
     assert len(out.intermediate_denoised_coord_stack) == K_UNIT
     assert len(out.intermediate_pred_aa_logit_stack) == K_UNIT
+    for inter_logits in out.intermediate_pred_aa_logit_stack:
+        assert inter_logits.shape == (B, N_RES, 20)
+        assert inter_logits.argmax(dim=-1).max() < 20  # X is never the argmax
 
 
 def test_main_trunk_intermediate_coords_shape_finite(
@@ -467,10 +473,7 @@ def test_integration_gradient_flow_composite_loss(
     kabsch_loss = atom_loss(
         pred.r_denoised, featurized_batch.r_gt, featurized_batch.atom5_mask
     ).mean()
-    ce_loss = F.cross_entropy(
-        rearrange(pred.seq_logits, "b n c -> (b n) c"),
-        rearrange(featurized_batch.aa_indices, "b n -> (b n)"),
-    )
+    ce_loss = seq_ce_loss(pred.seq_logits, featurized_batch.aa_indices)
     lddt = smooth_lddt_loss(
         pred.r_denoised, featurized_batch.r_gt, featurized_batch.atom5_mask, cutoff=15.0
     )
@@ -498,10 +501,7 @@ def test_integration_gradient_flow_composite_loss(
         gamma: float = 0.99 ** (K_unit - k_idx - 1)
         k_loss = atom_loss(
             inter_coords, featurized_batch.r_gt, featurized_batch.atom5_mask
-        ) + F.cross_entropy(
-            rearrange(inter_logits, "b n c -> (b n) c"),
-            rearrange(featurized_batch.aa_indices, "b n -> (b n)"),
-        )
+        ) + seq_ce_loss(inter_logits, featurized_batch.aa_indices)
         intermediate_loss = intermediate_loss + gamma * k_loss
     intermediate_loss = (intermediate_loss / max(K_unit, 1)).mean()
 
