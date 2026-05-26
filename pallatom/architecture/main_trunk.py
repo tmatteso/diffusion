@@ -209,7 +209,7 @@ class ResidueDistogramHead(nn.Module):
         self.d_min = d_min
         self.d_max = d_max
 
-        self.norm = nn.LayerNorm(c_pair)
+        self.layer_norm = nn.LayerNorm(c_pair)
         self.proj1 = LinearNoBias(c_pair, c_pair)
         self.proj2 = LinearNoBias(c_pair, n_bins)
 
@@ -220,7 +220,7 @@ class ResidueDistogramHead(nn.Module):
         # Symmetrise: z_ij_sym = (z_ij + z_ji) / 2
         # transpose(-3, -2) swaps the two N_token dims regardless of leading B
         z_sym = (z + z.transpose(-3, -2)) * 0.5
-        x = self.norm(z_sym)
+        x = self.layer_norm(z_sym)
         x = F.relu(self.proj1(x))
         return self.proj2(x)
 
@@ -275,7 +275,7 @@ class AtomDistogramHead(nn.Module):
         self.d_max = d_max
         self.window = 5 * atoms_per_res  # 5L
 
-        self.norm = nn.LayerNorm(c_atompair)
+        self.layer_norm = nn.LayerNorm(c_atompair)
         self.proj1 = LinearNoBias(c_atompair, c_atompair)
         self.proj2 = LinearNoBias(c_atompair, n_bins)
 
@@ -296,7 +296,7 @@ class AtomDistogramHead(nn.Module):
         mask   : (N_atom, N_atom)          — True for pairs inside the local window
         """
         N = p.size(0)
-        x = self.norm(p)
+        x = self.layer_norm(p)
         x = F.relu(self.proj1(x))
         logits = self.proj2(x)  # (N, N, n_bins)
 
@@ -469,12 +469,13 @@ class MainTrunk(nn.Module):
 
         # ------------------------------------------------------------------
         # Step 2b: s_init += aa_embedding(aa_indices)
-        # Clamp to [0, 20]: padding residues have aa_indices=-100 which clamps to 0
-        # (padding is excluded from all downstream losses; embedding value doesn't matter).
-        # Dropout-masked residues have aa_indices=20 and get the learned "X" embedding.
+        # Padding (aa_indices = -100) → zero vector via the valid gate.
+        # PDB-X / conditioning-dropped (aa_indices = 20) → aa_embedding[20] (null embedding).
+        # Real AAs (0-19) -> their embedding.
         # ------------------------------------------------------------------
-        aa_idx_clamped: Int[torch.Tensor, "B N_res"] = aa_indices.clamp(min=0, max=20)
-        s_init = s_init + self.aa_embedding(aa_idx_clamped)
+        valid: Bool[torch.Tensor, "B N_res"] = aa_indices >= 0
+        emb: Float[torch.Tensor, "B N_res c_res"] = self.aa_embedding(aa_indices.clamp(0, 20))
+        s_init = s_init + emb * rearrange(valid.float(), "b n -> b n 1")
 
         # ------------------------------------------------------------------
         # Step 3: t_i = TimeFourierEmbedding(¼·log(t̂/sigma_data))  [B, N_res, c_res]
@@ -611,6 +612,7 @@ class MainTrunk(nn.Module):
             intermediate_denoised_coord_stack.append(r_denoised)
 
             # Intermediate aa logits: scatter c_l atoms to residues [B, N_res, n_amino]
+            # n_amino should be 0-19 -> 20
             proj_c: Float[torch.Tensor, "B N_atom c_res"] = F.relu(self.inter_proj_seq[k](c_l))
             a_inter: Float[torch.Tensor, "B N_res c_res"] = scatter_mean(
                 proj_c, tok_offset_base, emb.B * emb.N_res, emb.B
