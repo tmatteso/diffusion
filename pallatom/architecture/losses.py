@@ -400,3 +400,34 @@ def distogram_loss_atom(
 # y_atom = F.one_hot(torch.randint(0, B_atom, (B, N_atoms, N_atoms)), num_classes=B_atom).float()
 # loss_atom_local = distogram_loss_atom(logits_atom, y_atom, local_mask).mean().item()
 # loss_atom_perfect = distogram_loss_atom(y_atom * 1e6, y_atom, local_mask).mean().item()
+
+
+# ---------------------------------------------------------------------------
+# Sequence cross-entropy loss
+# ---------------------------------------------------------------------------
+
+
+@jaxtyped(typechecker=beartype)
+def seq_ce_loss(
+    logits: Float[torch.Tensor, "B N_res n_amino"],
+    aa_indices: Int[torch.Tensor, "B N_res"],
+) -> Float[torch.Tensor, ""]:
+    """CE loss for the sequence head; ignores padding and null/unknown tokens.
+
+    Positions are ignored when aa_indices < 0 (padding) or aa_indices >= n_amino
+    (PDB-X at index 20, conditioning-dropped at index 20). Only real visible amino
+    acids (indices 0 to n_amino-1) contribute to the loss.
+
+    Args:
+        logits: Sequence logits from any head (final or intermediate).
+        aa_indices: Per-residue amino acid indices, post-conditioning-dropout.
+
+    Returns:
+        Scalar mean CE loss over all valid positions.
+    """
+    n_amino: int = logits.size(-1)
+    targets: Int[torch.Tensor, "B N_res"] = aa_indices.masked_fill(aa_indices >= n_amino, -100)
+    return F.cross_entropy(
+        rearrange(logits, "b n c -> (b n) c"),
+        rearrange(targets, "b n -> (b n)"),
+    )

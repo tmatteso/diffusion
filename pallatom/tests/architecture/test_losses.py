@@ -10,6 +10,7 @@ from architecture.losses import (
     med_loss,
     med_loss_per_block,
     pairwise_dist,
+    seq_ce_loss,
     smooth_lddt_loss,
 )
 from beartype import beartype
@@ -650,3 +651,25 @@ def test_distogram_loss_atom_wrong_shape() -> None:
     y = torch.zeros(N_ATOMS, K, dtype=torch.long)
     with pytest.raises(TypeCheckError):
         distogram_loss_atom(q_bad, y)
+
+
+# ---------------------------------------------------------------------------
+# seq_ce_loss
+# ---------------------------------------------------------------------------
+
+
+def test_seq_ce_loss_scalar_output() -> None:
+    """seq_ce_loss returns a 0-dim scalar for batched logits and indices."""
+    logits: Float[torch.Tensor, "B N VOCAB"] = torch.randn(B, N, VOCAB)
+    indices: Int[torch.Tensor, "B N"] = torch.randint(0, VOCAB, (B, N))
+    loss: Float[torch.Tensor, ""] = seq_ce_loss(logits, indices)
+    assert loss.ndim == 0
+    assert torch.isfinite(loss)
+
+
+def test_seq_ce_loss_wrong_rank() -> None:
+    """3-D logits with a 1-D index tensor triggers TypeCheckError."""
+    logits_bad: Float[torch.Tensor, "B N VOCAB"] = torch.randn(B, N, VOCAB)
+    indices_bad: Int[torch.Tensor, "N"] = torch.randint(0, VOCAB, (N,))
+    with pytest.raises(TypeCheckError):
+        seq_ce_loss(logits_bad, indices_bad)
