@@ -10,6 +10,7 @@ from architecture.atom_transformers import (
     ConditionedTransitionBlock,
     DiffusionTransformer,
     build_sparse_pairs,
+    compute_beta,
 )
 from beartype import beartype
 from einops import einsum, rearrange, reduce, repeat
@@ -283,6 +284,135 @@ def test_build_sparse_pairs_window_excludes_far_atoms():
 
 
 # ---------------------------------------------------------------------------
+# compute_beta
+# ---------------------------------------------------------------------------
+
+
+def test_compute_beta_output_shape(
+    neighbor_idx: Int[torch.Tensor, "N_atom K"],
+    valid_mask: Bool[torch.Tensor, "B N_atom K"],
+) -> None:
+    """compute_beta returns a float tensor of shape [B, N_atom, K] with matching dtype."""
+    ref = torch.randn(B, N_ATOM, C_ATOM)
+    beta = compute_beta(neighbor_idx, valid_mask, n_queries=32, n_keys=128, ref=ref)
+    assert beta.shape == (B, N_ATOM, K)
+    assert beta.dtype == ref.dtype
+
+
+def test_compute_beta_values_are_binary(
+    neighbor_idx: Int[torch.Tensor, "N_atom K"],
+    valid_mask: Bool[torch.Tensor, "B N_atom K"],
+) -> None:
+    """Every element of beta is exactly 0.0 or -1e10; no intermediate values."""
+    ref = torch.randn(B, N_ATOM, C_ATOM)
+    beta = compute_beta(neighbor_idx, valid_mask, n_queries=32, n_keys=128, ref=ref)
+    assert ((beta == 0.0) | (beta == -1e10)).all()
+
+
+def test_compute_beta_zero_for_near_atoms() -> None:
+    """An atom pair sharing a window centre receives beta=0.0.
+
+    n_queries=4, n_keys=8: centre 0 at 1.5 (half_q=2.0, half_k=4.0).
+    l=0: |0-1.5|=1.5 < 2.0 → query; m=1: |1-1.5|=0.5 < 4.0 → key → beta=0.0.
+    """
+    N_t, n_q, n_k, B_t = 8, 4, 8, 1
+    neighbor_idx_t = repeat(torch.arange(N_t), "k -> n k", n=N_t)
+    valid_mask_t = torch.ones(B_t, N_t, N_t, dtype=torch.bool)
+    ref = torch.zeros(B_t, N_t, C_ATOM)
+    beta = compute_beta(neighbor_idx_t, valid_mask_t, n_queries=n_q, n_keys=n_k, ref=ref)
+    assert beta[0, 0, 1].item() == 0.0
+
+
+def test_compute_beta_large_neg_for_far_atoms() -> None:
+    """An atom pair from disjoint windows receives beta=-1e10.
+
+    n_queries=n_keys=4: centres at 1.5 and 5.5 (half_q=half_k=2.0).
+    l=0 is a query for centre 0 (|0-1.5|=1.5<2.0).
+    m=7: |7-1.5|=5.5 > 2.0 → not a key for centre 0.
+    l=0: |0-5.5|=5.5 > 2.0 → not a query for centre 1.
+    No centre admits this pair → beta=-1e10.
+    """
+    N_t, n_q, n_k, B_t = 8, 4, 4, 1
+    neighbor_idx_t = repeat(torch.arange(N_t), "k -> n k", n=N_t)
+    valid_mask_t = torch.ones(B_t, N_t, N_t, dtype=torch.bool)
+    ref = torch.zeros(B_t, N_t, C_ATOM)
+    beta = compute_beta(neighbor_idx_t, valid_mask_t, n_queries=n_q, n_keys=n_k, ref=ref)
+    assert beta[0, 0, 7].item() == -1e10
+
+
+def test_compute_beta_valid_mask_forces_neg() -> None:
+    """valid_mask=False gives -1e10 even if the pair is geometrically in-window."""
+    N_t, n_q, n_k, B_t = 8, 4, 8, 1
+    neighbor_idx_t = repeat(torch.arange(N_t), "k -> n k", n=N_t)
+    valid_mask_t = torch.ones(B_t, N_t, N_t, dtype=torch.bool)
+    valid_mask_t[0, 0, 1] = False  # pair (l=0, m=1) is in-window but masked
+    ref = torch.zeros(B_t, N_t, C_ATOM)
+    beta = compute_beta(neighbor_idx_t, valid_mask_t, n_queries=n_q, n_keys=n_k, ref=ref)
+    assert beta[0, 0, 1].item() == -1e10  # mask wins over geometry
+    assert beta[0, 0, 0].item() == 0.0  # unmasked in-window pair is unaffected
+
+
+def test_compute_beta_boundary_exclusive() -> None:
+    """The window boundary is strict (<): the atom just outside is excluded.
+
+    With n_queries=n_keys=4, centres are at 1.5 and 5.5 (half_q=half_k=2.0).
+    Atom 3 is the last query for centre 0; atom 4 is the first query for centre 1.
+    Pair (l=3, m=4):
+      centre 0: l=3 is query (|3-1.5|=1.5<2), m=4 is NOT key (|4-1.5|=2.5>2)
+      centre 1: l=3 is NOT query (|3-5.5|=2.5>2)
+    → beta=-1e10.
+    Pair (l=3, m=3): centre 0 admits both → beta=0.0.
+    """
+    N_t, n_q, n_k, B_t = 8, 4, 4, 1
+    neighbor_idx_t = repeat(torch.arange(N_t), "k -> n k", n=N_t)
+    valid_mask_t = torch.ones(B_t, N_t, N_t, dtype=torch.bool)
+    ref = torch.zeros(B_t, N_t, C_ATOM)
+    beta = compute_beta(neighbor_idx_t, valid_mask_t, n_queries=n_q, n_keys=n_k, ref=ref)
+    assert beta[0, 3, 4].item() == -1e10
+    assert beta[0, 3, 3].item() == 0.0
+
+
+def test_compute_beta_cross_window_centre_admits_pair() -> None:
+    """A pair admitted by a neighbouring centre (not the query's own centre) gets 0.0.
+
+    n_queries=4, n_keys=8 (half_q=2.0, half_k=4.0). Centres at 1.5 and 5.5.
+    Pair (l=4, m=3):
+      centre 0: l=4 is NOT a query (|4-1.5|=2.5>2.0)
+      centre 1: l=4 IS a query (|4-5.5|=1.5<2.0), m=3 IS a key (|3-5.5|=2.5<4.0)
+    → beta=0.0 because centre 1 admits both. Tests multi-centre reduce logic.
+    """
+    N_t, n_q, n_k, B_t = 8, 4, 8, 1
+    neighbor_idx_t = repeat(torch.arange(N_t), "k -> n k", n=N_t)
+    valid_mask_t = torch.ones(B_t, N_t, N_t, dtype=torch.bool)
+    ref = torch.zeros(B_t, N_t, C_ATOM)
+    beta = compute_beta(neighbor_idx_t, valid_mask_t, n_queries=n_q, n_keys=n_k, ref=ref)
+    assert beta[0, 4, 3].item() == 0.0
+
+
+def test_compute_beta_all_zero_when_n_leq_n_queries(
+    neighbor_idx: Int[torch.Tensor, "N_atom K"],
+    valid_mask: Bool[torch.Tensor, "B N_atom K"],
+) -> None:
+    """When N <= n_queries every valid pair is in the single window → no -1e10 entries.
+
+    N_ATOM=24 < n_queries=32: single centre at 15.5 (half_q=16.0) covers all atoms.
+    n_keys=128, half_k=64.0: all atoms are keys too. Every valid pair gets beta=0.0.
+    """
+    ref = torch.randn(B, N_ATOM, C_ATOM)
+    beta = compute_beta(neighbor_idx, valid_mask, n_queries=32, n_keys=128, ref=ref)
+    assert (beta[valid_mask] == 0.0).all()
+
+
+def test_compute_beta_wrong_shape_raises() -> None:
+    """A 1-D neighbor_idx (missing K dimension) triggers TypeCheckError."""
+    neighbor_idx_bad = torch.zeros(N_ATOM, dtype=torch.long)  # 1-D, not [N, K]
+    valid_mask_t = torch.ones(B, N_ATOM, K, dtype=torch.bool)
+    ref = torch.zeros(B, N_ATOM, C_ATOM)
+    with pytest.raises(TypeCheckError):
+        compute_beta(neighbor_idx_bad, valid_mask_t, 32, 128, ref)
+
+
+# ---------------------------------------------------------------------------
 # ConditionedTransitionBlock
 # ---------------------------------------------------------------------------
 
@@ -427,6 +557,69 @@ def test_atom_transformer_gradient_flows(
     reduce(out, "b n c -> ", "sum").backward()
     assert q_g.grad is not None
     assert torch.isfinite(q_g.grad).all()
+
+
+def test_atom_transformer_block_isolation() -> None:
+    """Block-0 output is unchanged when block-1 inputs are scrambled.
+
+    With n_queries=n_keys=4 and N=8, blocks [0..3] and [4..7] map to disjoint
+    window centres (1.5 and 5.5). Since exp(-1e10)=0.0 in float32, cross-block
+    attention weights are exactly zero, so block-1 inputs cannot affect block-0 outputs.
+    """
+    n_q, N_t, B_t = 4, 8, 1
+    model = AtomTransformer(
+        C_ATOM, C_ATOMPAIR, n_blocks=1, n_heads=1, n_queries=n_q, n_keys=n_q
+    ).eval()
+    neighbor_idx_t = repeat(torch.arange(N_t), "k -> n k", n=N_t)
+    valid_mask_t = torch.ones(B_t, N_t, N_t, dtype=torch.bool)
+
+    manual_seed(0)
+    q = torch.randn(B_t, N_t, C_ATOM)
+    c = torch.randn(B_t, N_t, C_ATOM)
+    p = torch.randn(B_t, N_t, N_t, C_ATOMPAIR)
+
+    with torch.no_grad():
+        out1 = model(q, c, p, neighbor_idx_t, valid_mask_t)
+
+    manual_seed(1)
+    q_alt = q.clone()
+    c_alt = c.clone()
+    q_alt[:, n_q:, :] = torch.randn(B_t, n_q, C_ATOM)
+    c_alt[:, n_q:, :] = torch.randn(B_t, n_q, C_ATOM)
+
+    with torch.no_grad():
+        out2 = model(q_alt, c_alt, p, neighbor_idx_t, valid_mask_t)
+
+    assert torch.equal(out1[:, :n_q, :], out2[:, :n_q, :])
+
+
+def test_atom_transformer_gradient_isolation() -> None:
+    """Backpropping from block-0 outputs produces zero gradient for block-1 inputs.
+
+    With n_queries=n_keys=4 and N=8, the two blocks are disjoint. Softmax weights
+    for cross-block pairs are exactly 0.0 in float32, so the softmax gradient
+    (s_lm * (delta - s_lm) = 0 when s_lm=0) propagates zero back to block-1 inputs.
+    ConditionedTransitionBlock is pointwise, so it contributes no cross-block gradient.
+    """
+    n_q, N_t, B_t = 4, 8, 1
+    model = AtomTransformer(
+        C_ATOM, C_ATOMPAIR, n_blocks=1, n_heads=1, n_queries=n_q, n_keys=n_q
+    ).eval()
+    neighbor_idx_t = repeat(torch.arange(N_t), "k -> n k", n=N_t)
+    valid_mask_t = torch.ones(B_t, N_t, N_t, dtype=torch.bool)
+
+    manual_seed(0)
+    q = torch.randn(B_t, N_t, C_ATOM, requires_grad=True)
+    c = torch.randn(B_t, N_t, C_ATOM, requires_grad=True)
+    p = torch.randn(B_t, N_t, N_t, C_ATOMPAIR)
+
+    out = model(q, c, p, neighbor_idx_t, valid_mask_t)
+    out[:, :n_q, :].sum().backward()
+
+    assert q.grad is not None
+    assert c.grad is not None
+    assert q.grad[:, n_q:, :].abs().max().item() == 0.0
+    assert c.grad[:, n_q:, :].abs().max().item() == 0.0
 
 
 # ---------------------------------------------------------------------------

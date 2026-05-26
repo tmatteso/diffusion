@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from architecture.layers import LinearNoBias
 from architecture.node_update import AdaLN, AttentionPairBias
 from beartype import beartype
-from einops import rearrange, reduce, repeat
+from einops import einsum, rearrange, reduce, repeat
 from jaxtyping import Bool, Float, Int, jaxtyped
 
 # Local attention window size (residues), matching AlphaFold 3 atom transformer.
@@ -149,13 +149,13 @@ def build_sparse_pairs(
     half = window_size // 2
 
     # [N, N] bool — True where m is within half residues of l
-    diff = (tok_idx.unsqueeze(1) - tok_idx.unsqueeze(0)).abs()  # [N, N]
+    diff = (rearrange(tok_idx, "n -> n 1") - rearrange(tok_idx, "n -> 1 n")).abs()  # [N, N]
     in_window = diff < half  # [N, N]
 
     K = int(in_window.sum(dim=1).max().item())
 
     # For each row l, sort so valid neighbours appear first (out-of-window → sentinel N)
-    col = torch.arange(N, device=tok_idx.device).unsqueeze(0).expand(N, -1)  # [N, N]
+    col = repeat(torch.arange(N, device=tok_idx.device), "k -> n k", n=N)  # [N, N]
     sentinel = col.masked_fill(~in_window, N)
     neighbor_idx = sentinel.sort(dim=1).values[:, :K]  # [N, K], valid entries < N
 
@@ -163,6 +163,72 @@ def build_sparse_pairs(
     neighbor_idx = neighbor_idx.clamp(max=N - 1)  # padding slots → safe index 0
 
     return neighbor_idx, valid_mask
+
+
+# ---------------------------------------------------------------------------
+# compute_beta — Algorithm 7 line 1
+# ---------------------------------------------------------------------------
+
+
+@jaxtyped(typechecker=beartype)
+def compute_beta(
+    neighbor_idx: Int[torch.Tensor, "N K"],
+    valid_mask: Bool[torch.Tensor, "B N K"],
+    n_queries: int,
+    n_keys: int,
+    ref: Float[torch.Tensor, "B N c"],
+) -> Float[torch.Tensor, "B N K"]:
+    """Compute the sliding-window attention bias β (Algorithm 7, line 1).
+
+    Returns 0.0 for atom pairs (l, m) admitted by at least one query/key window
+    centre and by valid_mask; returns -1e10 everywhere else.
+
+    Window centres are placed at ``c * n_queries + (n_queries / 2 - 0.5)``
+    for ``c = 0, 1, …, ⌈N / n_queries⌉ - 1``.
+
+    Args:
+        neighbor_idx: Sparse neighbour indices [N, K].
+        valid_mask: True where neighbour slot is a real atom [B, N, K].
+        n_queries: Query-window full-width in atoms.
+        n_keys: Key-window full-width in atoms.
+        ref: Float tensor whose device and dtype are used for the output [B, N, c].
+
+    Returns:
+        Additive attention bias [B, N, K]; 0.0 for admitted pairs, -1e10 elsewhere.
+    """
+    B, N = ref.shape[0], ref.shape[1]
+    K = neighbor_idx.shape[1]
+    half_q = n_queries / 2.0
+    half_k = n_keys / 2.0
+
+    n_centres = math.ceil(N / n_queries)
+    centres: Float[torch.Tensor, "n_centres"] = torch.arange(
+        n_centres, device=ref.device, dtype=torch.float32
+    ) * n_queries + (half_q - 0.5)
+
+    atom_idx: Float[torch.Tensor, "B N"] = repeat(
+        torch.arange(N, device=ref.device, dtype=torch.float32), "N -> B N", B=B
+    )
+    m_idx: Float[torch.Tensor, "B N K"] = atom_idx[:, neighbor_idx]
+
+    l_in_window: Bool[torch.Tensor, "B N n_centres"] = (
+        rearrange(atom_idx, "B N -> B N 1") - rearrange(centres, "c -> 1 1 c")
+    ).abs() < half_q
+    m_in_window: Bool[torch.Tensor, "B N K n_centres"] = (
+        rearrange(m_idx, "B N K -> B N K 1") - rearrange(centres, "c -> 1 1 1 c")
+    ).abs() < half_k
+    both_in_window: Bool[torch.Tensor, "B N K n_centres"] = (
+        rearrange(l_in_window, "B N c -> B N 1 c") & m_in_window
+    )
+    in_window: Bool[torch.Tensor, "B N K"] = reduce(
+        both_in_window.float(), "B N K c -> B N K", "max"
+    ).bool()
+
+    return torch.where(
+        in_window & valid_mask,
+        torch.zeros(B, N, K, device=ref.device, dtype=ref.dtype),
+        torch.full((B, N, K), -1e10, device=ref.device, dtype=ref.dtype),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -225,46 +291,9 @@ class AtomTransformer(nn.Module):
         Returns:
             q : updated atom embeddings            [B, N, c_atom]
         """
-        B = q.shape[0]
-        N, K = neighbor_idx.shape
-        half_q = self.n_queries / 2.0
-        half_k = self.n_keys / 2.0
-
-        # Algorithm 7 line 1: β_lm
-        # Centres at n_queries/2 - 0.5, 3·n_queries/2 - 0.5, …
-        # (e.g. 15.5, 47.5, 79.5, … for n_queries=32)
-        n_centres = math.ceil(N / self.n_queries)
-        centres: Float[torch.Tensor, "n_centres"] = torch.arange(
-            n_centres, device=q.device, dtype=torch.float32
-        ) * self.n_queries + (half_q - 0.5)
-
-        atom_idx: Float[torch.Tensor, "B N"] = repeat(
-            torch.arange(N, device=q.device, dtype=torch.float32), "N -> B N", B=B
-        )
-        m_idx: Float[torch.Tensor, "B N K"] = atom_idx[
-            :, neighbor_idx
-        ]  # [B, N, K] — atom index of each sparse neighbour
-
-        # [B, N, n_centres]: True where atom l qualifies as a query for centre c
-        l_in_window: Bool[torch.Tensor, "B N n_centres"] = (
-            rearrange(atom_idx, "B N -> B N 1") - rearrange(centres, "c -> 1 1 c")
-        ).abs() < half_q
-        # [B, N, K, n_centres]: True where neighbour m qualifies as a key for centre c
-        m_in_window: Bool[torch.Tensor, "B N K n_centres"] = (
-            rearrange(m_idx, "B N K -> B N K 1") - rearrange(centres, "c -> 1 1 1 c")
-        ).abs() < half_k
-        # [B, N, K]: True if any centre admits both l as query and m as key
-        both_in_window: Bool[torch.Tensor, "B N K n_centres"] = (
-            rearrange(l_in_window, "B N c -> B N 1 c") & m_in_window
-        )
-        in_window: Bool[torch.Tensor, "B N K"] = reduce(
-            both_in_window.float(), "B N K c -> B N K", "max"
-        ).bool()
-
-        beta: Float[torch.Tensor, "B N K"] = torch.where(
-            in_window & valid_mask,
-            torch.zeros(B, N, K, device=q.device, dtype=q.dtype),
-            torch.full((B, N, K), -1e10, device=q.device, dtype=q.dtype),
+        # Algorithm 7 line 1: β_lm — sliding-window attention bias
+        beta: Float[torch.Tensor, "B N K"] = compute_beta(
+            neighbor_idx, valid_mask, self.n_queries, self.n_keys, q
         )
 
         # Algorithm 7 line 2: DiffusionTransformer — n_blocks rounds of attention + transition
@@ -412,9 +441,11 @@ class AtomFeatureEncoder(nn.Module):
 
         # Chain constraint: same ref_space_uid per batch item — [B, N_atom, K]
         chain_valid: Bool[torch.Tensor, "B N_atom K"] = (
-            ref_space_uid.unsqueeze(-1) == ref_space_uid[:, neighbor_idx]
+            rearrange(ref_space_uid, "b n -> b n 1") == ref_space_uid[:, neighbor_idx]
         )
-        valid_mask: Bool[torch.Tensor, "B N_atom K"] = window_valid.unsqueeze(0) & chain_valid
+        valid_mask: Bool[torch.Tensor, "B N_atom K"] = (
+            rearrange(window_valid, "n k -> 1 n k") & chain_valid
+        )
 
         # ------------------------------------------------------------------
         # Step 1: f^ref — each atom sees all sibling atoms' pos+element
@@ -455,7 +486,11 @@ class AtomFeatureEncoder(nn.Module):
 
         # Step 8: p_lm += proj(1/(1+||d||²)) * v_lm
         inv_sq: Float[torch.Tensor, "B N_atom K 1"] = 1.0 / (
-            1.0 + torch.einsum("b n k d, b n k d -> b n k", d_lm, d_lm).unsqueeze(-1)
+            1.0
+            + rearrange(
+                einsum(d_lm, d_lm, "b n k d, b n k d -> b n k"),
+                "b n k -> b n k 1",
+            )
         )
         p_lm = p_lm + self.proj_inv_sq(inv_sq) * rearrange(v_lm, "b n k -> b n k 1")
 
@@ -488,7 +523,7 @@ class AtomFeatureEncoder(nn.Module):
         # Step 14: p_lm += proj(LayerNorm(z_input[tok_l, tok_m]))
         # ------------------------------------------------------------------
         tok_nbr_shared: Int[torch.Tensor, "N_atom K"] = tok[neighbor_idx]
-        tok_l_shared: Int[torch.Tensor, "N_atom K"] = tok.unsqueeze(1).expand(-1, K)
+        tok_l_shared: Int[torch.Tensor, "N_atom K"] = repeat(tok, "n -> n k", k=K)
         z_gathered: Float[torch.Tensor, "B N_atom K c_pair"] = z_input[
             :, tok_l_shared, tok_nbr_shared
         ]
@@ -519,18 +554,18 @@ class AtomFeatureEncoder(nn.Module):
 
         # Vectorized scatter: offset tok_idx by b*N_token to flatten B by N_token → (B*N_token)
         tok_offset: Int[torch.Tensor, "B N_atom"] = (
-            tok_idx + torch.arange(B, device=tok_idx.device).unsqueeze(1) * N_token
+            tok_idx + repeat(torch.arange(B, device=tok_idx.device), "b -> b n", n=N_atom) * N_token
         )
         s_i_flat = torch.zeros(B * N_token, C, device=proj_q.device, dtype=proj_q.dtype)
         s_i_flat.scatter_add_(
             0,
-            rearrange(tok_offset, "b n -> (b n)").unsqueeze(1).expand(-1, C),
+            repeat(rearrange(tok_offset, "b n -> (b n)"), "bn -> bn c", c=C),
             rearrange(proj_q, "b n c -> (b n) c"),
         )
         counts_flat = torch.zeros(B * N_token, 1, device=proj_q.device, dtype=proj_q.dtype)
         counts_flat.scatter_add_(
             0,
-            rearrange(tok_offset, "b n -> (b n)").unsqueeze(1),
+            rearrange(tok_offset, "b n -> (b n) 1"),
             torch.ones(B * N_atom, 1, device=proj_q.device, dtype=proj_q.dtype),
         )
         s_i: Float[torch.Tensor, "B N_res c"] = rearrange(
@@ -653,14 +688,14 @@ class AtomAttentionDecoder(nn.Module):
         neighbor_idx, window_valid = build_sparse_pairs(tok, self.n_keys)
         K_built = neighbor_idx.size(1)
         B = tok_idx.size(0)
-        valid_mask: Bool[torch.Tensor, "B N_atom K"] = window_valid.unsqueeze(0).expand(B, -1, -1)
+        valid_mask: Bool[torch.Tensor, "B N_atom K"] = repeat(window_valid, "n k -> b n k", b=B)
 
         # Step 1: q = proj(LayerNorm(s[tok_idx])) + q_skip   [B, N_atom, c_atom]
         q: Float[torch.Tensor, "B N_atom c_atom"] = self.proj_s_q(self.norm_s_q(s[:, tok])) + q_skip
 
         # Step 2: p = proj(LayerNorm(z[tok_l, tok_m])) + p_skip  [B, N_atom, K, c_atompair]
         tok_nbr_shared: Int[torch.Tensor, "N_atom K"] = tok[neighbor_idx]
-        tok_l_shared: Int[torch.Tensor, "N_atom K"] = tok.unsqueeze(1).expand(-1, K_built)
+        tok_l_shared: Int[torch.Tensor, "N_atom K"] = repeat(tok, "n -> n k", k=K_built)
         z_gathered: Float[torch.Tensor, "B N_atom K c_pair"] = z[:, tok_l_shared, tok_nbr_shared]
         p: Float[torch.Tensor, "B N_atom K c_atompair"] = (
             self.proj_z(self.norm_z(z_gathered)) + p_skip
