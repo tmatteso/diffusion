@@ -124,3 +124,13 @@ def test_pipeline_preserves_pdb_x_as_index_20(c_beta_distogram_fn: Distogram) ->
     )
 
     assert item.aa_indices[x_pos].item() == 20
+
+
+def test_seq_ce_loss_all_ignored_returns_zero() -> None:
+    """seq_ce_loss returns 0.0 when every position is masked (no valid targets)."""
+    logits: Float[torch.Tensor, "1 5 20"] = torch.randn(1, 5, _N_AMINO)
+    aa_all_x: Int[torch.Tensor, "1 5"] = torch.full((1, 5), 20, dtype=torch.long)  # all X/null
+
+    loss: Float[torch.Tensor, ""] = seq_ce_loss(logits, aa_all_x)
+
+    assert loss.item() == 0.0

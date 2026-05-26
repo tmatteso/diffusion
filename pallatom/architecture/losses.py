@@ -427,7 +427,10 @@ def seq_ce_loss(
     """
     n_amino: int = logits.size(-1)
     targets: Int[torch.Tensor, "B N_res"] = aa_indices.masked_fill(aa_indices >= n_amino, -100)
+    if (targets != -100).sum() == 0:
+        return torch.zeros((), device=logits.device, dtype=logits.dtype)
     return F.cross_entropy(
         rearrange(logits, "b n c -> (b n) c"),
         rearrange(targets, "b n -> (b n)"),
+        ignore_index=-100,
     )
