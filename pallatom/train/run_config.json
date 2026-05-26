@@ -4,7 +4,9 @@
     "lr": 0.0003,
     "weight_decay": 0.0001,
     "grad_clip": 2.0,
-    "pretrained_weights": null
+    "pretrained_weights": null,
+    "resume_checkpoint": null,
+    "accumulated_token_budget": 4096
   },
   "model": {
     "f_ref_dim": 35,
@@ -50,20 +52,27 @@
     "save_every": 1
   },
   "logging": {
-    "log_interval": 1,
     "use_wandb": true,
     "wandb_project": "pallatom-training"
   },
   "loader": {
     "max_seq_length": 128,
-    "batch_size": 2
+    "batch_size": 2,
+    "token_budget": 512
   },
   "train_loader": {
     "max_seq_length": 128,
-    "batch_size": 4
+    "batch_size": 4,
+    "token_budget": 512
   },
   "test_loader": {
     "max_seq_length": 128,
-    "batch_size": 2
+    "batch_size": 2,
+    "token_budget": 512
+  },
+  "conditioning_dropout": {
+    "p_distogram": 0.15,
+    "p_atom": 0.15,
+    "p_seq": 0.15
   }
 }

@@ -324,10 +324,12 @@ def process_accum_window(
     total_proteins: int = sum(n_proteins_per_batch)
     n_micro: int = len(micro_buffer)
     loss_sums: dict[str, torch.Tensor] = {
-        f.name: torch.tensor(0.0) for f in dataclasses.fields(LossMetrics)
+        f.name: torch.tensor(0.0, device=model_params.device)
+        for f in dataclasses.fields(LossMetrics)
     }
     tput_sums: dict[str, torch.Tensor] = {
-        f.name: torch.tensor(0.0) for f in dataclasses.fields(ThroughputStatistics)
+        f.name: torch.tensor(0.0, device=model_params.device)
+        for f in dataclasses.fields(ThroughputStatistics)
     }
 
     maybe_no_sync = getattr(model_params.model, "no_sync", None)
@@ -375,10 +377,12 @@ def evaluate(
 ) -> tuple[LossMetrics, ThroughputStatistics]:
     """Full-dataset evaluation pass. Returns mean loss per metric."""
     loss_sums: dict[str, Float[torch.Tensor, ""]] = {
-        f.name: torch.tensor(0.0) for f in dataclasses.fields(LossMetrics)
+        f.name: torch.tensor(0.0, device=model_params.device)
+        for f in dataclasses.fields(LossMetrics)
     }
     tput_sums: dict[str, Float[torch.Tensor, ""]] = {
-        f.name: torch.tensor(0.0) for f in dataclasses.fields(ThroughputStatistics)
+        f.name: torch.tensor(0.0, device=model_params.device)
+        for f in dataclasses.fields(ThroughputStatistics)
     }
     n_batches = 0
 
