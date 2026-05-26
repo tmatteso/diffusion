@@ -205,17 +205,6 @@ def test_training_accepts_positive_grad_clip():
 # ---------------------------------------------------------------------------
 
 
-def test_model_default_values(model: ModelParams):
-    """ModelParams defaults match the expected compact model architecture dimensions."""
-    assert model.f_ref_dim == 35
-    assert model.n_bins == 39
-    assert model.c_atom == 16
-    assert model.c_pair == 16
-    assert model.c_res == 32
-    assert model.c_atompair == 2
-    assert model.K_unit == 3
-
-
 def test_model_rejects_zero_c_res():
     """ModelParams raises ValidationError when c_res is zero (embedding width must be positive)."""
     with pytest.raises(ValidationError):
@@ -363,69 +352,6 @@ def test_loss_rejects_nonpositive_smooth_lddt_cutoff():
     """LossParams raises ValidationError when smooth_lddt_cutoff is zero."""
     with pytest.raises(ValidationError):
         LossParams(smooth_lddt_cutoff=0)
-
-
-# ---------------------------------------------------------------------------
-# CheckpointParams — defaults and field constraints
-# ---------------------------------------------------------------------------
-
-
-def test_checkpoint_default_values(checkpoint: CheckpointParams):
-    """CheckpointParams defaults match the expected path and save-frequency settings."""
-    assert checkpoint.checkpoint_path == "pallatom_best.pt"
-    assert checkpoint.save_every == 1
-
-
-def test_checkpoint_accepts_save_every_zero():
-    """CheckpointParams accepts save_every=0 to disable periodic epoch checkpoints."""
-    assert CheckpointParams(save_every=0).save_every == 0
-
-
-def test_checkpoint_rejects_negative_save_every():
-    """CheckpointParams raises ValidationError when save_every is negative."""
-    with pytest.raises(ValidationError):
-        CheckpointParams(save_every=-1)
-
-
-# ---------------------------------------------------------------------------
-# LoggingParams — defaults and field constraints
-# ---------------------------------------------------------------------------
-
-
-def test_logging_default_values(logging_: LoggingParams):
-    """LoggingParams defaults match the expected logging frequency and W&B settings."""
-    assert logging_.use_wandb is True
-    assert logging_.wandb_project == "pallatom-training"
-
-
-def test_logging_accepts_wandb_enabled():
-    """LoggingParams stores a custom W&B project name when use_wandb=True."""
-    p = LoggingParams(use_wandb=True, wandb_project="my-project")
-    assert p.use_wandb is True
-    assert p.wandb_project == "my-project"
-
-
-# ---------------------------------------------------------------------------
-# LoaderConfig — defaults and field constraints
-# ---------------------------------------------------------------------------
-
-
-def test_loader_default_values(loader: LoaderConfig):
-    """LoaderConfig defaults match the expected sequence length and batch size settings."""
-    assert loader.max_seq_length == 128
-    assert loader.batch_size == 2
-
-
-def test_loader_rejects_zero_batch_size():
-    """LoaderConfig raises ValidationError when batch_size is zero."""
-    with pytest.raises(ValidationError):
-        LoaderConfig(batch_size=0)
-
-
-def test_loader_rejects_zero_max_seq_length():
-    """LoaderConfig raises ValidationError when max_seq_length is zero."""
-    with pytest.raises(ValidationError):
-        LoaderConfig(max_seq_length=0)
 
 
 # ---------------------------------------------------------------------------

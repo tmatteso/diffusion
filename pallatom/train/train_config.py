@@ -26,12 +26,12 @@ class ModelParams(BaseModel):
     n_bins: int = Field(
         default=39, gt=0
     )  # distogram bins for TemplateEmbedder (38 + 1 overflow bin)
-    c_atom: int = Field(default=16, gt=0)
-    c_pair: int = Field(default=16, gt=0)
-    c_res: int = Field(default=32, gt=0)
+    c_atom: int = Field(default=4, gt=0)
+    c_pair: int = Field(default=4, gt=0)
+    c_res: int = Field(default=8, gt=0)
     c_atompair: int = Field(default=2, gt=0)
-    K_unit: int = Field(default=3, gt=0)
-    max_residues: int = Field(default=256, gt=0)
+    K_unit: int = Field(default=8, gt=0)
+    max_residues: int = Field(default=128, gt=0)
 
 
 class NoiseScheduleParams(BaseModel):
