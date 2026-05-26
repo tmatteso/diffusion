@@ -612,7 +612,7 @@ def log_epoch(
                 "epoch": epoch_metrics.epoch,
                 "global_step": epoch_metrics.global_step,
                 **{f"train/{k}": v for k, v in train_dict.items()},
-                **{f"train/{k}": v for k, v in thru_stats_dict.items()},
+                **{f"throughput_statistics/{k}": v for k, v in thru_stats_dict.items()},
                 **{f"gradient_norms/{k}": v for k, v in gradient_norm_dict.items()},
                 **{f"val/{k}": v for k, v in val_dict.items()},
             }
