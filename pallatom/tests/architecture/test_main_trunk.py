@@ -175,8 +175,6 @@ def gt_atom_distogram_mask_sparse() -> Bool[torch.Tensor, "B N_atom K_sparse"]:
 # ---------------------------------------------------------------------------
 
 
-# absolute garbage. this is a fixturized function. it should yield an
-# output object for use in tests with no given input
 @pytest.fixture
 def featurized_batch(
     ref_pos: Float[torch.Tensor, "B N_atom 3"],
