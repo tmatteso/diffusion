@@ -885,11 +885,15 @@ def main(args: argparse.Namespace, tcfg: TrainConfig) -> None:
             optimizer=optimizer,
             scheduler=scheduler,
         )
-        model_params, best_val_loss = load_checkpoint(
-            model_params=model_params,
-            rank=rank,
-            log=log,
-        )
+
+        if tcfg.training.pretrained_weights is not None:
+            model_params, best_val_loss = load_checkpoint(
+                model_params=model_params,
+                rank=rank,
+                log=log,
+            )
+        else:
+            best_val_loss = torch.Tensor(float("inf"))
 
         if is_rank_zero and tcfg.logging.use_wandb:
             wandb.init(project=tcfg.logging.wandb_project, config=tcfg.model_dump())
