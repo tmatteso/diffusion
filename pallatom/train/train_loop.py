@@ -893,7 +893,7 @@ def main(args: argparse.Namespace, tcfg: TrainConfig) -> None:
                 log=log,
             )
         else:
-            best_val_loss = torch.Tensor(float("inf"))
+            best_val_loss = torch.tensor(float("inf"))
 
         if is_rank_zero and tcfg.logging.use_wandb:
             wandb.init(project=tcfg.logging.wandb_project, config=tcfg.model_dump())
