@@ -92,9 +92,17 @@ class ClusterIndex:
     # ------------------------------------------------------------------
     # Cache management
 
+    def _manifest_path(self) -> Path:
+        """Return the path to the names-manifest file inside the cluster directory."""
+        return self._cluster_dir / "names.manifest"
+
     def _cache_exists(self) -> bool:
-        """Return True if all 65 cluster JSONL files already exist."""
-        return all(self.cluster_file(k).exists() for k in range(self._n_clusters + 1))
+        """Return True if all cluster JSONL files exist and were built with the current names."""
+        if not all(self.cluster_file(k).exists() for k in range(self._n_clusters + 1)):
+            return False
+        if not self._manifest_path().exists():
+            return False
+        return json.loads(self._manifest_path().read_text()) == sorted(self._names)
 
     def _build_and_cache(self) -> None:
         """Partition source JSONL by length, write cluster files, build offset arrays."""
@@ -124,6 +132,7 @@ class ClusterIndex:
                     pos += len(raw_line)
             self.cluster_offsets.append(offsets)
 
+        self._manifest_path().write_text(json.dumps(sorted(self._names)))
         self._build_flat_index()
 
     def _load_from_cache(self) -> None:

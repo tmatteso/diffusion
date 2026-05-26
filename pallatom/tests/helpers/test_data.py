@@ -393,3 +393,66 @@ def test_bucketed_train_loader_yields_protein_batch(
     train_sampler.set_epoch(0)
     batch = next(iter(train_loader))
     assert isinstance(batch, ProteinBatch)
+
+
+def test_bucketed_debug_run_train_dataset_has_252_items(
+    bucketed_cfg: TrainConfig,
+    debug_jsonl_path: str,
+    debug_splits_path: str,
+) -> None:
+    """make_bucketed_data_loaders with debug_run=True yields a train dataset of _N_DEBUG items."""
+    train_loader, _, _, _ = make_bucketed_data_loaders(
+        cfg=bucketed_cfg,
+        jsonl_path=debug_jsonl_path,
+        splits_path=debug_splits_path,
+        num_workers=0,
+        debug_run=True,
+    )
+    assert len(cast(ClusteredProteinDataset, train_loader.dataset)) == _N_DEBUG
+
+
+_N_FULL = 300  # dataset larger than _N_DEBUG to expose cache-poisoning bug
+
+
+def test_bucketed_debug_run_not_poisoned_by_prior_full_cache(
+    bucketed_cfg: TrainConfig,
+    tmp_path: pathlib.Path,
+) -> None:
+    """debug_run=True must yield _N_DEBUG items even when cache was built by a prior full run.
+
+    Root cause: ClusterIndex._load_from_cache() reads all cluster-file lines without
+    re-applying the names filter, so a cache built from all _N_FULL proteins silently
+    returns _N_FULL items for a subsequent debug_run=True call capped at _N_DEBUG.
+    """
+    names = [f"{i:04d}p.A" for i in range(_N_FULL)]
+    jsonl_path = tmp_path / "full_proteins.jsonl"
+    with open(jsonl_path, "w") as f:
+        for name in names:
+            entry = {
+                "name": name,
+                "seq": "ACDEFG"[:_N_RES_DATA],
+                "coords": _make_coords(_N_RES_DATA),
+            }
+            f.write(json.dumps(entry) + "\n")
+    splits_path = tmp_path / "full_splits.json"
+    with open(splits_path, "w") as f:
+        json.dump({"train": names, "validation": names[:1], "test": names[:1]}, f)
+
+    # Seed the ClusterIndex cache with the full _N_FULL-protein dataset.
+    make_bucketed_data_loaders(
+        cfg=bucketed_cfg,
+        jsonl_path=str(jsonl_path),
+        splits_path=str(splits_path),
+        num_workers=0,
+        debug_run=False,
+    )
+
+    # A subsequent debug_run=True call must cap at _N_DEBUG despite the warm cache.
+    train_loader, _, _, _ = make_bucketed_data_loaders(
+        cfg=bucketed_cfg,
+        jsonl_path=str(jsonl_path),
+        splits_path=str(splits_path),
+        num_workers=0,
+        debug_run=True,
+    )
+    assert len(cast(ClusteredProteinDataset, train_loader.dataset)) == _N_DEBUG
