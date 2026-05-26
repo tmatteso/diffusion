@@ -43,7 +43,6 @@ from train.train_loop import (
     evaluate,
     load_checkpoint,
     log_epoch,
-    mask_seq_target,
     optimizer_step,
     process_accum_window,
     save_checkpoint,
@@ -481,32 +480,6 @@ def testto_protein_batch_seq_length_matches_batch_size(
     """to_protein_batch seq list has one entry per sample passed in."""
     result = to_protein_batch([single_sample])
     assert len(result.seq) == 1
-
-
-# ---------------------------------------------------------------------------
-# mask_seq_target
-# ---------------------------------------------------------------------------
-
-
-def testmask_seq_target_replaces_20_with_minus100() -> None:
-    """mask_seq_target maps mask token (20) to -100 (the CE ignore_index)."""
-    aa = torch.tensor([[0, 20, 5, 20]])
-    out = mask_seq_target(aa)
-    assert out[0, 1].item() == -100
-    assert out[0, 3].item() == -100
-
-
-def testmask_seq_target_preserves_non_mask_tokens() -> None:
-    """mask_seq_target leaves all indices other than 20 unchanged."""
-    aa = torch.tensor([[0, 1, 19, 5]])
-    out = mask_seq_target(aa)
-    assert torch.equal(out, torch.tensor([[0, 1, 19, 5]]))
-
-
-def testmask_seq_target_preserves_shape() -> None:
-    """mask_seq_target does not change the shape of the input tensor."""
-    aa = torch.randint(0, 20, (3, _N_KEEP))
-    assert mask_seq_target(aa).shape == aa.shape
 
 
 # ---------------------------------------------------------------------------

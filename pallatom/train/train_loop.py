@@ -13,20 +13,26 @@ import structlog
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-import torch.nn.functional as F
 import wandb
 from architecture.losses import (
     atom_loss,
     distogram_loss_atom,
     distogram_loss_residue,
+    seq_ce_loss,
     smooth_lddt_loss,
 )
 from architecture.main_trunk import MainTrunk, PredictedOutputs
 from beartype import beartype
-from einops import rearrange, reduce
+from einops import reduce
 from helpers.alignment import kabsch_align
 from helpers.bucketed_sampler import BucketedBatchSampler
-from helpers.context_managers import DistProcessGroup, FatalOnError, StepContext, StructlogConfig
+from helpers.context_managers import (
+    DDPNoSync,
+    DistProcessGroup,
+    FatalOnError,
+    StepContext,
+    StructlogConfig,
+)
 from helpers.data import make_bucketed_data_loaders
 from helpers.featurize import (
     Distogram,
@@ -50,11 +56,6 @@ from torch.optim import Adam
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from tqdm import tqdm
 from train.train_config import TrainConfig
-
-
-def mask_seq_target(aa_indices: Int[torch.Tensor, "B N_res"]) -> Int[torch.Tensor, "B N_res"]:
-    """Replace mask-token index 20 with -100 so CE loss ignores dropped positions."""
-    return aa_indices.masked_fill(aa_indices == 20, -100)
 
 
 def load_checkpoint(
@@ -153,11 +154,7 @@ def take_step(
     )
     lp = model_params.tcfg.loss
 
-    flat_aa_targets: Int[torch.Tensor, "B_N_res"] = torch.zeros(0, dtype=torch.long)
-    n_masked_aa: Int[torch.Tensor, ""] = torch.tensor(1)
     if train:
-        # Save orig amino-acid indices before conditioning dropout replaces some with <MASK> (20).
-        orig_aa_indices: Int[torch.Tensor, "B N_res"] = featurized_batch.aa_indices.clone()
         featurized_batch: FeaturizedBatch = apply_conditioning_dropout(
             featurized_batch,
             p_distogram=model_params.tcfg.conditioning_dropout.p_distogram,
@@ -165,16 +162,6 @@ def take_step(
             p_seq=model_params.tcfg.conditioning_dropout.p_seq,
             device=model_params.device,
         )
-        # MLM-style CE targets: original amino acid at positions where dropout placed <MASK> (20),
-        # -100 (ignore_index) at positions the model can still see and at padding.
-        # This forces the model to predict sequence from structure, not copy visible conditioning.
-        mask_positions: Int[torch.Tensor, "B N_res"] = featurized_batch.aa_indices == 20
-        aa_targets: Int[torch.Tensor, "B N_res"] = orig_aa_indices.masked_fill(
-            ~mask_positions, -100
-        )
-        # Flat targets reused for final and intermediate CE; count guards against p_seq=0 edge case.
-        flat_aa_targets = rearrange(aa_targets, "b n -> (b n)")
-        n_masked_aa = (flat_aa_targets >= 0).sum().clamp(min=1)
 
     t0 = time.perf_counter()
 
@@ -194,24 +181,10 @@ def take_step(
         ):
             intermediate_denoised_coord: Float[torch.Tensor, "B N_atom 3"]
             gamma_K_minus_k: float = lp.gamma ** (K_unit - k_idx - 1)
-            if train:
-                inter_ce: Float[torch.Tensor, ""] = (
-                    F.cross_entropy(
-                        rearrange(
-                            pred_outputs.intermediate_pred_aa_logit_stack[k_idx], "b n c -> (b n) c"
-                        ),
-                        flat_aa_targets,  # (b n)
-                        reduction="sum",
-                    )
-                    / n_masked_aa
-                )
-            else:
-                inter_ce: Float[torch.Tensor, ""] = F.cross_entropy(
-                    rearrange(
-                        pred_outputs.intermediate_pred_aa_logit_stack[k_idx], "b n c -> (b n) c"
-                    ),
-                    rearrange(mask_seq_target(featurized_batch.aa_indices), "b n -> (b n)"),
-                )
+            inter_ce: Float[torch.Tensor, ""] = seq_ce_loss(
+                pred_outputs.intermediate_pred_aa_logit_stack[k_idx],
+                featurized_batch.aa_indices,
+            )
 
             k_loss: Float[torch.Tensor, ""] = (
                 lp.lam
@@ -247,9 +220,8 @@ def take_step(
             featurized_batch.atom5_mask,
             cutoff=float(lp.smooth_lddt_cutoff),
         )
-        CE_loss: Float[torch.Tensor, ""] = F.cross_entropy(
-            rearrange(pred_outputs.seq_logits, "b n c -> (b n) c"),
-            rearrange(mask_seq_target(featurized_batch.aa_indices), "b n -> (b n)"),
+        CE_loss: Float[torch.Tensor, ""] = seq_ce_loss(
+            pred_outputs.seq_logits, featurized_batch.aa_indices
         )
 
         total_loss: Float[torch.Tensor, ""] = (
@@ -332,22 +304,12 @@ def process_accum_window(
         for f in dataclasses.fields(ThroughputStatistics)
     }
 
-    maybe_no_sync = getattr(model_params.model, "no_sync", None)
-
     for micro_idx, (mb, n_proteins) in enumerate(
         zip(micro_buffer, n_proteins_per_batch, strict=False)
     ):
         is_last = micro_idx == n_micro - 1
-        ctx = cast(
-            contextlib.AbstractContextManager[None],  # this context manager needs to be refactored.
-            (
-                maybe_no_sync()
-                if (not is_last and callable(maybe_no_sync))
-                else contextlib.nullcontext()
-            ),
-        )
         grad_scale: float = total_proteins / n_proteins
-        with ctx:
+        with DDPNoSync(model_params.model, is_last=is_last):
             loss_metrics, throughput_statistics = take_step(
                 batch=mb,
                 model_params=model_params,
@@ -385,6 +347,8 @@ def evaluate(
         for f in dataclasses.fields(ThroughputStatistics)
     }
     n_batches = 0
+    is_ddp: bool = dist.is_initialized()
+    world_size: int = dist.get_world_size() if is_ddp else 1
 
     for batch in loader:
         loss_metrics, throughput_statistics = take_step(
@@ -399,17 +363,16 @@ def evaluate(
             tput_sums[f.name] += getattr(throughput_statistics, f.name)
         n_batches += 1
 
-    if isinstance(model_params.model, DDP):
+    if is_ddp:
         for t in loss_sums.values():
             dist.all_reduce(t, op=dist.ReduceOp.SUM)  # pyright: ignore[reportUnknownMemberType]
         for t in tput_sums.values():
             dist.all_reduce(t, op=dist.ReduceOp.SUM)  # pyright: ignore[reportUnknownMemberType]
-        # shouldn't these then be divided by the worldsize?
 
     n = max(n_batches, 1)
     return (
-        LossMetrics(**{k: v / n for k, v in loss_sums.items()}),
-        ThroughputStatistics(**{k: v / n for k, v in tput_sums.items()}),
+        LossMetrics(**{k: v / (n * world_size) for k, v in loss_sums.items()}),
+        ThroughputStatistics(**{k: v / (n * world_size) for k, v in tput_sums.items()}),
     )
 
 
@@ -617,16 +580,25 @@ def log_epoch(
         return {f.name: getattr(dc, f.name).item() for f in dataclasses.fields(dc)}  # type: ignore[arg-type]
 
     val_dict = _to_float_dict(epoch_metrics.val_loss_metrics)
-    train_dict = (
-        _to_float_dict(epoch_metrics.train_loss_metrics)
-        | _to_float_dict(epoch_metrics.train_throughput_stats)
-        | _to_float_dict(epoch_metrics.train_gradient_norms)
-    )
+    train_dict = _to_float_dict(epoch_metrics.train_loss_metrics)
+    thru_stats_dict = _to_float_dict(epoch_metrics.train_throughput_stats)
+
+    gradient_norm_dict = _to_float_dict(epoch_metrics.train_gradient_norms)
 
     log.info(
         "train",
         epoch=epoch_metrics.epoch,
         **{k.replace(" ", "_"): round(v, 6) for k, v in train_dict.items()},
+    )
+    log.info(
+        "throughput_statistics",
+        epoch=epoch_metrics.epoch,
+        **{k.replace(" ", "_"): round(v, 6) for k, v in thru_stats_dict.items()},
+    )
+    log.info(
+        "gradient_norms",
+        epoch=epoch_metrics.epoch,
+        **{k.replace(" ", "_"): round(v, 6) for k, v in gradient_norm_dict.items()},
     )
     log.info(
         "val",
@@ -640,6 +612,8 @@ def log_epoch(
                 "epoch": epoch_metrics.epoch,
                 "global_step": epoch_metrics.global_step,
                 **{f"train/{k}": v for k, v in train_dict.items()},
+                **{f"train/{k}": v for k, v in thru_stats_dict.items()},
+                **{f"gradient_norms/{k}": v for k, v in gradient_norm_dict.items()},
                 **{f"val/{k}": v for k, v in val_dict.items()},
             }
         )

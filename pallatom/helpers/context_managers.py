@@ -1,9 +1,11 @@
 """Context manager helpers for distributed training, structured logging, and error handling."""
 
+import contextlib
 import io
 import json
 import os
 import traceback
+from collections.abc import Callable
 from types import TracebackType
 
 import structlog
@@ -127,6 +129,44 @@ class StructlogConfig:
         if self.f is not None:
             self.f.close()
         structlog.reset_defaults()
+
+
+class DDPNoSync:
+    """Suppresses DDP gradient all-reduces for non-final micro-batches.
+
+    Wraps ``model.no_sync()`` on all but the last micro-batch in an accumulation
+    window so the all-reduce fires exactly once, on the final backward pass.
+    Falls back to a no-op when the model does not expose ``no_sync`` (single-GPU).
+    """
+
+    def __init__(self, model: torch.nn.Module, *, is_last: bool) -> None:
+        """Select the inner context manager based on model type and micro-batch position.
+
+        Args:
+            model: The model (plain ``nn.Module`` or DDP-wrapped).
+            is_last: Whether this is the final micro-batch in the accumulation window.
+        """
+        maybe_no_sync: Callable[[], contextlib.AbstractContextManager[None]] | None = getattr(
+            model, "no_sync", None
+        )
+        if not is_last and callable(maybe_no_sync):
+            self._ctx: contextlib.AbstractContextManager[None] = maybe_no_sync()
+        else:
+            self._ctx = contextlib.nullcontext()
+
+    def __enter__(self) -> "DDPNoSync":
+        """Enter the inner context manager."""
+        self._ctx.__enter__()
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
+        """Exit the inner context manager."""
+        self._ctx.__exit__(exc_type, exc_val, exc_tb)
 
 
 class StepContext:
