@@ -224,10 +224,11 @@ def compute_beta(
         both_in_window.float(), "B N K c -> B N K", "max"
     ).bool()
 
+    mask_fill = max(-1e10, torch.finfo(ref.dtype).min / 2)
     return torch.where(
         in_window & valid_mask,
         torch.zeros(B, N, K, device=ref.device, dtype=ref.dtype),
-        torch.full((B, N, K), -1e10, device=ref.device, dtype=ref.dtype),
+        torch.full((B, N, K), mask_fill, device=ref.device, dtype=ref.dtype),
     )
 
 

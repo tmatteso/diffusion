@@ -412,6 +412,63 @@ def test_compute_beta_wrong_shape_raises() -> None:
         compute_beta(neighbor_idx_bad, valid_mask_t, 32, 128, ref)
 
 
+def test_compute_beta_no_inf_in_output(
+    neighbor_idx: Int[torch.Tensor, "N_atom K"],
+    valid_mask: Bool[torch.Tensor, "B N_atom K"],
+) -> None:
+    """compute_beta output contains no -inf values when ref dtype is float16.
+
+    Tripwire for mixed-precision: -1e10 overflows float16 range (~65504) to -inf,
+    which causes softmax([-inf, ...]) = NaN downstream.  Passes now (float32 training);
+    will break if compute_beta is ever called with a float16 ref.
+    """
+    ref = torch.zeros(B, N_ATOM, C_ATOM, dtype=torch.float16)
+    beta = compute_beta(neighbor_idx, valid_mask, n_queries=32, n_keys=128, ref=ref)
+    assert not beta.isinf().any()
+
+
+def test_compute_beta_asymmetric() -> None:
+    """Beta is directional: pair (l=0, m=4) admitted while (l=4, m=0) is blocked.
+
+    n_queries=2, n_keys=8, N=8: half_q=1.0, half_k=4.0.
+    Centres at 0.5, 2.5, 4.5, 6.5.
+    l=0 queries centre 0 (|0-0.5|=0.5 < 1.0); m=4 is a key (|4-0.5|=3.5 < 4.0) -> 0.0.
+    l=4 queries centre 2 (|4-4.5|=0.5 < 1.0); m=0 NOT a key (|0-4.5|=4.5 > 4.0) -> -1e10.
+    """
+    N_t, n_q, n_k, B_t = 8, 2, 8, 1
+    neighbor_idx_t: Int[torch.Tensor, "N_t N_t"] = repeat(torch.arange(N_t), "k -> n k", n=N_t)
+    valid_mask_t: Bool[torch.Tensor, "B_t N_t N_t"] = torch.ones(B_t, N_t, N_t, dtype=torch.bool)
+    ref = torch.zeros(B_t, N_t, C_ATOM)
+    beta = compute_beta(neighbor_idx_t, valid_mask_t, n_queries=n_q, n_keys=n_k, ref=ref)
+    assert beta[0, 0, 4].item() == 0.0, "pair (0,4) should be admitted by centre 0"
+    assert beta[0, 4, 0].item() == -1e10, "pair (4,0) blocked: m=0 outside key window of centre 2"
+
+
+def test_compute_beta_all_neighbors_masked_row(
+    neighbor_idx: Int[torch.Tensor, "N_atom K"],
+) -> None:
+    """A query whose entire valid_mask row is False gets all -1e10; adjacent rows unaffected."""
+    valid_mask = torch.ones(B, N_ATOM, K, dtype=torch.bool)
+    valid_mask[0, 0, :] = False
+    ref = torch.randn(B, N_ATOM, C_ATOM)
+    beta = compute_beta(neighbor_idx, valid_mask, n_queries=32, n_keys=128, ref=ref)
+    assert (beta[0, 0, :] == -1e10).all()
+    assert (beta[0, 1, :][valid_mask[0, 1, :]] == 0.0).any()
+
+
+def test_compute_beta_batch_independence(
+    neighbor_idx: Int[torch.Tensor, "N_atom K"],
+) -> None:
+    """Batch elements with different valid_masks produce fully independent beta values."""
+    valid_mask_two: Bool[torch.Tensor, "2 N_atom K"] = torch.zeros(2, N_ATOM, K, dtype=torch.bool)
+    valid_mask_two[0] = True  # batch 0: all valid; batch 1: all masked
+    ref = torch.randn(2, N_ATOM, C_ATOM)
+    # n_queries=32 > N_ATOM=24: single window covers all atoms; all valid pairs get 0.0
+    beta = compute_beta(neighbor_idx, valid_mask_two, n_queries=32, n_keys=128, ref=ref)
+    assert (beta[1] == -1e10).all()
+    assert (beta[0][valid_mask_two[0]] == 0.0).all()
+
+
 # ---------------------------------------------------------------------------
 # ConditionedTransitionBlock
 # ---------------------------------------------------------------------------
