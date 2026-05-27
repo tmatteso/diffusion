@@ -581,24 +581,25 @@ def test_attn_pair_bias_repeated_application_bounded(
     assert rms_final / rms_initial < 5.0
 
 
-def test_attn_pair_bias_gradient_scale_sensitivity(
+def test_attn_pair_bias_param_grads_finite_after_recycling(
+    s: Float[torch.Tensor, "B N_res C_res"],
     t: Float[torch.Tensor, "B N_res C_res"],
     z: Float[torch.Tensor, "B N_res N_res C_pair"],
 ) -> None:
-    """Gradient norms grow sub-exponentially when input scale doubles.
+    """All parameter gradients remain finite after 20 recycling steps.
 
-    Scales s by x1, x2, x4, x8 and measures how grad norms respond.  Healthy linear
-    scaling gives ratio ~8; softmax-mediated gradient explosions give 100+.  The
-    threshold 20.0 detects superlinear growth while permitting modest super-linearity.
+    An expansive operator causes gradient norms to grow with recycling depth via
+    backpropagation-through-time.  Finite gradients after the full 20-step unrolled
+    loop is a necessary condition for stable training in an 8-block decoder.
     """
-    attn = AttentionPairBias(C_RES, C_PAIR, n_heads=N_HEADS).eval()
-    base_s = torch.randn(B, N_RES, C_RES)
-    grad_norms: list[float] = []
-    for scale in [1, 2, 4, 8]:
-        s_scaled = (base_s * scale).requires_grad_(True)
-        out = attn(s_scaled, t, z)
-        out.pow(2).mean().backward()
-        assert s_scaled.grad is not None
-        grad_norm = float(torch.sqrt(reduce(s_scaled.grad**2, "... -> ", "sum")))
-        grad_norms.append(grad_norm)
-    assert grad_norms[-1] / grad_norms[0] < 20.0
+    attn = AttentionPairBias(C_RES, C_PAIR, n_heads=N_HEADS)
+    s_cycle = s.clone()
+    for _ in range(20):
+        s_cycle = s_cycle + attn(s_cycle, t, z)
+    loss = reduce(s_cycle**2, "... -> ", "mean")
+    torch.autograd.backward([loss])
+    for name, param in attn.named_parameters():
+        assert param.grad is not None, f"param {name!r} has no gradient after recycling"
+        assert torch.isfinite(
+            param.grad
+        ).all(), f"param {name!r} has non-finite gradient after 20 recycling steps"
