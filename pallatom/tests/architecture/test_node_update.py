@@ -4,7 +4,7 @@ import pytest
 import torch
 from architecture.node_update import AdaLN, AttentionPairBias, NodeUpdate
 from beartype import beartype
-from einops import reduce
+from einops import reduce, repeat
 from helpers.useful_objects import manual_seed
 from jaxtyping import Float, Int, TypeCheckError, jaxtyped
 
@@ -307,6 +307,89 @@ def test_node_update_train_dropout_preserves_shape_and_finite(
         out = model(s, t, z)
     assert out.shape == (B, N_RES, C_RES)
     assert torch.isfinite(out).all()
+
+
+def test_attn_pair_bias_all_masked_beta_no_nan(
+    attn: AttentionPairBias,
+    s: Float[torch.Tensor, "B N_res C_res"],
+    t: Float[torch.Tensor, "B N_res C_res"],
+    z: Float[torch.Tensor, "B N_res N_res C_pair"],
+) -> None:
+    """Output is finite when beta suppresses every key position with -1e10.
+
+    Guards against the softmax([-inf, ...]) = NaN failure that arises in float16
+    mixed-precision when -1e10 overflows to -inf.
+    """
+    beta = torch.full((B, N_RES, N_RES), -1e10)
+    with torch.no_grad():
+        out = attn(s, t, z, beta=beta)
+    assert torch.isfinite(out).all()
+
+
+def test_attn_pair_bias_single_unmasked_neighbor_dominates(
+    attn: AttentionPairBias,
+    s: Float[torch.Tensor, "B N_res C_res"],
+    t: Float[torch.Tensor, "B N_res C_res"],
+    z: Float[torch.Tensor, "B N_res N_res C_pair"],
+) -> None:
+    """Masking all keys except one materially changes the output from the all-open case."""
+    beta_one_open = torch.full((B, N_RES, N_RES), -1e10)
+    beta_one_open[:, :, 0] = 0.0
+    beta_all_open = torch.zeros(B, N_RES, N_RES)
+    with torch.no_grad():
+        out_one = attn(s, t, z, beta=beta_one_open)
+        out_all = attn(s, t, z, beta=beta_all_open)
+    assert not torch.allclose(out_one, out_all)
+
+
+def test_attn_pair_bias_beta_constant_shift_invariant(
+    attn: AttentionPairBias,
+    s: Float[torch.Tensor, "B N_res C_res"],
+    t: Float[torch.Tensor, "B N_res C_res"],
+    z: Float[torch.Tensor, "B N_res N_res C_pair"],
+) -> None:
+    """Adding a uniform constant to all beta entries leaves output unchanged.
+
+    Softmax is shift-invariant: exp(x+c)/sum(exp(x+c)) = exp(x)/sum(exp(x)).
+    """
+    beta_zero = torch.zeros(B, N_RES, N_RES)
+    beta_shifted = torch.full((B, N_RES, N_RES), 5.0)
+    with torch.no_grad():
+        out_zero = attn(s, t, z, beta=beta_zero)
+        out_shifted = attn(s, t, z, beta=beta_shifted)
+    assert torch.allclose(out_zero, out_shifted, atol=1e-5)
+
+
+def test_attn_pair_bias_sparse_equals_dense(
+    attn: AttentionPairBias,
+    s: Float[torch.Tensor, "B N_res C_res"],
+    t: Float[torch.Tensor, "B N_res C_res"],
+) -> None:
+    """Sparse path with neighbor_idx=[0..N-1] per query matches the dense path exactly."""
+    z = torch.randn(B, N_RES, N_RES, C_PAIR)
+    # neighbor_idx[i, j] = j — each query sees all N_RES keys in order
+    neighbor_idx: Int[torch.Tensor, "N_res N_res"] = repeat(
+        torch.arange(N_RES), "k -> n k", n=N_RES
+    )
+    with torch.no_grad():
+        out_dense = attn(s, t, z)
+        out_sparse = attn(s, t, z, neighbor_idx=neighbor_idx)
+    assert torch.allclose(out_dense, out_sparse, atol=1e-5)
+
+
+def test_attn_pair_bias_zero_pair_bias_weights_no_effect(
+    s: Float[torch.Tensor, "B N_res C_res"],
+    t: Float[torch.Tensor, "B N_res C_res"],
+) -> None:
+    """With z_to_b.weight zeroed, different pair embeddings z produce identical output."""
+    attn = AttentionPairBias(C_RES, C_PAIR, n_heads=N_HEADS).eval()
+    torch.nn.init.zeros_(attn.z_to_b.weight)
+    z1 = torch.randn(B, N_RES, N_RES, C_PAIR)
+    z2 = torch.randn(B, N_RES, N_RES, C_PAIR) * 10.0
+    with torch.no_grad():
+        out1 = attn(s, t, z1)
+        out2 = attn(s, t, z2)
+    assert torch.allclose(out1, out2, atol=1e-6)
 
 
 # ---------------------------------------------------------------------------
