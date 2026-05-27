@@ -533,3 +533,72 @@ def test_node_update_forward_wrong_shape(
     s_bad = torch.zeros(B, N_RES)  # missing c_res dim
     with pytest.raises(TypeCheckError):
         node_update(s_bad, t, z)
+
+
+# ---------------------------------------------------------------------------
+# AttentionPairBias — stability (residual gain, recycling, gradient scaling)
+# ---------------------------------------------------------------------------
+
+
+def test_attn_pair_bias_residual_gain_contractive(
+    s: Float[torch.Tensor, "B N_res C_res"],
+    t: Float[torch.Tensor, "B N_res C_res"],
+    z: Float[torch.Tensor, "B N_res N_res C_pair"],
+) -> None:
+    """The attention delta is contractive at random init: ||delta|| / ||s|| < 1.0.
+
+    AttentionPairBias.forward returns the additive update that NodeUpdate applies as
+    s = s + attn(s, t, z).  A gain >= 1.0 at init predicts compounding norm explosions
+    across 8 decoder recycling blocks in late training.
+    """
+    attn = AttentionPairBias(C_RES, C_PAIR, n_heads=N_HEADS).eval()
+    with torch.no_grad():
+        delta = attn(s, t, z)
+    delta_norm = float(torch.sqrt(reduce(delta**2, "... -> ", "sum")))
+    s_norm = float(torch.sqrt(reduce(s**2, "... -> ", "sum")))
+    gain = delta_norm / s_norm
+    assert gain < 1.0
+
+
+def test_attn_pair_bias_repeated_application_bounded(
+    s: Float[torch.Tensor, "B N_res C_res"],
+    t: Float[torch.Tensor, "B N_res C_res"],
+    z: Float[torch.Tensor, "B N_res N_res C_pair"],
+) -> None:
+    """RMS stays bounded after 20 rounds of s = s + attn(s, t, z) with z held fixed.
+
+    Simulates the decoder recycling loop.  An intrinsically expansive operator shows
+    exponential RMS growth even without training; a contractive one stays near the
+    initial scale.  Threshold 5.0 allows healthy growth while catching explosions.
+    """
+    attn = AttentionPairBias(C_RES, C_PAIR, n_heads=N_HEADS).eval()
+    s_cycle = s.clone()
+    rms_initial = float(torch.sqrt(reduce(s_cycle**2, "... -> ", "mean")))
+    with torch.no_grad():
+        for _ in range(20):
+            s_cycle = s_cycle + attn(s_cycle, t, z)
+    rms_final = float(torch.sqrt(reduce(s_cycle**2, "... -> ", "mean")))
+    assert rms_final / rms_initial < 5.0
+
+
+def test_attn_pair_bias_gradient_scale_sensitivity(
+    t: Float[torch.Tensor, "B N_res C_res"],
+    z: Float[torch.Tensor, "B N_res N_res C_pair"],
+) -> None:
+    """Gradient norms grow sub-exponentially when input scale doubles.
+
+    Scales s by x1, x2, x4, x8 and measures how grad norms respond.  Healthy linear
+    scaling gives ratio ~8; softmax-mediated gradient explosions give 100+.  The
+    threshold 20.0 detects superlinear growth while permitting modest super-linearity.
+    """
+    attn = AttentionPairBias(C_RES, C_PAIR, n_heads=N_HEADS).eval()
+    base_s = torch.randn(B, N_RES, C_RES)
+    grad_norms: list[float] = []
+    for scale in [1, 2, 4, 8]:
+        s_scaled = (base_s * scale).requires_grad_(True)
+        out = attn(s_scaled, t, z)
+        out.pow(2).mean().backward()
+        assert s_scaled.grad is not None
+        grad_norm = float(torch.sqrt(reduce(s_scaled.grad**2, "... -> ", "sum")))
+        grad_norms.append(grad_norm)
+    assert grad_norms[-1] / grad_norms[0] < 20.0
