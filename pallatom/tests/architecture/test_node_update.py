@@ -352,21 +352,21 @@ def test_attn_pair_bias_beta_constant_shift_invariant(
 
     Softmax is shift-invariant: exp(x+c)/sum(exp(x+c)) = exp(x)/sum(exp(x)).
     """
-    beta_zero = torch.zeros(B, N_RES, N_RES)
-    beta_shifted = torch.full((B, N_RES, N_RES), 5.0)
+    beta_base = torch.randn(B, N_RES, N_RES)
+    beta_shifted = beta_base + 5.0
     with torch.no_grad():
-        out_zero = attn(s, t, z, beta=beta_zero)
+        out_base = attn(s, t, z, beta=beta_base)
         out_shifted = attn(s, t, z, beta=beta_shifted)
-    assert torch.allclose(out_zero, out_shifted, atol=1e-5)
+    assert torch.allclose(out_base, out_shifted, atol=1e-5)
 
 
 def test_attn_pair_bias_sparse_equals_dense(
     attn: AttentionPairBias,
     s: Float[torch.Tensor, "B N_res C_res"],
     t: Float[torch.Tensor, "B N_res C_res"],
+    z: Float[torch.Tensor, "B N_res N_res C_pair"],
 ) -> None:
     """Sparse path with neighbor_idx=[0..N-1] per query matches the dense path exactly."""
-    z = torch.randn(B, N_RES, N_RES, C_PAIR)
     # neighbor_idx[i, j] = j — each query sees all N_RES keys in order
     neighbor_idx: Int[torch.Tensor, "N_res N_res"] = repeat(
         torch.arange(N_RES), "k -> n k", n=N_RES
