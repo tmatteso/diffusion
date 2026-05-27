@@ -418,9 +418,9 @@ def test_compute_beta_no_inf_in_output(
 ) -> None:
     """compute_beta output contains no -inf values when ref dtype is float16.
 
-    Tripwire for mixed-precision: -1e10 overflows float16 range (~65504) to -inf,
-    which causes softmax([-inf, ...]) = NaN downstream.  Passes now (float32 training);
-    will break if compute_beta is ever called with a float16 ref.
+    Regression guard for the float16 fill-value fix in compute_beta: the original
+    -1e10 constant raises RuntimeError when cast to float16 (overflow).  After the
+    fix, a dtype-safe value is used and the output contains no -inf.
     """
     ref = torch.zeros(B, N_ATOM, C_ATOM, dtype=torch.float16)
     beta = compute_beta(neighbor_idx, valid_mask, n_queries=32, n_keys=128, ref=ref)
@@ -436,7 +436,7 @@ def test_compute_beta_asymmetric() -> None:
     l=4 queries centre 2 (|4-4.5|=0.5 < 1.0); m=0 NOT a key (|0-4.5|=4.5 > 4.0) -> -1e10.
     """
     N_t, n_q, n_k, B_t = 8, 2, 8, 1
-    neighbor_idx_t: Int[torch.Tensor, "N_t N_t"] = repeat(torch.arange(N_t), "k -> n k", n=N_t)
+    neighbor_idx_t: Int[torch.Tensor, "N_t K_t"] = repeat(torch.arange(N_t), "k -> n k", n=N_t)
     valid_mask_t: Bool[torch.Tensor, "B_t N_t N_t"] = torch.ones(B_t, N_t, N_t, dtype=torch.bool)
     ref = torch.zeros(B_t, N_t, C_ATOM)
     beta = compute_beta(neighbor_idx_t, valid_mask_t, n_queries=n_q, n_keys=n_k, ref=ref)
@@ -453,7 +453,7 @@ def test_compute_beta_all_neighbors_masked_row(
     ref = torch.randn(B, N_ATOM, C_ATOM)
     beta = compute_beta(neighbor_idx, valid_mask, n_queries=32, n_keys=128, ref=ref)
     assert (beta[0, 0, :] == -1e10).all()
-    assert (beta[0, 1, :][valid_mask[0, 1, :]] == 0.0).any()
+    assert (beta[0, 1, :][valid_mask[0, 1, :]] == 0.0).all()
 
 
 def test_compute_beta_batch_independence(
