@@ -154,11 +154,6 @@ def take_step(
     )
     sigma_data = model_params.tcfg.noise.sigma_data
 
-    # Elucidating diffusion model loss weighting:
-    lambda_sigma_loss_weight: Float[torch.Tensor, ""] = (
-        featurized_batch.t_hat**2 + sigma_data**2
-    ) / (featurized_batch.t_hat * sigma_data) ** 2
-
     lp = model_params.tcfg.loss
 
     if train:
@@ -173,6 +168,11 @@ def take_step(
     t0 = time.perf_counter()
 
     with StepContext(model=model_params.model, train=train):
+        # Elucidating diffusion model loss weighting:
+        lambda_sigma_loss_weight: Float[torch.Tensor, ""] = (
+            featurized_batch.t_hat**2 + sigma_data**2
+        ) / (featurized_batch.t_hat * sigma_data) ** 2
+
         pred_outputs: PredictedOutputs = model_params.model(featurized_batch)
 
         Kabsch_aligned_MSE_loss: Float[torch.Tensor, ""] = atom_loss(
