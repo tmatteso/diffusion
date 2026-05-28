@@ -864,7 +864,7 @@ def main(args: argparse.Namespace, tcfg: TrainConfig) -> None:
         dr = tcfg.distogram_res
         da = tcfg.distogram_atom
         distogram_res = Distogram(
-            n_bins=dr.n_bins, min_dist=dr.min_dist, max_dist=dr.max_dist, overflow_bin=True
+            n_bins=dr.n_bins - 1, min_dist=dr.min_dist, max_dist=dr.max_dist, overflow_bin=True
         ).to(device)
         distogram_atom = Distogram(
             n_bins=da.n_bins, min_dist=da.min_dist, max_dist=da.max_dist, overflow_bin=False

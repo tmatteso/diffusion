@@ -403,7 +403,9 @@ class MainTrunk(nn.Module):
 
     ----------
     f_ref_dim    : per-atom f^ref feature size (3 + element_dim after tile)
-    n_bins       : distogram bins for TemplateEmbedder
+    n_bins       : number of distance bins; used for both TemplateEmbedder input and
+                   distogram head output — must equal the number of bins the data
+                   distogram produces (base bins + 1 overflow when overflow_bin=True)
     c_atom       : atom single dim
     c_pair       : trunk pair dim         (default 128)
     c_res        : trunk single/residue dim (default 256)
@@ -521,14 +523,10 @@ class MainTrunk(nn.Module):
         and applies the skip-connection projection.  The returned EmbeddedInputs can
         be passed directly to the decoder loop or inspected for interpretability.
         """
-        # n_templ_bins ≠ n_bins: template distogram has an overflow bin (39);
-        # the distogram heads produce n_bins (38) from the trunk config.
         ref_pos: Float[torch.Tensor, "B N_atom 3"] = batch.ref_pos
         ref_element: Float[torch.Tensor, "B N_atom E"] = batch.ref_element
         ref_space_uid: Int[torch.Tensor, "B N_atom"] = batch.ref_space_uid
-        f_distogram: Float[torch.Tensor, "B N_res N_res n_templ_bins"] = (
-            batch.gt_res_distogram.float()
-        )
+        f_distogram: Float[torch.Tensor, "B N_res N_res n_bins"] = batch.gt_res_distogram.float()
         f_pseudo_beta_mask: Float[torch.Tensor, "B N_res"] = batch.f_pseudo_beta_mask.float()
         f_residue_idx: Int[torch.Tensor, "B N_res"] = batch.f_residue_idx
 
