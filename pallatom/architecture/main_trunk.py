@@ -51,12 +51,12 @@ class EmbeddedInputs:
     r_input: Float[torch.Tensor, "B N_atom 3"]
     tok_idx: Int[torch.Tensor, "B N_atom"]
     center_uid: Int[torch.Tensor, "B N_res"]
-    t_hat: float
+    t_hat: Float[torch.Tensor, "B"]
     B: int
     N_atom: int
     N_res: int
     device: torch.device
-    denom: float
+    denom: Float[torch.Tensor, "B"]
 
 
 @jaxtyped(typechecker=beartype)
@@ -111,30 +111,29 @@ def scatter_mean(
 
 
 class TimeFourierEmbedding(nn.Module):
-    """Maps scalar x = ¼·log(t̂/sigma_data) to a Fourier feature vector ∈ R^{c_res}.
+    """Maps scalar t̂ to a Fourier feature vector ∈ R^{c_res} (Algorithm 22).
 
-    Uses learnable frequencies (as in AF3 / common diffusion practice).
+    Weights and biases are fixed random values sampled once at init, not learned.
     """
 
     def __init__(self, c_res: int) -> None:
         super().__init__()
-        assert c_res % 2 == 0, "c_res must be even for sin/cos pairs"
-        self.freqs = nn.Parameter(torch.randn(c_res // 2))
-        self.proj = LinearNoBias(c_res, c_res)
+        self.freqs: Float[torch.Tensor, "c_res"]
+        self.phases: Float[torch.Tensor, "c_res"]
+        self.register_buffer("freqs", torch.randn(c_res))
+        self.register_buffer("phases", torch.randn(c_res))
 
     def forward(self, x: Float[torch.Tensor, "..."]) -> Float[torch.Tensor, "... c_res"]:
-        """Map scalar noise-level encoding to a Fourier feature vector.
+        """Map noise-level scalar to a Fourier feature vector.
 
         Args:
-            x: Scalar or batched input (any leading shape); typically ¼·log(t̂/sigma_data).
+            x: Scalar or batched input (any leading shape).
 
         Returns:
-            Projected Fourier embedding of shape (*x.shape, c_res).
+            Cosine Fourier embedding of shape (*x.shape, c_res).
         """
-        # x: any leading shape; last dim expanded to c_res
-        angles = 2 * math.pi * rearrange(x, "... -> ... 1") * self.freqs  # (..., c_res//2)
-        emb = torch.cat([torch.sin(angles), torch.cos(angles)], dim=-1)
-        return self.proj(emb)
+        angles = 2 * math.pi * (rearrange(x, "... -> ... 1") * self.freqs + self.phases)
+        return torch.cos(angles)
 
 
 # ---------------------------------------------------------------------------
@@ -144,35 +143,111 @@ class TimeFourierEmbedding(nn.Module):
 
 
 class RelativePositionEncoding(nn.Module):
-    """Standard clipped relative position encoding.
+    """Algorithm 3 relative position encoding.
 
-    Produces z_ij^init ∈ R^{c_pair} from residue index differences.
+    Produces p_ij ∈ R^{c_z} from per-token identity features, encoding relative
+    residue position, relative token position within a residue, entity identity,
+    and relative chain index.
     """
 
-    def __init__(self, c_pair: int, max_rel: int = 32) -> None:
+    def __init__(self, c_pair: int, r_max: int = 32, s_max: int = 2) -> None:
         super().__init__()
-        self.max_rel = max_rel
-        n_bins = 2 * max_rel + 1
-        self.proj = LinearNoBias(n_bins, c_pair)
+        self.r_max = r_max
+        self.s_max = s_max
+        # Input dim: a_rel_pos (2r+2) + a_rel_token (2r+2) + b_same_entity (1) + a_rel_chain (2s+2)
+        in_dim = (2 * r_max + 2) + (2 * r_max + 2) + 1 + (2 * s_max + 2)
+        self.proj = LinearNoBias(in_dim, c_pair)
 
+    @jaxtyped(typechecker=beartype)
     def forward(
-        self, N_token: int, device: torch.device
-    ) -> Float[torch.Tensor, "N_res N_res c_pair"]:
-        """Compute relative position embeddings for a sequence of tokens.
+        self,
+        *,
+        residue_index: Int[torch.Tensor, "B N_res"],
+        asym_id: Int[torch.Tensor, "B N_res"],
+        entity_id: Int[torch.Tensor, "B N_res"],
+        token_index: Int[torch.Tensor, "B N_res"],
+        sym_id: Int[torch.Tensor, "B N_res"],
+    ) -> Float[torch.Tensor, "B N_res N_res c_pair"]:
+        """Compute Algorithm 3 relative position embeddings from per-token features.
 
         Args:
-            N_token: Number of residue tokens.
-            device: Target device for the output tensor.
+            residue_index: Integer residue index per token, shape (B, N_res).
+            asym_id: Asymmetric chain ID per token, shape (B, N_res).
+            entity_id: Entity ID per token, shape (B, N_res).
+            token_index: Within-residue token index per token, shape (B, N_res).
+            sym_id: Symmetric chain ID per token, shape (B, N_res).
 
         Returns:
-            Pair embedding of shape (N_token, N_token, c_pair).
+            Pair embedding of shape (B, N_res, N_res, c_pair).
         """
-        idx = torch.arange(N_token, device=device)
-        diff = rearrange(idx, "n -> n 1") - rearrange(idx, "n -> 1 n")  # (N, N)
-        diff = diff.clamp(-self.max_rel, self.max_rel) + self.max_rel  # shift to [0, 2R]
-        n_bins = 2 * self.max_rel + 1
-        onehot = F.one_hot(diff, num_classes=n_bins).float()  # (N, N, n_bins)
-        return self.proj(onehot)  # (N, N, c_pair)
+        r_max = self.r_max
+        s_max = self.s_max
+
+        # Lines 1-3: pairwise boolean masks
+        b_same_chain: Bool[torch.Tensor, "B N_res N_res"] = rearrange(
+            asym_id, "b n -> b n 1"
+        ) == rearrange(asym_id, "b m -> b 1 m")
+        b_same_residue: Bool[torch.Tensor, "B N_res N_res"] = rearrange(
+            residue_index, "b n -> b n 1"
+        ) == rearrange(residue_index, "b m -> b 1 m")
+        b_same_entity: Bool[torch.Tensor, "B N_res N_res"] = rearrange(
+            entity_id, "b n -> b n 1"
+        ) == rearrange(entity_id, "b m -> b 1 m")
+
+        # Line 4: d_residue — clipped within-chain, overflow bin across chains
+        d_res_raw: Int[torch.Tensor, "B N_res N_res"] = rearrange(
+            residue_index, "b n -> b n 1"
+        ) - rearrange(residue_index, "b m -> b 1 m")
+        d_residue: Int[torch.Tensor, "B N_res N_res"] = torch.where(
+            b_same_chain,
+            (d_res_raw + r_max).clamp(0, 2 * r_max),
+            torch.full_like(d_res_raw, 2 * r_max + 1),
+        )
+
+        # Line 5: a_rel_pos
+        a_rel_pos: Float[torch.Tensor, "B N_res N_res rel_pos_bins"] = F.one_hot(
+            d_residue, num_classes=2 * r_max + 2
+        ).float()
+
+        # Line 6: d_token — clipped when same chain+residue, overflow otherwise
+        d_tok_raw: Int[torch.Tensor, "B N_res N_res"] = rearrange(
+            token_index, "b n -> b n 1"
+        ) - rearrange(token_index, "b m -> b 1 m")
+        d_token: Int[torch.Tensor, "B N_res N_res"] = torch.where(
+            b_same_chain & b_same_residue,
+            (d_tok_raw + r_max).clamp(0, 2 * r_max),
+            torch.full_like(d_tok_raw, 2 * r_max + 1),
+        )
+
+        # Line 7: a_rel_token
+        a_rel_token: Float[torch.Tensor, "B N_res N_res rel_tok_bins"] = F.one_hot(
+            d_token, num_classes=2 * r_max + 2
+        ).float()
+
+        # Line 8: d_chain — clipped when NOT same chain, overflow when same chain
+        d_chain_raw: Int[torch.Tensor, "B N_res N_res"] = rearrange(
+            sym_id, "b n -> b n 1"
+        ) - rearrange(sym_id, "b m -> b 1 m")
+        d_chain: Int[torch.Tensor, "B N_res N_res"] = torch.where(
+            ~b_same_chain,
+            (d_chain_raw + s_max).clamp(0, 2 * s_max),
+            torch.full_like(d_chain_raw, 2 * s_max + 1),
+        )
+
+        # Line 9: a_rel_chain
+        a_rel_chain: Float[torch.Tensor, "B N_res N_res rel_chain_bins"] = F.one_hot(
+            d_chain, num_classes=2 * s_max + 2
+        ).float()
+
+        # Line 10: concat and project
+        b_entity_float: Float[torch.Tensor, "B N_res N_res 1"] = rearrange(
+            b_same_entity.float(), "b n m -> b n m 1"
+        )
+        # feat = rel_pos_bins + rel_tok_bins + rel_chain_bins + 1
+        features: Float[torch.Tensor, "B N_res N_res feat"] = torch.cat(
+            [a_rel_pos, a_rel_token, b_entity_float, a_rel_chain], dim=-1
+        )
+        return self.proj(features)  # feat -> c_pair
 
 
 # ---------------------------------------------------------------------------
@@ -329,7 +404,7 @@ class MainTrunk(nn.Module):
     ----------
     f_ref_dim    : per-atom f^ref feature size (3 + element_dim after tile)
     n_bins       : distogram bins for TemplateEmbedder
-    c_atom       : atom single dim        (default 128)
+    c_atom       : atom single dim
     c_pair       : trunk pair dim         (default 128)
     c_res        : trunk single/residue dim (default 256)
     c_atompair   : atom-pair dim          (default 16)
@@ -340,25 +415,30 @@ class MainTrunk(nn.Module):
 
     def __init__(
         self,
-        f_ref_dim: int = 35,  # 5 * 7
-        n_bins: int = 38,
-        n_atom_bins: int = 22,
-        c_atom: int = 128,
-        c_pair: int = 128,
-        c_res: int = 256,
-        c_atompair: int = 16,
-        n_blocks: int = 2,
-        n_heads: int = 4,
-        sigma_data: float = 16.0,
-        K_unit: int = 3,
-        n_amino: int = 20,
+        f_ref_dim: int,  # 5 * (3+4) 4 because N C O UNK
+        n_bins: int,
+        n_atom_bins: int,
+        c_atom: int,
+        c_pair: int,
+        c_res: int,
+        c_atompair: int,
+        n_blocks_atom_transformer_encoder: int,
+        n_heads_atom_transformer_encoder: int,
+        n_blocks_atom_transformer_decoder: int,
+        n_heads_atom_transformer_decoder: int,
+        n_pairformer_blocks_template_embedder: int,
+        n_paiformer_heads_template_embedder: int,
+        sigma_data: float,  # 16
+        K_unit: int,
+        n_amino: int,  # 20
+        residue_number: int,
     ) -> None:
         super().__init__()
         self.sigma_data = sigma_data
         self.K_unit = K_unit
 
         # Step 2: residue-idx feature → s_init
-        self.proj_residue_idx = LinearNoBias(c_res, c_res)
+        self.proj_residue_idx = LinearNoBias(residue_number, c_res)
         # Step 3: time Fourier embedding
         self.time_fourier = TimeFourierEmbedding(c_res)
         # Amino-acid sequence conditioning: 21 entries (0-19 = amino acids, 20 = mask token "X")
@@ -369,7 +449,12 @@ class MainTrunk(nn.Module):
 
         # Step 6: template embedder
         self.template_embedder = TemplateEmbedder(
-            n_bins=n_bins, c_z=c_pair, c=64, d=c_pair, n_blocks=2
+            n_bins=n_bins,
+            c_z=c_pair,
+            c=64,
+            d=c_pair,
+            n_blocks=n_pairformer_blocks_template_embedder,
+            n_heads=n_paiformer_heads_template_embedder,
         )
 
         # Step 7: atom feature encoder
@@ -380,8 +465,8 @@ class MainTrunk(nn.Module):
             c=c_res,
             d=c_atompair,
             m=c_atom,
-            n_blocks=n_blocks,
-            n_heads=n_heads,
+            n_blocks=n_blocks_atom_transformer_encoder,
+            n_heads=n_heads_atom_transformer_encoder,
         )
 
         # Step 8: project s_init → s_i addition
@@ -397,6 +482,8 @@ class MainTrunk(nn.Module):
                     c_pair=c_pair,
                     c_atom=c_atom,
                     c_atompair=c_atompair,
+                    n_blocks=n_blocks_atom_transformer_decoder,
+                    n_heads=n_heads_atom_transformer_decoder,
                 )
                 for _ in range(K_unit)
             ]
@@ -443,10 +530,11 @@ class MainTrunk(nn.Module):
             batch.gt_res_distogram.float()
         )
         f_pseudo_beta_mask: Float[torch.Tensor, "B N_res"] = batch.f_pseudo_beta_mask.float()
-        f_residue_idx: Float[torch.Tensor, "B N_res c_res"] = batch.f_residue_idx
-        r_input: Float[torch.Tensor, "B N_atom 3"] = batch.r_input
-        t_hat: float = batch.t_hat
-        t: float = batch.t_normalized
+        f_residue_idx: Int[torch.Tensor, "B N_res"] = batch.f_residue_idx
+
+        r_input: Float[torch.Tensor, "B N_atom 3"] = batch.r_gt
+        t_hat: Float[torch.Tensor, "B"] = batch.t_hat
+        t: Float[torch.Tensor, "B N_res N_res"] = batch.t_normalized
         tok_idx: Int[torch.Tensor, "B N_atom"] = batch.tok_idx
         center_uid: Int[torch.Tensor, "B N_res"] = batch.center_uid
         aa_indices: Int[torch.Tensor, "B N_res"] = batch.aa_indices
@@ -459,13 +547,17 @@ class MainTrunk(nn.Module):
 
         # ------------------------------------------------------------------
         # Step 1: r_scaled = r_input / sqrt(sigma_data² + t̂²)    [B, N_atom, 3]
+        # this is c_in from EDM. t_hat is sigma
         # ------------------------------------------------------------------
-        r_scaled: Float[torch.Tensor, "B N_atom 3"] = r_input / math.sqrt(sd**2 + t_hat**2)
+        denom: Float[torch.Tensor, "B"] = torch.sqrt(sd**2 + t_hat**2)
+        r_scaled: Float[torch.Tensor, "B N_atom 3"] = r_input / rearrange(denom, "b -> b 1 1")
 
         # ------------------------------------------------------------------
         # Step 2: s_init = LinearNoBias(f_residue_idx)         [B, N_res, c_res]
         # ------------------------------------------------------------------
-        s_init: Float[torch.Tensor, "B N_res c_res"] = self.proj_residue_idx(f_residue_idx)
+        s_init: Float[torch.Tensor, "B N_res c_res"] = self.proj_residue_idx(
+            F.one_hot(f_residue_idx, num_classes=self.proj_residue_idx.in_features).float()
+        )
 
         # ------------------------------------------------------------------
         # Step 2b: s_init += aa_embedding(aa_indices)
@@ -479,9 +571,10 @@ class MainTrunk(nn.Module):
 
         # ------------------------------------------------------------------
         # Step 3: t_i = TimeFourierEmbedding(¼·log(t̂/sigma_data))  [B, N_res, c_res]
+        # this is noise conditioning, c_noise from EDM.
         # ------------------------------------------------------------------
-        log_val = 0.25 * math.log(t_hat / sd + 1e-8)
-        log_arg = torch.full((B, N_res), log_val, device=device)
+        log_val: Float[torch.Tensor, "B"] = 0.25 * torch.log(t_hat / sd + 1e-8)
+        log_arg: Float[torch.Tensor, "B N_res"] = repeat(log_val, "b -> b n", n=N_res)
         t_i: Float[torch.Tensor, "B N_res c_res"] = self.time_fourier(log_arg)
 
         # ------------------------------------------------------------------
@@ -493,9 +586,24 @@ class MainTrunk(nn.Module):
         # Step 5: z_ij = RelativePositionEncoding(f*)    [N_res, N_res, c_pair]
         # expanded to [B, N_res, N_res, c_pair]
         # ------------------------------------------------------------------
-        z_ij_base: Float[torch.Tensor, "N_res N_res c_pair"] = self.rel_pos_enc(N_res, device)
-        z_ij: Float[torch.Tensor, "B N_res N_res c_pair"] = repeat(
-            z_ij_base, "n1 n2 c -> b n1 n2 c", b=B
+
+        # residue_index = protein.residue_index
+        # asym_id = spoof for now. make all zeros.
+        # entity_id = spoof for now. make all zeros.
+        # token_index = Token number. Increases monotonically; does not restart at 1
+        # for new chains. this is an arange
+        # sym_id = spoof for now. make all zeros.
+        zeros: Int[torch.Tensor, "B N_res"] = torch.zeros(B, N_res, dtype=torch.long, device=device)
+        explicit_arange_token_idx: Int[torch.Tensor, "B N_res"] = repeat(
+            torch.arange(N_res, dtype=torch.long, device=device), "n -> b n", b=B
+        )
+
+        z_ij: Float[torch.Tensor, "B N_res N_res c_pair"] = self.rel_pos_enc(
+            residue_index=f_residue_idx,
+            asym_id=zeros,
+            entity_id=zeros,
+            token_index=explicit_arange_token_idx,
+            sym_id=zeros,
         )
 
         # ------------------------------------------------------------------
@@ -548,7 +656,7 @@ class MainTrunk(nn.Module):
             N_atom=N_atom,
             N_res=N_res,
             device=device,
-            denom=math.sqrt(sd**2 + t_hat**2),
+            denom=denom,
         )
 
     # ----------------------------------------------------------------------
@@ -605,9 +713,9 @@ class MainTrunk(nn.Module):
             r_updates = r_updates + r_update
 
             # Step 14: r_denoised = sigma²/(sigma²+t̂²)·r_input + sigma·t̂/√(sigma²+t̂²)·r_updates
-            r_denoised = (sd**2 / (sd**2 + emb.t_hat**2)) * emb.r_input + (
-                sd * emb.t_hat / emb.denom
-            ) * r_updates
+            w_gt = rearrange(sd**2 / (sd**2 + emb.t_hat**2), "b -> b 1 1")
+            w_upd = rearrange(sd * emb.t_hat / emb.denom, "b -> b 1 1")
+            r_denoised = w_gt * emb.r_input + w_upd * r_updates
 
             intermediate_denoised_coord_stack.append(r_denoised)
 

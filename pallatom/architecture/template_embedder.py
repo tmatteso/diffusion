@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from architecture.atom_transformers import LinearNoBias
 from architecture.pairformer_stack import PairformerStack
 from beartype import beartype
-from einops import einsum, rearrange, repeat
+from einops import einsum, rearrange
 from jaxtyping import Float, jaxtyped
 
 # ---------------------------------------------------------------------------
@@ -30,10 +30,10 @@ class TemplateEmbedder(nn.Module):
         self,
         n_bins: int,
         c_z: int,
-        c: int = 64,
-        d: int = 128,
-        n_blocks: int = 2,
-        n_heads: int = 4,
+        c: int,
+        d: int,
+        n_blocks: int,
+        n_heads: int,
     ) -> None:
         super().__init__()
 
@@ -57,11 +57,9 @@ class TemplateEmbedder(nn.Module):
         f_distogram: Float[torch.Tensor, "B N_res N_res n_bins"],
         f_pseudo_beta_mask: Float[torch.Tensor, "B N_res"],
         z_ij: Float[torch.Tensor, "B N_res N_res c_z"],
-        t: float,  # scalar in [0, 1)
+        t: Float[torch.Tensor, "B N_res N_res"],
     ) -> Float[torch.Tensor, "B N_res N_res d"]:
         """Embed template distogram and pair features into time-conditioned pair representation."""
-        N = f_pseudo_beta_mask.size(1)
-
         # ------------------------------------------------------------------
         # Step 1: b_ij^mask = f_i^mask · f_j^mask
         # ------------------------------------------------------------------
@@ -73,8 +71,8 @@ class TemplateEmbedder(nn.Module):
         # ------------------------------------------------------------------
         # Step 2: b_ij^time = t ⊙ f_i^mask    (broadcast t over j)
         # ------------------------------------------------------------------
-        b_time: Float[torch.Tensor, "B N_res N_res 1"] = repeat(
-            t * f_pseudo_beta_mask, "b i -> b i j 1", j=N
+        b_time: Float[torch.Tensor, "B N_res N_res 1"] = rearrange(
+            t * rearrange(f_pseudo_beta_mask, "b i -> b i 1"), "b i j -> b i j 1"
         )
 
         # ------------------------------------------------------------------

@@ -152,6 +152,13 @@ def take_step(
     featurized_batch: FeaturizedBatch = featurize_batch(
         batch, model_params.tcfg, model_params.distogram_res, model_params.distogram_atom
     )
+    sigma_data = model_params.tcfg.noise.sigma_data
+
+    # Elucidating diffusion model loss weighting:
+    lambda_sigma_loss_weight: Float[torch.Tensor, ""] = (
+        featurized_batch.t_hat**2 + sigma_data**2
+    ) / (featurized_batch.t_hat * sigma_data) ** 2
+
     lp = model_params.tcfg.loss
 
     if train:
@@ -170,7 +177,8 @@ def take_step(
 
         Kabsch_aligned_MSE_loss: Float[torch.Tensor, ""] = atom_loss(
             pred_outputs.r_denoised, featurized_batch.r_gt, featurized_batch.atom5_mask
-        ).mean()
+        )
+        Kabsch_aligned_MSE_loss = (Kabsch_aligned_MSE_loss * lambda_sigma_loss_weight).mean()
 
         K_unit: int = len(pred_outputs.intermediate_denoised_coord_stack)
         intermediate_med_loss: Float[torch.Tensor, ""] = torch.tensor(
@@ -830,9 +838,9 @@ def main(args: argparse.Namespace, tcfg: TrainConfig) -> None:
 
         mp = tcfg.model
         tp = tcfg.training
-        model: MainTrunk = MainTrunk(
+        model: MainTrunk = MainTrunk(  # this be changed to init directly from the tcfg
             f_ref_dim=mp.f_ref_dim,
-            n_bins=mp.n_bins,
+            n_bins=tcfg.distogram_res.n_bins,
             n_atom_bins=tcfg.distogram_atom.n_bins,
             c_atom=mp.c_atom,
             c_pair=mp.c_pair,
@@ -840,6 +848,14 @@ def main(args: argparse.Namespace, tcfg: TrainConfig) -> None:
             c_atompair=mp.c_atompair,
             K_unit=mp.K_unit,
             sigma_data=tcfg.noise.sigma_data,
+            residue_number=mp.max_residues,
+            n_amino=mp.n_amino,
+            n_blocks_atom_transformer_encoder=mp.n_blocks_atom_transformer_encoder,
+            n_heads_atom_transformer_encoder=mp.n_heads_atom_transformer_encoder,
+            n_blocks_atom_transformer_decoder=mp.n_blocks_atom_transformer_decoder,
+            n_heads_atom_transformer_decoder=mp.n_heads_atom_transformer_decoder,
+            n_pairformer_blocks_template_embedder=mp.n_pairformer_blocks_template_embedder,
+            n_paiformer_heads_template_embedder=mp.n_paiformer_heads_template_embedder,
         ).to(device)
 
         optimizer = Adam(model.parameters(), lr=tp.lr, weight_decay=tp.weight_decay)

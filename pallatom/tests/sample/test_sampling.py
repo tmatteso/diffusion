@@ -45,11 +45,11 @@ def _make_trunk_mock() -> MagicMock:
     mock = MagicMock()
 
     def _forward(batch: FeaturizedBatch) -> PredictedOutputs:
-        B_local = batch.r_input.shape[0]
-        n_atom = batch.r_input.shape[1]
+        B_local = batch.r_gt.shape[0]
+        n_atom = batch.r_gt.shape[1]
         n_res = int(batch.tok_idx.max().item()) + 1
         return PredictedOutputs(
-            r_denoised=batch.r_input.clone(),
+            r_denoised=batch.r_gt.clone(),
             seq_logits=torch.zeros(B_local, n_res, 20),
             residue_distogram_logits=torch.zeros(B_local, n_res, n_res, 38),
             atom_distogram_logits=torch.zeros(B_local, n_atom, 1, 38),
@@ -84,7 +84,6 @@ def context(atom_disto_fn: Distogram, templ_disto: Distogram) -> FeaturizedBatch
             pdb_files=[],
             atom_distogram_fn=atom_disto_fn,
             templ_distogram_fn=templ_disto,
-            c_res=32,
         )
 
 
@@ -160,22 +159,6 @@ def bare_sampler(zero_denoiser_mock: MagicMock) -> EDMSampler:
         sigma_max=SIGMA_MAX,
         rho=7.0,
     )
-
-
-@pytest.fixture
-def context_c_res_64(atom_disto_fn: Distogram, templ_disto: Distogram) -> FeaturizedBatch:
-    """Provide a sampling context built with c_res=64 to test wider residue embeddings."""
-    with torch.no_grad():
-        return build_sampling_context(
-            atom_positions=torch.zeros(N_RES, 37, 3),
-            atom_mask=torch.ones(N_RES, 37),
-            residue_index=torch.arange(N_RES, dtype=torch.float),
-            seq="A" * N_RES,
-            pdb_files=[],
-            atom_distogram_fn=atom_disto_fn,
-            templ_distogram_fn=templ_disto,
-            c_res=64,
-        )
 
 
 @pytest.fixture
@@ -349,14 +332,9 @@ def test_build_sampling_context_center_uid_shape(context: FeaturizedBatch):
     assert context.center_uid.shape == (1, N_RES)
 
 
-def test_build_sampling_context_r_input_shape(context: FeaturizedBatch):
-    """The noisy-coordinate placeholder must match the full atom layout: (1, N_atom, 3)."""
-    assert context.r_input.shape == (1, N_ATOM, 3)
-
-
 def test_build_sampling_context_f_residue_idx_shape(context: FeaturizedBatch):
-    """The residue-index embedding must have a leading residue axis of size N_RES."""
-    assert context.f_residue_idx.ndim == 3
+    """The residue index must have shape (B, N_RES)."""
+    assert context.f_residue_idx.ndim == 2
     assert context.f_residue_idx.shape[1] == N_RES
 
 
@@ -405,14 +383,9 @@ def test_build_sampling_context_f_pseudo_beta_mask_all_zeros(context: Featurized
     assert (context.f_pseudo_beta_mask == 0).all()
 
 
-def test_build_sampling_context_placeholder_r_input_all_zeros(context: FeaturizedBatch):
-    """The r_input placeholder must start at zero; the sampler overwrites it at runtime."""
-    assert (context.r_input == 0).all()
-
-
 def test_build_sampling_context_f_residue_idx_is_finite(context: FeaturizedBatch):
-    """Sinusoidal residue-index embeddings must not produce NaN or Inf for any residue."""
-    assert torch.isfinite(context.f_residue_idx).all()
+    """Residue indices must be finite integers."""
+    assert torch.isfinite(context.f_residue_idx.float()).all()
 
 
 def test_build_sampling_context_atom5_mask_all_true(context: FeaturizedBatch):
@@ -427,8 +400,8 @@ def test_build_sampling_context_residue_mask_all_true(context: FeaturizedBatch):
 
 def test_build_sampling_context_placeholder_scalars(context: FeaturizedBatch):
     """The placeholder diffusion scalars must be initialised to t_hat=1.0 and t_normalized=0.5."""
-    assert context.t_hat == 1.0
-    assert context.t_normalized == 0.5
+    assert (context.t_hat == 1.0).all()
+    assert (context.t_normalized == 0.5).all()
 
 
 def test_build_sampling_context_n_atom_scales_linearly_with_n_res():
@@ -444,7 +417,6 @@ def test_build_sampling_context_n_atom_scales_linearly_with_n_res():
             [],
             a_fn,
             t_fn,
-            c_res=32,
         )
         large = build_sampling_context(
             torch.zeros(N_RES * 2, 37, 3),
@@ -454,7 +426,6 @@ def test_build_sampling_context_n_atom_scales_linearly_with_n_res():
             [],
             a_fn,
             t_fn,
-            c_res=32,
         )
     assert large.ref_pos.shape[1] == 2 * small.ref_pos.shape[1]
     assert large.tok_idx.shape[1] == 2 * small.tok_idx.shape[1]
@@ -474,7 +445,6 @@ def test_build_sampling_context_custom_n_templ_bins():
             [],
             a_fn,
             t_fn,
-            c_res=32,
         )
     assert ctx.gt_res_distogram.shape == (1, N_RES, N_RES, 20)  # 19 bins + 1 overflow
 
@@ -492,7 +462,6 @@ def test_build_sampling_context_custom_n_atom_bins():
             [],
             a_fn,
             t_fn,
-            c_res=32,
         )
     assert ctx.gt_atom_distogram_sparse.shape[3] == 10  # (B, N_atom, K, n_atom_bins)
 
@@ -504,14 +473,14 @@ def test_build_sampling_context_custom_n_atom_bins():
 
 def test_edm_precond_forward_output_shape(edm_precond: EDMPrecond):
     """The preconditioner outputs must have shapes (B, N_atom, 3) and (B, N_res, 20)."""
-    r_out, seq_out = edm_precond(torch.randn(1, N_ATOM, 3), t_hat=1.0)
+    r_out, seq_out = edm_precond(torch.randn(1, N_ATOM, 3), t_hat=torch.tensor([1.0]))
     assert r_out.shape == (1, N_ATOM, 3)
     assert seq_out.shape == (1, N_RES, 20)
 
 
 def test_edm_precond_forward_output_is_finite(edm_precond: EDMPrecond):
     """The preconditioner must not introduce NaN or Inf in either coordinate or sequence output."""
-    r_out, seq_out = edm_precond(torch.randn(1, N_ATOM, 3), t_hat=1.0)
+    r_out, seq_out = edm_precond(torch.randn(1, N_ATOM, 3), t_hat=torch.tensor([1.0]))
     assert torch.isfinite(r_out).all()
     assert torch.isfinite(seq_out).all()
 
@@ -522,17 +491,17 @@ def test_edm_precond_forward_output_is_finite(edm_precond: EDMPrecond):
 
 
 def test_edm_precond_context_r_input_not_mutated(edm_precond: EDMPrecond, context: FeaturizedBatch):
-    """The preconditioner must not overwrite context.r_input in-place across forward calls."""
-    r_before = context.r_input.clone()
-    edm_precond(torch.randn(1, N_ATOM, 3), t_hat=5.0)
-    assert torch.equal(context.r_input, r_before)
+    """The preconditioner must not overwrite context.r_gt in-place across forward calls."""
+    r_before = context.r_gt.clone()
+    edm_precond(torch.randn(1, N_ATOM, 3), t_hat=torch.tensor([5.0]))
+    assert torch.equal(context.r_gt, r_before)
 
 
 def test_edm_precond_context_t_hat_not_mutated(edm_precond: EDMPrecond, context: FeaturizedBatch):
     """The preconditioner must not mutate context.t_hat, which must retain its pre-call value."""
-    t_before = context.t_hat
-    edm_precond(torch.randn(1, N_ATOM, 3), t_hat=5.0)
-    assert context.t_hat == t_before
+    t_before = context.t_hat.clone()
+    edm_precond(torch.randn(1, N_ATOM, 3), t_hat=torch.tensor([5.0]))
+    assert torch.equal(context.t_hat, t_before)
 
 
 # ---------------------------------------------------------------------------
@@ -541,40 +510,40 @@ def test_edm_precond_context_t_hat_not_mutated(edm_precond: EDMPrecond, context:
 
 
 def test_edm_precond_passes_r_input_to_trunk(context: FeaturizedBatch):
-    """The preconditioner must forward the raw noisy coordinates as batch.r_input to the trunk."""
+    """The preconditioner must forward the raw noisy coordinates as batch.r_gt to the trunk."""
     mock = _make_trunk_mock()
     precond = EDMPrecond(mock, context, sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX)
     r = torch.randn(1, N_ATOM, 3)
-    precond(r, t_hat=1.0)
+    precond(r, t_hat=torch.tensor([1.0]))
     batch_seen = mock.call_args.args[0]
-    assert torch.equal(batch_seen.r_input, r)
+    assert torch.equal(batch_seen.r_gt, r)
 
 
 def test_edm_precond_passes_t_hat_to_trunk(context: FeaturizedBatch):
     """Preconditioner must forward sigma value as batch.t_hat so trunk can condition on noise."""
     mock = _make_trunk_mock()
     precond = EDMPrecond(mock, context, sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX)
-    precond(torch.randn(1, N_ATOM, 3), t_hat=3.14)
+    precond(torch.randn(1, N_ATOM, 3), t_hat=torch.tensor([3.14]))
     batch_seen = mock.call_args.args[0]
-    assert math.isclose(batch_seen.t_hat, 3.14)
+    assert torch.allclose(batch_seen.t_hat, torch.tensor([3.14]))
 
 
 def test_edm_precond_t_normalized_is_zero_at_sigma_min(context: FeaturizedBatch):
     """At t_hat=sigma_min the log-normalised diffusion time must collapse to 0.0."""
     mock = _make_trunk_mock()
     precond = EDMPrecond(mock, context, sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX)
-    precond(torch.randn(1, N_ATOM, 3), t_hat=SIGMA_MIN)
+    precond(torch.randn(1, N_ATOM, 3), t_hat=torch.tensor([SIGMA_MIN]))
     batch_seen = mock.call_args.args[0]
-    assert math.isclose(batch_seen.t_normalized, 0.0)
+    assert math.isclose(batch_seen.t_normalized[0, 0, 0].item(), 0.0)
 
 
 def test_edm_precond_t_normalized_is_one_at_sigma_max(context: FeaturizedBatch):
     """At t_hat=sigma_max the log-normalised diffusion time must equal 1.0."""
     mock = _make_trunk_mock()
     precond = EDMPrecond(mock, context, sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX)
-    precond(torch.randn(1, N_ATOM, 3), t_hat=SIGMA_MAX)
+    precond(torch.randn(1, N_ATOM, 3), t_hat=torch.tensor([SIGMA_MAX]))
     batch_seen = mock.call_args.args[0]
-    assert math.isclose(batch_seen.t_normalized, 1.0)
+    assert math.isclose(batch_seen.t_normalized[0, 0, 0].item(), 1.0)
 
 
 def test_edm_precond_t_normalized_at_geometric_midpoint_is_half(context: FeaturizedBatch):
@@ -583,16 +552,16 @@ def test_edm_precond_t_normalized_at_geometric_midpoint_is_half(context: Featuri
     t_mid = math.sqrt(SIGMA_MIN * SIGMA_MAX)
     mock = _make_trunk_mock()
     precond = EDMPrecond(mock, context, sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX)
-    precond(torch.randn(1, N_ATOM, 3), t_hat=t_mid)
+    precond(torch.randn(1, N_ATOM, 3), t_hat=torch.tensor([t_mid]))
     batch_seen = mock.call_args.args[0]
-    assert math.isclose(batch_seen.t_normalized, 0.5)
+    assert math.isclose(batch_seen.t_normalized[0, 0, 0].item(), 0.5)
 
 
 def test_edm_precond_trunk_called_exactly_once_per_forward(
     edm_precond: EDMPrecond, trunk_mock: MagicMock
 ):
     """Preconditioner forward pass must call trunk exactly once (no extra denoiser evaluations)."""
-    edm_precond(torch.randn(1, N_ATOM, 3), t_hat=1.0)
+    edm_precond(torch.randn(1, N_ATOM, 3), t_hat=torch.tensor([1.0]))
     assert trunk_mock.call_count == 1
 
 
@@ -604,13 +573,13 @@ def test_edm_precond_trunk_called_exactly_once_per_forward(
 def test_edm_precond_rejects_r_input_with_wrong_last_dim(edm_precond: EDMPrecond):
     """A last dimension of 4 instead of 3 must raise TypeCheckError due to the shape annotation."""
     with pytest.raises(TypeCheckError):
-        edm_precond(torch.randn(1, N_ATOM, 4), t_hat=1.0)  # 4 instead of 3
+        edm_precond(torch.randn(1, N_ATOM, 4), t_hat=torch.tensor([1.0]))  # 4 instead of 3
 
 
 def test_edm_precond_rejects_r_input_with_wrong_ndim(edm_precond: EDMPrecond):
     """A 2D tensor (missing the batch dimension) must raise TypeCheckError."""
     with pytest.raises(TypeCheckError):
-        edm_precond(torch.randn(N_ATOM, 3), t_hat=1.0)  # 2D instead of 3D
+        edm_precond(torch.randn(N_ATOM, 3), t_hat=torch.tensor([1.0]))  # 2D instead of 3D
 
 
 # ---------------------------------------------------------------------------
@@ -819,18 +788,11 @@ def test_build_sampling_context_gt_atom_distogram_sparse_leading_dim_is_n_atom(
     assert context.gt_atom_distogram_sparse.shape[3] == 22  # default n_atom_bins
 
 
-def test_build_sampling_context_c_res_embed_sets_f_residue_idx_dim(
-    context_c_res_64: FeaturizedBatch,
-):
-    """Passing c_res=64 must produce a residue-index embedding of shape (1, N_RES, 64)."""
-    assert context_c_res_64.f_residue_idx.shape == (1, N_RES, 64)
-
-
 def test_build_sampling_context_tensors_on_cpu_by_default(context: FeaturizedBatch):
     """Without an explicit device argument, all output tensors must reside on CPU."""
     assert context.ref_pos.device.type == "cpu"
     assert context.tok_idx.device.type == "cpu"
-    assert context.r_input.device.type == "cpu"
+    assert context.r_gt.device.type == "cpu"
 
 
 # ---------------------------------------------------------------------------
@@ -853,11 +815,13 @@ def test_edm_precond_t_normalized_formula_at_arbitrary_sigma(
 
         t_normalized = (log(sigma) - log(sigma_min)) / (log(sigma_max) - log(sigma_min))
     """
-    t_hat = 1.0
+    t_hat = torch.tensor([1.0])
     edm_precond(torch.randn(1, N_ATOM, 3), t_hat=t_hat)
     batch_seen = trunk_mock.call_args.args[0]
-    expected = (math.log(t_hat) - math.log(SIGMA_MIN)) / (math.log(SIGMA_MAX) - math.log(SIGMA_MIN))
-    assert math.isclose(batch_seen.t_normalized, expected)
+    expected = (math.log(t_hat.item()) - math.log(SIGMA_MIN)) / (
+        math.log(SIGMA_MAX) - math.log(SIGMA_MIN)
+    )
+    assert math.isclose(batch_seen.t_normalized[0, 0, 0].item(), expected, rel_tol=1e-6)
 
 
 def test_edm_precond_multiple_calls_are_independent(edm_precond: EDMPrecond):
@@ -865,8 +829,8 @@ def test_edm_precond_multiple_calls_are_independent(edm_precond: EDMPrecond):
     # Identity trunk mock returns r_input unchanged and zeros for seq_logits.
     r1 = torch.randn(1, N_ATOM, 3)
     r2 = torch.randn(1, N_ATOM, 3)
-    r_out1, seq_out1 = edm_precond(r1, t_hat=1.0)
-    r_out2, seq_out2 = edm_precond(r2, t_hat=2.0)
+    r_out1, seq_out1 = edm_precond(r1, t_hat=torch.tensor([1.0]))
+    r_out2, seq_out2 = edm_precond(r2, t_hat=torch.tensor([2.0]))
     assert torch.equal(r_out1, r1)
     assert torch.equal(r_out2, r2)
     assert seq_out1.shape == (1, N_RES, 20)
@@ -918,7 +882,6 @@ def test_edm_sampler_s_tmin_above_sigma_max_disables_injection(
 N_RES_AA = 6
 N_ATOM_AA = N_RES_AA * NATOM  # 30
 AA_SEQ_AA = "ACDEFG"  # len == N_RES_AA
-C_RES_AA = 32
 N_ATOM_BINS = 22
 
 
@@ -968,7 +931,6 @@ def aa_ctx(
             atom_distogram_fn=atom_disto_fn,
             batch_size=2,
             device="cpu",
-            c_res=C_RES_AA,
         )
 
 
@@ -1008,8 +970,8 @@ def test_build_aa_context_aa_indices_shape(aa_ctx: AllAtomContext):
 
 
 def test_build_aa_context_f_residue_idx_shape(aa_ctx: AllAtomContext):
-    """The residue-index embedding must have shape (batch_size, N_RES_AA, c_res)."""
-    assert aa_ctx.f_residue_idx.shape == (2, N_RES_AA, C_RES_AA)
+    """The residue index must have shape (batch_size, N_RES_AA)."""
+    assert aa_ctx.f_residue_idx.shape == (2, N_RES_AA)
 
 
 def test_build_aa_context_gt_atom_distogram_sparse_atom_dim(aa_ctx: AllAtomContext):
@@ -1039,8 +1001,8 @@ def test_build_aa_context_r_gt_is_finite(aa_ctx: AllAtomContext):
 
 
 def test_build_aa_context_f_residue_idx_is_finite(aa_ctx: AllAtomContext):
-    """Sinusoidal residue-index embeddings must be finite for all positions in the sequence."""
-    assert torch.isfinite(aa_ctx.f_residue_idx).all()
+    """Residue indices must be finite integers for all positions in the sequence."""
+    assert torch.isfinite(aa_ctx.f_residue_idx.float()).all()
 
 
 def test_build_aa_context_gt_atom_distogram_sparse_is_finite(aa_ctx: AllAtomContext):
@@ -1090,7 +1052,6 @@ def test_build_aa_context_batch_size_controls_leading_dim(
             atom_disto_fn,
             batch_size=3,
             device="cpu",
-            c_res=C_RES_AA,
         )
     assert ctx.r_gt.shape[0] == 3
     assert ctx.aa_indices.shape[0] == 3
@@ -1336,7 +1297,6 @@ def unconditional_ctx(atom_disto_fn: Distogram, templ_disto: Distogram) -> Featu
             pdb_files=[],
             atom_distogram_fn=atom_disto_fn,
             templ_distogram_fn=templ_disto,
-            c_res=32,
         )
 
 
@@ -1352,7 +1312,6 @@ def seq_only_ctx(atom_disto_fn: Distogram, templ_disto: Distogram) -> Featurized
             pdb_files=[],
             atom_distogram_fn=atom_disto_fn,
             templ_distogram_fn=templ_disto,
-            c_res=32,
         )
 
 
@@ -1373,7 +1332,6 @@ def seq_partial_atoms_ctx(
             pdb_files=[],
             atom_distogram_fn=atom_disto_fn,
             templ_distogram_fn=templ_disto,
-            c_res=32,
         )
 
 
@@ -1391,7 +1349,6 @@ def partial_templ_no_seq_ctx(
             pdb_files=[partial_template_pdb],
             atom_distogram_fn=atom_disto_fn,
             templ_distogram_fn=templ_disto,
-            c_res=32,
         )
 
 
@@ -1409,7 +1366,6 @@ def full_templ_no_seq_ctx(
             pdb_files=[full_template_pdb],
             atom_distogram_fn=atom_disto_fn,
             templ_distogram_fn=templ_disto,
-            c_res=32,
         )
 
 
@@ -1427,7 +1383,6 @@ def full_atoms_partial_templ_ctx(
             pdb_files=[partial_template_pdb],
             atom_distogram_fn=atom_disto_fn,
             templ_distogram_fn=templ_disto,
-            c_res=32,
         )
 
 
@@ -1741,7 +1696,6 @@ def test_build_aa_context_x_sequence_does_not_raise(
             atom_distogram_fn=atom_disto_fn,
             batch_size=1,
             device="cpu",
-            c_res=C_RES_AA,
         )
     assert isinstance(ctx, AllAtomContext)
 
@@ -1759,7 +1713,6 @@ def test_build_aa_context_x_maps_to_index_20(
             atom_distogram_fn=atom_disto_fn,
             batch_size=1,
             device="cpu",
-            c_res=C_RES_AA,
         )
     assert (ctx.aa_indices == 20).all()
 
@@ -1777,7 +1730,6 @@ def test_build_aa_context_x_is_distinct_from_alanine(
             atom_distogram_fn=atom_disto_fn,
             batch_size=1,
             device="cpu",
-            c_res=C_RES_AA,
         )
         ctx_a = build_AA_context(
             atom_37_coordinate_tensor=torch.zeros(N_RES_AA, 37, 3),
@@ -1787,7 +1739,6 @@ def test_build_aa_context_x_is_distinct_from_alanine(
             atom_distogram_fn=atom_disto_fn,
             batch_size=1,
             device="cpu",
-            c_res=C_RES_AA,
         )
     assert not torch.equal(ctx_x.aa_indices, ctx_a.aa_indices)
 
@@ -1817,7 +1768,7 @@ def test_all_atom_context_wrong_shape() -> None:
                 b_local, n_atom_local, k_local, dtype=torch.bool
             ),
             aa_indices=torch.zeros(b_local, n_res_local, dtype=torch.long),
-            f_residue_idx=torch.zeros(b_local, n_res_local, 32),
+            f_residue_idx=torch.zeros(b_local, n_res_local, dtype=torch.long),
         )
 
 
@@ -1833,7 +1784,6 @@ def test_build_aa_context_wrong_shape(atom_disto_fn: Distogram) -> None:
             atom_distogram_fn=atom_disto_fn,
             batch_size=1,
             device="cpu",
-            c_res=32,
         )
 
 
@@ -1866,7 +1816,6 @@ def test_build_sampling_context_wrong_shape(
             pdb_files=[],
             atom_distogram_fn=atom_disto_fn,
             templ_distogram_fn=templ_disto,
-            c_res=32,
         )
 
 

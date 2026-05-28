@@ -1,7 +1,12 @@
 """Pydantic configuration models for conditional sampling."""
 
 from pydantic import BaseModel, ConfigDict, Field
-from train.train_config import ModelParams, NoiseScheduleParams
+from train.train_config import (
+    AtomDistogramParams,
+    ModelParams,
+    NoiseScheduleParams,
+    ResidueDistogramParams,
+)
 
 
 class SamplerParams(BaseModel):
@@ -48,6 +53,8 @@ class SampleConfig(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     model: ModelParams = Field(default_factory=ModelParams)
+    distogram_res: ResidueDistogramParams = Field(default_factory=ResidueDistogramParams)
+    distogram_atom: AtomDistogramParams = Field(default_factory=AtomDistogramParams)
     noise: NoiseScheduleParams = Field(default_factory=NoiseScheduleParams)
     sampler: SamplerParams = Field(default_factory=SamplerParams)
     generation: GenerationParams = Field(default_factory=GenerationParams)

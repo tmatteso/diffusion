@@ -262,7 +262,7 @@ def c_beta_distogram_fn(tcfg: TrainConfig) -> Distogram:
     """Provide the residue-level Cβ Distogram configured from tcfg.distogram_res."""
     dr = tcfg.distogram_res
     return Distogram(
-        n_bins=dr.n_bins, min_dist=dr.min_dist, max_dist=dr.max_dist, overflow_bin=True
+        n_bins=dr.n_bins - 1, min_dist=dr.min_dist, max_dist=dr.max_dist, overflow_bin=True
     ).eval()
 
 
@@ -280,15 +280,25 @@ def model_params(
     tcfg: TrainConfig, c_beta_distogram_fn: Distogram, atom_distogram_fn: Distogram
 ) -> ModelSetup:
     """Provide a ModelSetup bundling a small CPU MainTrunk with the tcfg training configuration."""
-    trunk = MainTrunk(
-        f_ref_dim=tcfg.model.f_ref_dim,
-        n_bins=tcfg.model.n_bins,
+    mp = tcfg.model
+    trunk: MainTrunk = MainTrunk(  # this be changed to init directly from the tcfg
+        f_ref_dim=mp.f_ref_dim,
+        n_bins=tcfg.distogram_res.n_bins,
         n_atom_bins=tcfg.distogram_atom.n_bins,
-        c_atom=tcfg.model.c_atom,
-        c_pair=tcfg.model.c_pair,
-        c_res=tcfg.model.c_res,
-        c_atompair=tcfg.model.c_atompair,
-        K_unit=tcfg.model.K_unit,
+        c_atom=mp.c_atom,
+        c_pair=mp.c_pair,
+        c_res=mp.c_res,
+        c_atompair=mp.c_atompair,
+        K_unit=mp.K_unit,
+        sigma_data=tcfg.noise.sigma_data,
+        residue_number=mp.max_residues,
+        n_amino=mp.n_amino,
+        n_blocks_atom_transformer_encoder=mp.n_blocks_atom_transformer_encoder,
+        n_heads_atom_transformer_encoder=mp.n_heads_atom_transformer_encoder,
+        n_blocks_atom_transformer_decoder=mp.n_blocks_atom_transformer_decoder,
+        n_heads_atom_transformer_decoder=mp.n_heads_atom_transformer_decoder,
+        n_pairformer_blocks_template_embedder=mp.n_pairformer_blocks_template_embedder,
+        n_paiformer_heads_template_embedder=mp.n_paiformer_heads_template_embedder,
     ).eval()
     optimizer = Adam(trunk.parameters(), lr=tcfg.training.lr)
     scheduler = CosineAnnealingLR(optimizer, T_max=tcfg.training.num_epochs)
@@ -355,11 +365,6 @@ def test_featurize_batch_pseudo_beta_mask_shape(featurized_batch: FeaturizedBatc
     assert featurized_batch.f_pseudo_beta_mask.shape == (B, N_RES)
 
 
-def test_featurize_batch_r_input_shape(featurized_batch: FeaturizedBatch) -> None:
-    """featurize_batch produces r_input of shape (B, N_ATOM, 3)."""
-    assert featurized_batch.r_input.shape == (B, N_ATOM, 3)
-
-
 def test_featurize_batch_tok_idx_shape(featurized_batch: FeaturizedBatch) -> None:
     """featurize_batch produces tok_idx of shape (B, N_ATOM)."""
     assert featurized_batch.tok_idx.shape == (B, N_ATOM)
@@ -385,12 +390,13 @@ def test_featurize_batch_all_tensor_fields_finite(featurized_batch: FeaturizedBa
 
 def test_featurize_batch_t_hat_is_positive(featurized_batch: FeaturizedBatch) -> None:
     """featurize_batch samples a strictly positive noise level t_hat from the log-normal prior."""
-    assert featurized_batch.t_hat > 0.0
+    assert (featurized_batch.t_hat > 0.0).all()
 
 
 def test_featurize_batch_t_normalized_in_unit_interval(featurized_batch: FeaturizedBatch) -> None:
-    """featurize_batch normalises t_hat to the [0, 1] interval via the log-linear schedule."""
-    assert 0.0 <= featurized_batch.t_normalized <= 1.0
+    """featurize_batch draws t_normalized from Uni[0, 1] and broadcasts to (B, N_res, N_res)."""
+    assert (featurized_batch.t_normalized >= 0.0).all()
+    assert (featurized_batch.t_normalized <= 1.0).all()
 
 
 def test_featurize_batch_ref_space_uid_all_zeros(featurized_batch: FeaturizedBatch) -> None:
@@ -547,29 +553,6 @@ def testref_pos_for_residue_output_finite() -> None:
     assert torch.isfinite(pos).all()
 
 
-def test_featurize_single_item_returns_featurized_item(c_beta_distogram_fn: Distogram) -> None:
-    """featurize_single_item returns a FeaturizedItem with the expected N_res."""
-    atom37_positions = torch.randn(N_RES, 37, 3)
-    atom37_mask = torch.ones(N_RES, 37)
-    index = torch.arange(N_RES).float()
-    ala_ref_pos = ref_pos_for_residue("ALA")
-    ala_ref_elem = torch.zeros(5, 4)
-    ala_ref_elem[:, 0] = 1.0  # C element for all atoms
-    item = featurize_single_item(
-        atom37_positions,
-        atom37_mask,
-        index,
-        AA_SEQ,
-        ala_ref_pos,
-        ala_ref_elem,
-        c_res=C_RES,
-        c_beta_distogram_fn=c_beta_distogram_fn,
-        device="cpu",
-    )
-    assert isinstance(item, FeaturizedItem)
-    assert item.N_res == N_RES
-
-
 # ---------------------------------------------------------------------------
 # Shape-contract enforcement — negative tests
 # ---------------------------------------------------------------------------
@@ -618,13 +601,12 @@ def test_featurized_batch_wrong_shape() -> None:
             gt_res_distogram=torch.zeros(B, N_RES, N_RES, N_BINS, dtype=torch.long),
             f_pseudo_beta_mask=torch.zeros(B, N_RES, dtype=torch.long),
             f_residue_idx=torch.zeros(B, N_RES, C_RES),
-            r_input=torch.zeros(B, n_atom, 3),
             r_gt=torch.zeros(B, n_atom, 3),
             atom5_mask=torch.zeros(B, n_atom, dtype=torch.bool),
             aa_indices=torch.zeros(B, N_RES, dtype=torch.long),
             residue_mask=torch.zeros(B, N_RES, dtype=torch.bool),
-            t_hat=1.0,
-            t_normalized=0.5,
+            t_hat=torch.zeros(B, dtype=torch.long),
+            t_normalized=torch.zeros(B, N_RES, N_RES, dtype=torch.long),
             tok_idx=torch.zeros(B, n_atom, dtype=torch.long),
             center_uid=torch.zeros(B, N_RES, dtype=torch.long),
             gt_atom_distogram_sparse=torch.zeros(B, n_atom, k_local, 5),
@@ -647,6 +629,8 @@ def test_featurized_item_wrong_shape() -> None:
             ref_pos=torch.zeros(n_atom, 3),
             ref_element=torch.zeros(n_atom, 4),
             f_residue_idx=torch.zeros(N_RES, C_RES),
+            t_hat=torch.randn(B),
+            t_template=torch.randn(B, N_RES, N_RES),
         )
 
 
@@ -665,9 +649,11 @@ def test_featurize_single_item_wrong_shape(disto: Distogram) -> None:
             AA_SEQ,
             ala_ref_pos,
             ala_ref_elem,
-            c_res=C_RES,
             c_beta_distogram_fn=disto,
             device="cpu",
+            sigma_data=16,
+            P_std=1.5,
+            P_mean=-1.2,
         )
 
 

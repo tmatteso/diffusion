@@ -16,6 +16,7 @@ from architecture.main_trunk import (
     AtomDistogramHead,
     MainTrunk,
     PredictedOutputs,
+    RelativePositionEncoding,
     ResidueDistogramHead,
     TimeFourierEmbedding,
     scatter_mean,
@@ -26,6 +27,7 @@ from helpers.featurize import FeaturizedBatch, sinusoidal_encoding
 from helpers.useful_objects import manual_seed
 from jaxtyping import Bool, Float, Int, TypeCheckError, jaxtyped
 
+# there should exist a set of enums that are imported here and in the configs
 B = 2
 N_RES = 50
 ATOMS_PER_RES = 3
@@ -45,6 +47,15 @@ F_REF_DIM = ATOMS_PER_RES * (
     3 + E
 )  # encoder groups all sibling atoms: n_per_res*(pos_dim+elem_dim)
 
+N_BLOCKS_ATOM_TRANSFORMER_ENCODER = 3
+N_HEADS_ATOM_TRANSFORMER_ENCODER = 4
+N_BLOCKS_ATOM_TRANSFORMER_DECODER = 3
+N_HEADS_ATOM_TRANSFORMER_DECODER = 4
+N_PAIRFORMER_BLOCKS_TEMPLATE_EMBEDDER = 2
+N_PAIFORMER_HEADS_TEMPLATE_EMBEDDER = 16
+SIGMA_DATA = 16
+N_AMINO = 20
+RESIDUE_NUMBER = 50
 manual_seed(42)
 
 # @pytest.fixture(autouse=True)
@@ -91,9 +102,16 @@ def model() -> MainTrunk:
         c_pair=C_PAIR,
         c_res=C_RES,
         c_atompair=C_ATOMPAIR,
-        n_blocks=1,
-        n_heads=2,
         K_unit=K_UNIT,
+        n_blocks_atom_transformer_encoder=N_BLOCKS_ATOM_TRANSFORMER_ENCODER,
+        n_heads_atom_transformer_encoder=N_HEADS_ATOM_TRANSFORMER_ENCODER,
+        n_blocks_atom_transformer_decoder=N_BLOCKS_ATOM_TRANSFORMER_DECODER,
+        n_heads_atom_transformer_decoder=N_HEADS_ATOM_TRANSFORMER_DECODER,
+        n_pairformer_blocks_template_embedder=N_PAIRFORMER_BLOCKS_TEMPLATE_EMBEDDER,
+        n_paiformer_heads_template_embedder=N_HEADS_ATOM_TRANSFORMER_DECODER,
+        sigma_data=SIGMA_DATA,
+        n_amino=N_AMINO,
+        residue_number=RESIDUE_NUMBER,
     ).eval()
 
 
@@ -133,9 +151,9 @@ def f_pseudo_beta_mask() -> Float[torch.Tensor, "B N_res"]:
 
 
 @pytest.fixture
-def f_residue_idx() -> Float[torch.Tensor, "B N_res C_res"]:
-    """Pre-projected sinusoidal residue index encoding [B, N_RES, C_RES]."""
-    return torch.randn(B, N_RES, C_RES)
+def f_residue_idx() -> Int[torch.Tensor, "B N_res"]:
+    """Integer residue position indices [B, N_RES] — monotonically increasing per batch item."""
+    return repeat(torch.arange(N_RES, dtype=torch.long), "n -> b n", b=B).contiguous()
 
 
 @pytest.fixture
@@ -182,7 +200,7 @@ def featurized_batch(
     ref_space_uid: Int[torch.Tensor, "B N_atom"],
     f_distogram: Float[torch.Tensor, "B N_res N_res N_bins"],
     f_pseudo_beta_mask: Float[torch.Tensor, "B N_res"],
-    f_residue_idx: Float[torch.Tensor, "B N_res C_res"],
+    f_residue_idx: Int[torch.Tensor, "B N_res"],
     r_input: Float[torch.Tensor, "B N_atom 3"],
     tok_idx: Int[torch.Tensor, "B N_atom"],
     center_uid: Int[torch.Tensor, "B N_res"],
@@ -197,13 +215,12 @@ def featurized_batch(
         gt_res_distogram=f_distogram.long(),
         f_pseudo_beta_mask=f_pseudo_beta_mask.long(),
         f_residue_idx=f_residue_idx,
-        r_input=r_input,
         r_gt=torch.zeros_like(r_input),
         atom5_mask=torch.ones(B, N_ATOM, dtype=torch.bool),
         aa_indices=torch.zeros(B, N_RES, dtype=torch.long),
         residue_mask=torch.ones(B, N_RES, dtype=torch.bool),
-        t_hat=1.0,
-        t_normalized=0.5,
+        t_hat=torch.rand(B) + 0.1,
+        t_normalized=torch.randn(B, N_RES, N_RES),
         tok_idx=tok_idx,
         center_uid=center_uid,
         gt_atom_distogram_sparse=gt_atom_distogram_sparse,
@@ -250,12 +267,15 @@ def test_time_fourier_embedding_output_shape(model: MainTrunk):
     assert torch.isfinite(out).all()
 
 
-def test_time_fourier_embedding_gradient_flows_to_freqs():
-    """Learned frequency parameters receive gradients during backprop through Fourier embedding."""
+def test_time_fourier_embedding_fixed_buffers():
+    """Freqs and phases are non-trainable buffers, and outputs are bounded in [-1, 1]."""
     emb = TimeFourierEmbedding(C_RES)
-    reduce(emb(torch.randn(N_RES)), "n d -> ", "sum").backward()
-    assert emb.freqs.grad is not None
-    assert torch.isfinite(emb.freqs.grad).all()
+    assert not emb.freqs.requires_grad
+    assert not emb.phases.requires_grad
+    assert len(list(emb.parameters())) == 0
+    out = emb(torch.randn(N_RES))
+    assert (out >= -1.0).all()
+    assert (out <= 1.0).all()
 
 
 # ---------------------------------------------------------------------------
@@ -264,17 +284,175 @@ def test_time_fourier_embedding_gradient_flows_to_freqs():
 
 
 def test_rel_pos_enc_output_shape(model: MainTrunk):
-    """RelativePositionEncoding returns an [N_res, N_res, C_pair] tensor with all finite values."""
-    out = model.rel_pos_enc(N_RES, torch.device("cpu"))
-    assert out.shape == (N_RES, N_RES, C_PAIR)
+    """RelativePositionEncoding returns [B, N_res, N_res, C_pair] with all finite values."""
+    res_idx = repeat(torch.arange(N_RES, dtype=torch.long), "n -> b n", b=B)
+    zeros = torch.zeros(B, N_RES, dtype=torch.long)
+    out = model.rel_pos_enc(
+        residue_index=res_idx,
+        asym_id=zeros,
+        entity_id=zeros,
+        token_index=res_idx,
+        sym_id=zeros,
+    )
+    assert out.shape == (B, N_RES, N_RES, C_PAIR)
     assert torch.isfinite(out).all()
 
 
 def test_rel_pos_enc_deterministic(model: MainTrunk):
-    """RelativePositionEncoding is purely positional — calls with same N_res return same out."""
-    out1 = model.rel_pos_enc(N_RES, torch.device("cpu"))
-    out2 = model.rel_pos_enc(N_RES, torch.device("cpu"))
+    """RelativePositionEncoding is purely positional — same inputs always return same output."""
+    res_idx = repeat(torch.arange(N_RES, dtype=torch.long), "n -> b n", b=B)
+    zeros = torch.zeros(B, N_RES, dtype=torch.long)
+    kwargs = {
+        "residue_index": res_idx,
+        "asym_id": zeros,
+        "entity_id": zeros,
+        "token_index": res_idx,
+        "sym_id": zeros,
+    }
+    out1 = model.rel_pos_enc(**kwargs)
+    out2 = model.rel_pos_enc(**kwargs)
     assert torch.allclose(out1, out2)
+
+
+def test_rel_pos_enc_algo3_output_shape() -> None:
+    """Algorithm 3 forward returns [1, N, N, C_pair] for batch-size-1 inputs."""
+    enc = RelativePositionEncoding(C_PAIR, r_max=4, s_max=2)
+    N = 10
+    residue_index = rearrange(torch.arange(N, dtype=torch.long), "n -> 1 n")
+    asym_id = torch.zeros(1, N, dtype=torch.long)
+    entity_id = torch.zeros(1, N, dtype=torch.long)
+    token_index = torch.zeros(1, N, dtype=torch.long)
+    sym_id = torch.zeros(1, N, dtype=torch.long)
+    out = enc(
+        residue_index=residue_index,
+        asym_id=asym_id,
+        entity_id=entity_id,
+        token_index=token_index,
+        sym_id=sym_id,
+    )
+    assert out.shape == (1, N, N, C_PAIR)
+    assert torch.isfinite(out).all()
+
+
+def test_rel_pos_enc_algo3_cross_chain_ignores_residue_distance() -> None:
+    """Cross-chain pairs always use the overflow bin regardless of residue_index values."""
+    enc = RelativePositionEncoding(C_PAIR, r_max=4, s_max=2)
+    N = 4
+    asym_id = rearrange(torch.tensor([0, 0, 1, 1], dtype=torch.long), "n -> 1 n")
+    entity_id = torch.zeros(1, N, dtype=torch.long)
+    token_index = torch.zeros(1, N, dtype=torch.long)
+    sym_id = rearrange(torch.tensor([0, 0, 1, 1], dtype=torch.long), "n -> 1 n")
+
+    idx_a = rearrange(torch.tensor([0, 1, 0, 1], dtype=torch.long), "n -> 1 n")
+    idx_b = rearrange(torch.tensor([0, 1, 50, 51], dtype=torch.long), "n -> 1 n")
+
+    out_a = enc(
+        residue_index=idx_a,
+        asym_id=asym_id,
+        entity_id=entity_id,
+        token_index=token_index,
+        sym_id=sym_id,
+    )
+    out_b = enc(
+        residue_index=idx_b,
+        asym_id=asym_id,
+        entity_id=entity_id,
+        token_index=token_index,
+        sym_id=sym_id,
+    )
+
+    assert torch.allclose(out_a[0, 0, 2], out_b[0, 0, 2])
+    assert torch.allclose(out_a[0, 1, 3], out_b[0, 1, 3])
+
+
+def test_rel_pos_enc_algo3_same_chain_uses_residue_distance() -> None:
+    """Same-chain pairs encode the clipped residue index difference, not the overflow bin."""
+    enc = RelativePositionEncoding(C_PAIR, r_max=4, s_max=2)
+    N = 6
+    asym_id = torch.zeros(1, N, dtype=torch.long)
+    entity_id = torch.zeros(1, N, dtype=torch.long)
+    token_index = torch.zeros(1, N, dtype=torch.long)
+    sym_id = torch.zeros(1, N, dtype=torch.long)
+
+    idx_close = rearrange(torch.arange(N, dtype=torch.long), "n -> 1 n")
+    idx_spread = rearrange(torch.arange(N, dtype=torch.long) * 3, "n -> 1 n")
+
+    out_close = enc(
+        residue_index=idx_close,
+        asym_id=asym_id,
+        entity_id=entity_id,
+        token_index=token_index,
+        sym_id=sym_id,
+    )
+    out_spread = enc(
+        residue_index=idx_spread,
+        asym_id=asym_id,
+        entity_id=entity_id,
+        token_index=token_index,
+        sym_id=sym_id,
+    )
+
+    assert not torch.allclose(out_close[0, 0, 1], out_spread[0, 0, 1])
+
+
+def test_rel_pos_enc_algo3_entity_flag_differs_across_entities() -> None:
+    """b_same_entity is 1 iff entity_id[i]==entity_id[j]; differing entity_ids change output."""
+    enc = RelativePositionEncoding(C_PAIR, r_max=4, s_max=2)
+    N = 4
+    residue_index = rearrange(torch.arange(N, dtype=torch.long), "n -> 1 n")
+    asym_id = torch.zeros(1, N, dtype=torch.long)
+    token_index = torch.zeros(1, N, dtype=torch.long)
+    sym_id = torch.zeros(1, N, dtype=torch.long)
+
+    entity_same = torch.zeros(1, N, dtype=torch.long)
+    entity_split = rearrange(torch.tensor([0, 0, 1, 1], dtype=torch.long), "n -> 1 n")
+
+    out_same = enc(
+        residue_index=residue_index,
+        asym_id=asym_id,
+        entity_id=entity_same,
+        token_index=token_index,
+        sym_id=sym_id,
+    )
+    out_split = enc(
+        residue_index=residue_index,
+        asym_id=asym_id,
+        entity_id=entity_split,
+        token_index=token_index,
+        sym_id=sym_id,
+    )
+
+    assert not torch.allclose(out_same[0, 0, 2], out_split[0, 0, 2])
+
+
+def test_rel_pos_enc_algo3_chain_distance_varies_with_sym_id() -> None:
+    """Cross-chain d_chain = clip(sym_i - sym_j + s_max, 0, 2*s_max); diff sym_ids change output."""
+    enc = RelativePositionEncoding(C_PAIR, r_max=4, s_max=2)
+    N = 4
+    residue_index = rearrange(torch.arange(N, dtype=torch.long), "n -> 1 n")
+    asym_id = rearrange(torch.tensor([0, 0, 1, 1], dtype=torch.long), "n -> 1 n")
+    entity_id = torch.zeros(1, N, dtype=torch.long)
+    token_index = torch.zeros(1, N, dtype=torch.long)
+
+    sym_id_a = rearrange(torch.tensor([0, 0, 1, 1], dtype=torch.long), "n -> 1 n")
+    sym_id_b = rearrange(torch.tensor([0, 0, 2, 2], dtype=torch.long), "n -> 1 n")
+
+    out_a = enc(
+        residue_index=residue_index,
+        asym_id=asym_id,
+        entity_id=entity_id,
+        token_index=token_index,
+        sym_id=sym_id_a,
+    )
+    out_b = enc(
+        residue_index=residue_index,
+        asym_id=asym_id,
+        entity_id=entity_id,
+        token_index=token_index,
+        sym_id=sym_id_b,
+    )
+
+    assert not torch.allclose(out_a[0, 0, 2], out_b[0, 0, 2])
 
 
 # ---------------------------------------------------------------------------
@@ -411,19 +589,6 @@ def test_main_trunk_intermediate_coords_shape_finite(
     for r in out.intermediate_denoised_coord_stack:
         assert r.shape == (B, N_ATOM, 3)
         assert torch.isfinite(r).all()
-
-
-def test_main_trunk_gradient_flows_to_r_input(model: MainTrunk, featurized_batch: FeaturizedBatch):
-    """The denoised output is differentiable with respect to the noisy input positions r_input."""
-    r_input_g = torch.randn(B, N_ATOM, 3, requires_grad=True)
-    batch_g = FeaturizedBatch(
-        **{k: v for k, v in featurized_batch.__dict__.items() if k != "r_input"},
-        r_input=r_input_g,
-    )
-    out = model(batch_g)
-    reduce(out.r_denoised, "b n d -> ", "sum").backward()
-    assert r_input_g.grad is not None
-    assert torch.isfinite(r_input_g.grad).all()
 
 
 def test_main_trunk_forward_with_mask_token_aa_indices(

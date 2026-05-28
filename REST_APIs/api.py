@@ -30,7 +30,12 @@ from sample.sampling import (  # noqa: E402
     atom5_to_atom37,
     build_sampling_context,
 )
-from train.train_config import ModelParams, NoiseScheduleParams  # noqa: E402
+from train.train_config import (  # noqa: E402
+    AtomDistogramParams,
+    ModelParams,
+    NoiseScheduleParams,
+    ResidueDistogramParams,
+)
 
 # ── startup configuration (override via environment variables) ────────────────
 CHECKPOINT_PATH: str = os.environ.get(
@@ -59,18 +64,29 @@ def _load_model(
     checkpoint_path: str,
     mp: ModelParams,
     noise: NoiseScheduleParams,
+    atom_dist_params: AtomDistogramParams,
+    residue_dist_params: ResidueDistogramParams,
     device: str,
 ) -> MainTrunk:
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=True)
     model = MainTrunk(
         f_ref_dim=mp.f_ref_dim,
-        n_bins=mp.n_bins,
+        n_bins=residue_dist_params.n_bins,
+        n_atom_bins=atom_dist_params.n_bins,
         c_atom=mp.c_atom,
         c_pair=mp.c_pair,
         c_res=mp.c_res,
         c_atompair=mp.c_atompair,
+        n_amino=mp.n_amino,
         K_unit=mp.K_unit,
         sigma_data=noise.sigma_data,
+        residue_number=mp.max_residues,
+        n_blocks_atom_transformer_encoder=mp.n_blocks_atom_transformer_encoder,
+        n_heads_atom_transformer_encoder=mp.n_heads_atom_transformer_encoder,
+        n_blocks_atom_transformer_decoder=mp.n_blocks_atom_transformer_decoder,
+        n_heads_atom_transformer_decoder=mp.n_heads_atom_transformer_decoder,
+        n_pairformer_blocks_template_embedder=mp.n_pairformer_blocks_template_embedder,
+        n_paiformer_heads_template_embedder=mp.n_paiformer_heads_template_embedder,
     ).to(device)
     model.load_state_dict(ckpt["model"])
     model.eval()
@@ -85,10 +101,14 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
 
     mp = ModelParams()
     noise = NoiseScheduleParams()
-    model = _load_model(CHECKPOINT_PATH, mp, noise, DEVICE)
+    atom_dist_params = AtomDistogramParams()
+    residue_dist_params = ResidueDistogramParams()
+
+    model = _load_model(CHECKPOINT_PATH, mp, noise, atom_dist_params, residue_dist_params, DEVICE)
+    # this needs to get redone at some point. terrible
     atom_disto = Distogram(n_bins=22, min_dist=2.0, max_dist=22.0, overflow_bin=False).to(DEVICE)
     templ_disto = Distogram(
-        n_bins=mp.n_bins - 1, min_dist=3.25, max_dist=50.75, overflow_bin=True
+        n_bins=residue_dist_params.n_bins - 1, min_dist=3.25, max_dist=50.75, overflow_bin=True
     ).to(DEVICE)
     _app.state.loaded = AppState(
         semaphore=asyncio.Semaphore(1),
@@ -234,7 +254,6 @@ def run_sampling(req: SampleRequest, state: AppState) -> list[str]:
         List of PDB-formatted strings, one per requested sample.
     """
     model: MainTrunk = state.model
-    mp: ModelParams = state.mp
     noise: NoiseScheduleParams = state.noise
     atom_disto: Distogram = state.atom_disto
     templ_disto: Distogram = state.templ_disto
@@ -289,7 +308,6 @@ def run_sampling(req: SampleRequest, state: AppState) -> list[str]:
             pdb_files=pdb_files,
             atom_distogram_fn=atom_disto,
             templ_distogram_fn=templ_disto,
-            c_res=mp.c_res,
             batch_size=B,
             device=DEVICE,
         )

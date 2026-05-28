@@ -151,8 +151,10 @@ def test_time_modulates_output(
 ):
     """Changing diffusion time t changes template embedding, confirms time conditioning is wired."""
     with torch.no_grad():
-        out_t0 = embedder(f_distogram, f_pseudo_beta_mask, z_ij, t=0.0)
-        out_t5 = embedder(f_distogram, f_pseudo_beta_mask, z_ij, t=0.5)
+        out_t0 = embedder(f_distogram, f_pseudo_beta_mask, z_ij, t=torch.zeros(B, N_RES, N_RES))
+        out_t5 = embedder(
+            f_distogram, f_pseudo_beta_mask, z_ij, t=torch.full((B, N_RES, N_RES), 0.5)
+        )
     assert mean_sq_diff(out_t0, out_t5).item() > 0
 
 
@@ -163,9 +165,10 @@ def test_mask_zeros_modulates_output(
     z_ij: Float[torch.Tensor, "B N_res N_res C_z"],
 ):
     """All-zero pseudo-beta mask (no valid template) produces diff output than all-ones mask."""
+    t = torch.full((B, N_RES, N_RES), 0.5)
     with torch.no_grad():
-        out_ones = embedder(f_distogram, torch.ones(B, N_RES), z_ij, t=0.5)
-        out_zeros = embedder(f_distogram, zero_mask, z_ij, t=0.5)
+        out_ones = embedder(f_distogram, torch.ones(B, N_RES), z_ij, t=t)
+        out_zeros = embedder(f_distogram, zero_mask, z_ij, t=t)
     assert mean_sq_diff(out_ones, out_zeros).item() > 0
 
 
@@ -177,9 +180,10 @@ def test_distogram_modulates_output(
     """Different distogram templates produce different embeddings."""
     f_dist_a = F.one_hot(torch.randint(0, N_BINS, (B, N_RES, N_RES)), N_BINS).float()
     f_dist_b = F.one_hot(torch.randint(0, N_BINS, (B, N_RES, N_RES)), N_BINS).float()
+    t = torch.full((B, N_RES, N_RES), 0.5)
     with torch.no_grad():
-        out_a = embedder(f_dist_a, f_pseudo_beta_mask, z_ij, t=0.5)
-        out_b = embedder(f_dist_b, f_pseudo_beta_mask, z_ij, t=0.5)
+        out_a = embedder(f_dist_a, f_pseudo_beta_mask, z_ij, t=t)
+        out_b = embedder(f_dist_b, f_pseudo_beta_mask, z_ij, t=t)
     assert mean_sq_diff(out_a, out_b).item() > 0
 
 
@@ -191,9 +195,10 @@ def test_z_ij_modulates_output(
     """Different trunk pair embeddings z_ij produce different template embedder outputs."""
     z_a = torch.randn(B, N_RES, N_RES, C_Z)
     z_b = torch.randn(B, N_RES, N_RES, C_Z)
+    t = torch.full((B, N_RES, N_RES), 0.5)
     with torch.no_grad():
-        out_a = embedder(f_distogram, f_pseudo_beta_mask, z_a, t=0.5)
-        out_b = embedder(f_distogram, f_pseudo_beta_mask, z_b, t=0.5)
+        out_a = embedder(f_distogram, f_pseudo_beta_mask, z_a, t=t)
+        out_b = embedder(f_distogram, f_pseudo_beta_mask, z_b, t=t)
     assert mean_sq_diff(out_a, out_b).item() > 0
 
 
@@ -205,8 +210,12 @@ def test_batched_consistency(
 ):
     """Processing single sample in batch produces same result as extracting from a larger batch."""
     with torch.no_grad():
-        out_batch = embedder(f_distogram, f_pseudo_beta_mask, z_ij, t=0.5)
-        out_single = embedder(f_distogram[:1], f_pseudo_beta_mask[:1], z_ij[:1], t=0.5)
+        out_batch = embedder(
+            f_distogram, f_pseudo_beta_mask, z_ij, t=torch.full((B, N_RES, N_RES), 0.5)
+        )
+        out_single = embedder(
+            f_distogram[:1], f_pseudo_beta_mask[:1], z_ij[:1], t=torch.full((1, N_RES, N_RES), 0.5)
+        )
     assert torch.allclose(
         rearrange(out_batch[0], "n m d -> 1 n m d"),
         out_single,
@@ -226,7 +235,8 @@ def test_gradient_flows_to_z_ij(
 ):
     """Template embedder output is differentiable with respect to the input pair embedding z_ij."""
     z_g = torch.randn(B, N_RES, N_RES, C_Z, requires_grad=True)
-    out = embedder(f_distogram, f_pseudo_beta_mask, z_g, t=0.3)
+    t = torch.full((B, N_RES, N_RES), 0.3)
+    out = embedder(f_distogram, f_pseudo_beta_mask, z_g, t=t)
     reduce(out, "b n m d -> ", "sum").backward()
     assert z_g.grad is not None
     assert torch.isfinite(z_g.grad).all()
@@ -239,7 +249,8 @@ def test_gradient_flows_to_f_distogram(
 ):
     """Template embedder output is differentiable with respect to distogram template features."""
     f_dist_g = torch.randn(B, N_RES, N_RES, N_BINS, requires_grad=True)
-    out = embedder(f_dist_g, f_pseudo_beta_mask, z_ij, t=0.3)
+    t = torch.full((B, N_RES, N_RES), 0.3)
+    out = embedder(f_dist_g, f_pseudo_beta_mask, z_ij, t=t)
     reduce(out, "b n m d -> ", "sum").backward()
     assert f_dist_g.grad is not None
     assert torch.isfinite(f_dist_g.grad).all()
@@ -252,7 +263,8 @@ def test_gradient_flows_to_f_pseudo_beta_mask(
 ):
     """The template embedder output is differentiable with respect to the pseudo-beta mask."""
     mask_g = torch.ones(B, N_RES, requires_grad=True)
-    out = embedder(f_distogram, mask_g, z_ij, t=0.3)
+    t = torch.full((B, N_RES, N_RES), 0.3)
+    out = embedder(f_distogram, mask_g, z_ij, t=t)
     reduce(out, "b n m d -> ", "sum").backward()
     assert mask_g.grad is not None
     assert torch.isfinite(mask_g.grad).all()

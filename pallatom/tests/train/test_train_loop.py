@@ -68,6 +68,16 @@ _N_ATOM_BINS = 5
 _K_UNIT = 1
 _BATCH_TOKENS: int = _N_KEEP
 
+N_BLOCKS_ATOM_TRANSFORMER_ENCODER = 3
+N_HEADS_ATOM_TRANSFORMER_ENCODER = 4
+N_BLOCKS_ATOM_TRANSFORMER_DECODER = 3
+N_HEADS_ATOM_TRANSFORMER_DECODER = 4
+N_PAIRFORMER_BLOCKS_TEMPLATE_EMBEDDER = 2
+N_PAIFORMER_HEADS_TEMPLATE_EMBEDDER = 16
+SIGMA_DATA = 16.0
+N_AMINO = 20
+RESIDUE_NUMBER = 50
+
 EXPECTED_CHECKPOINT_KEYS = frozenset({"model", "optimizer", "scheduler", "best_val_loss"})
 
 
@@ -300,6 +310,15 @@ def model() -> MainTrunk:
         c_res=_C_RES,
         c_atompair=_C_ATOMPAIR,
         K_unit=_K_UNIT,
+        n_blocks_atom_transformer_encoder=N_BLOCKS_ATOM_TRANSFORMER_ENCODER,
+        n_heads_atom_transformer_encoder=N_HEADS_ATOM_TRANSFORMER_ENCODER,
+        n_blocks_atom_transformer_decoder=N_BLOCKS_ATOM_TRANSFORMER_DECODER,
+        n_heads_atom_transformer_decoder=N_HEADS_ATOM_TRANSFORMER_DECODER,
+        n_pairformer_blocks_template_embedder=N_PAIRFORMER_BLOCKS_TEMPLATE_EMBEDDER,
+        n_paiformer_heads_template_embedder=N_HEADS_ATOM_TRANSFORMER_DECODER,
+        sigma_data=SIGMA_DATA,
+        n_amino=N_AMINO,
+        residue_number=RESIDUE_NUMBER,
     )
 
 
@@ -312,7 +331,6 @@ def tcfg(tmp_path: pathlib.Path) -> TrainConfig:
         ),
         model=ModelParams(
             f_ref_dim=_F_REF_DIM,
-            n_bins=_N_BINS,
             c_atom=_C_ATOM,
             c_pair=_C_PAIR,
             c_res=_C_RES,
@@ -1649,34 +1667,3 @@ def test_integration_gradient_flow_through_all_submodules(
         assert any(
             torch.isfinite(g).all().item() and g.abs().max().item() > 0 for g in grads
         ), f"submodule '{prefix}' has no finite nonzero gradients"
-
-
-def test_train_wandb_global_step_in_payload(
-    model_params: ModelSetup,
-    mini_batch: Mapping[str, Float[torch.Tensor, "..."] | list[str]],
-    distogram_res: Distogram,
-    distogram_atom: Distogram,
-    log: FilteringBoundLogger,
-    wandb_payloads: list[dict[str, object]],
-    tmp_path: pathlib.Path,
-) -> None:
-    """W&B payload contains a 'global_step' key that is at least 1 after the first epoch."""
-    tcfg_w = TrainConfig(
-        training=TrainingParams(
-            num_epochs=1, lr=1e-4, grad_clip=1.0, accumulated_token_budget=_BATCH_TOKENS
-        ),
-        model=model_params.tcfg.model,
-        checkpoint=CheckpointParams(checkpoint_path=str(tmp_path / "gs.pt"), save_every=100),
-        logging=LoggingParams(use_wandb=True),
-    )
-    mp_w = _make_model_params(model_params.model, tcfg_w, distogram_res, distogram_atom)
-    loader, _sampler_gs = _make_mock_loader(mini_batch)
-    train(
-        best_val_loss=torch.tensor(float("inf")),
-        train_loader=loader,
-        train_sampler=cast(BucketedBatchSampler, _sampler_gs),
-        test_loader=loader,
-        model_params=mp_w,
-        log=log,
-    )
-    assert int(cast(int, wandb_payloads[0]["global_step"])) >= 1

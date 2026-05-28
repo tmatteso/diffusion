@@ -32,7 +32,9 @@ class FeaturizedItem:
     aa_indices: Int[torch.Tensor, "N_res"]
     ref_pos: Float[torch.Tensor, "N_atom 3"]
     ref_element: Float[torch.Tensor, "N_atom 4"]
-    f_residue_idx: Float[torch.Tensor, "N_res c_res"]
+    f_residue_idx: Int[torch.Tensor, "N_res"]
+    t_hat: Float[torch.Tensor, ""]
+    t_template: Float[torch.Tensor, "N_res N_res"]
 
 
 @jaxtyped(typechecker=beartype)
@@ -45,14 +47,13 @@ class FeaturizedBatch:
     ref_space_uid: Int[torch.Tensor, "B N_atom"]
     gt_res_distogram: Int[torch.Tensor, "B N_res N_res n_templ_bins"]
     f_pseudo_beta_mask: Int[torch.Tensor, "B N_res"]
-    f_residue_idx: Float[torch.Tensor, "B N_res c_res"]
-    r_input: Float[torch.Tensor, "B N_atom 3"]
+    f_residue_idx: Int[torch.Tensor, "B N_res"]
     r_gt: Float[torch.Tensor, "B N_atom 3"]
     atom5_mask: Bool[torch.Tensor, "B N_atom"]
     aa_indices: Int[torch.Tensor, "B N_res"]
     residue_mask: Bool[torch.Tensor, "B N_res"]
-    t_hat: float
-    t_normalized: float
+    t_hat: Float[torch.Tensor, "B"]
+    t_normalized: Float[torch.Tensor, "B N_res N_res"]
     tok_idx: Int[torch.Tensor, "B N_atom"]
     center_uid: Int[torch.Tensor, "B N_res"]
     gt_atom_distogram_sparse: Float[torch.Tensor, "B N_atom K n_atom_bins"]

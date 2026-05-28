@@ -32,7 +32,7 @@ from helpers.atom_utils import (
     to_pdb,
 )
 from helpers.context_managers import FatalOnError, StructlogConfig
-from helpers.featurize import Distogram, FeaturizedBatch, sinusoidal_encoding
+from helpers.featurize import Distogram, FeaturizedBatch
 from jaxtyping import Bool, Float, Int, jaxtyped
 from sample.sample_config import SampleConfig
 
@@ -83,16 +83,20 @@ class EDMPrecond(nn.Module):
     @jaxtyped(typechecker=beartype)
     def forward(
         self,
-        r_input: Float[torch.Tensor, "B N_atom 3"],
-        t_hat: float,
+        r_gt: Float[torch.Tensor, "B N_atom 3"],
+        t_hat: Float[torch.Tensor, "B"],
     ) -> tuple[Float[torch.Tensor, "B N_atom 3"], Float[torch.Tensor, "B N_res n_amino"]]:
         """Denoise noisy atom coordinates at noise level t_hat and return denoised positions."""
-        t_normalized: float = (math.log(t_hat) - math.log(self.sigma_min)) / (
+        t_scalar: Float[torch.Tensor, "B"] = (torch.log(t_hat) - math.log(self.sigma_min)) / (
             math.log(self.sigma_max) - math.log(self.sigma_min)
+        )
+        n_res: int = self.context.t_normalized.shape[1]
+        t_normalized: Float[torch.Tensor, "B N_res N_res"] = repeat(
+            t_scalar, "b -> b n m", n=n_res, m=n_res
         )
         batch = dataclasses.replace(
             self.context,
-            r_input=r_input,
+            r_gt=r_gt,
             t_hat=t_hat,
             t_normalized=t_normalized,
         )
@@ -116,7 +120,7 @@ class AllAtomContext:  # N_atom = N_res * 5 for atom5 representation
 
     # amino acid input -- aa indices is the seq itself, f_residue_idx is the residue index
     aa_indices: Int[torch.Tensor, "B N_res"]
-    f_residue_idx: Float[torch.Tensor, "B N_res c_res"]
+    f_residue_idx: Int[torch.Tensor, "B N_res"]
 
 
 @jaxtyped(typechecker=beartype)
@@ -128,14 +132,13 @@ def build_AA_context(
     atom_distogram_fn: Distogram,
     batch_size: int,
     device: str,
-    c_res: int,
 ) -> AllAtomContext:
     """Build the all-atom conditioning context from a single ground-truth structure.
 
     Converts atom37 coordinates to the compact atom5 representation, maps the
     amino-acid sequence string to integer indices (using mask token 20 for unknown
-    residues), computes a sinusoidal residue-index encoding, and precomputes the
-    sparse atom-pair distogram over a local K-neighbour window.  All single-protein
+    residues), stores the raw integer residue index, and precomputes the sparse
+    atom-pair distogram over a local K-neighbour window.  All single-protein
     tensors are replicated along the batch dimension to produce a batch of size
     ``batch_size``, ready to be consumed by the sampling loop.
 
@@ -144,8 +147,7 @@ def build_AA_context(
             layout, shape (N_res, 37, 3).
         atom_37_mask: Binary mask indicating which atom37 slots are present,
             shape (N_res, 37).
-        residue_index: Per-residue index used to build the sinusoidal position
-            encoding, shape (N_res,).
+        residue_index: Per-residue index, shape (N_res,).
         aa_sequence: One-letter amino-acid sequence string; residues not found in
             the standard vocabulary are mapped to mask token 20.
         atom_distogram_fn: Callable that accepts batched atom positions and masks
@@ -153,20 +155,16 @@ def build_AA_context(
         batch_size: Number of parallel sampling trajectories; all context tensors
             are tiled to this batch dimension.
         device: PyTorch device string for tensor allocation.
-        c_res: Residue embedding width used to size the sinusoidal encoding.
 
     Returns:
         An AllAtomContext with batched ground-truth atom positions, atom masks,
-        residue masks, sequence indices, sinusoidal residue encodings, and sparse
+        residue masks, sequence indices, integer residue indices, and sparse
         atom-pair distogram labels.
     """
     N_res: int = atom_37_coordinate_tensor.shape[0]
     _aa_vals = [restype_order.get(r, 20) for r in aa_sequence]
     aa_indices_i: Int[torch.Tensor, N_res] = torch.tensor(_aa_vals, dtype=torch.long, device=device)
-    f_residue_idx_i: Float[torch.Tensor, "N_res c_res"] = rearrange(
-        sinusoidal_encoding(rearrange(residue_index, "n_res -> 1 n_res"), dim=c_res),
-        "1 n_res c_res -> n_res c_res",
-    )
+    f_residue_idx_i: Int[torch.Tensor, "N_res"] = residue_index.long().to(device)
 
     atom5_pos, atom5_mask = atom37_to_atom5(
         rearrange(atom_37_coordinate_tensor, "n a d -> 1 n a d"),
@@ -187,9 +185,7 @@ def build_AA_context(
     )
     residue_mask: Bool[torch.Tensor, "B N_res"] = repeat(residue_mask_i, "n -> b n", b=batch_size)
     aa_indices: Int[torch.Tensor, "B N_res"] = repeat(aa_indices_i, "n -> b n", b=batch_size)
-    f_residue_idx: Float[torch.Tensor, "B N_res c_res"] = repeat(
-        f_residue_idx_i, "n c -> b n c", b=batch_size
-    )
+    f_residue_idx: Int[torch.Tensor, "B N_res"] = repeat(f_residue_idx_i, "n -> b n", b=batch_size)
     # atom distogram
     # ── Sparse atom distogram (batched) ──────────────────────────────────────
     _tok_single: Int[torch.Tensor, "N_atom"] = torch.arange(
@@ -314,7 +310,6 @@ def build_sampling_context(
     pdb_files: list[str],
     atom_distogram_fn: "Distogram",
     templ_distogram_fn: "Distogram",
-    c_res: int,
     batch_size: int = 1,
     device: str = "cpu",
 ) -> FeaturizedBatch:
@@ -324,12 +319,11 @@ def build_sampling_context(
     ----------
     atom_positions    : (N_res, 37, 3) reference atom coordinates in atom37 layout
     atom_mask         : (N_res, 37) float mask; 1 where atom is present
-    residue_index     : (N_res,) per-residue position index (sinusoidal encoding applied internally)
+    residue_index     : (N_res,) per-residue position index
     seq               : amino-acid sequence string of length N_res
     pdb_files         : PDB paths used as templates; empty list → unconditioned templates
     atom_distogram_fn : Distogram for atom-level pairwise distances
     templ_distogram_fn: Distogram for template Cβ pairwise distances
-    c_res             : residue embedding dimension
     batch_size        : B — number of parallel samples; all share the same context
     device            : torch device string
     """
@@ -347,7 +341,6 @@ def build_sampling_context(
             atom_distogram_fn=atom_distogram_fn,
             batch_size=B,
             device=device,
-            c_res=c_res,
         )
 
     # ── TemplateContext (residue-level distogram from PDB templates) ─────────
@@ -415,13 +408,12 @@ def build_sampling_context(
         ref_pos=tile(ref_pos_single),
         ref_element=tile(ref_element_single),
         ref_space_uid=torch.zeros(B, N_atom, dtype=torch.long, device=device),
-        t_hat=1.0,
-        t_normalized=0.5,
+        t_hat=1.0 * torch.ones(B),  # these are spoofed inputs and are incorrect
+        t_normalized=0.5 * torch.ones(B, N_res, N_res),  # spoofed inputs and are incorrect
         tok_idx=tile(tok_idx_single),
         center_uid=tile(center_uid_single),
         gt_res_distogram=gt_res_distogram,
         f_pseudo_beta_mask=f_pseudo_beta_mask,
-        r_input=torch.zeros(B, N_atom, 3, dtype=torch.float64, device=device),
         r_gt=aa_ctx.r_gt,
         atom5_mask=aa_ctx.atom5_mask,
         residue_mask=aa_ctx.residue_mask,
@@ -527,15 +519,16 @@ class EDMSampler:
                 sigma_hat = sigma_cur
 
             # ── first derivative (Euler predictor) ─────────────────────────
+            B: int = shape[0]
             D_cur: Float[torch.Tensor, "B N_atom 3"]
-            D_cur, seq_logits = self.denoiser(z, sigma_hat.item())
+            D_cur, seq_logits = self.denoiser(z, repeat(sigma_hat, "-> b", b=B))
             d_cur: Float[torch.Tensor, "B N_atom 3"] = (z - D_cur) / sigma_hat
             z_next: Float[torch.Tensor, "B N_atom 3"] = z + (sigma_next - sigma_hat) * d_cur
 
             # ── second derivative (Heun corrector), skip at last step ──────
             if sigma_next > 0:
                 D_next: Float[torch.Tensor, "B N_atom 3"]
-                D_next, seq_logits = self.denoiser(z_next, sigma_next.item())
+                D_next, seq_logits = self.denoiser(z_next, repeat(sigma_next, "-> b", b=B))
                 d_next: Float[torch.Tensor, "B N_atom 3"] = (z_next - D_next) / sigma_next
                 d_avg: Float[torch.Tensor, "B N_atom 3"] = (d_cur + d_next) / 2.0
                 z_next = z + (sigma_next - sigma_hat) * d_avg
@@ -585,13 +578,22 @@ def main(args: argparse.Namespace, scfg: SampleConfig, device: str) -> None:
 
         model = MainTrunk(
             f_ref_dim=mp.f_ref_dim,
-            n_bins=mp.n_bins,
+            n_bins=scfg.distogram_res.n_bins,
+            n_atom_bins=scfg.distogram_atom.n_bins,
             c_atom=mp.c_atom,
             c_pair=mp.c_pair,
             c_res=mp.c_res,
             c_atompair=mp.c_atompair,
             K_unit=mp.K_unit,
             sigma_data=noise.sigma_data,
+            residue_number=mp.max_residues,
+            n_amino=mp.n_amino,
+            n_blocks_atom_transformer_encoder=mp.n_blocks_atom_transformer_encoder,
+            n_heads_atom_transformer_encoder=mp.n_heads_atom_transformer_encoder,
+            n_blocks_atom_transformer_decoder=mp.n_blocks_atom_transformer_decoder,
+            n_heads_atom_transformer_decoder=mp.n_heads_atom_transformer_decoder,
+            n_pairformer_blocks_template_embedder=mp.n_pairformer_blocks_template_embedder,
+            n_paiformer_heads_template_embedder=mp.n_paiformer_heads_template_embedder,
         ).to(device)
         ckpt = torch.load(scfg.checkpoint.checkpoint_path, map_location=device)
         model.load_state_dict(ckpt["model"])
@@ -606,7 +608,7 @@ def main(args: argparse.Namespace, scfg: SampleConfig, device: str) -> None:
             device
         )
         _templ_disto = Distogram(
-            n_bins=mp.n_bins - 1, min_dist=3.25, max_dist=50.75, overflow_bin=True
+            n_bins=scfg.distogram_res.n_bins - 1, min_dist=3.25, max_dist=50.75, overflow_bin=True
         ).to(device)
         context: FeaturizedBatch = build_sampling_context(
             atom_positions=torch.zeros(N_RES, 37, 3, device=device),
@@ -616,7 +618,6 @@ def main(args: argparse.Namespace, scfg: SampleConfig, device: str) -> None:
             pdb_files=[],
             atom_distogram_fn=_atom_disto,
             templ_distogram_fn=_templ_disto,
-            c_res=mp.c_res,
             batch_size=B_SAMPLE,
             device=device,
         )

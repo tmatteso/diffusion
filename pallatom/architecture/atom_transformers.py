@@ -36,6 +36,7 @@ class ConditionedTransitionBlock(nn.Module):
         self.a_to_b_1 = LinearNoBias(c_a, expansion * c_a)
         self.a_to_b_2 = LinearNoBias(c_a, expansion * c_a)
         self.s_to_a = nn.Linear(c_s, c_a)  # biasinit=-2.0
+        nn.init.constant_(self.s_to_a.bias, -2.0)
         self.b_to_a = LinearNoBias(expansion * c_a, c_a)
 
     @jaxtyped(typechecker=beartype)
@@ -111,8 +112,8 @@ class DiffusionTransformer(nn.Module):
             Refined atom embeddings of shape ``(B, N_res, c_a)``.
         """
         for _ in range(self.N_block):
-            b = self.attn_pair_bias(a=a, s=s, z=z, beta=beta, neighbor_idx=neighbor_idx)
-            a = b + self.cond_trans_block(a, s)
+            a = a + self.attn_pair_bias(a=a, s=s, z=z, beta=beta, neighbor_idx=neighbor_idx)
+            a = a + self.cond_trans_block(a, s)
         return a
 
 

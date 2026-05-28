@@ -75,6 +75,7 @@ class AttentionPairBias(nn.Module):
         self.z_to_b = LinearNoBias(c_pair, self.n_heads)
         self.a_to_g = LinearNoBias(c_res, c_res)
         self.s_to_a = nn.Linear(c_res, c_res)  # biasinit=-2.0
+        nn.init.constant_(self.s_to_a.bias, -2.0)
         self.out_to_a = LinearNoBias(c_res, c_res)
 
         self.norm_z = nn.LayerNorm(c_pair)
@@ -183,7 +184,7 @@ class NodeUpdate(nn.Module):
     """Parameters
 
     ----------
-    c       : single embedding dim  (default 256)
+    c       : single embedding dim
     c_pair  : pair   embedding dim
     n_heads : attention heads       (default 8, per Algorithm 6)
     dropout : rowwise dropout prob  (default 0.25, per Algorithm 6)
@@ -191,8 +192,8 @@ class NodeUpdate(nn.Module):
 
     def __init__(
         self,
-        c: int = 256,
-        c_pair: int = 128,
+        c: int,
+        c_pair: int,
         n_heads: int = 8,
         dropout: float = 0.25,
     ) -> None:

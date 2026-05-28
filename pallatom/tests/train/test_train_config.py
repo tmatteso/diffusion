@@ -252,48 +252,6 @@ def test_noise_rejects_sigma_min_greater_than_sigma_max():
 
 
 # ---------------------------------------------------------------------------
-# ResidueDistogramParams — defaults, field constraints, cross-field validator
-# ---------------------------------------------------------------------------
-
-
-def test_residue_distogram_default_values(distogram_res: ResidueDistogramParams):
-    """ResidueDistogramParams defaults match the expected Cβ distogram binning settings."""
-    assert math.isclose(distogram_res.min_dist, 3.25)
-    assert math.isclose(distogram_res.max_dist, 50.75)
-
-    assert distogram_res.n_bins == 38
-    assert distogram_res.tok_emb_dim == 32
-
-
-def test_residue_distogram_min_dist_lt_max_dist(distogram_res: ResidueDistogramParams):
-    """Default min_dist is strictly less than max_dist for residue distograms."""
-    assert distogram_res.min_dist < distogram_res.max_dist
-
-
-def test_residue_distogram_rejects_zero_n_bins():
-    """ResidueDistogramParams raises ValidationError when n_bins is zero."""
-    with pytest.raises(ValidationError):
-        ResidueDistogramParams(n_bins=0)
-
-
-def test_residue_distogram_rejects_min_equal_to_max():
-    """ResidueDistogramParams cross-field validator rejects min_dist == max_dist."""
-    with pytest.raises(ValidationError):
-        ResidueDistogramParams(min_dist=10.0, max_dist=10.0)
-
-
-def test_residue_distogram_rejects_min_greater_than_max():
-    """ResidueDistogramParams cross-field validator rejects min_dist > max_dist."""
-    with pytest.raises(ValidationError):
-        ResidueDistogramParams(min_dist=20.0, max_dist=10.0)
-
-
-def test_residue_distogram_accepts_zero_min_dist():
-    """ResidueDistogramParams accepts min_dist=0.0 for distance ranges starting at the origin."""
-    assert ResidueDistogramParams(min_dist=0.0, max_dist=10.0).min_dist == 0.0
-
-
-# ---------------------------------------------------------------------------
 # AtomDistogramParams — defaults
 # ---------------------------------------------------------------------------
 

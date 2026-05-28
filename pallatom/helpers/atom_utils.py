@@ -469,6 +469,11 @@ class Protein:
 
     # Amino-acid type for each residue represented as an integer between 0 and
     # 20, where 20 is 'X'.
+
+    # expanded form for pallatom ligand
+    # restype: One-hot encoding of the sequence. 32 possible values: 20 amino acids + unknown,
+    # 4 RNA nucleotides + unknown, 4 DNA nucleotides + unknown, and gap.
+    # Ligands represented as “unknown amino acid”
     aatype: Int[npt.NDArray[np.intp], "num_res"]
 
     # Binary float mask to indicate presence of a particular atom. 1.0 if an atom
@@ -482,10 +487,21 @@ class Protein:
     # belongs to.
     chain_index: Int[npt.NDArray[np.intp], "num_res"]
 
-    # typically this would be B-factors, or temperature factors, of each residue
-    # (in sq. angstroms units), representing the displacement of the residue from its
-    # ground truth mean value.
     b_factors: Float[npt.NDArray[np.float64], "num_res num_atom_type"]
+
+    # molecular type: MOL_TYPE_PROTEIN (0), MOL_TYPE_DNA (1), MOL_TYPE_RNA (2), MOL_TYPE_LIGAND(3).
+    # mol_type: Float[npt.NDArray[np.float64], "num_res num_atom_type"]
+
+    # # Unique integer for each distinct sequence. if chains A, B and C share a sequence,
+    # # then they all have the same entity_id
+    # entity_id: Int[npt.NDArray[np.intp], "num_res"]
+
+    # # Unique integer within chains of this sequence. E.g. if chains A, B and
+    # # C share a sequence but D does not, their sym_ids would be [0, 1, 2, 0].
+    # sym_id: Int[npt.NDArray[np.intp], "num_res"]
+
+
+# since we are actually going to implement this, I want to only i/o mmcifs
 
 
 def classify_mol_type(resname: str, atom_names: frozenset[str]) -> int:

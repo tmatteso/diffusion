@@ -21,7 +21,6 @@ _ATOMS_PER_RES = 5
 _N_ATOM = _N_RES * _ATOMS_PER_RES  # 25
 _N_BINS = 16
 _N_AMINO_BINS = 22
-_C_RES = 32
 _N_AMINO = 20
 
 
@@ -42,14 +41,13 @@ def minimal_batch() -> FeaturizedBatch:
         ref_space_uid=torch.zeros(_B, _N_ATOM, dtype=torch.long),
         gt_res_distogram=torch.zeros(_B, _N_RES, _N_RES, _N_BINS, dtype=torch.long),
         f_pseudo_beta_mask=torch.ones(_B, _N_RES, dtype=torch.long),
-        f_residue_idx=torch.randn(_B, _N_RES, _C_RES),
-        r_input=torch.randn(_B, _N_ATOM, 3),
+        f_residue_idx=torch.zeros(_B, _N_RES, dtype=torch.long),
         r_gt=torch.randn(_B, _N_ATOM, 3),
         atom5_mask=torch.ones(_B, _N_ATOM, dtype=torch.bool),
         aa_indices=torch.randint(0, _N_AMINO, (_B, _N_RES), dtype=torch.long),
         residue_mask=torch.ones(_B, _N_RES, dtype=torch.bool),
-        t_hat=1.0,
-        t_normalized=0.5,
+        t_hat=torch.randn(_B),
+        t_normalized=torch.randn(_B, _N_RES, _N_RES),
         tok_idx=tok,
         center_uid=cuid,
         gt_atom_distogram_sparse=torch.randn(_B, _N_ATOM, _N_ATOM, _N_AMINO_BINS),
@@ -118,9 +116,11 @@ def test_pipeline_preserves_pdb_x_as_index_20(c_beta_distogram_fn: Distogram) ->
         aa_seq,
         ala_ref_pos,
         ala_ref_elem,
-        c_res=_C_RES,
         c_beta_distogram_fn=c_beta_distogram_fn,
         device="cpu",
+        sigma_data=16.0,
+        P_std=1.5,
+        P_mean=-1.2,
     )
 
     assert item.aa_indices[x_pos].item() == 20

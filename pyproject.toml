@@ -102,6 +102,15 @@ select = [
     "FBT",  # boolean trap — prefer keyword-only args or enums over bare bool params
     "PT",   # pytest style — raises match=, one statement per raises block, parametrize format
     "ISC",  # implicit string concatenation — catches ("foo" "bar") copy-paste bugs
+# "PTH", # flake8-use-pathlib
+# "DOC", # pydoclint
+# "LOG", # flake8-logging
+# "G",   # flake8-logging-format
+# "PIE", # flake8-pie
+# "T20", # flake8-print
+# "PYI", # flake8-pyi
+# "SLF", # flake8-self
+# "FAST", # FastAPI
 ]
 ignore = [
     "F722", "F821", "UP037", # jaxtyping shape strings are runtime-parsed, not forward refs

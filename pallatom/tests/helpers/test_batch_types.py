@@ -130,7 +130,9 @@ def featurized_item() -> FeaturizedItem:
         aa_indices=torch.zeros(N_RES, dtype=torch.long),
         ref_pos=torch.randn(N_ATOM, 3),
         ref_element=torch.zeros(N_ATOM, 4),
-        f_residue_idx=torch.randn(N_RES, C_RES),
+        f_residue_idx=torch.arange(N_RES, dtype=torch.long),
+        t_hat=torch.randn([]),
+        t_template=torch.randn(N_RES, N_RES),
     )
 
 
@@ -180,8 +182,8 @@ def test_featurized_item_ref_element_shape(featurized_item: FeaturizedItem) -> N
 
 
 def test_featurized_item_f_residue_idx_shape(featurized_item: FeaturizedItem) -> None:
-    """FeaturizedItem.f_residue_idx has shape (N_RES, C_RES)."""
-    assert featurized_item.f_residue_idx.shape == (N_RES, C_RES)
+    """FeaturizedItem.f_residue_idx has shape (N_RES,)."""
+    assert featurized_item.f_residue_idx.shape == (N_RES,)
 
 
 # ---------------------------------------------------------------------------
@@ -203,6 +205,8 @@ def test_featurized_item_rejects_1d_flat_pos() -> None:
             ref_pos=torch.randn(N_ATOM, 3),
             ref_element=torch.zeros(N_ATOM, 4),
             f_residue_idx=torch.randn(N_RES, C_RES),
+            t_hat=torch.randn(1),
+            t_template=torch.randn(N_RES, C_RES),
         )
 
 
@@ -220,6 +224,8 @@ def test_featurized_item_rejects_wrong_ref_element_dim() -> None:
             ref_pos=torch.randn(N_ATOM, 3),
             ref_element=torch.zeros(N_ATOM, 3),
             f_residue_idx=torch.randn(N_RES, C_RES),
+            t_hat=torch.randn(1),
+            t_template=torch.randn(N_RES, C_RES),
         )
 
 
@@ -237,14 +243,13 @@ def featurized_batch() -> FeaturizedBatch:
         ref_space_uid=torch.zeros(B, N_ATOM, dtype=torch.long),
         gt_res_distogram=torch.zeros(B, N_RES, N_RES, N_TEMPL_BINS, dtype=torch.long),
         f_pseudo_beta_mask=torch.zeros(B, N_RES, dtype=torch.long),
-        f_residue_idx=torch.randn(B, N_RES, C_RES),
-        r_input=torch.randn(B, N_ATOM, 3),
+        f_residue_idx=repeat(torch.arange(N_RES, dtype=torch.long), "n -> b n", b=B),
         r_gt=torch.randn(B, N_ATOM, 3),
         atom5_mask=torch.ones(B, N_ATOM, dtype=torch.bool),
         aa_indices=torch.zeros(B, N_RES, dtype=torch.long),
         residue_mask=torch.ones(B, N_RES, dtype=torch.bool),
-        t_hat=0.5,
-        t_normalized=0.5,
+        t_hat=torch.randn(B),
+        t_normalized=torch.rand(B, N_RES, N_RES),
         tok_idx=torch.zeros(B, N_ATOM, dtype=torch.long),
         center_uid=repeat(torch.arange(N_RES, dtype=torch.long), "n -> b n", b=B),
         gt_atom_distogram_sparse=torch.randn(B, N_ATOM, K, N_ATOM_BINS),
@@ -278,13 +283,8 @@ def test_featurized_batch_gt_res_distogram_shape(featurized_batch: FeaturizedBat
 
 
 def test_featurized_batch_f_residue_idx_shape(featurized_batch: FeaturizedBatch) -> None:
-    """FeaturizedBatch.f_residue_idx has shape (B, N_RES, C_RES)."""
-    assert featurized_batch.f_residue_idx.shape == (B, N_RES, C_RES)
-
-
-def test_featurized_batch_r_input_shape(featurized_batch: FeaturizedBatch) -> None:
-    """FeaturizedBatch.r_input has shape (B, N_ATOM, 3)."""
-    assert featurized_batch.r_input.shape == (B, N_ATOM, 3)
+    """FeaturizedBatch.f_residue_idx has shape (B, N_RES)."""
+    assert featurized_batch.f_residue_idx.shape == (B, N_RES)
 
 
 def test_featurized_batch_atom5_mask_shape(featurized_batch: FeaturizedBatch) -> None:
@@ -300,13 +300,14 @@ def test_featurized_batch_gt_atom_distogram_sparse_shape(
 
 
 def test_featurized_batch_t_hat_is_float(featurized_batch: FeaturizedBatch) -> None:
-    """FeaturizedBatch.t_hat is a Python float."""
-    assert isinstance(featurized_batch.t_hat, float)
+    """FeaturizedBatch.t_hat is a floating-point tensor."""
+    assert featurized_batch.t_hat.is_floating_point()
 
 
 def test_featurized_batch_t_normalized_in_unit_interval(featurized_batch: FeaturizedBatch) -> None:
-    """FeaturizedBatch.t_normalized lies in [0, 1]."""
-    assert 0.0 <= featurized_batch.t_normalized <= 1.0
+    """FeaturizedBatch.t_normalized has all values in [0, 1]."""
+    assert featurized_batch.t_normalized.min() >= 0.0
+    assert featurized_batch.t_normalized.max() <= 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -324,13 +325,12 @@ def test_featurized_batch_rejects_unbatched_ref_pos() -> None:
             gt_res_distogram=torch.zeros(B, N_RES, N_RES, N_TEMPL_BINS, dtype=torch.long),
             f_pseudo_beta_mask=torch.zeros(B, N_RES, dtype=torch.long),
             f_residue_idx=torch.randn(B, N_RES, C_RES),
-            r_input=torch.randn(B, N_ATOM, 3),
             r_gt=torch.randn(B, N_ATOM, 3),
             atom5_mask=torch.ones(B, N_ATOM, dtype=torch.bool),
             aa_indices=torch.zeros(B, N_RES, dtype=torch.long),
             residue_mask=torch.ones(B, N_RES, dtype=torch.bool),
-            t_hat=0.5,
-            t_normalized=0.5,
+            t_hat=torch.randn(B),
+            t_normalized=torch.randn(B, N_RES, N_RES),
             tok_idx=torch.zeros(B, N_ATOM, dtype=torch.long),
             center_uid=repeat(torch.arange(N_RES, dtype=torch.long), "n -> b n", b=B),
             gt_atom_distogram_sparse=torch.randn(B, N_ATOM, K, N_ATOM_BINS),
@@ -339,7 +339,7 @@ def test_featurized_batch_rejects_unbatched_ref_pos() -> None:
 
 
 def test_featurized_batch_rejects_wrong_coords_dim() -> None:
-    """FeaturizedBatch raises when r_input last dim is 4 instead of 3."""
+    """FeaturizedBatch raises when r_gt last dim is 4 instead of 3."""
     with pytest.raises((TypeCheckError, Exception)):
         FeaturizedBatch(
             ref_pos=torch.randn(B, N_ATOM, 3),
@@ -348,13 +348,12 @@ def test_featurized_batch_rejects_wrong_coords_dim() -> None:
             gt_res_distogram=torch.zeros(B, N_RES, N_RES, N_TEMPL_BINS, dtype=torch.long),
             f_pseudo_beta_mask=torch.zeros(B, N_RES, dtype=torch.long),
             f_residue_idx=torch.randn(B, N_RES, C_RES),
-            r_input=torch.randn(B, N_ATOM, 4),
-            r_gt=torch.randn(B, N_ATOM, 3),
+            r_gt=torch.randn(B, N_ATOM, 4),
             atom5_mask=torch.ones(B, N_ATOM, dtype=torch.bool),
             aa_indices=torch.zeros(B, N_RES, dtype=torch.long),
             residue_mask=torch.ones(B, N_RES, dtype=torch.bool),
-            t_hat=0.5,
-            t_normalized=0.5,
+            t_hat=torch.randn(B),
+            t_normalized=torch.randn(B, N_RES, N_RES),
             tok_idx=torch.zeros(B, N_ATOM, dtype=torch.long),
             center_uid=repeat(torch.arange(N_RES, dtype=torch.long), "n -> b n", b=B),
             gt_atom_distogram_sparse=torch.randn(B, N_ATOM, K, N_ATOM_BINS),
