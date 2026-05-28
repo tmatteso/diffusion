@@ -26,7 +26,7 @@ class TriangleMultiplicationOutgoing(nn.Module):
     def __init__(self, c: int, c_hidden: int | None = None) -> None:
         super().__init__()
         c_hidden = c_hidden or c
-        self.norm = nn.LayerNorm(c)
+        self.norm_z = nn.LayerNorm(c)
         self.proj_a = LinearNoBias(c, c_hidden)
         self.gate_a = nn.Linear(c, c_hidden)
         self.proj_b = LinearNoBias(c, c_hidden)
@@ -41,7 +41,7 @@ class TriangleMultiplicationOutgoing(nn.Module):
         z: Float[torch.Tensor, "B N_res N_res c_pair"],
     ) -> Float[torch.Tensor, "B N_res N_res c_pair"]:
         """Compute outgoing triangle product: m[i,j] = Σ_k a[i,k] ⊙ b[k,j]."""
-        zn: Float[torch.Tensor, "B N_res N_res c_pair"] = self.norm(z)
+        zn: Float[torch.Tensor, "B N_res N_res c_pair"] = self.norm_z(z)
         a: Float[torch.Tensor, "B N_res N_res c_hidden"] = torch.sigmoid(
             self.gate_a(zn)
         ) * self.proj_a(zn)
@@ -67,7 +67,7 @@ class TriangleMultiplicationIncoming(nn.Module):
     def __init__(self, c: int, c_hidden: int | None = None) -> None:
         super().__init__()
         c_hidden = c_hidden or c
-        self.norm = nn.LayerNorm(c)
+        self.norm_z = nn.LayerNorm(c)
         self.proj_a = LinearNoBias(c, c_hidden)
         self.gate_a = nn.Linear(c, c_hidden)
         self.proj_b = LinearNoBias(c, c_hidden)
@@ -82,7 +82,7 @@ class TriangleMultiplicationIncoming(nn.Module):
         z: Float[torch.Tensor, "B N_res N_res c_pair"],
     ) -> Float[torch.Tensor, "B N_res N_res c_pair"]:
         """Compute incoming triangle product: m[i,j] = Σ_k a[k,i] ⊙ b[j,k]."""
-        zn: Float[torch.Tensor, "B N_res N_res c_pair"] = self.norm(z)
+        zn: Float[torch.Tensor, "B N_res N_res c_pair"] = self.norm_z(z)
         a: Float[torch.Tensor, "B N_res N_res c_hidden"] = torch.sigmoid(
             self.gate_a(zn)
         ) * self.proj_a(zn)
@@ -125,8 +125,8 @@ class PairformerBlock(nn.Module):
 
         self.row_dropout = DropoutRowwise(p=0.25)
         self.column_dropout = DropoutColumnwise(p=0.25)
-        self.b_proj_start = LinearNoBias(c_pair, n_heads)
-        self.b_proj_end = LinearNoBias(c_pair, n_heads)
+        self.b_proj_start = LinearNoBias(c_pair, n_heads // 4)
+        self.b_proj_end = LinearNoBias(c_pair, n_heads // 4)
 
         self.triangle_mult_outgoing = TriangleMultiplicationOutgoing(
             c=c_pair, c_hidden=self.c_hidden
@@ -135,10 +135,10 @@ class PairformerBlock(nn.Module):
             c=c_pair, c_hidden=self.c_hidden
         )
         self.triangle_attn_starting_node = TriangleAttentionStartingNodeWithBias(
-            c_pair=c_pair, n_heads=self.n_heads
+            c_pair=c_pair, n_heads=n_heads // 4
         )
         self.triangle_attn_ending_node = TriangleAttentionEndingNodeWithBias(
-            c_pair=c_pair, n_heads=self.n_heads
+            c_pair=c_pair, n_heads=n_heads // 4
         )
         self.transition1 = Transition(c_pair)
 

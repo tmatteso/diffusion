@@ -18,7 +18,7 @@ N_BINS = 8
 C_Z = 16  # input pair dim
 C = 8  # internal pair dim  (must divide N_HEADS)
 D = 16  # output dim
-N_HEADS = 2
+N_HEADS = 4
 N_BLOCKS = 1
 
 
