@@ -242,6 +242,55 @@ def kabsch_rmsd(
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Augmentation
+# ---------------------------------------------------------------------------
+
+
+@jaxtyped(typechecker=beartype)
+def centre_random_augment(
+    coords: Float[torch.Tensor, "B N_atom 3"],
+) -> Float[torch.Tensor, "B N_atom 3"]:
+    """Centre and randomly rotate coordinates uniformly from SO(3).
+
+    Implements CentreRandomAugmentation from Algorithm 18: subtracts the
+    per-batch centroid then applies one independent Haar-uniform SO(3) rotation
+    per batch element.
+
+    Rotation is sampled via QR decomposition of a Gaussian matrix (Mezzadri
+    2007). Column j of Q is rescaled by sign(R_jj) to fix the canonical sign
+    ambiguity in QR; the last column is then negated when det(Q) = -1 to
+    restrict the distribution to SO(3).
+
+    Args:
+        coords: (B, N_atom, 3) batched atom positions.
+
+    Returns:
+        (B, N_atom, 3) centred and randomly rotated coordinates.
+    """
+    B: int = coords.shape[0]
+
+    centroid: Float[torch.Tensor, "B 1 3"] = reduce(coords, "b n d -> b 1 d", "mean")
+    coords_centred: Float[torch.Tensor, "B N_atom 3"] = coords - centroid
+
+    z: Float[torch.Tensor, "B 3 3"] = torch.randn(B, 3, 3, device=coords.device, dtype=coords.dtype)
+    q, r = torch.qr(z)
+
+    # Fix sign ambiguity so R has a positive diagonal (Mezzadri 2007).
+    diag_sign: Float[torch.Tensor, "B 3"] = torch.sign(torch.diagonal(r, dim1=-2, dim2=-1))
+    q = q * rearrange(diag_sign, "b d -> b 1 d")
+
+    # Enforce det = +1 by negating the last column when det(Q) = -1.
+    det: Float[torch.Tensor, "B"] = q.det()
+    last_col_sign: Float[torch.Tensor, "B 1"] = rearrange(torch.sign(det), "b -> b 1")
+    col_scale: Float[torch.Tensor, "B 3"] = torch.cat(
+        [torch.ones(B, 2, device=coords.device, dtype=coords.dtype), last_col_sign], dim=-1
+    )
+    q = q * rearrange(col_scale, "b d -> b 1 d")
+
+    return einsum(coords_centred, q, "b n i, b i j -> b n j")
+
+
 @jaxtyped(typechecker=beartype)
 def apply_transform(
     coords: Float[torch.Tensor, "... M 3"],

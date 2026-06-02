@@ -25,7 +25,6 @@ from helpers.atom_utils import Protein, protein_from_pdb, to_pdb  # noqa: E402
 from helpers.featurize import Distogram  # noqa: E402
 from sample.sampling import (  # noqa: E402
     NATOM,
-    EDMPrecond,
     EDMSampler,
     atom5_to_atom37,
     build_sampling_context,
@@ -152,16 +151,9 @@ class SampleRequest(BaseModel):
     structure_pdb: str | None = Field(
         default=None,
         description=(
-            "PDB string for atom-level conditioning. "
+            "PDB string for atom and template level conditioning. "
             "Residues present in the PDB fill r_gt/atom5_mask; uncovered positions are zeroed. "
             "Must cover ≤ n_res residues."
-        ),
-    )
-    template_pdb: str | None = Field(
-        default=None,
-        description=(
-            "PDB string for template-distogram conditioning. "
-            "May cover fewer than n_res residues (padded with zeros)."
         ),
     )
 
@@ -291,40 +283,21 @@ def run_sampling(req: SampleRequest, state: AppState) -> list[str]:
     seq: str = req.sequence if req.sequence is not None else "X" * N_res
 
     # ── template-distogram conditioning ──────────────────────────────────────
-    pdb_files: list[str] = []
     tmp_path: str | None = None
-    try:
-        if req.template_pdb is not None:
-            with tempfile.NamedTemporaryFile(mode="w", suffix=".pdb", delete=False) as f:
-                f.write(req.template_pdb)
-                tmp_path = f.name
-            pdb_files = [tmp_path]
 
-        context = build_sampling_context(
-            atom_positions=atom_positions,
-            atom_mask=atom_mask,
-            residue_index=residue_index,
-            seq=seq,
-            pdb_files=pdb_files,
-            atom_distogram_fn=atom_disto,
-            templ_distogram_fn=templ_disto,
-            batch_size=B,
-            device=DEVICE,
-        )
-    finally:
-        if tmp_path is not None:
-            os.unlink(tmp_path)
-
-    edm_precond = EDMPrecond(
-        model,
-        context,
-        sigma_min=noise.sigma_min,
-        sigma_max=noise.sigma_max,
-    ).to(DEVICE)
-    edm_precond.eval()
+    context = build_sampling_context(
+        atom_positions=atom_positions,
+        atom_mask=atom_mask,
+        residue_index=residue_index,
+        seq=seq,
+        pdb_file_path=req.structure_pdb,
+        atom_distogram_fn=atom_disto,
+        templ_distogram_fn=templ_disto,
+        batch_size=B,
+        device=DEVICE,
+    )
 
     edm_sampler = EDMSampler(
-        edm_precond,
         sigma_min=noise.sigma_min,
         sigma_max=noise.sigma_max,
         rho=req.rho,
@@ -336,8 +309,6 @@ def run_sampling(req: SampleRequest, state: AppState) -> list[str]:
 
     coords_batch, seq_logit_batch = edm_sampler.sample(
         shape=(B, N_atom, 3),
-        steps=req.ddim_steps,
-        device=DEVICE,
     )
 
     return coords_to_pdb_strings(coords_batch, seq_logit_batch, N_res)

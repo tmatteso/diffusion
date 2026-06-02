@@ -1,0 +1,93 @@
+refactor: overhaul featurization, tooling, and sampling pipeline
+
+Featurization correctness (featurize.py, batch_types.py)
+---------------------------------------------------------
+Move per-item computation — tok_idx, center_uid, ref_space_uid, and
+the sparse atom distogram — into featurize_single_item instead of
+the batch-level pass. This is the right level of abstraction because
+each item has independent geometry.
+
+Replace the broadcast atom_mask_flat (residue mask tiled over atoms)
+with the true per-atom atom5_mask. Previously, a residue with a missing
+heavy atom was treated as fully present; now each atom slot is masked
+independently.
+
+Change center_uid shape from (B, N_res) to (B, N_atom): each atom now
+carries its own residue-center index, making the model's extraction of
+r_center in step 15 a straightforward gather rather than an indirect
+lookup.
+
+Remove residue_mask from FeaturizedItem and FeaturizedBatch; the same
+information is already available as f_pseudo_beta_mask. Update all
+consumers (conditioning dropout, distogram loss, throughput stats) to
+use f_pseudo_beta_mask.
+
+Pad aa_indices to max_seq_len_in_batch with -100 inside
+featurize_single_item rather than in the collation path. This keeps the
+CE ignore index bookkeeping co-located with where the sequence is
+encoded.
+
+Add centre_random_augment (alignment.py)
+-----------------------------------------
+Implement CentreRandomAugmentation from Algorithm 18: subtract the
+per-batch centroid, then apply one independent Haar-uniform SO(3)
+rotation per batch element via QR decomposition (Mezzadri 2007). Add
+a full suite of tests verifying shape, zero centroid, Gram-matrix
+preservation, Kabsch-roundtrip, proper SO(3) det, and translation
+invariance.
+
+Integrate centre_random_augment into the sampling loop (sampling.py).
+
+Noise schedule and sampler parameter tuning
+--------------------------------------------
+Widen the noise schedule: sigma_max 42 -> 160, sigma_min 3.8 -> 4e-4.
+These values better bracket real coordinate RMS deviations for proteins
+at the Angstrom scale.
+
+Increase default ddim_steps 40 -> 200. Enable stochastic Karras
+churning by default (S_churn=0.2, S_tmin=0.01, S_tmax=1.0).
+Add eta_step_scale and seq_temperature as first-class sampler params.
+
+Merge template_pdb into structure_pdb in the REST API (api.py): a
+single PDB now carries both atom-level and template-distogram
+conditioning, removing the awkward two-path input.
+
+BucketedSampler performance (bucketed_sampler.py)
+--------------------------------------------------
+Replace Python random.shuffle with numpy default_rng for the epoch
+shuffle and sortish sort. Numpy's sort releases the GIL, enabling
+truly parallel chunk processing via ThreadPoolExecutor(n_threads).
+Add a worker-init pattern (_worker_init / globals) so the large
+flat_to_cluster and cluster_rep_len arrays are pickled once at worker
+startup rather than on every batch-plan submission.
+
+TrainArgs typed dataclass (train_loop.py)
+-----------------------------------------
+Replace argparse.Namespace with a fully typed TrainArgs dataclass and a
+dedicated _parse_args() function. This lets pyright check all
+downstream accesses to CLI flags and catches future rename mismatches
+at type-check time rather than at runtime.
+
+Add weights_only=True to torch.load to avoid the pickle-arbitrary-code
+footgun introduced in PyTorch 2.x.
+
+Pydantic model_config ClassVar annotation (train_config.py)
+------------------------------------------------------------
+Annotate model_config as ClassVar[ConfigDict] on every Pydantic model.
+Without this, basedpyright (and strict pyright) infer it as an instance
+field override, which produces a false reportIncompatibleVariableOverride
+error.
+
+Tooling migration: pyright -> basedpyright
+------------------------------------------
+Swap pyright for basedpyright in pyproject.toml, pre-commit, and both
+devcontainer definitions (replacing the Pylance extension). basedpyright
+adds stricter defaults and first-class support for PEP 695 / new typing
+forms without requiring Pylance's IDE coupling.
+
+Enable additional ruff rule sets: PYI, C90 (McCabe complexity), NPY
+(NumPy-specific), FURB (refurb), ASYNC, LOG, G (logging format), PIE,
+SLF (private-member access), and FAST (FastAPI). Bump minimum ruff
+version to >=0.15.15. Add wemake-python-styleguide and
+flake8-pyproject to dev dependencies (hook commented out pending
+ML-friendly ignore configuration).

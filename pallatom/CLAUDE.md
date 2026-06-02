@@ -52,7 +52,7 @@ All tensors are **unbatched** (no leading `B` dimension) unless otherwise noted.
 | `t_hat`              | `float`                                                   | Noise level σ of the input noise (scalar, not a tensor). |
 | `t`                  | `float`                                                   | Diffusion time in `[0, 1)` passed to `TemplateEmbedder` for time-conditional template weighting. |
 | `tok_idx`            | `Int[Tensor, "N_atom"]`                                   | Maps each atom to its parent residue index in `[0, N_res)`. |
-| `center_uid`         | `Int[Tensor, "N_res"]`                                    | Index into the atom dimension of the representative (center) atom for each residue; used in step 15 to extract `r_center`. |
+| `center_uid`         | `Int[Tensor, "N_atom"]`                                   | For each atom, the index of its residue's center atom; broadcast per-residue center into the atom dimension, used in step 15 to extract `r_center`. |
 
 ### Key intermediate tensors
 

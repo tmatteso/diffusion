@@ -15,7 +15,7 @@ import torch.nn as nn
 from architecture.main_trunk import MainTrunk
 from einops import rearrange, reduce
 from helpers.bucketed_sampler import BucketedBatchSampler
-from helpers.data import make_bucketed_data_loaders, to_protein_batch
+from helpers.data import make_bucketed_data_loaders, to_protein_batch_dynamic
 from helpers.featurize import Distogram, ProteinBatch
 from helpers.useful_objects import (
     ComponentNorms,
@@ -355,7 +355,7 @@ def model_params(
 
 @pytest.fixture
 def single_sample() -> Mapping[str, Float[torch.Tensor, "..."] | str]:
-    """Provide a single unbatched protein sample for to_protein_batch tests."""
+    """Provide a single unbatched protein sample for to_protein_batch_dynamic tests."""
     return {
         "atom_positions": torch.randn(_N_KEEP, 37, 3),
         "atom_mask": torch.ones(_N_KEEP, 37),
@@ -435,68 +435,68 @@ def wandb_call_counter(monkeypatch: pytest.MonkeyPatch) -> list[object]:
 
 
 # ---------------------------------------------------------------------------
-# to_protein_batch
+# to_protein_batch_dynamic
 # ---------------------------------------------------------------------------
 
 
-def testto_protein_batch_returns_protein_batch(
+def test_to_protein_batch_dynamic_returns_protein_batch(
     single_sample: Mapping[str, Float[torch.Tensor, "..."] | str],
 ) -> None:
-    """to_protein_batch returns a ProteinBatch dataclass instance."""
-    assert isinstance(to_protein_batch([single_sample]), ProteinBatch)
+    """to_protein_batch_dynamic returns a ProteinBatch dataclass instance."""
+    assert isinstance(to_protein_batch_dynamic([single_sample]), ProteinBatch)
 
 
-def testto_protein_batch_atom_positions_shape(
+def test_to_protein_batch_dynamic_atom_positions_shape(
     single_sample: Mapping[str, Float[torch.Tensor, "..."] | str],
 ) -> None:
-    """to_protein_batch stacks atom_positions into a batched tensor with a leading batch dim."""
-    result = to_protein_batch([single_sample])
+    """to_protein_batch_dynamic stacks atom_positions into batched tensor with leading batch dim."""
+    result = to_protein_batch_dynamic([single_sample])
     assert result.atom_positions.shape == torch.Size(
         [1, *cast("torch.Tensor", single_sample["atom_positions"]).shape]
     )
 
 
-def testto_protein_batch_atom_mask_shape(
+def test_to_protein_batch_dynamic_atom_mask_shape(
     single_sample: Mapping[str, Float[torch.Tensor, "..."] | str],
 ) -> None:
-    """to_protein_batch stacks atom_mask into a batched tensor with a leading batch dim."""
-    result = to_protein_batch([single_sample])
+    """to_protein_batch_dynamic stacks atom_mask into a batched tensor with a leading batch dim."""
+    result = to_protein_batch_dynamic([single_sample])
     assert result.atom_mask.shape == torch.Size(
         [1, *cast("torch.Tensor", single_sample["atom_mask"]).shape]
     )
 
 
-def testto_protein_batch_residue_index_shape(
+def test_to_protein_batch_dynamic_residue_index_shape(
     single_sample: Mapping[str, Float[torch.Tensor, "..."] | str],
 ) -> None:
-    """to_protein_batch stacks residue_index into a batched tensor with a leading batch dim."""
-    result = to_protein_batch([single_sample])
+    """to_protein_batch_dynamic stacks residue_index into batched tensor with leading batch dim."""
+    result = to_protein_batch_dynamic([single_sample])
     assert result.residue_index.shape == torch.Size(
         [1, *cast("torch.Tensor", single_sample["residue_index"]).shape]
     )
 
 
-def testto_protein_batch_seq_is_list(
+def test_to_protein_batch_dynamic_seq_is_list(
     single_sample: Mapping[str, Float[torch.Tensor, "..."] | str],
 ) -> None:
-    """to_protein_batch wraps the sequence field into a Python list."""
-    result = to_protein_batch([single_sample])
+    """to_protein_batch_dynamic wraps the sequence field into a Python list."""
+    result = to_protein_batch_dynamic([single_sample])
     assert isinstance(result.seq, list)
 
 
-def testto_protein_batch_seq_elements_are_strings(
+def test_to_protein_batch_dynamic_seq_elements_are_strings(
     single_sample: Mapping[str, Float[torch.Tensor, "..."] | str],
 ) -> None:
-    """to_protein_batch seq list contains only str elements."""
-    result = to_protein_batch([single_sample])
+    """to_protein_batch_dynamic seq list contains only str elements."""
+    result = to_protein_batch_dynamic([single_sample])
     assert all(isinstance(s, str) for s in result.seq)
 
 
-def testto_protein_batch_seq_length_matches_batch_size(
+def test_to_protein_batch_dynamic_seq_length_matches_batch_size(
     single_sample: Mapping[str, Float[torch.Tensor, "..."] | str],
 ) -> None:
-    """to_protein_batch seq list has one entry per sample passed in."""
-    result = to_protein_batch([single_sample])
+    """to_protein_batch_dynamic seq list has one entry per sample passed in."""
+    result = to_protein_batch_dynamic([single_sample])
     assert len(result.seq) == 1
 
 
@@ -986,6 +986,28 @@ def test_load_checkpoint_returns_best_val_loss(
     save_checkpoint(model_params=model_params, rank=0, log=log, best_val_loss=torch.tensor(0.314))
     _, loaded_loss = load_checkpoint(model_params=model_params, rank=0, log=log)
     assert abs(loaded_loss.item() - 0.314) < 1e-5
+
+
+def test_checkpoint_round_trip_preserves_weights_and_loss(
+    model_params: ModelSetup, log: FilteringBoundLogger
+) -> None:
+    """save→load→save is lossless: second checkpoint matches first for weights and best_val_loss."""
+    best_val_loss = torch.tensor(0.271)
+    path = model_params.tcfg.checkpoint.checkpoint_path
+
+    save_checkpoint(model_params=model_params, rank=0, log=log, best_val_loss=best_val_loss)
+    first_sd = {k: v.clone() for k, v in model_params.model.state_dict().items()}
+
+    for p in model_params.model.parameters():
+        nn.init.zeros_(p)
+
+    restored, loaded_loss = load_checkpoint(model_params=model_params, rank=0, log=log)
+    save_checkpoint(model_params=restored, rank=0, log=log, best_val_loss=loaded_loss)
+
+    second_ckpt = torch.load(path, weights_only=True)
+    for k, v in first_sd.items():
+        assert torch.allclose(v, second_ckpt["model"][k]), f"Param '{k}' differs after round trip"
+    assert abs(second_ckpt["best_val_loss"].item() - best_val_loss.item()) < 1e-6
 
 
 # ---------------------------------------------------------------------------
@@ -1488,8 +1510,7 @@ def jsonl_path(tmp_path: pathlib.Path) -> str:
                 "name": name,
                 "seq": "ACDEFG"[:_N_RES_BUCKET],
                 "coords": {
-                    atom: np.random.randn(_N_RES_BUCKET, 3).tolist()
-                    for atom in ("N", "CA", "C", "O")
+                    atom: np.zeros((_N_RES_BUCKET, 3)).tolist() for atom in ("N", "CA", "C", "O")
                 },
             }
             f.write(json.dumps(entry) + "\n")

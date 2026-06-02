@@ -50,7 +50,7 @@ class EmbeddedInputs:
     c_l: Float[torch.Tensor, "B N_atom c_atom"]
     r_input: Float[torch.Tensor, "B N_atom 3"]
     tok_idx: Int[torch.Tensor, "B N_atom"]
-    center_uid: Int[torch.Tensor, "B N_res"]
+    center_uid: Int[torch.Tensor, "B N_atom"]
     t_hat: Float[torch.Tensor, "B"]
     B: int
     N_atom: int
@@ -534,7 +534,7 @@ class MainTrunk(nn.Module):
         t_hat: Float[torch.Tensor, "B"] = batch.t_hat
         t: Float[torch.Tensor, "B N_res N_res"] = batch.t_normalized
         tok_idx: Int[torch.Tensor, "B N_atom"] = batch.tok_idx
-        center_uid: Int[torch.Tensor, "B N_res"] = batch.center_uid
+        center_uid: Int[torch.Tensor, "B N_atom"] = batch.center_uid
         aa_indices: Int[torch.Tensor, "B N_res"] = batch.aa_indices
 
         B = r_input.size(0)
@@ -710,7 +710,8 @@ class MainTrunk(nn.Module):
             # Step 13: r_updates += r_update
             r_updates = r_updates + r_update
 
-            # Step 14: r_denoised = sigma²/(sigma²+t̂²)·r_input + sigma·t̂/√(sigma²+t̂²)·r_updates
+            # Step 14: EDM adjustment
+            # r_denoised = sigma²/(sigma²+t̂²)·r_input + sigma·t̂/√(sigma²+t̂²)·r_updates
             w_gt = rearrange(sd**2 / (sd**2 + emb.t_hat**2), "b -> b 1 1")
             w_upd = rearrange(sd * emb.t_hat / emb.denom, "b -> b 1 1")
             r_denoised = w_gt * emb.r_input + w_upd * r_updates
@@ -726,9 +727,15 @@ class MainTrunk(nn.Module):
             inter_logits: Float[torch.Tensor, "B N_res n_amino"] = self.inter_seq_logits[k](a_inter)
             intermediate_pred_aa_logit_stack.append(inter_logits)
 
-            # Step 15: r_center = r_denoised[:, center_uid[0]]  [B, N_res, 3]
-            # center_uid identical across batch items
-            r_center: Float[torch.Tensor, "B N_res 3"] = r_denoised[:, emb.center_uid[0]]
+            # Step 15: r_center = r_denoised[center_uid]  [B, N_res, 3]
+            # center_uid is [B, N_atom]: every atom stores its residue's center atom index.
+            # Stride by atoms_per_res to get one unique center index per residue [B, N_res],
+            # then gather from r_denoised along the atom dimension.
+            atoms_per_res: int = emb.N_atom // emb.N_res
+            center_uid_per_res: Int[torch.Tensor, "B N_res"] = emb.center_uid[:, ::atoms_per_res]
+            r_center: Float[torch.Tensor, "B N_res 3"] = r_denoised.gather(
+                1, repeat(center_uid_per_res, "b n -> b n d", d=3)
+            )
 
             # Step 16: z_ij = PairUpdate(z_ij, r_center)        [B, N_res, N_res, c_pair]
             z_ij = self.pair_updates[k](z_ij, r_center)

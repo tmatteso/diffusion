@@ -1,12 +1,14 @@
 """Pydantic configuration models for training, noise schedule, and model hyperparameters."""
 
+from typing import ClassVar
+
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class TrainingParams(BaseModel):
     """Optimizer and training loop hyperparameters."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True)
 
     num_epochs: int = 50
     lr: float = Field(default=3e-4, gt=0)
@@ -20,7 +22,7 @@ class TrainingParams(BaseModel):
 class ModelParams(BaseModel):
     """Architecture channel dimensions and capacity parameters."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True)
 
     f_ref_dim: int = Field(default=35, gt=0)  # 5 atoms by 7 features
     c_atom: int = Field(default=4, gt=0)
@@ -41,11 +43,11 @@ class ModelParams(BaseModel):
 class NoiseScheduleParams(BaseModel):
     """EDM diffusion noise schedule params (sigma bounds, data scale, and sampling distribution)."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True)
 
     sigma_data: float = Field(default=16.0, gt=0)
-    sigma_max: float = Field(default=42.3689, gt=0)
-    sigma_min: float = Field(default=3.807123, gt=0)
+    sigma_max: float = Field(default=160, gt=0)
+    sigma_min: float = Field(default=4 * 10 ** (-4), gt=0)
     P_mean: float = Field(default=-1.2)
     P_std: float = Field(default=1.5, gt=0)
 
@@ -60,7 +62,7 @@ class NoiseScheduleParams(BaseModel):
 class ResidueDistogramParams(BaseModel):
     """Binning configuration for the residue-level Cβ distance distogram."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True)
 
     min_dist: float = Field(default=3.25, ge=0)
     max_dist: float = Field(default=50.75, gt=0)
@@ -86,7 +88,7 @@ class AtomDistogramParams(ResidueDistogramParams):
 class LossParams(BaseModel):
     """Weights and thresholds for the composite training loss."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True)
 
     # polar residues get weight 2.0, others 1.0 in the basic L0 loss
     lam: float = Field(default=1.0, gt=0)
@@ -102,7 +104,7 @@ class LossParams(BaseModel):
 class CheckpointParams(BaseModel):
     """Checkpoint file path and save frequency."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True)
 
     checkpoint_path: str = "pallatom_best.pt"
     save_every: int = Field(default=1, ge=0)
@@ -111,7 +113,7 @@ class CheckpointParams(BaseModel):
 class LoggingParams(BaseModel):
     """Logging frequency and W&B project configuration."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True)
     use_wandb: bool = True
     wandb_project: str = "pallatom-training"
 
@@ -119,7 +121,7 @@ class LoggingParams(BaseModel):
 class LoaderConfig(BaseModel):
     """DataLoader sequence length cap, batch size, and token budget."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True)
 
     max_seq_length: int = Field(default=128, gt=0)  # was 256
     batch_size: int = Field(default=2, gt=0)  # was 2
@@ -133,7 +135,7 @@ TestLoaderConfig = LoaderConfig
 class ConditioningDropoutConfig(BaseModel):
     """Per-conditioning-signal dropout probabilities used during training."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True)
 
     p_distogram: float = Field(default=0.15, ge=0.0, le=1.0)
     p_atom: float = Field(default=0.15, ge=0.0, le=1.0)
@@ -143,7 +145,7 @@ class ConditioningDropoutConfig(BaseModel):
 class TrainConfig(BaseModel):
     """Top-level frozen config aggregating all training sub-configs."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True)
 
     training: TrainingParams = Field(default_factory=TrainingParams)
     model: ModelParams = Field(default_factory=ModelParams)

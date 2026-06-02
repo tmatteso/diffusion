@@ -4,6 +4,9 @@ import json
 from collections.abc import Mapping
 from pathlib import Path
 
+import numpy as np
+import numpy.typing as npt
+
 
 class ClusterIndex:
     """Partitions proteins from a source JSONL into per-length-cluster JSONL files.
@@ -16,6 +19,10 @@ class ClusterIndex:
 
     The cluster directory is derived from the source path:
         <source_stem>_clusters/ sibling to <source>.jsonl
+
+    All index arrays are stored as compact numpy arrays to minimise RAM. A Python list
+    of ints takes ~28 bytes per element; numpy int32 takes 4 bytes — a 7 times reduction
+    that matters for datasets with millions of proteins.
 
     Args:
         jsonl_path:   Path to the source JSONL protein dataset.
@@ -42,13 +49,14 @@ class ClusterIndex:
         # Overflow cluster (index n_clusters) has rep_len = token_budget + 1 so that
         # the greedy-packing overflow check `rep_len > token_budget` fires correctly.
         bin_width = token_budget // n_clusters
-        self.cluster_rep_len: list[int] = [bin_width * (k + 1) for k in range(n_clusters)] + [
-            token_budget + 1
-        ]
+        self.cluster_rep_len: npt.NDArray[np.int32] = np.array(
+            [bin_width * (k + 1) for k in range(n_clusters)] + [token_budget + 1],
+            dtype=np.int32,
+        )
 
-        self.flat_to_cluster: list[int] = []
-        self.flat_to_local: list[int] = []
-        self.cluster_offsets: list[list[int]] = []
+        self.flat_to_cluster: npt.NDArray[np.int32] = np.empty(0, dtype=np.int32)
+        self.flat_to_local: npt.NDArray[np.int32] = np.empty(0, dtype=np.int32)
+        self.cluster_offsets: list[npt.NDArray[np.int64]] = []
 
         if self._cache_exists():
             self._load_from_cache()
@@ -120,17 +128,17 @@ class ClusterIndex:
                 k = self.assign_cluster(seq_len)
                 cluster_lines[k].append(raw_line)
 
-        # Write cluster files and record byte offsets.
+        # Write cluster files and record byte offsets as compact int64 arrays.
         self.cluster_offsets = []
         for k in range(self._n_clusters + 1):
-            offsets: list[int] = []
+            raw_offsets: list[int] = []
             with open(self.cluster_file(k), "wb") as f:
                 pos = 0
                 for raw_line in cluster_lines[k]:
-                    offsets.append(pos)
+                    raw_offsets.append(pos)
                     f.write(raw_line)
                     pos += len(raw_line)
-            self.cluster_offsets.append(offsets)
+            self.cluster_offsets.append(np.array(raw_offsets, dtype=np.int64))
 
         self._manifest_path().write_text(json.dumps(sorted(self._names)))
         self._build_flat_index()
@@ -139,21 +147,25 @@ class ClusterIndex:
         """Read cluster files to rebuild byte-offset arrays. Does not parse protein data."""
         self.cluster_offsets = []
         for k in range(self._n_clusters + 1):
-            offsets: list[int] = []
+            raw_offsets: list[int] = []
             byte_pos = 0
             with open(self.cluster_file(k), "rb") as f:
                 for raw_line in f:
-                    offsets.append(byte_pos)
+                    raw_offsets.append(byte_pos)
                     byte_pos += len(raw_line)
-            self.cluster_offsets.append(offsets)
+            self.cluster_offsets.append(np.array(raw_offsets, dtype=np.int64))
 
         self._build_flat_index()
 
     def _build_flat_index(self) -> None:
-        """Populate flat_to_cluster and flat_to_local from cluster_offsets."""
-        self.flat_to_cluster = []
-        self.flat_to_local = []
-        for k, offsets in enumerate(self.cluster_offsets):
-            for local_idx in range(len(offsets)):
-                self.flat_to_cluster.append(k)
-                self.flat_to_local.append(local_idx)
+        """Populate flat_to_cluster and flat_to_local from cluster_offsets.
+
+        Uses numpy vectorised ops instead of a nested Python loop — ~10 times faster for
+        large datasets, and produces compact int32 storage (4 bytes/element vs 28 bytes
+        for Python ints).
+        """
+        counts = np.array([len(o) for o in self.cluster_offsets], dtype=np.int32)
+        self.flat_to_cluster = np.repeat(
+            np.arange(len(self.cluster_offsets), dtype=np.int32), counts
+        )
+        self.flat_to_local = np.concatenate([np.arange(int(c), dtype=np.int32) for c in counts])

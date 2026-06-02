@@ -24,22 +24,6 @@ from torch.utils.data.distributed import DistributedSampler
 from train.train_config import TrainConfig
 
 
-def to_protein_batch(
-    samples: list[Mapping[str, Float[torch.Tensor, "..."] | str]],
-) -> ProteinBatch:
-    """Collate a list of per-protein dicts into a ProteinBatch."""
-    return ProteinBatch(
-        atom_positions=torch.stack(
-            cast("list[torch.Tensor]", [s["atom_positions"] for s in samples])
-        ),
-        atom_mask=torch.stack(cast("list[torch.Tensor]", [s["atom_mask"] for s in samples])),
-        residue_index=torch.stack(
-            cast("list[torch.Tensor]", [s["residue_index"] for s in samples])
-        ),
-        seq=cast("list[str]", [s["seq"] for s in samples]),
-    )
-
-
 class ProteinDataset(torch.utils.data.Dataset[Mapping[str, torch.Tensor | str]]):
     """Lazy-loading Dataset backed by a JSONL file.
 
@@ -114,10 +98,10 @@ class ProteinDataset(torch.utils.data.Dataset[Mapping[str, torch.Tensor | str]])
 
         np_example = make_np_example(entry["coords"])
         center_positions(np_example)
-        make_fixed_size(np_example, self.max_seq_length)
+        make_fixed_size(np_example, self.max_seq_length)  # truncation
 
         sample = {k: torch.tensor(v, dtype=torch.float32) for k, v in np_example.items()}
-        sample["seq"] = entry["seq"][: self.max_seq_length]
+        sample["seq"] = entry["seq"][: self.max_seq_length]  # padding?
         return sample
 
 
@@ -188,9 +172,9 @@ class ClusteredProteinDataset(
             Dict with atom_positions (N, 37, 3), atom_mask (N, 37),
             residue_index (N,), and seq (str), where N <= token_budget.
         """
-        cluster_id = self.cluster_index.flat_to_cluster[idx]
-        local_idx = self.cluster_index.flat_to_local[idx]
-        offset = self.cluster_index.cluster_offsets[cluster_id][local_idx]
+        cluster_id = int(self.cluster_index.flat_to_cluster[idx])
+        local_idx = int(self.cluster_index.flat_to_local[idx])
+        offset = int(self.cluster_index.cluster_offsets[cluster_id][local_idx])
 
         self._open(cluster_id)
         self._files[cluster_id].seek(offset)  # type: ignore[union-attr]
@@ -336,7 +320,7 @@ def make_bucketed_data_loaders(
             sampler=val_sampler,
             num_workers=num_workers,
             pin_memory=True,
-            collate_fn=to_protein_batch,
+            collate_fn=to_protein_batch_dynamic,
         )
         test_loader = torch.utils.data.DataLoader(
             test_set,
@@ -344,7 +328,7 @@ def make_bucketed_data_loaders(
             sampler=test_sampler,
             num_workers=num_workers,
             pin_memory=True,
-            collate_fn=to_protein_batch,
+            collate_fn=to_protein_batch_dynamic,
         )
     else:
         val_loader = torch.utils.data.DataLoader(
@@ -353,7 +337,7 @@ def make_bucketed_data_loaders(
             shuffle=False,
             num_workers=num_workers,
             pin_memory=True,
-            collate_fn=to_protein_batch,
+            collate_fn=to_protein_batch_dynamic,
         )
         test_loader = torch.utils.data.DataLoader(
             test_set,
@@ -361,7 +345,7 @@ def make_bucketed_data_loaders(
             shuffle=False,
             num_workers=num_workers,
             pin_memory=True,
-            collate_fn=to_protein_batch,
+            collate_fn=to_protein_batch_dynamic,
         )
 
     return cast(

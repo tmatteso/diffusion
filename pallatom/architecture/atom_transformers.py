@@ -540,7 +540,7 @@ class AtomFeatureEncoder(nn.Module):
         # Step 16: AtomTransformer with 32 / 128 sparse window described in AF3
         # ------------------------------------------------------------------
         # this function signature has changed. it will also have changed in AtomDecoder.
-        q_skip: Float[torch.Tensor, "B N_atom m"] = self.transformer(
+        q_skip = self.transformer(
             q_skip,
             c_l,
             p_lm,
@@ -707,7 +707,7 @@ class AtomAttentionDecoder(nn.Module):
         p = (p + self.mlp_p(p)) * rearrange(valid_mask, "b n k -> b n k 1")
 
         # Step 4: AtomTransformer — 32-residue sparse window
-        q: Float[torch.Tensor, "B N_atom c_atom"] = self.transformer(
+        q = self.transformer(
             q,
             c,
             p,

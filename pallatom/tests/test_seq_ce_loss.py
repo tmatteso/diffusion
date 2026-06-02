@@ -15,6 +15,7 @@ from helpers.featurize import (
 from jaxtyping import Bool, Float, Int
 
 # Module-level constants used by fixtures
+# this is unacceptable.
 _B = 1
 _N_RES = 5
 _ATOMS_PER_RES = 5
@@ -32,8 +33,11 @@ def minimal_batch() -> FeaturizedBatch:
         "n -> b n",
         b=_B,
     ).contiguous()
-    cuid: Int[torch.Tensor, "1 5"] = repeat(
-        torch.arange(0, _N_ATOM, _ATOMS_PER_RES), "n -> b n", b=_B
+    cuid: Int[torch.Tensor, "1 25"] = repeat(
+        torch.arange(0, _N_ATOM, _ATOMS_PER_RES),
+        "n -> b (n a)",
+        b=_B,
+        a=_ATOMS_PER_RES,
     ).contiguous()
     return FeaturizedBatch(
         ref_pos=torch.randn(_B, _N_ATOM, 3),
@@ -45,7 +49,6 @@ def minimal_batch() -> FeaturizedBatch:
         r_gt=torch.randn(_B, _N_ATOM, 3),
         atom5_mask=torch.ones(_B, _N_ATOM, dtype=torch.bool),
         aa_indices=torch.randint(0, _N_AMINO, (_B, _N_RES), dtype=torch.long),
-        residue_mask=torch.ones(_B, _N_RES, dtype=torch.bool),
         t_hat=torch.randn(_B),
         t_normalized=torch.randn(_B, _N_RES, _N_RES),
         tok_idx=tok,
@@ -59,6 +62,12 @@ def minimal_batch() -> FeaturizedBatch:
 def c_beta_distogram_fn() -> Distogram:
     """Minimal Cβ distogram function for featurize_single_item tests."""
     return Distogram(n_bins=_N_BINS, min_dist=2.0, max_dist=22.0, overflow_bin=True).eval()
+
+
+@pytest.fixture
+def atom_distogram_fn() -> Distogram:
+    """Minimal tom distogram function for featurize_single_item tests."""
+    return Distogram(n_bins=_N_BINS, min_dist=2.0, max_dist=22.0, overflow_bin=False).eval()
 
 
 def test_intermediate_and_final_ce_are_identical() -> None:
@@ -79,7 +88,7 @@ def test_conditioning_dropout_uses_index_20_not_minus_100(
     out: FeaturizedBatch = apply_conditioning_dropout(
         minimal_batch, p_distogram=0.0, p_atom=0.0, p_seq=1.0, device="cpu"
     )
-    valid: Bool[torch.Tensor, "1 5"] = minimal_batch.residue_mask
+    valid: Bool[torch.Tensor, "1 5"] = minimal_batch.f_pseudo_beta_mask.bool()
     assert (out.aa_indices[valid] == 20).all()
     assert not (out.aa_indices[valid] == -100).any()
 
@@ -96,7 +105,10 @@ def test_seq_ce_loss_ignores_minus_100() -> None:
     assert torch.allclose(loss_full, loss_half)
 
 
-def test_pipeline_preserves_pdb_x_as_index_20(c_beta_distogram_fn: Distogram) -> None:
+def test_pipeline_preserves_pdb_x_as_index_20(
+    c_beta_distogram_fn: Distogram,
+    atom_distogram_fn: Distogram,
+) -> None:
     """featurize_single_item maps 'X' in the sequence string to aa_indices == 20."""
     n_res = 5
     x_pos = 2
@@ -117,10 +129,12 @@ def test_pipeline_preserves_pdb_x_as_index_20(c_beta_distogram_fn: Distogram) ->
         ala_ref_pos,
         ala_ref_elem,
         c_beta_distogram_fn=c_beta_distogram_fn,
+        atom_distogram_fn=atom_distogram_fn,
         device="cpu",
         sigma_data=16.0,
         P_std=1.5,
         P_mean=-1.2,
+        max_seq_len_in_batch=n_res,
     )
 
     assert item.aa_indices[x_pos].item() == 20

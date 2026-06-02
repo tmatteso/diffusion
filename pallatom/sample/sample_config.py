@@ -15,11 +15,13 @@ class SamplerParams(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     rho: float = Field(default=7.0, gt=0)
-    S_churn: float = Field(default=0.0, ge=0)
-    S_tmin: float = Field(default=0.0, ge=0)
-    S_tmax: float = Field(default=1e38, gt=0)
+    S_churn: float = Field(default=0.2, ge=0)
+    S_tmin: float = Field(default=0.01, ge=0)
+    S_tmax: float = Field(default=1.0, gt=0)
     S_noise: float = Field(default=1.003, gt=0)
-    ddim_steps: int = Field(default=40, gt=1)
+    ddim_steps: int = Field(default=200, gt=1)
+    eta_step_scale: float = Field(default=2.25, gt=1)
+    seq_temperature: float = Field(default=0.1, gt=0)
 
 
 class GenerationParams(BaseModel):

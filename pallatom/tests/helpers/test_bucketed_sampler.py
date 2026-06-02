@@ -122,8 +122,7 @@ def small_cluster_index(tmp_path: pathlib.Path) -> ClusterIndex:
     ]
     path = tmp_path / "proteins.jsonl"
     with open(path, "w") as f:
-        for entry in entries:
-            f.write(json.dumps(entry) + "\n")
+        f.writelines(json.dumps(entry) + "\n" for entry in entries)
     return ClusterIndex(path, [f"p{i}" for i in range(80)], token_budget=512, n_clusters=64)
 
 
@@ -200,3 +199,60 @@ def test_sampler_len_after_set_epoch(small_cluster_index: ClusterIndex) -> None:
     )
     sampler.set_epoch(0)
     assert len(sampler) == len(list(sampler))
+
+
+# ---------------------------------------------------------------------------
+# n_threads parameter (multithreaded chunk processing)
+# ---------------------------------------------------------------------------
+
+
+def test_compute_batch_plan_accepts_n_threads() -> None:
+    """compute_batch_plan accepts an n_threads keyword argument."""
+    n = 100
+    flat_to_cluster = [0] * n
+    rep_lens = _rep_lens()
+    batches = compute_batch_plan(
+        flat_to_cluster, rep_lens, n, 512, 16, seed=0, max_seq_len=512, n_threads=2
+    )
+    all_indices = sorted(i for batch in batches for i in batch)
+    assert all_indices == list(range(n))
+
+
+def test_sampler_accepts_n_threads(small_cluster_index: ClusterIndex) -> None:
+    """BucketedBatchSampler accepts n_threads and produces the same coverage."""
+    sampler = BucketedBatchSampler(
+        small_cluster_index,
+        token_budget=512,
+        max_seq_len=512,
+        seed=0,
+        prefetch_epochs=1,
+        n_threads=2,
+    )
+    sampler.set_epoch(0)
+    all_indices = sorted(i for batch in sampler for i in batch)
+    assert all_indices == list(range(len(small_cluster_index)))
+
+
+def test_sampler_n_threads_same_result_as_single_thread(small_cluster_index: ClusterIndex) -> None:
+    """Multi-threaded packing produces the same batch set as single-threaded (same seed)."""
+    sampler_1 = BucketedBatchSampler(
+        small_cluster_index,
+        token_budget=512,
+        max_seq_len=512,
+        seed=42,
+        prefetch_epochs=1,
+        n_threads=1,
+    )
+    sampler_4 = BucketedBatchSampler(
+        small_cluster_index,
+        token_budget=512,
+        max_seq_len=512,
+        seed=42,
+        prefetch_epochs=1,
+        n_threads=4,
+    )
+    sampler_1.set_epoch(0)
+    sampler_4.set_epoch(0)
+    indices_1 = sorted(i for batch in sampler_1 for i in batch)
+    indices_4 = sorted(i for batch in sampler_4 for i in batch)
+    assert indices_1 == indices_4

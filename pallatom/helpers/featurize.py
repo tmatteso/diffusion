@@ -10,6 +10,7 @@ from architecture.atom_transformers import WINDOW_SIZE, build_sparse_pairs
 from beartype import beartype
 from einops import rearrange, reduce, repeat
 from helpers.atom_utils import (
+    ATOM5_CA,
     ATOM5_ELEMENTS,
     ATOM5_NAMES,
     atom37_to_atom5,
@@ -187,9 +188,11 @@ def featurize_single_item(
     ala_ref_pos: Float[torch.Tensor, "5 3"],
     ala_ref_elem: Float[torch.Tensor, "5 4"],
     c_beta_distogram_fn: Distogram,
+    atom_distogram_fn: Distogram,
     sigma_data: float,
     P_std: float,
     P_mean: float,
+    max_seq_len_in_batch: int,
     device: str = _DEFAULT_DEVICE,
 ) -> FeaturizedItem:
     """Featurize a single protein from atom37 representation to model-ready tensors.
@@ -211,9 +214,14 @@ def featurize_single_item(
         ala_ref_elem: ALA atom element one-hots, shape ``(5, 4)``, already on ``device``.
         c_beta_distogram_fn: Callable mapping Cβ positions and residue mask to a
             ``(N_res, N_res, n_bins)`` distogram tensor.
+        atom_distogram_fn: Callable mapping atom positions and atom mask to a
+            ``(N_res, N_res, n_atom_bins)`` distogram tensor.
         sigma_data: Data standard deviation constant used to scale the sampled noise level.
         P_std: Standard deviation of the lognormal noise schedule (ln sigma ~ N(P_mean, P_std²)).
         P_mean: Mean of the lognormal noise schedule (ln sigma ~ N(P_mean, P_std²)).
+        max_seq_len_in_batch: Padded sequence len of the batch (``batch.atom_positions.shape[1]``).
+            Used to pad ``aa_indices`` to ``N_res`` with ``-100`` (CE ignore index) for residues
+            that are padding rather than real amino acids.
         device: PyTorch device string for newly created tensors.
 
     Returns:
@@ -222,7 +230,7 @@ def featurize_single_item(
         and the sampled diffusion noise level.
     """
     Natom: int = 5
-    N_res_i: int = atom37_positions.shape[0]
+    N_res: int = atom37_positions.shape[0]
 
     # Noise schedule lognormal. ln(sigma) ~ N(Pmean, Pstd**2),
     # Pmean = -1.2, Pstd = 1.5, sigma_data = 16,
@@ -235,59 +243,97 @@ def featurize_single_item(
 
     # t_normalized is drawn from uniform(0, 1) and broadcast to every residue pair.
     t_scalar: Float[torch.Tensor, ""] = torch.rand((), device=device)
-    t_template: Float[torch.Tensor, "N_res N_res"] = repeat(
-        t_scalar, "-> n m", n=N_res_i, m=N_res_i
-    )
+    t_template: Float[torch.Tensor, "N_res N_res"] = repeat(t_scalar, "-> n m", n=N_res, m=N_res)
 
-    _seq_len = min(len(aa_sequence), N_res_i)
-    _aa_vals = [restype_order[r] for r in aa_sequence[:_seq_len]]
-    _aa_vals += [-100] * (N_res_i - _seq_len)
-    aa_indices_i: Int[torch.Tensor, "N_res"] = torch.tensor(
-        _aa_vals, dtype=torch.long, device=device
+    aa_vals = [restype_order[r] for r in aa_sequence]
+    aa_indices: Int[torch.Tensor, "N_res"] = torch.full(
+        (max_seq_len_in_batch,), -100, dtype=torch.long, device=device
     )
-
-    atom5_pos, atom5_msk = atom37_to_atom5(
+    aa_indices[: len(aa_vals)] = torch.tensor(aa_vals, dtype=torch.long, device=device)
+    atom5_pos: Float[torch.Tensor, "N_res 5 3"]
+    atom5_mask: Float[torch.Tensor, "N_res 5"]
+    atom5_pos, atom5_mask = atom37_to_atom5(
         rearrange(atom37_positions, "n a d -> 1 n a d"),
         rearrange(atom37_mask, "n a -> 1 n a"),
     )
     atom5_pos = rearrange(atom5_pos, "1 n a d -> n a d")
-    atom5_msk = rearrange(atom5_msk, "1 n a -> n a")
-    residue_mask_i: Bool[torch.Tensor, "N_res"] = atom5_msk.any(dim=-1)
+    atom5_mask = rearrange(atom5_mask, "1 n a -> n a")
+    residue_mask: Bool[torch.Tensor, "N_res"] = atom5_mask.any(dim=-1)
+    # f_pseudo_beta: Mask indicating if the Cβ atom has coordinates for the template at
+    # this residue, where 1 indicates existing residues and 0 is used for
+    # padding residues. f_pseudo_beta == residue_mask
 
-    c_beta_pos, f_pseudo_beta_i = atom37_to_cb(
+    c_beta_pos: Float[torch.Tensor, "B N_res 5 3"]
+    c_beta_pos, _ = atom37_to_cb(
         rearrange(atom37_positions, "n a d -> 1 n a d"),
         rearrange(atom37_mask, "n a -> 1 n a"),
     )
     c_beta_pos = rearrange(c_beta_pos, "1 n d -> n d")
-    f_pseudo_beta_i = rearrange(f_pseudo_beta_i, "1 n -> n")
 
-    gt_res_disto_i, _ = c_beta_distogram_fn(c_beta_pos, residue_mask_i)
+    gt_res_distogram: Float[torch.Tensor, "N_atom N_atom n_template_bins"]
+    gt_res_distogram, _ = c_beta_distogram_fn(c_beta_pos, residue_mask)
 
-    flat_pos_i: Float[torch.Tensor, "N_atom 3"] = rearrange(atom5_pos, "n a d -> (n a) d")
-    atom_mask_flat_i: Bool[torch.Tensor, "N_atom"] = repeat(residue_mask_i, "n -> (n a)", a=Natom)
+    flat_pos: Float[torch.Tensor, "N_atom 3"] = rearrange(atom5_pos, "n a d -> (n a) d")
+    atom_mask_flat: Bool[torch.Tensor, "N_atom"] = rearrange(atom5_mask.bool(), "n a -> (n a)")
 
-    ref_pos_i: Float[torch.Tensor, "N_atom 3"] = rearrange(
-        repeat(ala_ref_pos, "a d -> n a d", n=N_res_i), "n a d -> (n a) d"
+    ref_pos: Float[torch.Tensor, "N_atom 3"] = rearrange(
+        repeat(ala_ref_pos, "a d -> n a d", n=N_res), "n a d -> (n a) d"
     )
-    ref_elem_i: Float[torch.Tensor, "N_atom 4"] = rearrange(
-        repeat(ala_ref_elem, "a e -> n a e", n=N_res_i), "n a e -> (n a) e"
+    ref_elem: Float[torch.Tensor, "N_atom 4"] = rearrange(
+        repeat(ala_ref_elem, "a e -> n a e", n=N_res), "n a e -> (n a) e"
     )
+    # The pdb residue number for calculating relative positional embedding
+    f_residue_idx: Int[torch.Tensor, "N_res"] = index.long()
+    # atom to residue map
+    token_idx: Int[torch.Tensor, "N_atom"] = torch.arange(N_res, device=device).repeat_interleave(
+        Natom
+    )
+    # center is alpha carbon for standard protein residues, C1prime for nucleic acid residues
+    center_single: Int[torch.Tensor, "N_atom"] = (
+        torch.arange(N_res, device=device) * 5 + ATOM5_CA
+    ).repeat_interleave(Natom)
+    # ref_space_uid is the numerical encoding of the chain id and residue index associated with
+    # this reference conformer. Each (chain id, residue index) tuple is assigned an integer
+    # on first appearance.
+    ref_space_uid: Int[torch.Tensor, "B N_atom"] = f_residue_idx.repeat_interleave(Natom)
+    # because we are only using one chain right now, f_residue_idx == ref_space_uid
 
-    f_residue_idx_i: Int[torch.Tensor, "N_res"] = index.long()
+    neighbor_idx: Float[torch.Tensor, "N, K"]
+    valid_mask: Float[torch.Tensor, "N, K"]  # True where the slot is a real neighbour (not padding)
+    neighbor_idx, valid_mask = build_sparse_pairs(token_idx, WINDOW_SIZE)  # (N_atom, K)
+
+    # atom_distogram_fn
+    gt_atom_disto_dense: Float[torch.Tensor, "N_atom N_atom n_atom_bins"]
+    gt_atom_mask_dense: Bool[torch.Tensor, "N_atom N_atom"]
+    gt_atom_disto_dense, gt_atom_mask_dense = atom_distogram_fn(flat_pos, atom_mask_flat)
+    n_atom_bins: int = gt_atom_disto_dense.shape[-1]
+
+    # Vectorised sparse gather: result[l, k] = dense[l, neighbor_idx[l, k]]
+    # index must be the same shape as the output
+    gt_atom_distogram_sparse: Float[torch.Tensor, "N_atom K n_atom_bins"] = (
+        gt_atom_disto_dense.gather(1, repeat(neighbor_idx, "n k -> n k d", d=n_atom_bins))
+    )
+    gt_atom_distogram_mask_sparse: Bool[torch.Tensor, "N_atom K"] = (
+        gt_atom_mask_dense.long().gather(1, neighbor_idx).bool() & valid_mask
+    )
+    del gt_atom_disto_dense, gt_atom_mask_dense
 
     return FeaturizedItem(
-        N_res=N_res_i,
-        flat_pos=flat_pos_i,
-        atom_mask_flat=atom_mask_flat_i,
-        residue_mask=residue_mask_i,
-        f_pseudo_beta=f_pseudo_beta_i.long(),
-        gt_res_distogram=gt_res_disto_i.long(),
-        aa_indices=aa_indices_i,
-        ref_pos=ref_pos_i,
-        ref_element=ref_elem_i,
-        f_residue_idx=f_residue_idx_i,
+        flat_pos=flat_pos,
+        atom_mask_flat=atom_mask_flat,
+        f_pseudo_beta=residue_mask.long(),
+        gt_res_distogram=gt_res_distogram.long(),
+        aa_indices=aa_indices,
+        ref_pos=ref_pos,
+        ref_element=ref_elem,
+        f_residue_idx=f_residue_idx,
         t_hat=t_hat,
         t_template=t_template,
+        ref_space_uid=ref_space_uid,
+        tok_idx=token_idx,
+        center_uid=center_single,
+        gt_atom_distogram_sparse=gt_atom_distogram_sparse,
+        gt_atom_distogram_mask_sparse=gt_atom_distogram_mask_sparse,
     )
 
 
@@ -321,7 +367,6 @@ def featurize_batch(
         residue encodings, and the sampled noise level sigma.
     """
     B: int = len(batch.seq)
-    Natom: int = 5
     device: str = str(distogram_res.edges.device)
 
     # ── Shared noise for the whole batch ──────────────────────────────────────
@@ -329,8 +374,8 @@ def featurize_batch(
     sigma_data = tcfg.noise.sigma_data
 
     # ── Shared helpers reused across all items ────────────────────────────────
-    ala_ref_pos = ref_pos_for_residue("ALA").to(device)  # (5, 3)
-    ala_ref_elem = ATOM5_ELEMENTS.float().to(device)  # (5, 4)
+    ala_ref_pos: Float[torch.Tensor, "5 3"] = ref_pos_for_residue("ALA").to(device)  # (5, 3)
+    ala_ref_elem: Float[torch.Tensor, "5 4"] = ATOM5_ELEMENTS.float().to(device)  # (5, 4)
 
     # ── Per-item featurization ────────────────────────────────────────────────
     items: list[FeaturizedItem] = [
@@ -342,22 +387,19 @@ def featurize_batch(
             ala_ref_pos=ala_ref_pos,
             ala_ref_elem=ala_ref_elem,
             c_beta_distogram_fn=distogram_res,
+            atom_distogram_fn=distogram_atom,
             sigma_data=sigma_data,
             P_std=P_std,
             P_mean=P_mean,
+            max_seq_len_in_batch=batch.atom_positions.shape[1],
             device=device,
         )
         for ix in range(B)
     ]
 
-    # All items must have the same N_res (ProteinBatch is pre-padded by the DataLoader).
-    N_res_total: int = items[0].N_res
-    N_atom_total: int = N_res_total * Natom
-
     # ── Stack per-item tensors into a single batched tensor ──────────────────
     packed_flat_pos = torch.stack([it.flat_pos for it in items])  # (B, N_atom, 3)
     packed_atom_mask = torch.stack([it.atom_mask_flat for it in items])  # (B, N_atom)
-    packed_res_mask = torch.stack([it.residue_mask for it in items])  # (B, N_res)
     packed_pseudo_beta = torch.stack([it.f_pseudo_beta for it in items])  # (B, N_res)
     packed_aa = torch.stack([it.aa_indices for it in items])  # (B, N_res)
     packed_ref_pos = torch.stack([it.ref_pos for it in items])  # (B, N_atom, 3)
@@ -365,63 +407,33 @@ def featurize_batch(
     packed_res_idx = torch.stack([it.f_residue_idx for it in items])  # (B, N_res)
     packed_t_hat = torch.stack([it.t_hat for it in items])  # (B, )
     packed_t_temp = torch.stack([it.t_template for it in items])  # (B, N_res, N_res)
-    gt_res_distogram = torch.stack(
+    packed_gt_res_distogram = torch.stack(
         [it.gt_res_distogram for it in items]
     )  # (B, N_res, N_res, n_templ_bins)
-
-    # Each item is a single chain; ref_space_uid = 0 everywhere (no separators needed).
-    ref_space_uid: Int[torch.Tensor, "B N_atom"] = torch.zeros(
-        B, N_atom_total, dtype=torch.long, device=device
+    packed_ref_space_uid = torch.stack([it.ref_space_uid for it in items])
+    packed_center_uid = torch.stack([it.center_uid for it in items])
+    packed_tok_idx = torch.stack([it.tok_idx for it in items])
+    packed_gt_atom_distogram_sparse = torch.stack([it.gt_atom_distogram_sparse for it in items])
+    packed_gt_atom_distogram_mask_sparse = torch.stack(
+        [it.gt_atom_distogram_mask_sparse for it in items]
     )
-
-    # tok_idx and center_uid are identical for all items (same N_res after padding).
-    _tok_single: Int[torch.Tensor, "N_atom"] = torch.arange(
-        N_res_total, dtype=torch.long, device=device
-    ).repeat_interleave(Natom)
-    _center_single: Int[torch.Tensor, "N_res"] = (
-        torch.arange(N_res_total, dtype=torch.long, device=device) * Natom + 1
-    )  # should always be the alpha carbon
-    tok_idx: Int[torch.Tensor, "B N_atom"] = repeat(
-        _tok_single, "n_atom -> b n_atom", b=B
-    ).contiguous()
-    center_uid: Int[torch.Tensor, "B N_res"] = repeat(
-        _center_single, "n_res -> b n_res", b=B
-    ).contiguous()
-
-    # ── Sparse atom distogram (batched) ──────────────────────────────────────
-    neighbor_idx, _ = build_sparse_pairs(_tok_single, WINDOW_SIZE)  # (N_atom, K)
-
-    # atom_distogram_fn supports batched input: (B, N_atom, 3) → (B, N_atom, N_atom, n_bins)
-    gt_atom_disto_dense, gt_atom_mask_dense = distogram_atom(packed_flat_pos, packed_atom_mask)
-    n_atom_bins: int = gt_atom_disto_dense.shape[-1]
-
-    # Vectorised sparse gather: result[b, l, k] = dense[b, l, neighbor_idx[l, k]]
-    nbr_b: Int[torch.Tensor, "B N_atom K"] = repeat(neighbor_idx, "n k -> b n k", b=B)
-    gt_atom_distogram_sparse: Float[torch.Tensor, "B N_atom K n_atom_bins"] = (
-        gt_atom_disto_dense.gather(2, repeat(nbr_b, "b n k -> b n k d", d=n_atom_bins))
-    )
-    gt_atom_distogram_mask_sparse: Bool[torch.Tensor, "B N_atom K"] = (
-        gt_atom_mask_dense.long().gather(2, nbr_b).bool()
-    )
-    del gt_atom_disto_dense, gt_atom_mask_dense
 
     return FeaturizedBatch(
         ref_pos=packed_ref_pos,
         ref_element=packed_ref_elem,
-        ref_space_uid=ref_space_uid,
-        gt_res_distogram=gt_res_distogram,
+        ref_space_uid=packed_ref_space_uid,
+        gt_res_distogram=packed_gt_res_distogram,
         f_pseudo_beta_mask=packed_pseudo_beta,
         f_residue_idx=packed_res_idx,
         r_gt=packed_flat_pos,
         atom5_mask=packed_atom_mask,
         aa_indices=packed_aa,
-        residue_mask=packed_res_mask,
         t_hat=packed_t_hat,
         t_normalized=packed_t_temp,
-        tok_idx=tok_idx,
-        center_uid=center_uid,
-        gt_atom_distogram_sparse=gt_atom_distogram_sparse,
-        gt_atom_distogram_mask_sparse=gt_atom_distogram_mask_sparse,
+        tok_idx=packed_tok_idx,
+        center_uid=packed_center_uid,
+        gt_atom_distogram_sparse=packed_gt_atom_distogram_sparse,
+        gt_atom_distogram_mask_sparse=packed_gt_atom_distogram_mask_sparse,
     )
 
 
@@ -446,7 +458,7 @@ def apply_conditioning_dropout(
       the mask token (index 20, "X").
 
     Dropout is applied only to residues present in the batch (gated by
-    ``residue_mask``), so padding positions are never affected.
+    ``f_pseudo_beta_mask``), so padding positions are never affected.
 
     Args:
         batch: Featurized batch whose conditioning tensors will be partially zeroed.
@@ -463,17 +475,17 @@ def apply_conditioning_dropout(
         ``gt_res_distogram``, ``f_pseudo_beta_mask``, ``atom5_mask``, and
         ``aa_indices`` are partially zeroed according to the sampled masks.
     """
-    residue_mask: Bool[torch.Tensor, "B N_res"] = batch.residue_mask
-    B, N_res = residue_mask.shape
+    f_pseudo_beta: Bool[torch.Tensor, "B N_res"] = batch.f_pseudo_beta_mask.bool()
+    B, N_res = f_pseudo_beta.shape
 
     drop_d: Bool[torch.Tensor, "B N_res"] = (
-        torch.bernoulli(torch.full((B, N_res), p_distogram, device=device)).bool() & residue_mask
+        torch.bernoulli(torch.full((B, N_res), p_distogram, device=device)).bool() & f_pseudo_beta
     )
     drop_a: Bool[torch.Tensor, "B N_res"] = (
-        torch.bernoulli(torch.full((B, N_res), p_atom, device=device)).bool() & residue_mask
+        torch.bernoulli(torch.full((B, N_res), p_atom, device=device)).bool() & f_pseudo_beta
     )
     drop_s: Bool[torch.Tensor, "B N_res"] = (
-        torch.bernoulli(torch.full((B, N_res), p_seq, device=device)).bool() & residue_mask
+        torch.bernoulli(torch.full((B, N_res), p_seq, device=device)).bool() & f_pseudo_beta
     )
 
     # Distogram: zero rows AND columns for dropped residues (matrix is symmetric)

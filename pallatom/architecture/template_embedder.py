@@ -94,7 +94,7 @@ class TemplateEmbedder(nn.Module):
         # ------------------------------------------------------------------
         # Step 5: v_ij = PairformerStack(v_ij, N_block)
         # ------------------------------------------------------------------
-        v_ij: Float[torch.Tensor, "B N_res N_res c"] = self.pairformer(s=None, z=v_ij)
+        v_ij = self.pairformer(s=None, z=v_ij)
 
         # ------------------------------------------------------------------
         # Step 6: u_ij = LinearNoBias(ReLU(LayerNorm(v_ij)))

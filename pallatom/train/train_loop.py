@@ -6,7 +6,7 @@ import dataclasses
 import math
 import os
 import time
-from collections.abc import Mapping
+from collections.abc import Iterable
 from typing import NoReturn, cast
 
 import structlog
@@ -25,6 +25,7 @@ from architecture.main_trunk import MainTrunk, PredictedOutputs
 from beartype import beartype
 from einops import reduce
 from helpers.alignment import kabsch_align
+from helpers.batch_types import FeaturizedBatch, ProteinBatch
 from helpers.bucketed_sampler import BucketedBatchSampler
 from helpers.context_managers import (
     DDPNoSync,
@@ -36,8 +37,6 @@ from helpers.context_managers import (
 from helpers.data import make_bucketed_data_loaders
 from helpers.featurize import (
     Distogram,
-    FeaturizedBatch,
-    ProteinBatch,
     apply_conditioning_dropout,
     featurize_batch,
 )
@@ -74,20 +73,25 @@ def load_checkpoint(
         The same ``model_params`` with model, optimizer, and scheduler state restored.
     """
     path: str = model_params.tcfg.checkpoint.checkpoint_path
-    ckpt = torch.load(path, map_location=model_params.device)
+    ckpt: dict[str, dict[str, Float[torch.Tensor, "..."]] | Float[torch.Tensor, ""]] = torch.load(
+        path, map_location=model_params.device, weights_only=True
+    )
+    model_sd = cast(dict[str, Float[torch.Tensor, "..."]], ckpt["model"])
     if isinstance(model_params.model, DDP):
-        cast(MainTrunk, getattr(model_params.model, "module")).load_state_dict(  # noqa: B009
-            ckpt["model"]
+        _ = cast(MainTrunk, getattr(model_params.model, "module")).load_state_dict(  # noqa: B009
+            model_sd
         )
     else:
-        model_params.model.load_state_dict(ckpt["model"])
-
-    model_params.optimizer.load_state_dict(ckpt["optimizer"])
-    model_params.scheduler.load_state_dict(ckpt["scheduler"])
-    best_val_loss = ckpt["best_val_loss"]
+        _ = model_params.model.load_state_dict(model_sd)
+    model_params.optimizer.load_state_dict(
+        cast(dict[str, Float[torch.Tensor, "..."]], ckpt["optimizer"])
+    )
+    model_params.scheduler.load_state_dict(
+        cast(dict[str, Float[torch.Tensor, "..."]], ckpt["scheduler"])
+    )
     if rank == 0:
         log.info("resumed from checkpoint", path=path)
-    return model_params, best_val_loss
+    return model_params, cast(Float[torch.Tensor, ""], ckpt["best_val_loss"])
 
 
 def save_checkpoint(
@@ -116,10 +120,14 @@ def save_checkpoint(
         inner = cast(MainTrunk, getattr(model_params.model, "module"))  # noqa: B009
     else:
         inner: MainTrunk = model_params.model
-    ckpt: Mapping[str, Mapping[str, Float[torch.Tensor, ""]] | Float[torch.Tensor, ""]] = {
-        "model": inner.state_dict(),
-        "optimizer": model_params.optimizer.state_dict(),
-        "scheduler": model_params.scheduler.state_dict(),
+    ckpt: dict[str, dict[str, Float[torch.Tensor, "..."]] | Float[torch.Tensor, ""]] = {
+        "model": cast(dict[str, Float[torch.Tensor, "..."]], inner.state_dict()),
+        "optimizer": cast(
+            dict[str, Float[torch.Tensor, "..."]], model_params.optimizer.state_dict()
+        ),
+        "scheduler": cast(
+            dict[str, Float[torch.Tensor, "..."]], model_params.scheduler.state_dict()
+        ),
         "best_val_loss": best_val_loss,
     }
     torch.save(ckpt, path)
@@ -157,7 +165,7 @@ def take_step(
     lp = model_params.tcfg.loss
 
     if train:
-        featurized_batch: FeaturizedBatch = apply_conditioning_dropout(
+        featurized_batch = apply_conditioning_dropout(
             featurized_batch,
             p_distogram=model_params.tcfg.conditioning_dropout.p_distogram,
             p_atom=model_params.tcfg.conditioning_dropout.p_atom,
@@ -173,7 +181,7 @@ def take_step(
             featurized_batch.t_hat**2 + sigma_data**2
         ) / (featurized_batch.t_hat * sigma_data) ** 2
 
-        pred_outputs: PredictedOutputs = model_params.model(featurized_batch)
+        pred_outputs = cast(PredictedOutputs, model_params.model(featurized_batch))
 
         Kabsch_aligned_MSE_loss: Float[torch.Tensor, ""] = atom_loss(
             pred_outputs.r_denoised, featurized_batch.r_gt, featurized_batch.atom5_mask
@@ -213,7 +221,7 @@ def take_step(
         residue_distogram_loss: Float[torch.Tensor, ""] = distogram_loss_residue(
             pred_outputs.residue_distogram_logits,
             gt_res_bin_idx,
-            featurized_batch.residue_mask,
+            featurized_batch.f_pseudo_beta_mask.bool(),
         ).mean()
 
         atom_distogram_loss: Float[torch.Tensor, ""] = distogram_loss_atom(
@@ -259,8 +267,8 @@ def take_step(
     t1 = time.perf_counter()
     step_time = t1 - t0
 
-    b_size, n_res = featurized_batch.residue_mask.shape
-    actual_residues = int(featurized_batch.residue_mask.sum().item())
+    b_size, n_res = featurized_batch.f_residue_idx.shape
+    actual_residues = int(featurized_batch.f_pseudo_beta_mask.sum().item())
     actual_atoms = int(featurized_batch.atom5_mask.sum().item())
 
     return LossMetrics(
@@ -358,7 +366,7 @@ def evaluate(
     is_ddp: bool = dist.is_initialized()
     world_size: int = dist.get_world_size() if is_ddp else 1
 
-    for batch in loader:
+    for batch in cast(Iterable[ProteinBatch], loader):
         loss_metrics, throughput_statistics = take_step(
             batch=batch,
             model_params=model_params,
@@ -373,9 +381,9 @@ def evaluate(
 
     if is_ddp:
         for t in loss_sums.values():
-            dist.all_reduce(t, op=dist.ReduceOp.SUM)  # pyright: ignore[reportUnknownMemberType]
+            _ = dist.all_reduce(t, op=dist.ReduceOp.SUM)  # pyright: ignore[reportUnknownMemberType]
         for t in tput_sums.values():
-            dist.all_reduce(t, op=dist.ReduceOp.SUM)  # pyright: ignore[reportUnknownMemberType]
+            _ = dist.all_reduce(t, op=dist.ReduceOp.SUM)  # pyright: ignore[reportUnknownMemberType]
 
     n = max(n_batches, 1)
     return (
@@ -404,7 +412,7 @@ def component_grad_norms(model: MainTrunk | DDP) -> ComponentNorms:
         inner: MainTrunk = model
 
     def _norm(attr: str) -> Float[torch.Tensor, ""]:
-        sub_module: nn.Module = getattr(inner, attr)
+        sub_module = cast(nn.Module, getattr(inner, attr))
         grad_norms: list[torch.Tensor] = [
             torch.sqrt(reduce(parameter.grad.detach() ** 2, "... -> ", "sum"))
             for parameter in sub_module.parameters()
@@ -457,12 +465,12 @@ def optimizer_step(
     )
     component_norms = component_grad_norms(model_params.model)
     tp = model_params.tcfg.training
-    nn.utils.clip_grad_norm_(
+    _ = nn.utils.clip_grad_norm_(
         model_params.model.parameters(),
         tp.grad_clip if tp.grad_clip is not None else float("inf"),
     )
 
-    model_params.optimizer.step()  # pyright: ignore[reportUnknownMemberType]
+    _ = model_params.optimizer.step()  # pyright: ignore[reportUnknownMemberType]
     model_params.optimizer.zero_grad()
     return loss_metrics, throughput_statistics, component_norms, global_step + 1
 
@@ -584,8 +592,11 @@ def log_epoch(
         return  # do nothing for non rank 0 workers
     lg = model_params.tcfg.logging
 
-    def _to_float_dict(dc: object) -> dict[str, float]:
-        return {f.name: getattr(dc, f.name).item() for f in dataclasses.fields(dc)}  # type: ignore[arg-type]
+    def _to_float_dict(dc: LossMetrics | ThroughputStatistics | ComponentNorms) -> dict[str, float]:
+        return {
+            f.name: cast(Float[torch.Tensor, ""], getattr(dc, f.name)).item()
+            for f in dataclasses.fields(dc)
+        }
 
     val_dict = _to_float_dict(epoch_metrics.val_loss_metrics)
     train_dict = _to_float_dict(epoch_metrics.train_loss_metrics)
@@ -655,14 +666,17 @@ def _flush_micro_buffer(
         model_params=model_params,
         global_step=step.global_step,
     )
-    loss_dict = {
-        f.name: getattr(loss_metrics, f.name).item() for f in dataclasses.fields(loss_metrics)
+    loss_dict: dict[str, float] = {
+        f.name: cast(Float[torch.Tensor, ""], getattr(loss_metrics, f.name)).item()
+        for f in dataclasses.fields(loss_metrics)
     }
     if any(math.isnan(v) for v in loss_dict.values()) and step.rank == 0:
         log.error("nan_loss", step=new_global_step, **{k: f"{v:.2f}" for k, v in loss_dict.items()})
-    step.pbar.update(1)
+    _ = step.pbar.update(1)
     if step.rank == 0:
-        step.pbar.set_postfix({k: f"{v:.2f}" for k, v in loss_dict.items()})  # type: ignore[reportUnknownMemberType]
+        step.pbar.set_postfix(  # pyright: ignore[reportUnknownMemberType]
+            {k: f"{v:.2f}" for k, v in loss_dict.items()}
+        )
     step.step_loss_metrics.append(loss_metrics)
     step.step_throughput_stats.append(throughput_stats)
     step.step_component_norms.append(component_norms)
@@ -721,7 +735,7 @@ def train(
     global_step = 0
 
     for epoch in range(1, tp.num_epochs + 1):
-        model_params.model.train()
+        _ = model_params.model.train()  # returns "DistributedDataParallel | MainTrunk"
         train_sampler.set_epoch(epoch)
         n_batches = 0
         micro_buffer: list[ProteinBatch] = []
@@ -748,7 +762,7 @@ def train(
             step_n_proteins=[],
         )
 
-        for batch in train_loader:
+        for batch in cast(Iterable[ProteinBatch], train_loader):
             n_proteins: int = batch.atom_positions.shape[0]
             n_all_tokens: int = n_proteins * batch.atom_positions.shape[1]
 
@@ -805,7 +819,44 @@ def train(
         pbar.close()
 
 
-def main(args: argparse.Namespace, tcfg: TrainConfig) -> None:
+@dataclasses.dataclass
+class TrainArgs:
+    """Parsed command-line arguments for the training entry point."""
+
+    data: str
+    splits: str
+    config: str
+    log_file: str
+    num_workers: int
+    ddp: bool
+    debug_run: bool
+
+
+def _parse_args() -> TrainArgs:
+    """Build the argument parser and return a fully typed TrainArgs."""
+    _ = parser = argparse.ArgumentParser(description="Train PallAtom")
+    _ = parser.add_argument("--data", required=True, help="path to proteins.jsonl")
+    _ = parser.add_argument("--splits", required=True, help="path to splits.json")
+    _ = parser.add_argument("--config", required=True, help="path to TrainConfig JSON")
+    _ = parser.add_argument("--log_file", required=True, help="path to write structured JSON log")
+    _ = parser.add_argument("--num_workers", type=int, default=4)
+    _ = parser.add_argument("--ddp", action="store_true", help="DistributedDataParallel training")
+    _ = parser.add_argument(
+        "--debug_run", action="store_true", help="restrict to 252 proteins for fast iteration"
+    )
+    ns = parser.parse_args()
+    return TrainArgs(
+        data=cast(str, ns.data),
+        splits=cast(str, ns.splits),
+        config=cast(str, ns.config),
+        log_file=cast(str, ns.log_file),
+        num_workers=cast(int, ns.num_workers),
+        ddp=cast(bool, ns.ddp),
+        debug_run=cast(bool, ns.debug_run),
+    )
+
+
+def main(args: TrainArgs, tcfg: TrainConfig) -> None:
     """Entry point for training; dispatches to DDP or single-device based on args.ddp.
 
     Uses ExitStack so both paths share all setup code after context initialisation.
@@ -823,10 +874,10 @@ def main(args: argparse.Namespace, tcfg: TrainConfig) -> None:
             is_rank_zero = True
             device = "cuda:0" if torch.cuda.is_available() else "cpu"
 
-        stack.enter_context(StructlogConfig(is_rank_zero, args.log_file))
-        stack.enter_context(FatalOnError())
+        _ = stack.enter_context(StructlogConfig(is_rank_zero, args.log_file))
+        _ = stack.enter_context(FatalOnError())
 
-        log = structlog.get_logger()
+        log = cast(FilteringBoundLogger, structlog.get_logger())
 
         train_loader, val_loader, _, train_sampler = make_bucketed_data_loaders(
             cfg=tcfg,
@@ -890,7 +941,7 @@ def main(args: argparse.Namespace, tcfg: TrainConfig) -> None:
             best_val_loss = torch.tensor(float("inf"))
 
         if is_rank_zero and tcfg.logging.use_wandb:
-            wandb.init(project=tcfg.logging.wandb_project, config=tcfg.model_dump())
+            _ = wandb.init(project=tcfg.logging.wandb_project, config=tcfg.model_dump())
 
         train(
             best_val_loss=best_val_loss,
@@ -903,17 +954,7 @@ def main(args: argparse.Namespace, tcfg: TrainConfig) -> None:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train PallAtom")
-    parser.add_argument("--data", required=True, help="path to proteins.jsonl")
-    parser.add_argument("--splits", required=True, help="path to splits.json")
-    parser.add_argument("--config", help="path to TrainConfig JSON (omit for defaults)")
-    parser.add_argument("--log_file", default=None, help="path to write structured JSON log lines")
-    parser.add_argument("--num_workers", type=int, default=4)
-    parser.add_argument("--ddp", action="store_true", help="use DistributedDataParallel training")
-    parser.add_argument(
-        "--debug_run", action="store_true", help="restrict to 252 proteins for fast iteration"
-    )
-    args = parser.parse_args()
+    args = _parse_args()
     with open(args.config) as _f:
         tcfg = TrainConfig.model_validate_json(_f.read())
     main(args, tcfg)

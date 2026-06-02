@@ -4,6 +4,7 @@ import json
 import pathlib
 from collections.abc import Mapping, Sequence
 
+import numpy as np
 import pytest
 from helpers.cluster_index import ClusterIndex
 
@@ -25,8 +26,7 @@ def _write_jsonl(
 ) -> None:
     """Write entries as JSONL to path."""
     with open(path, "w") as f:
-        for entry in entries:
-            f.write(json.dumps(entry) + "\n")
+        f.writelines(json.dumps(entry) + "\n" for entry in entries)
 
 
 # ---------------------------------------------------------------------------
@@ -151,9 +151,12 @@ def test_cluster_index_cache_hit_same_result(tmp_path: pathlib.Path) -> None:
     _write_jsonl(tmp_path / "proteins.jsonl", entries)
     idx1 = ClusterIndex(tmp_path / "proteins.jsonl", ["p1", "p2"])
     idx2 = ClusterIndex(tmp_path / "proteins.jsonl", ["p1", "p2"])
-    assert idx1.flat_to_cluster == idx2.flat_to_cluster
-    assert idx1.flat_to_local == idx2.flat_to_local
-    assert idx1.cluster_offsets == idx2.cluster_offsets
+    assert np.array_equal(idx1.flat_to_cluster, idx2.flat_to_cluster)
+    assert np.array_equal(idx1.flat_to_local, idx2.flat_to_local)
+    assert all(
+        np.array_equal(a, b)
+        for a, b in zip(idx1.cluster_offsets, idx2.cluster_offsets, strict=True)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -167,3 +170,70 @@ def test_assign_cluster_raises_on_zero(tmp_path: pathlib.Path) -> None:
     idx = ClusterIndex(tmp_path / "p.jsonl", ["p1"], token_budget=512, n_clusters=64)
     with pytest.raises(ValueError, match="seq_len must be positive"):
         idx.assign_cluster(0)
+
+
+# ---------------------------------------------------------------------------
+# numpy array storage
+# ---------------------------------------------------------------------------
+
+
+def test_flat_to_cluster_is_numpy_int32(tmp_path: pathlib.Path) -> None:
+    """flat_to_cluster is a compact numpy int32 array, not a Python list."""
+    entries: list[_Entry] = [
+        {"name": "p1", "seq": "A" * 8, "coords": _make_coords(8)},
+        {"name": "p2", "seq": "A" * 16, "coords": _make_coords(16)},
+    ]
+    _write_jsonl(tmp_path / "p.jsonl", entries)
+    idx = ClusterIndex(tmp_path / "p.jsonl", ["p1", "p2"])
+    assert isinstance(idx.flat_to_cluster, np.ndarray)
+    assert idx.flat_to_cluster.dtype == np.int32
+
+
+def test_flat_to_local_is_numpy_int32(tmp_path: pathlib.Path) -> None:
+    """flat_to_local is a compact numpy int32 array, not a Python list."""
+    entries: list[_Entry] = [
+        {"name": "p1", "seq": "A" * 8, "coords": _make_coords(8)},
+        {"name": "p2", "seq": "A" * 16, "coords": _make_coords(16)},
+    ]
+    _write_jsonl(tmp_path / "p.jsonl", entries)
+    idx = ClusterIndex(tmp_path / "p.jsonl", ["p1", "p2"])
+    assert isinstance(idx.flat_to_local, np.ndarray)
+    assert idx.flat_to_local.dtype == np.int32
+
+
+def test_cluster_rep_len_is_numpy_int32(tmp_path: pathlib.Path) -> None:
+    """cluster_rep_len is a compact numpy int32 array, not a Python list."""
+    _write_jsonl(tmp_path / "p.jsonl", [{"name": "p1", "seq": "A", "coords": _make_coords(1)}])
+    idx = ClusterIndex(tmp_path / "p.jsonl", ["p1"])
+    assert isinstance(idx.cluster_rep_len, np.ndarray)
+    assert idx.cluster_rep_len.dtype == np.int32
+
+
+def test_cluster_offsets_elements_are_numpy_int64(tmp_path: pathlib.Path) -> None:
+    """Each element of cluster_offsets is a numpy int64 array of byte offsets."""
+    entries: list[_Entry] = [
+        {"name": "p1", "seq": "A" * 8, "coords": _make_coords(8)},
+        {"name": "p2", "seq": "A" * 16, "coords": _make_coords(16)},
+    ]
+    _write_jsonl(tmp_path / "p.jsonl", entries)
+    idx = ClusterIndex(tmp_path / "p.jsonl", ["p1", "p2"])
+    for offsets in idx.cluster_offsets:
+        assert isinstance(offsets, np.ndarray)
+        assert offsets.dtype == np.int64
+
+
+def test_cluster_index_cache_hit_numpy_arrays(tmp_path: pathlib.Path) -> None:
+    """Second construction reads cache and produces identical numpy arrays."""
+    entries: list[_Entry] = [
+        {"name": "p1", "seq": "A" * 8, "coords": _make_coords(8)},
+        {"name": "p2", "seq": "A" * 16, "coords": _make_coords(16)},
+    ]
+    _write_jsonl(tmp_path / "proteins.jsonl", entries)
+    idx1 = ClusterIndex(tmp_path / "proteins.jsonl", ["p1", "p2"])
+    idx2 = ClusterIndex(tmp_path / "proteins.jsonl", ["p1", "p2"])
+    assert np.array_equal(idx1.flat_to_cluster, idx2.flat_to_cluster)
+    assert np.array_equal(idx1.flat_to_local, idx2.flat_to_local)
+    assert all(
+        np.array_equal(a, b)
+        for a, b in zip(idx1.cluster_offsets, idx2.cluster_offsets, strict=True)
+    )

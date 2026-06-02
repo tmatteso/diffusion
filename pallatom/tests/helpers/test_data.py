@@ -30,7 +30,9 @@ _N_DEBUG = 252  # debug_run sampler uses SubsetRandomSampler(range(252))
 
 
 def _make_coords(n: int) -> Mapping[str, list[list[float]]]:
-    return {atom: np.random.randn(n, 3).tolist() for atom in ("N", "CA", "C", "O")}
+    """Return synthetic backbone coordinates for N, CA, C, O atoms."""
+    rng = np.random.default_rng()
+    return {atom: rng.standard_normal((n, 3)).tolist() for atom in ("N", "CA", "C", "O")}
 
 
 # ---------------------------------------------------------------------------
@@ -233,8 +235,7 @@ def _make_entry(name: str, seq_len: int) -> dict[str, object]:
 def _write_jsonl(path: pathlib.Path, entries: list[dict[str, object]]) -> None:
     """Write entries as JSONL to path."""
     with open(path, "w") as f:
-        for entry in entries:
-            f.write(json.dumps(entry) + "\n")
+        f.writelines(json.dumps(entry) + "\n" for entry in entries)
 
 
 # ---------------------------------------------------------------------------

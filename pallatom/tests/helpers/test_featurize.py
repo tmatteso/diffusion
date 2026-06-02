@@ -371,8 +371,8 @@ def test_featurize_batch_tok_idx_shape(featurized_batch: FeaturizedBatch) -> Non
 
 
 def test_featurize_batch_center_uid_shape(featurized_batch: FeaturizedBatch) -> None:
-    """featurize_batch produces center_uid of shape (B, N_RES)."""
-    assert featurized_batch.center_uid.shape == (B, N_RES)
+    """featurize_batch produces center_uid of shape (B, N_ATOM)."""
+    assert featurized_batch.center_uid.shape == (B, N_ATOM)
 
 
 # ---------------------------------------------------------------------------
@@ -399,10 +399,13 @@ def test_featurize_batch_t_normalized_in_unit_interval(featurized_batch: Featuri
     assert (featurized_batch.t_normalized <= 1.0).all()
 
 
-def test_featurize_batch_ref_space_uid_all_zeros(featurized_batch: FeaturizedBatch) -> None:
-    """ref_space_uid is 0 everywhere for single-chain proteins (no chain separators needed)."""
-    # Single-chain proteins: ref_space_uid is 0 for all atoms in all batch items.
-    assert (featurized_batch.ref_space_uid == 0).all()
+def test_featurize_batch_ref_space_uid_tiles_residue_index(
+    featurized_batch: FeaturizedBatch,
+) -> None:
+    """ref_space_uid holds the residue index repeated 5x per residue for all atoms."""
+    # Each block of 5 atoms belonging to residue r gets ref_space_uid = r.
+    for r in range(N_RES):
+        assert (featurized_batch.ref_space_uid[:, r * 5 : (r + 1) * 5] == r).all()
 
 
 def test_featurize_batch_tok_idx_maps_atoms_to_residues(featurized_batch: FeaturizedBatch) -> None:
@@ -412,8 +415,8 @@ def test_featurize_batch_tok_idx_maps_atoms_to_residues(featurized_batch: Featur
 
 
 def test_featurize_batch_center_uid_points_to_ca(featurized_batch: FeaturizedBatch) -> None:
-    """center_uid[b, r] equals r*5+1, the C alpha atom index for residue r."""
-    expected = torch.arange(N_RES) * 5 + 1  # (N_RES,)
+    """center_uid[b, atom] equals r*5+1 (C_alpha index for residue r) for each atom in residue r."""
+    expected = (torch.arange(N_RES) * 5 + 1).repeat_interleave(5)  # (N_ATOM,)
     for b in range(B):
         assert torch.equal(featurized_batch.center_uid[b], expected)
 
@@ -483,7 +486,7 @@ def test_conditioning_dropout_p1_seq_sets_all_to_mask_token(
     out = apply_conditioning_dropout(
         featurized_batch, p_distogram=0.0, p_atom=0.0, p_seq=1.0, device="cpu"
     )
-    valid = featurized_batch.residue_mask
+    valid = featurized_batch.f_pseudo_beta_mask.bool()
     assert (out.aa_indices[valid] == 20).all()
 
 
@@ -510,11 +513,11 @@ def test_conditioning_dropout_distogram_symmetric(featurized_batch: FeaturizedBa
 
 
 def test_conditioning_dropout_respects_residue_mask(featurized_batch: FeaturizedBatch) -> None:
-    """Conditioning dropout never modifies padding residues (residue_mask=False)."""
-    # Padding residues (residue_mask=False) must not be changed
+    """Conditioning dropout never modifies padding residues (f_pseudo_beta_mask=0)."""
+    # Padding residues (f_pseudo_beta_mask=0) must not be changed
     batch_with_padding = dataclasses.replace(
         featurized_batch,
-        residue_mask=torch.zeros_like(featurized_batch.residue_mask, dtype=torch.bool),
+        f_pseudo_beta_mask=torch.zeros_like(featurized_batch.f_pseudo_beta_mask),
     )
     out = apply_conditioning_dropout(
         batch_with_padding, p_distogram=1.0, p_atom=1.0, p_seq=1.0, device="cpu"
@@ -604,11 +607,10 @@ def test_featurized_batch_wrong_shape() -> None:
             r_gt=torch.zeros(B, n_atom, 3),
             atom5_mask=torch.zeros(B, n_atom, dtype=torch.bool),
             aa_indices=torch.zeros(B, N_RES, dtype=torch.long),
-            residue_mask=torch.zeros(B, N_RES, dtype=torch.bool),
             t_hat=torch.zeros(B, dtype=torch.long),
             t_normalized=torch.zeros(B, N_RES, N_RES, dtype=torch.long),
             tok_idx=torch.zeros(B, n_atom, dtype=torch.long),
-            center_uid=torch.zeros(B, N_RES, dtype=torch.long),
+            center_uid=torch.zeros(B, n_atom, dtype=torch.long),
             gt_atom_distogram_sparse=torch.zeros(B, n_atom, k_local, 5),
             gt_atom_distogram_mask_sparse=torch.zeros(B, n_atom, k_local, dtype=torch.bool),
         )
@@ -617,12 +619,11 @@ def test_featurized_batch_wrong_shape() -> None:
 def test_featurized_item_wrong_shape() -> None:
     """Wrong flat_pos ndim (1-D instead of 2-D) triggers TypeCheckError."""
     n_atom = N_RES * 5
+    k_local = 4
     with pytest.raises(TypeCheckError):
         FeaturizedItem(
-            N_res=N_RES,
             flat_pos=torch.zeros(n_atom),  # must be 2-D "N_atom 3"
             atom_mask_flat=torch.zeros(n_atom, dtype=torch.bool),
-            residue_mask=torch.zeros(N_RES, dtype=torch.bool),
             f_pseudo_beta=torch.zeros(N_RES, dtype=torch.long),
             gt_res_distogram=torch.zeros(N_RES, N_RES, N_BINS, dtype=torch.long),
             aa_indices=torch.zeros(N_RES, dtype=torch.long),
@@ -631,6 +632,11 @@ def test_featurized_item_wrong_shape() -> None:
             f_residue_idx=torch.zeros(N_RES, C_RES),
             t_hat=torch.randn(B),
             t_template=torch.randn(B, N_RES, N_RES),
+            ref_space_uid=torch.zeros(n_atom, dtype=torch.long),
+            tok_idx=torch.zeros(n_atom, dtype=torch.long),
+            center_uid=torch.zeros(n_atom, dtype=torch.long),
+            gt_atom_distogram_sparse=torch.zeros(n_atom, k_local, 5),
+            gt_atom_distogram_mask_sparse=torch.zeros(n_atom, k_local, dtype=torch.bool),
         )
 
 
@@ -650,10 +656,12 @@ def test_featurize_single_item_wrong_shape(disto: Distogram) -> None:
             ala_ref_pos,
             ala_ref_elem,
             c_beta_distogram_fn=disto,
+            atom_distogram_fn=disto,
             device="cpu",
             sigma_data=16,
             P_std=1.5,
             P_mean=-1.2,
+            max_seq_len_in_batch=N_RES,
         )
 
 

@@ -70,11 +70,18 @@ repos:
         args: [--fix]
         stages: [pre-commit]
 
+  # - repo: https://github.com/wemake-services/wemake-python-styleguide
+  #   rev: 0.19.0
+  #   hooks:
+  #     - id: wemake-python-styleguide
+  #       name: "🐍 wemake · Strict Python style guide"
+  #       stages: [pre-commit]
+
   - repo: local
     hooks:
-      - id: pyright
-        name: pyright
-        entry: pyright pallatom REST_APIs
+      - id: basedpyright
+        name: basedpyright
+        entry: basedpyright pallatom
         language: system
         types: [python]
         pass_filenames: false

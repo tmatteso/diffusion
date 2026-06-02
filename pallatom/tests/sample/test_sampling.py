@@ -13,11 +13,11 @@ from helpers.atom_utils import Protein, restype_order, to_pdb
 from helpers.featurize import Distogram, FeaturizedBatch
 from helpers.useful_objects import manual_seed
 from jaxtyping import Float, TypeCheckError
+from sample.sample_config import SamplerParams
 from sample.sampling import (
     ATOM5_TO_ATOM37,
     NATOM,
     AllAtomContext,
-    EDMPrecond,
     EDMSampler,
     TemplateContext,
     atom5_to_atom37,
@@ -25,9 +25,9 @@ from sample.sampling import (
     build_sampling_context,
     build_template_context,
 )
+from train.train_config import NoiseScheduleParams
 
 manual_seed(0)
-np.random.seed(0)
 
 N_RES = 4
 N_ATOM = N_RES * NATOM  # 20
@@ -81,9 +81,11 @@ def context(atom_disto_fn: Distogram, templ_disto: Distogram) -> FeaturizedBatch
             atom_mask=torch.ones(N_RES, 37),
             residue_index=torch.arange(N_RES, dtype=torch.float),
             seq="A" * N_RES,
-            pdb_files=[],
+            pdb_file_path=None,
             atom_distogram_fn=atom_disto_fn,
             templ_distogram_fn=templ_disto,
+            batch_size=1,
+            device="cpu",
         )
 
 
@@ -94,27 +96,37 @@ def trunk_mock() -> MagicMock:
 
 
 @pytest.fixture
-def edm_precond(trunk_mock: MagicMock, context: FeaturizedBatch) -> EDMPrecond:
-    """Provide an EDMPrecond wired to the identity trunk mock with standard sigma bounds."""
-    return EDMPrecond(trunk_mock, context, sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX)
-
-
-@pytest.fixture
-def edm_sampler(edm_precond: EDMPrecond) -> EDMSampler:
-    """Provide a deterministic EDMSampler (S_churn=0) built on the identity preconditioner."""
-    return EDMSampler(edm_precond, sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX, S_churn=0.0)
+def edm_sampler(
+    trunk_mock: MagicMock, context: FeaturizedBatch, templ_disto: Distogram
+) -> EDMSampler:
+    """Provide a deterministic EDMSampler (S_churn=0) built on the identity trunk mock."""
+    return EDMSampler(
+        trunk_mock,
+        context,
+        templ_disto,
+        SamplerParams(S_churn=0.0),
+        NoiseScheduleParams(sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX),
+    )
 
 
 @pytest.fixture
 def zero_denoiser_mock() -> MagicMock:
-    """MagicMock denoiser that always returns zeros."""
+    """MagicMock trunk that always returns zero denoised coordinates."""
     mock = MagicMock()
 
-    def zero_side_effect(
-        r: Float[torch.Tensor, "B N_atom 3"], _sigma: float
-    ) -> tuple[Float[torch.Tensor, "B N_atom 3"], Float[torch.Tensor, "B 1 n_amino"]]:
+    def zero_side_effect(batch: FeaturizedBatch) -> PredictedOutputs:
         """Return zero coordinates and zero sequence logits."""
-        return (torch.zeros_like(r), torch.zeros(r.shape[0], 1, 20))
+        B_local = batch.r_gt.shape[0]
+        n_atom = batch.r_gt.shape[1]
+        n_res = int(batch.tok_idx.max().item()) + 1
+        return PredictedOutputs(
+            r_denoised=torch.zeros_like(batch.r_gt),
+            seq_logits=torch.zeros(B_local, n_res, 20),
+            residue_distogram_logits=torch.zeros(B_local, n_res, n_res, 38),
+            atom_distogram_logits=torch.zeros(B_local, n_atom, 1, 38),
+            intermediate_denoised_coord_stack=[],
+            intermediate_pred_aa_logit_stack=[],
+        )
 
     mock.side_effect = zero_side_effect
     return mock
@@ -122,71 +134,72 @@ def zero_denoiser_mock() -> MagicMock:
 
 @pytest.fixture
 def identity_denoiser_mock() -> MagicMock:
-    """MagicMock denoiser that returns its input unchanged."""
-    mock = MagicMock()
-
-    def identity_side_effect(
-        r: Float[torch.Tensor, "B N_atom 3"], _sigma: float
-    ) -> tuple[Float[torch.Tensor, "B N_atom 3"], Float[torch.Tensor, "B 1 n_amino"]]:
-        """Return cloned input coordinates and zero sequence logits."""
-        return (r.clone(), torch.zeros(r.shape[0], 1, 20))
-
-    mock.side_effect = identity_side_effect
-    return mock
+    """MagicMock trunk that returns r_gt unchanged as the denoised output."""
+    return _make_trunk_mock()
 
 
 @pytest.fixture
 def half_denoiser_mock() -> MagicMock:
-    """MagicMock denoiser that scales input by 0.5 (non-trivial, trajectory-dependent)."""
+    """MagicMock trunk that scales r_gt by 0.5 (non-trivial, trajectory-dependent)."""
     mock = MagicMock()
 
-    def half_side_effect(
-        r: Float[torch.Tensor, "B N_atom 3"], _sigma: float
-    ) -> tuple[Float[torch.Tensor, "B N_atom 3"], Float[torch.Tensor, "B 1 n_amino"]]:
-        """Return 0.5 * input coordinates and zero sequence logits."""
-        return (r * 0.5, torch.zeros(r.shape[0], 1, 20))
+    def half_side_effect(batch: FeaturizedBatch) -> PredictedOutputs:
+        """Return 0.5 * r_gt as denoised coordinates and zero sequence logits."""
+        B_local = batch.r_gt.shape[0]
+        n_atom = batch.r_gt.shape[1]
+        n_res = int(batch.tok_idx.max().item()) + 1
+        return PredictedOutputs(
+            r_denoised=batch.r_gt.clone() * 0.5,
+            seq_logits=torch.zeros(B_local, n_res, 20),
+            residue_distogram_logits=torch.zeros(B_local, n_res, n_res, 38),
+            atom_distogram_logits=torch.zeros(B_local, n_atom, 1, 38),
+            intermediate_denoised_coord_stack=[],
+            intermediate_pred_aa_logit_stack=[],
+        )
 
     mock.side_effect = half_side_effect
     return mock
 
 
 @pytest.fixture
-def bare_sampler(zero_denoiser_mock: MagicMock) -> EDMSampler:
+def bare_sampler(
+    zero_denoiser_mock: MagicMock, context: FeaturizedBatch, templ_disto: Distogram
+) -> EDMSampler:
     """EDMSampler with a zero denoiser; used for _sigma_schedule tests only."""
     return EDMSampler(
         zero_denoiser_mock,
-        sigma_min=SIGMA_MIN,
-        sigma_max=SIGMA_MAX,
-        rho=7.0,
+        context,
+        templ_disto,
+        SamplerParams(rho=7.0),
+        NoiseScheduleParams(sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX),
     )
 
 
 @pytest.fixture
-def edm_precond_custom_sigmas(context: FeaturizedBatch) -> EDMPrecond:
-    """Provide an EDMPrecond with non-default sigma_min=0.01 and sigma_max=50.0."""
-    return EDMPrecond(MagicMock(), context, sigma_min=0.01, sigma_max=50.0)
-
-
-@pytest.fixture
-def identity_det_sampler(identity_denoiser_mock: MagicMock) -> EDMSampler:
+def identity_det_sampler(
+    identity_denoiser_mock: MagicMock, context: FeaturizedBatch, templ_disto: Distogram
+) -> EDMSampler:
     """Provide a deterministic EDMSampler (S_churn=0) using the identity denoiser."""
     return EDMSampler(
         identity_denoiser_mock,
-        sigma_min=SIGMA_MIN,
-        sigma_max=SIGMA_MAX,
-        S_churn=0.0,
+        context,
+        templ_disto,
+        SamplerParams(S_churn=0.0),
+        NoiseScheduleParams(sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX),
     )
 
 
 @pytest.fixture
-def identity_stoch_sampler_tmin_high(identity_denoiser_mock: MagicMock) -> EDMSampler:
+def identity_stoch_sampler_tmin_high(
+    identity_denoiser_mock: MagicMock, context: FeaturizedBatch, templ_disto: Distogram
+) -> EDMSampler:
     """Provide a stochastic EDMSampler with S_tmin set far above sigma_max to suppress injection."""
     return EDMSampler(
         identity_denoiser_mock,
-        sigma_min=SIGMA_MIN,
-        sigma_max=SIGMA_MAX,
-        S_churn=2.0,
-        S_tmin=SIGMA_MAX * 10,
+        context,
+        templ_disto,
+        SamplerParams(S_churn=2.0, S_tmin=SIGMA_MAX * 10),
+        NoiseScheduleParams(sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX),
     )
 
 
@@ -328,8 +341,8 @@ def test_build_sampling_context_tok_idx_shape(context: FeaturizedBatch):
 
 
 def test_build_sampling_context_center_uid_shape(context: FeaturizedBatch):
-    """center_uid must contain one representative atom index per residue: shape (1, N_RES)."""
-    assert context.center_uid.shape == (1, N_RES)
+    """center_uid maps every atom to its residue's CA index, shape (1, N_ATOM)."""
+    assert context.center_uid.shape == (1, N_ATOM)
 
 
 def test_build_sampling_context_f_residue_idx_shape(context: FeaturizedBatch):
@@ -354,9 +367,10 @@ def test_build_sampling_context_ref_element_rows_are_one_hot(context: Featurized
     assert torch.allclose(row_sums, torch.ones(1, N_ATOM))
 
 
-def test_build_sampling_context_ref_space_uid_all_zeros(context: FeaturizedBatch):
-    """With a single chain input, every atom must belong to chain 0 (ref_space_uid all zeros)."""
-    assert (context.ref_space_uid == 0).all()
+def test_build_sampling_context_ref_space_uid_equals_residue_index(context: FeaturizedBatch):
+    """ref_space_uid must assign each atom the index of its parent residue."""
+    expected = torch.arange(N_RES).repeat_interleave(NATOM)
+    assert torch.equal(context.ref_space_uid[0], expected)
 
 
 def test_build_sampling_context_tok_idx_maps_atoms_to_parent_residue(context: FeaturizedBatch):
@@ -366,9 +380,9 @@ def test_build_sampling_context_tok_idx_maps_atoms_to_parent_residue(context: Fe
 
 
 def test_build_sampling_context_center_uid_points_to_ca_slot(context: FeaturizedBatch):
-    """center_uid must point to atom5 slot 1 (C alpha) within each residue's atom block."""
-    # atom5 slot 1 is C alpha; center_uid[0, i] = i * NATOM + 1
-    expected = torch.arange(N_RES) * NATOM + 1
+    """center_uid maps every atom to the CA index of its parent residue."""
+    # Each residue i broadcasts its CA index (i * NATOM + 1) to all NATOM atoms.
+    expected = torch.arange(N_RES).repeat_interleave(NATOM) * NATOM + 1
     assert torch.equal(context.center_uid[0], expected)
 
 
@@ -393,11 +407,6 @@ def test_build_sampling_context_atom5_mask_all_true(context: FeaturizedBatch):
     assert context.atom5_mask.all()
 
 
-def test_build_sampling_context_residue_mask_all_true(context: FeaturizedBatch):
-    """When every atom is present, every residue must be marked valid in the residue mask."""
-    assert context.residue_mask.all()
-
-
 def test_build_sampling_context_placeholder_scalars(context: FeaturizedBatch):
     """The placeholder diffusion scalars must be initialised to t_hat=1.0 and t_normalized=0.5."""
     assert (context.t_hat == 1.0).all()
@@ -414,18 +423,22 @@ def test_build_sampling_context_n_atom_scales_linearly_with_n_res():
             torch.ones(N_RES, 37),
             torch.arange(N_RES, dtype=torch.float),
             "A" * N_RES,
-            [],
+            None,
             a_fn,
             t_fn,
+            batch_size=1,
+            device="cpu",
         )
         large = build_sampling_context(
             torch.zeros(N_RES * 2, 37, 3),
             torch.ones(N_RES * 2, 37),
             torch.arange(N_RES * 2, dtype=torch.float),
             "A" * (N_RES * 2),
-            [],
+            None,
             a_fn,
             t_fn,
+            batch_size=1,
+            device="cpu",
         )
     assert large.ref_pos.shape[1] == 2 * small.ref_pos.shape[1]
     assert large.tok_idx.shape[1] == 2 * small.tok_idx.shape[1]
@@ -442,9 +455,11 @@ def test_build_sampling_context_custom_n_templ_bins():
             torch.ones(N_RES, 37),
             torch.arange(N_RES, dtype=torch.float),
             "A" * N_RES,
-            [],
+            None,
             a_fn,
             t_fn,
+            batch_size=1,
+            device="cpu",
         )
     assert ctx.gt_res_distogram.shape == (1, N_RES, N_RES, 20)  # 19 bins + 1 overflow
 
@@ -459,182 +474,60 @@ def test_build_sampling_context_custom_n_atom_bins():
             torch.ones(N_RES, 37),
             torch.arange(N_RES, dtype=torch.float),
             "A" * N_RES,
-            [],
+            None,
             a_fn,
             t_fn,
+            batch_size=1,
+            device="cpu",
         )
     assert ctx.gt_atom_distogram_sparse.shape[3] == 10  # (B, N_atom, K, n_atom_bins)
 
 
 # ---------------------------------------------------------------------------
-# EDMPrecond.forward — output shape and finiteness
+# EDMSampler.noise_schedule — boundary values and properties
 # ---------------------------------------------------------------------------
 
 
-def test_edm_precond_forward_output_shape(edm_precond: EDMPrecond):
-    """The preconditioner outputs must have shapes (B, N_atom, 3) and (B, N_res, 20)."""
-    r_out, seq_out = edm_precond(torch.randn(1, N_ATOM, 3), t_hat=torch.tensor([1.0]))
-    assert r_out.shape == (1, N_ATOM, 3)
-    assert seq_out.shape == (1, N_RES, 20)
+def test_noise_schedule_at_t0_equals_sigma_data_times_sigma_max(bare_sampler: EDMSampler):
+    """At t=0 the AF3 formula collapses to sigma_data * sigma_max."""
+    result = bare_sampler.noise_schedule(torch.tensor(0.0))
+    expected = bare_sampler.sigma_data * bare_sampler.sigma_max
+    assert math.isclose(result.item(), expected, rel_tol=1e-5)
 
 
-def test_edm_precond_forward_output_is_finite(edm_precond: EDMPrecond):
-    """The preconditioner must not introduce NaN or Inf in either coordinate or sequence output."""
-    r_out, seq_out = edm_precond(torch.randn(1, N_ATOM, 3), t_hat=torch.tensor([1.0]))
-    assert torch.isfinite(r_out).all()
-    assert torch.isfinite(seq_out).all()
+def test_noise_schedule_at_t1_equals_sigma_data_times_sigma_min(bare_sampler: EDMSampler):
+    """At t=1 the AF3 formula collapses to sigma_data * sigma_min."""
+    result = bare_sampler.noise_schedule(torch.tensor(1.0))
+    expected = bare_sampler.sigma_data * bare_sampler.sigma_min
+    assert math.isclose(result.item(), expected, rel_tol=1e-5)
 
 
-# ---------------------------------------------------------------------------
-# EDMPrecond.forward — context immutability
-# ---------------------------------------------------------------------------
-
-
-def test_edm_precond_context_r_input_not_mutated(edm_precond: EDMPrecond, context: FeaturizedBatch):
-    """The preconditioner must not overwrite context.r_gt in-place across forward calls."""
-    r_before = context.r_gt.clone()
-    edm_precond(torch.randn(1, N_ATOM, 3), t_hat=torch.tensor([5.0]))
-    assert torch.equal(context.r_gt, r_before)
-
-
-def test_edm_precond_context_t_hat_not_mutated(edm_precond: EDMPrecond, context: FeaturizedBatch):
-    """The preconditioner must not mutate context.t_hat, which must retain its pre-call value."""
-    t_before = context.t_hat.clone()
-    edm_precond(torch.randn(1, N_ATOM, 3), t_hat=torch.tensor([5.0]))
-    assert torch.equal(context.t_hat, t_before)
-
-
-# ---------------------------------------------------------------------------
-# EDMPrecond.forward — values forwarded to trunk
-# ---------------------------------------------------------------------------
-
-
-def test_edm_precond_passes_r_input_to_trunk(context: FeaturizedBatch):
-    """The preconditioner must forward the raw noisy coordinates as batch.r_gt to the trunk."""
-    mock = _make_trunk_mock()
-    precond = EDMPrecond(mock, context, sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX)
-    r = torch.randn(1, N_ATOM, 3)
-    precond(r, t_hat=torch.tensor([1.0]))
-    batch_seen = mock.call_args.args[0]
-    assert torch.equal(batch_seen.r_gt, r)
-
-
-def test_edm_precond_passes_t_hat_to_trunk(context: FeaturizedBatch):
-    """Preconditioner must forward sigma value as batch.t_hat so trunk can condition on noise."""
-    mock = _make_trunk_mock()
-    precond = EDMPrecond(mock, context, sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX)
-    precond(torch.randn(1, N_ATOM, 3), t_hat=torch.tensor([3.14]))
-    batch_seen = mock.call_args.args[0]
-    assert torch.allclose(batch_seen.t_hat, torch.tensor([3.14]))
-
-
-def test_edm_precond_t_normalized_is_zero_at_sigma_min(context: FeaturizedBatch):
-    """At t_hat=sigma_min the log-normalised diffusion time must collapse to 0.0."""
-    mock = _make_trunk_mock()
-    precond = EDMPrecond(mock, context, sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX)
-    precond(torch.randn(1, N_ATOM, 3), t_hat=torch.tensor([SIGMA_MIN]))
-    batch_seen = mock.call_args.args[0]
-    assert math.isclose(batch_seen.t_normalized[0, 0, 0].item(), 0.0)
-
-
-def test_edm_precond_t_normalized_is_one_at_sigma_max(context: FeaturizedBatch):
-    """At t_hat=sigma_max the log-normalised diffusion time must equal 1.0."""
-    mock = _make_trunk_mock()
-    precond = EDMPrecond(mock, context, sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX)
-    precond(torch.randn(1, N_ATOM, 3), t_hat=torch.tensor([SIGMA_MAX]))
-    batch_seen = mock.call_args.args[0]
-    assert math.isclose(batch_seen.t_normalized[0, 0, 0].item(), 1.0)
-
-
-def test_edm_precond_t_normalized_at_geometric_midpoint_is_half(context: FeaturizedBatch):
-    """At geometric midpoint of [sigma_min, sigma_max] log-scale normalisation is exactly 0.5."""
-    # Geometric midpoint of [sigma_min, sigma_max] on log scale → t_normalized = 0.5
-    t_mid = math.sqrt(SIGMA_MIN * SIGMA_MAX)
-    mock = _make_trunk_mock()
-    precond = EDMPrecond(mock, context, sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX)
-    precond(torch.randn(1, N_ATOM, 3), t_hat=torch.tensor([t_mid]))
-    batch_seen = mock.call_args.args[0]
-    assert math.isclose(batch_seen.t_normalized[0, 0, 0].item(), 0.5)
-
-
-def test_edm_precond_trunk_called_exactly_once_per_forward(
-    edm_precond: EDMPrecond, trunk_mock: MagicMock
-):
-    """Preconditioner forward pass must call trunk exactly once (no extra denoiser evaluations)."""
-    edm_precond(torch.randn(1, N_ATOM, 3), t_hat=torch.tensor([1.0]))
-    assert trunk_mock.call_count == 1
-
-
-# ---------------------------------------------------------------------------
-# EDMPrecond.forward — type enforcement
-# ---------------------------------------------------------------------------
-
-
-def test_edm_precond_rejects_r_input_with_wrong_last_dim(edm_precond: EDMPrecond):
-    """A last dimension of 4 instead of 3 must raise TypeCheckError due to the shape annotation."""
-    with pytest.raises(TypeCheckError):
-        edm_precond(torch.randn(1, N_ATOM, 4), t_hat=torch.tensor([1.0]))  # 4 instead of 3
-
-
-def test_edm_precond_rejects_r_input_with_wrong_ndim(edm_precond: EDMPrecond):
-    """A 2D tensor (missing the batch dimension) must raise TypeCheckError."""
-    with pytest.raises(TypeCheckError):
-        edm_precond(torch.randn(N_ATOM, 3), t_hat=torch.tensor([1.0]))  # 2D instead of 3D
-
-
-# ---------------------------------------------------------------------------
-# EDMSampler._sigma_schedule — length and boundary values
-# ---------------------------------------------------------------------------
-
-
-def test_sigma_schedule_length_is_steps_plus_one(bare_sampler: EDMSampler):
-    """The schedule must have steps+1 entries: one sigma per predictor step plus terminal zero."""
-    sigmas = bare_sampler.sigma_schedule(10, "cpu")
-    assert sigmas.shape == (11,)
-
-
-def test_sigma_schedule_first_value_equals_sigma_max(bare_sampler: EDMSampler):
-    """Sampling starts from highest noise level, so first schedule entry must equal sigma_max."""
-    sigmas = bare_sampler.sigma_schedule(20, "cpu")
-    assert math.isclose(sigmas[0].item(), SIGMA_MAX, rel_tol=1e-5)
-
-
-def test_sigma_schedule_last_value_is_zero(bare_sampler: EDMSampler):
-    """The terminal entry of the Karras schedule must be exactly zero (clean sample target)."""
-    sigmas = bare_sampler.sigma_schedule(20, "cpu")
-    assert math.isclose(sigmas[-1].item(), 0.0)
-
-
-def test_sigma_schedule_is_monotonically_non_increasing(bare_sampler: EDMSampler):
-    """Noise levels must never increase as the schedule progresses toward the clean sample."""
-    sigmas = bare_sampler.sigma_schedule(20, "cpu")
-    diffs = sigmas[1:] - sigmas[:-1]
+def test_noise_schedule_is_monotonically_decreasing(bare_sampler: EDMSampler):
+    """Noise level must never increase as t increases from 0 to 1."""
+    ts = torch.linspace(0.0, 1.0, 20)
+    vals = torch.stack([bare_sampler.noise_schedule(t) for t in ts])
+    diffs = vals[1:] - vals[:-1]
     assert (diffs <= 0).all()
 
 
-def test_sigma_schedule_strictly_decreasing(bare_sampler: EDMSampler):
-    """Every consecutive pair in the schedule must be strictly ordered (no plateaus)."""
-    sigmas = bare_sampler.sigma_schedule(10, "cpu")
-    diffs = sigmas[1:] - sigmas[:-1]
-    assert (diffs < 0).all()
+def test_noise_schedule_all_values_positive(bare_sampler: EDMSampler):
+    """Noise level must be strictly positive for all t in [0, 1]."""
+    ts = torch.linspace(0.0, 1.0, 20)
+    vals = torch.stack([bare_sampler.noise_schedule(t) for t in ts])
+    assert (vals > 0).all()
 
 
-def test_sigma_schedule_all_values_nonnegative(bare_sampler: EDMSampler):
-    """No sigma in schedule may be negative; minimum physically meaningful noise level is zero."""
-    sigmas = bare_sampler.sigma_schedule(20, "cpu")
-    assert (sigmas >= 0).all()
-
-
-def test_sigma_schedule_different_rho_gives_different_intermediate_values(
-    zero_denoiser_mock: MagicMock,
+def test_noise_schedule_different_rho_gives_different_intermediate_values(
+    zero_denoiser_mock: MagicMock, context: FeaturizedBatch, templ_disto: Distogram
 ):
-    """Changing Karras rho hyperparameter must alter schedule values while preserving endpoints."""
-    s1 = EDMSampler(zero_denoiser_mock, sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX, rho=7.0)
-    s2 = EDMSampler(zero_denoiser_mock, sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX, rho=3.0)
-    sig1 = s1.sigma_schedule(10, "cpu")
-    sig2 = s2.sigma_schedule(10, "cpu")
-    # Endpoints are the same; interior values must differ with different rho
-    assert not torch.allclose(sig1[1:-1], sig2[1:-1])
+    """Changing rho must alter intermediate noise levels while preserving boundary values."""
+    noise = NoiseScheduleParams(sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX)
+    s1 = EDMSampler(zero_denoiser_mock, context, templ_disto, SamplerParams(rho=7.0), noise)
+    s2 = EDMSampler(zero_denoiser_mock, context, templ_disto, SamplerParams(rho=3.0), noise)
+    ts = torch.linspace(0.1, 0.9, 10)
+    vals1 = torch.stack([s1.noise_schedule(t) for t in ts])
+    vals2 = torch.stack([s2.noise_schedule(t) for t in ts])
+    assert not torch.allclose(vals1, vals2)
 
 
 # ---------------------------------------------------------------------------
@@ -642,31 +535,38 @@ def test_sigma_schedule_different_rho_gives_different_intermediate_values(
 # ---------------------------------------------------------------------------
 
 
-def test_edm_sampler_identity_denoiser_z_unchanged_across_step_counts(
-    identity_denoiser_mock: MagicMock,
+def test_edm_sampler_identity_denoiser_produces_finite_output(
+    identity_denoiser_mock: MagicMock, context: FeaturizedBatch, templ_disto: Distogram
 ):
-    """Identity denoiser, ODE drift zero, so final sample == init noise regardless of step count."""
-    # D_θ(z, sigma) = z  ⟹  d = (z - z)/sigma = 0  ⟹  z_next = z for every step.
-    # The output equals the initial noise regardless of how many steps are run.
-    # (steps=1 is excluded: _sigma_schedule divides by steps-1, causing 0/0.)
-
+    """Identity denoiser must produce finite coordinates and sequence logits."""
     sampler = EDMSampler(
-        identity_denoiser_mock, sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX, S_churn=0.0
+        identity_denoiser_mock,
+        context,
+        templ_disto,
+        SamplerParams(S_churn=0.0, ddim_steps=4),
+        NoiseScheduleParams(sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX),
     )
     manual_seed(7)
-    z2, seq2 = sampler.sample((1, N_ATOM, 3), steps=2)
-    manual_seed(7)
-    z6, seq6 = sampler.sample((1, N_ATOM, 3), steps=6)
-    assert torch.allclose(z2, z6, atol=1e-5)
-    assert torch.equal(seq2, seq6)
+    z, seq = sampler.sample((1, N_ATOM, 3))
+    assert z.shape == (1, N_ATOM, 3)
+    assert torch.isfinite(z).all()
+    assert torch.isfinite(seq).all()
 
 
-def test_edm_sampler_zero_denoiser_output_is_zero(zero_denoiser_mock: MagicMock):
+def test_edm_sampler_zero_denoiser_output_is_zero(
+    zero_denoiser_mock: MagicMock, context: FeaturizedBatch, templ_disto: Distogram
+):
     """With a zero denoiser the trajectory drives all coordinates to zero by the final step."""
     # D_θ(z, sigma) = 0  ⟹  d = z/sigma  ⟹  z scales by sigma_next/sigma_hat each step;
     # at the final step sigma_next = 0, so the trajectory converges exactly to 0.
-    sampler = EDMSampler(zero_denoiser_mock, sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX, S_churn=0.0)
-    out, seq_out = sampler.sample((1, N_ATOM, 3), steps=5)
+    sampler = EDMSampler(
+        zero_denoiser_mock,
+        context,
+        templ_disto,
+        SamplerParams(S_churn=0.0),
+        NoiseScheduleParams(sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX),
+    )
+    out, seq_out = sampler.sample((1, N_ATOM, 3))
     assert torch.allclose(out, torch.zeros(1, N_ATOM, 3), atol=1e-5)
     assert torch.allclose(seq_out, torch.zeros_like(seq_out))
 
@@ -679,28 +579,31 @@ def test_edm_sampler_zero_denoiser_output_is_zero(zero_denoiser_mock: MagicMock)
 def test_edm_sampler_deterministic_without_s_churn(edm_sampler: EDMSampler):
     """With S_churn=0, the same random seed must always produce the exact same output tensors."""
     manual_seed(3)
-    out1, seq_out1 = edm_sampler.sample((1, N_ATOM, 3), steps=3)
+    out1, seq_out1 = edm_sampler.sample((1, N_ATOM, 3))
     manual_seed(3)
-    out2, seq_out2 = edm_sampler.sample((1, N_ATOM, 3), steps=3)
+    out2, seq_out2 = edm_sampler.sample((1, N_ATOM, 3))
     assert torch.equal(out1, out2)
     assert torch.equal(seq_out1, seq_out2)
 
 
 def test_edm_sampler_s_churn_produces_different_result_than_deterministic(
-    identity_denoiser_mock: MagicMock,
+    identity_denoiser_mock: MagicMock, context: FeaturizedBatch, templ_disto: Distogram
 ):
     """Enabling S_churn must inject per-step noise that changes output relative to the ODE run."""
     # S_churn > 0 injects extra noise per step before the predictor.
     # With the identity denoiser (d = 0), z never moves during predictor/corrector,
     # so injected noise accumulates unfiltered → output diverges from the ODE run.
     # (Zero denoiser is unsuitable here: it drives z → 0 regardless of S_churn.)
+    noise = NoiseScheduleParams(sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX)
     manual_seed(5)
-    det = EDMSampler(identity_denoiser_mock, sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX, S_churn=0.0)
-    stoch = EDMSampler(
-        identity_denoiser_mock, sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX, S_churn=2.0
+    det = EDMSampler(
+        identity_denoiser_mock, context, templ_disto, SamplerParams(S_churn=0.0), noise
     )
-    out_det, seq_det = det.sample((1, N_ATOM, 3), steps=5)
-    out_stoch, seq_stoch = stoch.sample((1, N_ATOM, 3), steps=5)
+    stoch = EDMSampler(
+        identity_denoiser_mock, context, templ_disto, SamplerParams(S_churn=2.0), noise
+    )
+    out_det, seq_det = det.sample((1, N_ATOM, 3))
+    out_stoch, seq_stoch = stoch.sample((1, N_ATOM, 3))
     assert not torch.allclose(out_det, out_stoch)
     assert torch.isfinite(seq_det).all()
     assert torch.isfinite(seq_stoch).all()
@@ -711,14 +614,22 @@ def test_edm_sampler_s_churn_produces_different_result_than_deterministic(
 # ---------------------------------------------------------------------------
 
 
-def test_edm_sampler_heun_corrector_call_count(zero_denoiser_mock: MagicMock):
-    """Heun requires 2·steps: one predictor per step plus one corrector except at terminal step."""
-    # steps predictor calls + (steps - 1) corrector calls (skipped when sigma_next = 0)
-    # Total = 2·steps - 1
-    steps = 5
-    sampler = EDMSampler(zero_denoiser_mock, sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX, S_churn=0.0)
-    sampler.sample((1, N_ATOM, 3), steps=steps)
-    assert zero_denoiser_mock.call_count == 2 * steps - 1
+def test_edm_sampler_denoiser_called_twice_per_step(
+    zero_denoiser_mock: MagicMock, context: FeaturizedBatch, templ_disto: Distogram
+):
+    """Each loop step must call denoise twice: once for self-conditioning and once for update."""
+    # Loop runs over range(1, ddim_steps - 1) = ddim_steps - 2 iterations.
+    # Each iteration calls denoise twice → total = 2 * (ddim_steps - 2).
+    ddim_steps = 5
+    sampler = EDMSampler(
+        zero_denoiser_mock,
+        context,
+        templ_disto,
+        SamplerParams(S_churn=0.0, ddim_steps=ddim_steps),
+        NoiseScheduleParams(sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX),
+    )
+    sampler.sample((1, N_ATOM, 3))
+    assert zero_denoiser_mock.call_count == 2 * (ddim_steps - 2)
 
 
 # ---------------------------------------------------------------------------
@@ -727,16 +638,21 @@ def test_edm_sampler_heun_corrector_call_count(zero_denoiser_mock: MagicMock):
 
 
 def test_edm_sampler_step_count_changes_output_for_nontrivial_denoiser(
-    half_denoiser_mock: MagicMock,
+    half_denoiser_mock: MagicMock, context: FeaturizedBatch, templ_disto: Distogram
 ):
     """Coarser sigma grid (fewer steps) must integrate differently and yield a different output."""
     # D_θ(z, sigma) = 0.5·z: trajectory depends on the sigma grid.
     # Coarser grid (fewer steps) integrates differently → different final output.
+    noise = NoiseScheduleParams(sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX)
     manual_seed(9)
-    coarse = EDMSampler(half_denoiser_mock, sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX, S_churn=0.0)
-    fine = EDMSampler(half_denoiser_mock, sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX, S_churn=0.0)
-    out_coarse, seq_coarse = coarse.sample((1, N_ATOM, 3), steps=2)
-    out_fine, seq_fine = fine.sample((1, N_ATOM, 3), steps=10)
+    coarse = EDMSampler(
+        half_denoiser_mock, context, templ_disto, SamplerParams(S_churn=0.0, ddim_steps=4), noise
+    )
+    fine = EDMSampler(
+        half_denoiser_mock, context, templ_disto, SamplerParams(S_churn=0.0, ddim_steps=10), noise
+    )
+    out_coarse, seq_coarse = coarse.sample((1, N_ATOM, 3))
+    out_fine, seq_fine = fine.sample((1, N_ATOM, 3))
     assert not torch.allclose(out_coarse, out_fine)
     assert torch.isfinite(seq_coarse).all()
     assert torch.isfinite(seq_fine).all()
@@ -798,43 +714,7 @@ def test_build_sampling_context_tensors_on_cpu_by_default(context: FeaturizedBat
 # ---------------------------------------------------------------------------
 # EDMPrecond — attribute storage and formula correctness
 # ---------------------------------------------------------------------------
-
-
-def test_edm_precond_stores_sigma_min_and_sigma_max(edm_precond_custom_sigmas: EDMPrecond):
-    """Constructor must store supplied sigma bounds as instance attributes for schedule queries."""
-    assert edm_precond_custom_sigmas.sigma_min == 0.01
-    assert edm_precond_custom_sigmas.sigma_max == 50.0
-
-
-def test_edm_precond_t_normalized_formula_at_arbitrary_sigma(
-    edm_precond: EDMPrecond, trunk_mock: MagicMock
-):
-    """Log-normalised t_normalized matches the expected formula for any sigma.
-
-    The formula is:
-
-        t_normalized = (log(sigma) - log(sigma_min)) / (log(sigma_max) - log(sigma_min))
-    """
-    t_hat = torch.tensor([1.0])
-    edm_precond(torch.randn(1, N_ATOM, 3), t_hat=t_hat)
-    batch_seen = trunk_mock.call_args.args[0]
-    expected = (math.log(t_hat.item()) - math.log(SIGMA_MIN)) / (
-        math.log(SIGMA_MAX) - math.log(SIGMA_MIN)
-    )
-    assert math.isclose(batch_seen.t_normalized[0, 0, 0].item(), expected, rel_tol=1e-6)
-
-
-def test_edm_precond_multiple_calls_are_independent(edm_precond: EDMPrecond):
-    """Successive forward calls must not share state: outputs depend only on their own inputs."""
-    # Identity trunk mock returns r_input unchanged and zeros for seq_logits.
-    r1 = torch.randn(1, N_ATOM, 3)
-    r2 = torch.randn(1, N_ATOM, 3)
-    r_out1, seq_out1 = edm_precond(r1, t_hat=torch.tensor([1.0]))
-    r_out2, seq_out2 = edm_precond(r2, t_hat=torch.tensor([2.0]))
-    assert torch.equal(r_out1, r1)
-    assert torch.equal(r_out2, r2)
-    assert seq_out1.shape == (1, N_RES, 20)
-    assert seq_out2.shape == (1, N_RES, 20)
+# """Successive forward calls must not share state: outputs depend only on their own inputs."""
 
 
 # ---------------------------------------------------------------------------
@@ -842,11 +722,12 @@ def test_edm_precond_multiple_calls_are_independent(edm_precond: EDMPrecond):
 # ---------------------------------------------------------------------------
 
 
-def test_sigma_schedule_penultimate_value_is_sigma_min(bare_sampler: EDMSampler):
-    """The penultimate schedule entry must equal sigma_min; the final step then drops to zero."""
-    # At i = steps-1 the Karras schedule formula collapses to sigma_min.
-    sigmas = bare_sampler.sigma_schedule(20, "cpu")
-    assert math.isclose(sigmas[-2].item(), SIGMA_MIN, rel_tol=1e-5)
+def test_noise_schedule_midpoint_is_between_boundaries(bare_sampler: EDMSampler):
+    """At t=0.5, noise level must be between sigma_data*sigma_min and sigma_data*sigma_max."""
+    mid = bare_sampler.noise_schedule(torch.tensor(0.5))
+    lo = bare_sampler.sigma_data * bare_sampler.sigma_min
+    hi = bare_sampler.sigma_data * bare_sampler.sigma_max
+    assert lo < mid.item() < hi
 
 
 # ---------------------------------------------------------------------------
@@ -854,9 +735,9 @@ def test_sigma_schedule_penultimate_value_is_sigma_min(bare_sampler: EDMSampler)
 # ---------------------------------------------------------------------------
 
 
-def test_edm_sampler_sample_steps_2_runs_without_error(edm_sampler: EDMSampler):
-    """Minimum step count of 2 runs without error and returns finite coordinate and seq tensors."""
-    out, seq_out = edm_sampler.sample((1, N_ATOM, 3), steps=2)
+def test_edm_sampler_sample_runs_without_error(edm_sampler: EDMSampler):
+    """sample() runs without error and returns finite coordinate and seq tensors."""
+    out, seq_out = edm_sampler.sample((1, N_ATOM, 3))
     assert out.shape == (1, N_ATOM, 3)
     assert torch.isfinite(out).all()
     assert torch.isfinite(seq_out).all()
@@ -868,9 +749,9 @@ def test_edm_sampler_s_tmin_above_sigma_max_disables_injection(
     """When S_tmin exceeds sigma_max no step satisfies condition, result identical to S_churn=0."""
     # S_tmin > sigma_max ⟹ S_tmin ≤ sigma_cur is never met ⟹ same as S_churn=0.
     manual_seed(5)
-    out_det, seq_det = identity_det_sampler.sample((1, N_ATOM, 3), steps=5)
+    out_det, seq_det = identity_det_sampler.sample((1, N_ATOM, 3))
     manual_seed(5)
-    out_stoch, seq_stoch = identity_stoch_sampler_tmin_high.sample((1, N_ATOM, 3), steps=5)
+    out_stoch, seq_stoch = identity_stoch_sampler_tmin_high.sample((1, N_ATOM, 3))
     assert torch.allclose(out_det, out_stoch)
     assert torch.equal(seq_det, seq_stoch)
 
@@ -1103,13 +984,7 @@ def templ_disto() -> Distogram:
 @pytest.fixture
 def template_ctx(np_protein: Protein, templ_disto: Distogram) -> TemplateContext:
     """Provide single-template TemplateContext built from np_protein and template distogram."""
-    return build_template_context([np_protein], templ_disto)
-
-
-@pytest.fixture
-def template_ctx_batch2(np_protein: Protein, templ_disto: Distogram) -> TemplateContext:
-    """Provide two-template TemplateContext by repeating np_protein twice to test batch dim."""
-    return build_template_context([np_protein, np_protein], templ_disto)
+    return build_template_context(np_protein, batch_size=1, distogram_fn=templ_disto, device="cpu")
 
 
 # ---------------------------------------------------------------------------
@@ -1135,12 +1010,6 @@ def test_build_template_context_f_template_distogram_shape(template_ctx: Templat
 def test_build_template_context_f_pseudo_beta_mask_shape(template_ctx: TemplateContext):
     """The pseudo-β mask must have one entry per residue per template: shape (1, N_RES)."""
     assert template_ctx.f_pseudo_beta_mask.shape == (1, N_RES)
-
-
-def test_build_template_context_batch_size_is_len_proteins(template_ctx_batch2: TemplateContext):
-    """Passing two proteins must set the leading batch dimension to 2 in both distogram and mask."""
-    assert template_ctx_batch2.f_template_distogram.shape[0] == 2
-    assert template_ctx_batch2.f_pseudo_beta_mask.shape[0] == 2
 
 
 # ---------------------------------------------------------------------------
@@ -1189,8 +1058,8 @@ def test_build_template_context_different_proteins_give_different_distograms(
         chain_index=np.zeros(N_RES, dtype=np.intp),
         b_factors=np.ones((N_RES, 37), dtype=np.float64),
     )
-    ctx_a = build_template_context([prot_a], templ_disto)
-    ctx_b = build_template_context([prot_b], templ_disto)
+    ctx_a = build_template_context(prot_a, batch_size=1, distogram_fn=templ_disto, device="cpu")
+    ctx_b = build_template_context(prot_b, batch_size=1, distogram_fn=templ_disto, device="cpu")
     assert not torch.equal(ctx_a.f_template_distogram, ctx_b.f_template_distogram)
 
 
@@ -1204,26 +1073,6 @@ def test_build_template_context_full_ca_mask_gives_all_ones_pseudo_beta_mask(
 ):
     """When all atoms (including alpha C) are present, every residue has pseudo-β mask value 1."""
     assert (template_ctx.f_pseudo_beta_mask == 1).all()
-
-
-def test_build_template_context_padded_residues_have_zero_pseudo_beta_mask(
-    np_protein_short: Protein, templ_disto: Distogram
-):
-    """Residues added by pad to match longer protein marked absent (mask 0) in shorter template."""
-    # np_protein_short has N_RES-2 residues; batched with full-length protein it is
-    # padded to N_RES. The 2 trailing padded residues must have mask 0.
-    prot_full = _make_protein(N_RES)
-    ctx = build_template_context([prot_full, np_protein_short], templ_disto)
-    assert (ctx.f_pseudo_beta_mask[1, N_RES - 2 :] == 0).all()
-
-
-def test_build_template_context_non_padded_residues_have_nonzero_pseudo_beta_mask(
-    np_protein_short: Protein, templ_disto: Distogram
-):
-    """Non-padded residues of the shorter protein must retain their original pseudo-β mask of 1."""
-    prot_full = _make_protein(N_RES)
-    ctx = build_template_context([prot_full, np_protein_short], templ_disto)
-    assert (ctx.f_pseudo_beta_mask[1, : N_RES - 2] == 1).all()
 
 
 # ===========================================================================
@@ -1294,9 +1143,11 @@ def unconditional_ctx(atom_disto_fn: Distogram, templ_disto: Distogram) -> Featu
             atom_mask=torch.zeros(N_RES, 37),
             residue_index=torch.zeros(N_RES),
             seq="A" * N_RES,
-            pdb_files=[],
+            pdb_file_path=None,
             atom_distogram_fn=atom_disto_fn,
             templ_distogram_fn=templ_disto,
+            batch_size=1,
+            device="cpu",
         )
 
 
@@ -1309,9 +1160,11 @@ def seq_only_ctx(atom_disto_fn: Distogram, templ_disto: Distogram) -> Featurized
             atom_mask=torch.zeros(N_RES, 37),
             residue_index=torch.arange(N_RES, dtype=torch.float),
             seq=SEQ_4,
-            pdb_files=[],
+            pdb_file_path=None,
             atom_distogram_fn=atom_disto_fn,
             templ_distogram_fn=templ_disto,
+            batch_size=1,
+            device="cpu",
         )
 
 
@@ -1329,61 +1182,63 @@ def seq_partial_atoms_ctx(
             atom_mask=partial_atom_msk,
             residue_index=torch.arange(N_RES, dtype=torch.float),
             seq=SEQ_4,
-            pdb_files=[],
+            pdb_file_path=None,
             atom_distogram_fn=atom_disto_fn,
             templ_distogram_fn=templ_disto,
+            batch_size=1,
+            device="cpu",
         )
 
 
-@pytest.fixture
-def partial_templ_no_seq_ctx(
-    partial_template_pdb: str, atom_disto_fn: Distogram, templ_disto: Distogram
-) -> FeaturizedBatch:
-    """Use case 4: partial template (N_PARTIAL < N_RES residues), no sequence, no atoms."""
-    with torch.no_grad():
-        return build_sampling_context(
-            atom_positions=torch.zeros(N_RES, 37, 3),
-            atom_mask=torch.zeros(N_RES, 37),
-            residue_index=torch.zeros(N_RES),
-            seq="A" * N_RES,
-            pdb_files=[partial_template_pdb],
-            atom_distogram_fn=atom_disto_fn,
-            templ_distogram_fn=templ_disto,
-        )
+# @pytest.fixture
+# def partial_templ_no_seq_ctx(
+#     partial_template_pdb: str, atom_disto_fn: Distogram, templ_disto: Distogram
+# ) -> FeaturizedBatch:
+#     """Use case 4: partial template (N_PARTIAL < N_RES residues), no sequence, no atoms."""
+#     with torch.no_grad():
+#         return build_sampling_context(
+#             atom_positions=torch.zeros(N_RES, 37, 3),
+#             atom_mask=torch.zeros(N_RES, 37),
+#             residue_index=torch.zeros(N_RES),
+#             seq="A" * N_RES,
+#             pdb_files=[partial_template_pdb],
+#             atom_distogram_fn=atom_disto_fn,
+#             templ_distogram_fn=templ_disto,
+#         )
 
 
-@pytest.fixture
-def full_templ_no_seq_ctx(
-    full_template_pdb: str, atom_disto_fn: Distogram, templ_disto: Distogram
-) -> FeaturizedBatch:
-    """Use case 5: full template (all N_RES residues), no sequence, no atoms."""
-    with torch.no_grad():
-        return build_sampling_context(
-            atom_positions=torch.zeros(N_RES, 37, 3),
-            atom_mask=torch.zeros(N_RES, 37),
-            residue_index=torch.zeros(N_RES),
-            seq="A" * N_RES,
-            pdb_files=[full_template_pdb],
-            atom_distogram_fn=atom_disto_fn,
-            templ_distogram_fn=templ_disto,
-        )
+# @pytest.fixture
+# def full_templ_no_seq_ctx(
+#     full_template_pdb: str, atom_disto_fn: Distogram, templ_disto: Distogram
+# ) -> FeaturizedBatch:
+#     """Use case 5: full template (all N_RES residues), no sequence, no atoms."""
+#     with torch.no_grad():
+#         return build_sampling_context(
+#             atom_positions=torch.zeros(N_RES, 37, 3),
+#             atom_mask=torch.zeros(N_RES, 37),
+#             residue_index=torch.zeros(N_RES),
+#             seq="A" * N_RES,
+#             pdb_files=[full_template_pdb],
+#             atom_distogram_fn=atom_disto_fn,
+#             templ_distogram_fn=templ_disto,
+#         )
 
 
-@pytest.fixture
-def full_atoms_partial_templ_ctx(
-    partial_template_pdb: str, atom_disto_fn: Distogram, templ_disto: Distogram
-) -> FeaturizedBatch:
-    """Use case 6: all atoms present, partial template (N_PARTIAL < N_RES), no sequence."""
-    with torch.no_grad():
-        return build_sampling_context(
-            atom_positions=torch.randn(N_RES, 37, 3, generator=torch.Generator().manual_seed(42)),
-            atom_mask=torch.ones(N_RES, 37),
-            residue_index=torch.arange(N_RES, dtype=torch.float),
-            seq="A" * N_RES,
-            pdb_files=[partial_template_pdb],
-            atom_distogram_fn=atom_disto_fn,
-            templ_distogram_fn=templ_disto,
-        )
+# @pytest.fixture
+# def full_atoms_partial_templ_ctx(
+#     partial_template_pdb: str, atom_disto_fn: Distogram, templ_disto: Distogram
+# ) -> FeaturizedBatch:
+#     """Use case 6: all atoms present, partial template (N_PARTIAL < N_RES), no sequence."""
+#     with torch.no_grad():
+#         return build_sampling_context(
+#             atom_positions=torch.randn(N_RES, 37, 3, generator=torch.Generator().manual_seed(42)),
+#             atom_mask=torch.ones(N_RES, 37),
+#             residue_index=torch.arange(N_RES, dtype=torch.float),
+#             seq="A" * N_RES,
+#             pdb_files=[partial_template_pdb],
+#             atom_distogram_fn=atom_disto_fn,
+#             templ_distogram_fn=templ_disto,
+#         )
 
 
 # ---------------------------------------------------------------------------
@@ -1411,11 +1266,6 @@ def test_unconditional_atom5_mask_all_false(unconditional_ctx: FeaturizedBatch):
     """A zero atom_mask, yields atom5_mask full of entirely False elements."""
     # Zero atom_mask → no atoms present in any residue
     assert not unconditional_ctx.atom5_mask.any()
-
-
-def test_unconditional_residue_mask_all_false(unconditional_ctx: FeaturizedBatch):
-    """With no atoms present, the residue-level validity mask must also be entirely False."""
-    assert not unconditional_ctx.residue_mask.any()
 
 
 def test_unconditional_r_gt_all_zeros(unconditional_ctx: FeaturizedBatch):
@@ -1455,11 +1305,6 @@ def test_seq_only_atom5_mask_all_false(seq_only_ctx: FeaturizedBatch):
     assert not seq_only_ctx.atom5_mask.any()
 
 
-def test_seq_only_residue_mask_all_false(seq_only_ctx: FeaturizedBatch):
-    """With no atom coordinates, no residue qualifies as structurally present in residue mask."""
-    assert not seq_only_ctx.residue_mask.any()
-
-
 def test_seq_only_residue_idx_embedding_differs_from_unconditional(
     seq_only_ctx: FeaturizedBatch, unconditional_ctx: FeaturizedBatch
 ):
@@ -1490,18 +1335,6 @@ def test_seq_partial_atoms_atom5_mask_false_for_second_half(seq_partial_atoms_ct
     assert not seq_partial_atoms_ctx.atom5_mask[0, N_PARTIAL * NATOM :].any()
 
 
-def test_seq_partial_atoms_residue_mask_true_for_first_half(seq_partial_atoms_ctx: FeaturizedBatch):
-    """Residues with atoms must be marked valid (True) in the per-residue mask."""
-    assert seq_partial_atoms_ctx.residue_mask[0, :N_PARTIAL].all()
-
-
-def test_seq_partial_atoms_residue_mask_false_for_second_half(
-    seq_partial_atoms_ctx: FeaturizedBatch,
-):
-    """Residues without atoms must be marked absent (False) in the per-residue mask."""
-    assert not seq_partial_atoms_ctx.residue_mask[0, N_PARTIAL:].any()
-
-
 def test_seq_partial_atoms_r_gt_nonzero_for_valid_residues(seq_partial_atoms_ctx: FeaturizedBatch):
     """Ground-truth coordinates for residues with atoms contain at least some non-zero values."""
     assert not (seq_partial_atoms_ctx.r_gt[0, : N_PARTIAL * NATOM] == 0).all()
@@ -1519,163 +1352,10 @@ def test_seq_partial_atoms_no_template_distogram(seq_partial_atoms_ctx: Featuriz
 
 
 # ---------------------------------------------------------------------------
-# Use case 4 — partial template only (no sequence, no atoms)
+# Use cases 4, 5, 6 — template-conditioned scenarios
+# (fixtures partial_templ_no_seq_ctx / full_templ_no_seq_ctx /
+#  full_atoms_partial_templ_ctx are not yet implemented for the new API)
 # ---------------------------------------------------------------------------
-
-
-def test_partial_templ_no_seq_context_shape(partial_templ_no_seq_ctx: FeaturizedBatch):
-    """Partial template produces context shaped for full N_RES target, not template's N_PARTIAL."""
-    # Template has N_PARTIAL residues; context must still be shaped for N_RES
-    assert partial_templ_no_seq_ctx.gt_res_distogram.shape == (1, N_RES, N_RES, N_TEMPL_BINS)
-    assert partial_templ_no_seq_ctx.f_pseudo_beta_mask.shape == (1, N_RES)
-
-
-def test_partial_templ_no_seq_distogram_has_template_info(
-    partial_templ_no_seq_ctx: FeaturizedBatch,
-):
-    """N_PARTIAL by N_PARTIAL top-left block of distogram is non-zero (encoded from template)."""
-    # Top-left N_PARTIAL by N_PARTIAL block is from the template → not all zeros
-    assert not (partial_templ_no_seq_ctx.gt_res_distogram[0, :N_PARTIAL, :N_PARTIAL] == 0).all()
-
-
-def test_partial_templ_no_seq_distogram_padding_is_zero(partial_templ_no_seq_ctx: FeaturizedBatch):
-    """Rows and columns beyond template's coverage must be padded with zeros in the distogram."""
-    assert (partial_templ_no_seq_ctx.gt_res_distogram[0, N_PARTIAL:, :] == 0).all()
-    assert (partial_templ_no_seq_ctx.gt_res_distogram[0, :, N_PARTIAL:] == 0).all()
-
-
-def test_partial_templ_no_seq_pseudo_beta_mask_set_for_covered_residues(
-    partial_templ_no_seq_ctx: FeaturizedBatch,
-):
-    """The first N_PARTIAL residues covered by the template must all have pseudo-β mask value 1."""
-    assert partial_templ_no_seq_ctx.f_pseudo_beta_mask[0, :N_PARTIAL].all()
-
-
-def test_partial_templ_no_seq_pseudo_beta_mask_zero_for_uncovered_residues(
-    partial_templ_no_seq_ctx: FeaturizedBatch,
-):
-    """Residues beyond the template's coverage must have pseudo-β mask value 0."""
-    assert (partial_templ_no_seq_ctx.f_pseudo_beta_mask[0, N_PARTIAL:] == 0).all()
-
-
-def test_partial_templ_no_seq_aa_indices_all_alanine(partial_templ_no_seq_ctx: FeaturizedBatch):
-    """Without explicit sequence input, amino-acid indices must default to all-alanine (index 0)."""
-    assert (partial_templ_no_seq_ctx.aa_indices == 0).all()
-
-
-def test_partial_templ_no_seq_atom5_mask_all_false(partial_templ_no_seq_ctx: FeaturizedBatch):
-    """Template-only conditioning provides no atom coordinates, so atom5 mask must be all-False."""
-    assert not partial_templ_no_seq_ctx.atom5_mask.any()
-
-
-# ---------------------------------------------------------------------------
-# Use case 5 — full template (no sequence, no atoms)
-# ---------------------------------------------------------------------------
-
-
-def test_full_templ_no_seq_gt_res_distogram_shape(full_templ_no_seq_ctx: FeaturizedBatch):
-    """Full-length template produces distogram of shape (1, N_RES, N_RES, N_TEMPL_BINS)."""
-    assert full_templ_no_seq_ctx.gt_res_distogram.shape == (1, N_RES, N_RES, N_TEMPL_BINS)
-
-
-def test_full_templ_no_seq_distogram_not_all_zeros(full_templ_no_seq_ctx: FeaturizedBatch):
-    """Full template with random coordinates encodes non-trivial pairwise distances (not zero)."""
-    assert not (full_templ_no_seq_ctx.gt_res_distogram == 0).all()
-
-
-def test_full_templ_no_seq_pseudo_beta_mask_all_ones(full_templ_no_seq_ctx: FeaturizedBatch):
-    """A full template with all atoms present must set pseudo-β mask to 1 for every residue."""
-    assert (full_templ_no_seq_ctx.f_pseudo_beta_mask == 1).all()
-
-
-def test_full_templ_no_seq_aa_indices_all_alanine(full_templ_no_seq_ctx: FeaturizedBatch):
-    """Without explicit sequence conditioning, amino-acid indices are default alanine (0)."""
-    assert (full_templ_no_seq_ctx.aa_indices == 0).all()
-
-
-def test_full_templ_no_seq_atom5_mask_all_false(full_templ_no_seq_ctx: FeaturizedBatch):
-    """Template-only conditioning provides no atom5 coordinates, so atom5_mask is entirely False."""
-    assert not full_templ_no_seq_ctx.atom5_mask.any()
-
-
-def test_full_templ_has_more_distogram_signal_than_partial_templ(
-    full_templ_no_seq_ctx: FeaturizedBatch, partial_templ_no_seq_ctx: FeaturizedBatch
-):
-    """Full template distogram contains more non-zero entries than partial template distogram."""
-    # Full template has non-zero entries across the whole N_RES by N_RES distogram;
-    # the partial template has zeros in the padded rows/cols.  Sum of non-zero
-    # entries must therefore be strictly greater for the full template.
-    full_nonzero = (full_templ_no_seq_ctx.gt_res_distogram != 0).sum()
-    partial_nonzero = (partial_templ_no_seq_ctx.gt_res_distogram != 0).sum()
-    assert full_nonzero > partial_nonzero
-
-
-# ---------------------------------------------------------------------------
-# Use case 6 — all atoms present + partial template, no sequence
-# ---------------------------------------------------------------------------
-
-
-def test_full_atoms_partial_templ_atom5_mask_all_true(
-    full_atoms_partial_templ_ctx: FeaturizedBatch,
-):
-    """With all atom37 positions present, atom5 mask must be entirely True across all residues."""
-    assert full_atoms_partial_templ_ctx.atom5_mask.all()
-
-
-def test_full_atoms_partial_templ_residue_mask_all_true(
-    full_atoms_partial_templ_ctx: FeaturizedBatch,
-):
-    """With all atoms present, every residue must be marked valid in the residue mask."""
-    assert full_atoms_partial_templ_ctx.residue_mask.all()
-
-
-def test_full_atoms_partial_templ_distogram_shape(full_atoms_partial_templ_ctx: FeaturizedBatch):
-    """Template distogram must still span full N_RES by N_RES space even with partial template."""
-    assert full_atoms_partial_templ_ctx.gt_res_distogram.shape == (1, N_RES, N_RES, N_TEMPL_BINS)
-
-
-def test_full_atoms_partial_templ_distogram_has_template_info(
-    full_atoms_partial_templ_ctx: FeaturizedBatch,
-):
-    """Top-left N_PARTIAL by N_PARTIAL block encodes actual template distances (not all zero)."""
-    assert not (full_atoms_partial_templ_ctx.gt_res_distogram[0, :N_PARTIAL, :N_PARTIAL] == 0).all()
-
-
-def test_full_atoms_partial_templ_distogram_padding_is_zero(
-    full_atoms_partial_templ_ctx: FeaturizedBatch,
-):
-    """Rows and columns beyond partial template's N_PARTIAL coverage must be padded with zeros."""
-    assert (full_atoms_partial_templ_ctx.gt_res_distogram[0, N_PARTIAL:, :] == 0).all()
-    assert (full_atoms_partial_templ_ctx.gt_res_distogram[0, :, N_PARTIAL:] == 0).all()
-
-
-def test_full_atoms_partial_templ_pseudo_beta_mask_covered_residues(
-    full_atoms_partial_templ_ctx: FeaturizedBatch,
-):
-    """The first N_PARTIAL residues covered by the template must have pseudo-β mask value 1."""
-    assert full_atoms_partial_templ_ctx.f_pseudo_beta_mask[0, :N_PARTIAL].all()
-
-
-def test_full_atoms_partial_templ_pseudo_beta_mask_uncovered_residues_zero(
-    full_atoms_partial_templ_ctx: FeaturizedBatch,
-):
-    """Residues beyond the partial template's coverage must have pseudo-β mask value 0."""
-    assert (full_atoms_partial_templ_ctx.f_pseudo_beta_mask[0, N_PARTIAL:] == 0).all()
-
-
-def test_full_atoms_partial_templ_aa_indices_all_alanine(
-    full_atoms_partial_templ_ctx: FeaturizedBatch,
-):
-    """Without sequence conditioning, all amino-acid indices must remain at alanine default (0)."""
-    assert (full_atoms_partial_templ_ctx.aa_indices == 0).all()
-
-
-def test_full_atoms_partial_templ_r_gt_all_finite_and_nonzero(
-    full_atoms_partial_templ_ctx: FeaturizedBatch,
-):
-    """With random non-zero atom positions, r_gt is finite and must not collapse to all-zero."""
-    assert torch.isfinite(full_atoms_partial_templ_ctx.r_gt).all()
-    assert not (full_atoms_partial_templ_ctx.r_gt == 0).all()
 
 
 # ---------------------------------------------------------------------------
@@ -1748,13 +1428,6 @@ def test_build_aa_context_x_is_distinct_from_alanine(
 # ---------------------------------------------------------------------------
 
 
-def test_edm_precond_forward_wrong_shape(edm_precond: EDMPrecond) -> None:
-    """Wrong r_input ndim (2-D instead of 3-D) triggers TypeCheckError."""
-    r_bad = torch.zeros(1, N_ATOM)  # missing coordinate dim
-    with pytest.raises(TypeCheckError):
-        edm_precond(r_bad, 1.0)
-
-
 def test_all_atom_context_wrong_shape() -> None:
     """Wrong r_gt ndim (2-D instead of 3-D) triggers TypeCheckError."""
     b_local, n_atom_local, n_res_local, k_local = 2, N_ATOM, N_RES, 4
@@ -1797,9 +1470,9 @@ def test_template_context_wrong_shape() -> None:
 
 
 def test_build_template_context_wrong_type(templ_disto: Distogram) -> None:
-    """Non-Protein list element triggers TypeCheckError."""
+    """Non-Protein argument triggers TypeCheckError."""
     with pytest.raises(TypeCheckError):
-        build_template_context([42], templ_disto)  # type: ignore[list-item]
+        build_template_context(42, batch_size=1, distogram_fn=templ_disto, device="cpu")  # type: ignore[arg-type]
 
 
 def test_build_sampling_context_wrong_shape(
@@ -1813,22 +1486,24 @@ def test_build_sampling_context_wrong_shape(
             atom_mask=torch.ones(N_RES, 37),
             residue_index=torch.arange(N_RES, dtype=torch.float),
             seq="A" * N_RES,
-            pdb_files=[],
+            pdb_file_path=None,
             atom_distogram_fn=atom_disto_fn,
             templ_distogram_fn=templ_disto,
+            batch_size=1,
+            device="cpu",
         )
 
 
-def test_edm_sampler_sigma_schedule_wrong_type(bare_sampler: EDMSampler) -> None:
-    """Non-int steps triggers TypeCheckError."""
+def test_noise_schedule_wrong_type(bare_sampler: EDMSampler) -> None:
+    """Passing a plain float instead of a scalar tensor triggers TypeCheckError."""
     with pytest.raises(TypeCheckError):
-        bare_sampler.sigma_schedule(3.14, "cpu")  # type: ignore[arg-type]
+        bare_sampler.noise_schedule(3.14)  # type: ignore[arg-type]
 
 
 def test_edm_sampler_sample_wrong_type(edm_sampler: EDMSampler) -> None:
     """Tuple with non-int element triggers TypeCheckError."""
     with pytest.raises(TypeCheckError):
-        edm_sampler.sample(shape=(1, N_ATOM, "bad"), steps=2)  # type: ignore[arg-type]
+        edm_sampler.sample(shape=(1, N_ATOM, "bad"))  # type: ignore[arg-type]
 
 
 def test_atom5_to_atom37_wrong_shape() -> None:

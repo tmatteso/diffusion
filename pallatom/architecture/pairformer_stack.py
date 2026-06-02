@@ -162,7 +162,7 @@ class PairformerBlock(nn.Module):
         z = z + self.row_dropout(self.traingle_mult_incoming(z))
         b: Float[torch.Tensor, "B N_res N_res n_heads"] = self.b_proj_start(z)
         z = z + self.row_dropout(self.triangle_attn_starting_node(z, b))
-        b: Float[torch.Tensor, "B N_res N_res n_heads"] = self.b_proj_end(z)
+        b = self.b_proj_end(z)
         z = z + self.column_dropout(self.triangle_attn_ending_node(z, b))
         z = z + self.transition1(z)
         if s is not None:

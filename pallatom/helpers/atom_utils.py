@@ -3,7 +3,7 @@
 import dataclasses
 from collections.abc import Mapping, MutableMapping
 from types import MappingProxyType
-from typing import Final
+from typing import Final, cast
 
 import numpy as np
 import numpy.typing as npt
@@ -16,6 +16,7 @@ from jaxtyping import Bool, Float, Int, jaxtyped
 
 # atom5 slot order: N=0, CA=1, C=2, O=3, CB=4
 ATOM5_NAMES = ["N", "CA", "C", "O", "CB"]
+ATOMS_PER_RES = 5
 
 # Element encoding: N=0, C=1, O=2, UNK=3 (side-chain placeholder)
 # Backbone slots: N→[1,0,0,0], CA→[0,1,0,0], C→[0,1,0,0], O→[0,0,1,0], CB→[0,0,0,1]
@@ -442,8 +443,9 @@ def center_positions(
     ca_positions = atom_positions[:, 1, :]  # N, 1, 3
     ca_mask = atom_mask[:, 1]  # N, 1
 
-    ca_center = np.sum(ca_mask[..., None] * ca_positions, axis=0) / (
-        np.sum(ca_mask, axis=0) + 1e-9
+    ca_center = cast(
+        npt.NDArray[np.float64],
+        np.sum(ca_mask[..., None] * ca_positions, axis=0) / (np.sum(ca_mask, axis=0) + 1e-9),
     )  # this is the masked mean of ca positions with a small epsilon. shape of 1, 1, 3
     atom_positions = (atom_positions - ca_center[None, ...]) * atom_mask[
         ..., None
@@ -723,14 +725,16 @@ def to_pdb(prot: Protein) -> str:
 
     # Construct a mapping from chain integer indices to chain ID strings.
     chain_ids: dict[int, str] = {}
-    for i in np.unique(chain_index):  # np.unique gives sorted output.
-        if i >= PDB_MAX_CHAINS:
+    unique_chains = np.unique(chain_index)
+    for ci_idx in range(len(unique_chains)):
+        ci = cast(int, unique_chains[ci_idx])
+        if ci >= PDB_MAX_CHAINS:
             raise ValueError(f"The PDB format supports at most {PDB_MAX_CHAINS} chains.")
-        chain_ids[int(i)] = PDB_CHAIN_IDS[int(i)]
+        chain_ids[ci] = PDB_CHAIN_IDS[ci]
 
     pdb_lines.append("MODEL     1")
     atom_index = 1
-    last_chain_index = chain_index[0]
+    last_chain_index = cast(np.intp, chain_index[0])
     # Add all atom sites.
     for i in range(aatype.shape[0]):
         # Close the previous chain if in a multichain PDB.
@@ -738,18 +742,23 @@ def to_pdb(prot: Protein) -> str:
             pdb_lines.append(
                 chain_end(
                     atom_index,
-                    res_1to3(aatype[i - 1]),
-                    chain_ids[int(chain_index[i - 1])],
-                    residue_index[i - 1],
+                    res_1to3(cast(int, aatype[i - 1])),
+                    chain_ids[cast(int, chain_index[i - 1])],
+                    cast(int, residue_index[i - 1]),
                 )
             )
-            last_chain_index = chain_index[i]
+            last_chain_index = cast(np.intp, chain_index[i])
             atom_index += 1  # Atom index increases at the TER symbol.
 
-        res_name_3 = res_1to3(aatype[i])
-        for atom_name, pos, mask, b_factor in zip(
-            atom_types, atom_positions[i], atom_mask[i], b_factors[i], strict=False
-        ):
+        res_name_3 = res_1to3(cast(int, aatype[i]))
+        atom_pos_i = cast(npt.NDArray[np.float64], atom_positions[i])
+        atom_mask_i = cast(npt.NDArray[np.float64], atom_mask[i])
+        b_factors_i = cast(npt.NDArray[np.float64], b_factors[i])
+        for j in range(len(atom_types)):
+            atom_name = atom_types[j]
+            pos = cast(npt.NDArray[np.float64], atom_pos_i[j])
+            mask = cast(float, atom_mask_i[j])
+            b_factor = cast(float, b_factors_i[j])
             if mask < 0.5:
                 continue
 
@@ -775,7 +784,10 @@ def to_pdb(prot: Protein) -> str:
     # Close the final chain.
     pdb_lines.append(
         chain_end(
-            atom_index, res_1to3(aatype[-1]), chain_ids[int(chain_index[-1])], residue_index[-1]
+            atom_index,
+            res_1to3(cast(int, aatype[-1])),
+            chain_ids[cast(int, chain_index[-1])],
+            cast(int, residue_index[-1]),
         )
     )
     pdb_lines.append("ENDMDL")

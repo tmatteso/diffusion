@@ -170,9 +170,12 @@ def tok_idx() -> Int[torch.Tensor, "B N_atom"]:
 
 
 @pytest.fixture
-def center_uid() -> Int[torch.Tensor, "B N_res"]:
-    """Index of center atom of each residue [B, N_RES], used to extract per-residue positions."""
-    single = torch.arange(0, N_ATOM, ATOMS_PER_RES)
+def center_uid() -> Int[torch.Tensor, "B N_atom"]:
+    """Center atom index per atom [B, N_ATOM]; all atoms in a residue share same center index."""
+    res_centers = torch.arange(0, N_ATOM, ATOMS_PER_RES)  # [0, 3, 6, ..., 147] — one per residue
+    single = repeat(
+        res_centers, "n -> (n a)", a=ATOMS_PER_RES
+    )  # broadcast to every atom in residue
     return repeat(single, "n -> b n", b=B).contiguous()
 
 
@@ -218,7 +221,6 @@ def featurized_batch(
         r_gt=torch.zeros_like(r_input),
         atom5_mask=torch.ones(B, N_ATOM, dtype=torch.bool),
         aa_indices=torch.zeros(B, N_RES, dtype=torch.long),
-        residue_mask=torch.ones(B, N_RES, dtype=torch.bool),
         t_hat=torch.rand(B) + 0.1,
         t_normalized=torch.randn(B, N_RES, N_RES),
         tok_idx=tok_idx,
@@ -644,7 +646,7 @@ def test_integration_gradient_flow_composite_loss(
         0, pred.residue_distogram_logits.size(-1) - 1
     )
     res_distogram_loss = distogram_loss_residue(
-        pred.residue_distogram_logits, gt_res_bin_idx, featurized_batch.residue_mask
+        pred.residue_distogram_logits, gt_res_bin_idx, featurized_batch.f_pseudo_beta_mask.bool()
     ).mean()
     atom_distogram_loss = distogram_loss_atom(
         pred.atom_distogram_logits,

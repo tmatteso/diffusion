@@ -23,10 +23,8 @@ class ProteinBatch:
 class FeaturizedItem:
     """Per-protein features produced by featurize_single_item before batching."""
 
-    N_res: int
     flat_pos: Float[torch.Tensor, "N_atom 3"]
     atom_mask_flat: Bool[torch.Tensor, "N_atom"]
-    residue_mask: Bool[torch.Tensor, "N_res"]
     f_pseudo_beta: Int[torch.Tensor, "N_res"]
     gt_res_distogram: Int[torch.Tensor, "N_res N_res n_templ_bins"]
     aa_indices: Int[torch.Tensor, "N_res"]
@@ -35,6 +33,11 @@ class FeaturizedItem:
     f_residue_idx: Int[torch.Tensor, "N_res"]
     t_hat: Float[torch.Tensor, ""]
     t_template: Float[torch.Tensor, "N_res N_res"]
+    ref_space_uid: Int[torch.Tensor, "N_atom"]
+    tok_idx: Int[torch.Tensor, "N_atom"]
+    center_uid: Int[torch.Tensor, "N_atom"]
+    gt_atom_distogram_sparse: Float[torch.Tensor, "N_atom K n_atom_bins"]
+    gt_atom_distogram_mask_sparse: Bool[torch.Tensor, "N_atom K"]
 
 
 @jaxtyped(typechecker=beartype)
@@ -51,10 +54,9 @@ class FeaturizedBatch:
     r_gt: Float[torch.Tensor, "B N_atom 3"]
     atom5_mask: Bool[torch.Tensor, "B N_atom"]
     aa_indices: Int[torch.Tensor, "B N_res"]
-    residue_mask: Bool[torch.Tensor, "B N_res"]
     t_hat: Float[torch.Tensor, "B"]
     t_normalized: Float[torch.Tensor, "B N_res N_res"]
     tok_idx: Int[torch.Tensor, "B N_atom"]
-    center_uid: Int[torch.Tensor, "B N_res"]
+    center_uid: Int[torch.Tensor, "B N_atom"]
     gt_atom_distogram_sparse: Float[torch.Tensor, "B N_atom K n_atom_bins"]
     gt_atom_distogram_mask_sparse: Bool[torch.Tensor, "B N_atom K"]
