@@ -36,3 +36,5 @@ docs/superpowers/*
 # json / jsonl. these are configs and datafiles
 pallatom/train/*.json
 pallatom/train/*.jsonl
+# commit messages
+commit_msg.txt

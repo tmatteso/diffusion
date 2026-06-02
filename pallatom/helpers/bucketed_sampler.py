@@ -244,7 +244,7 @@ class BucketedBatchSampler(torch.utils.data.Sampler[list[int]]):
         world_size: int = 1,
         rank: int = 0,
         seed: int = 0,
-        prefetch_epochs: int = 2,
+        prefetch_epochs: int = 5,
         n_threads: int | None = None,
     ) -> None:
         self._cluster_index = cluster_index
