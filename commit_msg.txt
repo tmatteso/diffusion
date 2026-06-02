@@ -1,21 +1,12 @@
-fix: zero centre-of-mass of sampled coordinates to prevent global drift
+fix: add missing sqrt in S_churn noise injection formula
 
-Without this fix, EDMSampler.sample() could return structures with
-alpha carbons hundreds of ångströms apart even when training RMSD
-looked healthy. The root cause was a training/sampling mismatch: the
-model was trained on zero-COM inputs, but sampling drew the initial
-noise from an uncentred N(0, I) prior and returned the raw model
-output r_denoised without recentering it. Training RMSD was computed
-on aligned or already-centred structures, so it never exposed the
-global positional drift.
+EDM Algorithm 2 scales the injected noise by sqrt(t_hat² - sigma²),
+not by (t_hat² - sigma²) directly. The missing square root caused the
+noise amplitude to grow as sigma² rather than sigma, producing an
+injection ~1700x too large at the first step with the default schedule
+(sigma_data=16, sigma_max=160, S_churn=0.2) and collapsing every
+sample immediately.
 
-Two changes fix this:
-- Zero the COM of the initial noise before the first denoising step
-  so the trajectory starts in the prior the model was trained on.
-- Subtract the COM of r_denoised before returning it so callers
-  always receive a zero-centred structure regardless of any residual
-  drift accumulated during the ODE integration.
-
-Add test_edm_sampler_output_com_is_zero to verify the guarantee: with
-an identity denoiser the returned coordinates must have COM < 1e-5 at
-every batch element and coordinate axis.
+The bug was invisible when S_churn=0 because t_hat==c_T at that point,
+making t_hat²-c_T²=0 regardless of the missing sqrt. Any positive
+S_churn activated the wrong branch and destroyed the trajectory.

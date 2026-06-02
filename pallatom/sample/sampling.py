@@ -481,7 +481,7 @@ class EDMSampler:
             # Select temporarily increased noise level t_hat
             t_hat: Float[torch.Tensor, ""] = c_T * (gamma + 1)
             # Add new noise to move from t_p to t_hat
-            noisy_r_l: Float[torch.Tensor, "B N_atom 3"] = r_l + self.S_noise * (
+            noisy_r_l: Float[torch.Tensor, "B N_atom 3"] = r_l + self.S_noise * torch.sqrt(
                 t_hat**2 - c_T**2
             ) * torch.randn((shape), device=self.device)
             # update the self condition feature
