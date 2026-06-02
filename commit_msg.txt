@@ -1,12 +1,19 @@
-fix: add missing sqrt in S_churn noise injection formula
+fix: correct noise injection, c_noise formula, and sampler clamp
 
-EDM Algorithm 2 scales the injected noise by sqrt(t_hat² - sigma²),
-not by (t_hat² - sigma²) directly. The missing square root caused the
-noise amplitude to grow as sigma² rather than sigma, producing an
-injection ~1700x too large at the first step with the default schedule
-(sigma_data=16, sigma_max=160, S_churn=0.2) and collapsing every
-sample immediately.
+Training forward pass was missing three pieces needed to match the
+EDM/AF3 diffusion specification:
 
-The bug was invisible when S_churn=0 because t_hat==c_T at that point,
-making t_hat²-c_T²=0 regardless of the missing sqrt. Any positive
-S_churn activated the wrong branch and destroyed the trajectory.
+Noise injection: MainTrunk received r_gt but never perturbed it.
+Now internally samples zero-CoM Gaussian noise and scales by t_hat
+(r_input = r_gt + t_hat * ε), consistent with the sampling loop.
+The variable was also renamed from r_input to r_gt at the call site
+to make the distinction between clean and noised coordinates clear.
+
+c_noise formula: was 0.25 * log(t̂/σ_data + ε), which is wrong.
+The correct AF3 formula is 0.25 * log(t̂); σ_data is already
+absorbed into t̂ through the definition t̂ = σ_data * σ, so
+dividing by σ_data again double-corrects the scale.
+
+Sampler t_hat clamp: the S_churn augmented noise level is now
+clamped to σ_data * σ_max so the sampler never injects noise that
+falls outside the training distribution.

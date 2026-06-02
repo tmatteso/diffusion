@@ -479,11 +479,18 @@ class EDMSampler:
             else:
                 gamma = 0.0
             # Select temporarily increased noise level t_hat
-            t_hat: Float[torch.Tensor, ""] = c_T * (gamma + 1)
+            # clamp to never introduce more new noise than what is present in train data.
+            t_hat: Float[torch.Tensor, ""] = torch.clamp(
+                c_T * (gamma + 1),
+                max=self.sigma_data * self.sigma_max,
+            )
+
             # Add new noise to move from t_p to t_hat
-            noisy_r_l: Float[torch.Tensor, "B N_atom 3"] = r_l + self.S_noise * torch.sqrt(
-                t_hat**2 - c_T**2
-            ) * torch.randn((shape), device=self.device)
+            eps = torch.randn((shape), device=self.device)
+            # zero the center of mass of the noise.
+            eps = eps - reduce(eps, "b n d -> b 1 d", "mean")
+            noisy_r_l = r_l + self.S_noise * torch.sqrt(t_hat**2 - c_T**2) * eps
+
             # update the self condition feature
             r_denoised, seq_logits = self.denoise(
                 r_noisy=noisy_r_l,

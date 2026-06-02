@@ -238,7 +238,7 @@ def featurize_single_item(
     ln_sigma: Float[torch.Tensor, ""] = torch.randn((), device=device) * P_std + P_mean
     sigma: Float[torch.Tensor, ""] = torch.exp(ln_sigma)
     # sigma_data is a constant determined by the variance of the data (default 16)
-    # t_hat is the sampled noise level.
+    # t_hat is the sampled noise level. This according to AF3.
     t_hat: Float[torch.Tensor, ""] = sigma_data * sigma
 
     # t_normalized is drawn from uniform(0, 1) and broadcast to every residue pair.
