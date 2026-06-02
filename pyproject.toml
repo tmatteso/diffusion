@@ -144,7 +144,7 @@ known-first-party = ["diffusion"]
 [tool.basedpyright]
 extraPaths = ["pallatom"]
 pythonVersion = "3.10"
-typeCheckingMode = "strict" #"all" # -- lets come back to this
+typeCheckingMode = "strict" #"all"
 exclude = ["**/*.ipynb", "pallatom/tests/*"] # ignore tests temporarily
 
 enableBasedFeatures = true

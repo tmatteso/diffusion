@@ -12,7 +12,7 @@ import torch
 from architecture.atom_transformers import WINDOW_SIZE, build_sparse_pairs
 from architecture.main_trunk import MainTrunk
 from beartype import beartype
-from einops import rearrange, repeat
+from einops import rearrange, reduce, repeat
 from helpers.alignment import centre_random_augment
 from helpers.atom_utils import (
     ATOM5_ELEMENTS,
@@ -457,8 +457,9 @@ class EDMSampler:
         c_T: Float[torch.Tensor, ""] = self.noise_schedule(
             1 - (torch.rand((), device=self.device)) * delta_t
         )
-        # r_l ~ c_T * N(0, I)
+        # r_l ~ c_T * N(0, I), centred so the prior matches zero-COM training data
         r_l: Float[torch.Tensor, "B N_atom 3"] = c_T * torch.randn((shape), device=self.device)
+        r_l = r_l - reduce(r_l, "b n d -> b 1 d", "mean")
 
         r_denoised: Float[torch.Tensor, "B N_atom 3"] = r_l
         seq_logits: Float[torch.Tensor, "B N_res n_amino"] = torch.zeros(
@@ -524,7 +525,7 @@ class EDMSampler:
         decode_seqs: Float[torch.Tensor, "B N_res"] = torch.argmax(
             torch.softmax((seq_logits) / self.seq_temperature, dim=-1), dim=-1
         ).float()
-
+        r_denoised = r_denoised - reduce(r_denoised, "b n d -> b 1 d", "mean")
         return r_denoised, decode_seqs
 
 

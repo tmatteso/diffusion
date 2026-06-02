@@ -1,23 +1,21 @@
-test: add Protein PDB serialisation roundtrip test
+fix: zero centre-of-mass of sampled coordinates to prevent global drift
 
-No test existed that exercised the full serialize-then-parse path
-through to_pdb / protein_from_pdb. Since that path is lossy (absent
-atoms are dropped; b_factors are overwritten with molecule-type
-encoding on parse), subtle bugs could go undetected.
+Without this fix, EDMSampler.sample() could return structures with
+alpha carbons hundreds of ångströms apart even when training RMSD
+looked healthy. The root cause was a training/sampling mismatch: the
+model was trained on zero-COM inputs, but sampling drew the initial
+noise from an uncentred N(0, I) prior and returned the raw model
+output r_denoised without recentering it. Training RMSD was computed
+on aligned or already-centred structures, so it never exposed the
+global positional drift.
 
-The new roundtrip_protein fixture is purpose-built for this test:
-atom positions are pre-rounded to three decimal places to match the
-PDB %8.3f column width, so atom_positions can be asserted with exact
-equality rather than an approximate tolerance. Absent-atom positions
-are zeroed, so the full (N_res, 37, 3) array can be compared without
-masking. GLY is included as the last residue to exercise the
-CB-absent code path.
+Two changes fix this:
+- Zero the COM of the initial noise before the first denoising step
+  so the trajectory starts in the prior the model was trained on.
+- Subtract the COM of r_denoised before returning it so callers
+  always receive a zero-centred structure regardless of any residual
+  drift accumulated during the ODE integration.
 
-The b_factors assertion checks float(MOL_TYPE_PROTEIN) on the
-recovered object rather than comparing to the fixture's zeros.
-protein_from_pdb unconditionally replaces b_factors with molecule-
-type encoding; the assertion documents that contract explicitly
-instead of relying on a numerical coincidence.
-
-Also replace np.random.randn in long_np_example with a seeded
-np.random.default_rng to clear the NPY002 ruff warning.
+Add test_edm_sampler_output_com_is_zero to verify the guarantee: with
+an identity denoiser the returned coordinates must have COM < 1e-5 at
+every batch element and coordinate axis.

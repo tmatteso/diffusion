@@ -637,6 +637,23 @@ def test_edm_sampler_denoiser_called_twice_per_step(
 # ---------------------------------------------------------------------------
 
 
+def test_edm_sampler_output_com_is_zero(
+    identity_denoiser_mock: MagicMock, context: FeaturizedBatch, templ_disto: Distogram
+):
+    """The returned r_denoised must have centre of mass at the origin for every batch element."""
+    sampler = EDMSampler(
+        identity_denoiser_mock,
+        context,
+        templ_disto,
+        SamplerParams(S_churn=0.0, ddim_steps=4),
+        NoiseScheduleParams(sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX),
+    )
+    manual_seed(7)
+    r_denoised, _ = sampler.sample((1, N_ATOM, 3))
+    com: Float[torch.Tensor, "1 3"] = reduce(r_denoised, "b n_atom d -> b d", "mean")
+    assert torch.allclose(com, torch.zeros_like(com), atol=1e-5)
+
+
 def test_edm_sampler_step_count_changes_output_for_nontrivial_denoiser(
     half_denoiser_mock: MagicMock, context: FeaturizedBatch, templ_disto: Distogram
 ):
