@@ -485,8 +485,9 @@ def short_np_example() -> Mapping[str, npt.NDArray[np.float64] | npt.NDArray[np.
 @pytest.fixture
 def long_np_example() -> Mapping[str, npt.NDArray[np.float64] | npt.NDArray[np.intp]]:
     """Provide a numpy example dict with 20 residues (longer than NP_MAX_LEN=10)."""
+    rng = np.random.default_rng(3)
     return {
-        "atom_positions": np.random.randn(20, 37, 3),
+        "atom_positions": rng.standard_normal((20, 37, 3)),
         "residue_index": np.arange(20),
     }
 
@@ -668,6 +669,45 @@ def two_chain_protein() -> Protein:
     )
 
 
+@pytest.fixture
+def roundtrip_protein() -> Protein:
+    """Provide a 5-residue Protein for PDB serialisation roundtrip tests.
+
+    Positions are pre-rounded to 3 decimal places to match the PDB ATOM
+    column width (``%8.3f``), and absent-atom positions are zero so every
+    field can be compared directly after a ``to_pdb`` / ``protein_from_pdb``
+    cycle without masking.
+    """
+    # atom_types ordering in this repo: N=0, CA=1, C=2, CB=3, O=4
+    _bb_cb: list[int] = [0, 1, 2, 3, 4]  # N, CA, C, CB, O — non-GLY residues
+    _bb: list[int] = [0, 1, 2, 4]  # N, CA, C, O    — GLY has no CB
+
+    # ALA=0, ARG=1, SER=15, VAL=19, GLY=7  (indices into restypes list)
+    _aatype = np.array([0, 1, 15, 19, 7], dtype=np.intp)
+    _num_res = _aatype.shape[0]
+
+    _atom_mask = np.zeros((_num_res, N_ATOM_TYPE), dtype=np.float64)
+    for _i in range(_num_res - 1):  # residues 0-3: non-GLY
+        _atom_mask[_i, _bb_cb] = 1.0
+    _atom_mask[_num_res - 1, _bb] = 1.0  # last residue: GLY, no CB
+
+    _rng = np.random.default_rng(7)
+    _atom_positions = np.zeros((_num_res, N_ATOM_TYPE, 3), dtype=np.float64)
+    for _i in range(_num_res):
+        _present = _bb_cb if _i < _num_res - 1 else _bb
+        for _j in _present:
+            _atom_positions[_i, _j] = np.round(_rng.standard_normal(3), 3)
+
+    return Protein(
+        atom_positions=_atom_positions,
+        aatype=_aatype,
+        atom_mask=_atom_mask,
+        residue_index=np.arange(_num_res, dtype=np.intp),
+        chain_index=np.zeros(_num_res, dtype=np.intp),
+        b_factors=np.zeros((_num_res, N_ATOM_TYPE), dtype=np.float64),
+    )
+
+
 def test_to_pdb_returns_string(simple_protein: Protein):
     """to_pdb returns a plain str, not bytes or another type."""
     assert isinstance(to_pdb(simple_protein), str)
@@ -731,6 +771,23 @@ def test_to_pdb_raises_too_many_chains():
     )
     with pytest.raises(ValueError, match="chains"):
         to_pdb(prot)
+
+
+def test_to_pdb_protein_from_pdb_roundtrip(
+    roundtrip_protein: Protein,
+    tmp_path: pathlib.Path,
+) -> None:
+    """All Protein fields are preserved through a to_pdb / protein_from_pdb cycle."""
+    pdb_path = tmp_path / "roundtrip.pdb"
+    pdb_path.write_text(to_pdb(roundtrip_protein))
+    recovered = protein_from_pdb(str(pdb_path))
+
+    assert np.array_equal(roundtrip_protein.aatype, recovered.aatype)
+    assert np.array_equal(roundtrip_protein.residue_index, recovered.residue_index)
+    assert np.array_equal(roundtrip_protein.chain_index, recovered.chain_index)
+    assert np.array_equal(roundtrip_protein.atom_mask, recovered.atom_mask)
+    assert np.array_equal(roundtrip_protein.atom_positions, recovered.atom_positions)
+    assert np.all(recovered.b_factors == float(MOL_TYPE_PROTEIN))
 
 
 # ---------------------------------------------------------------------------
