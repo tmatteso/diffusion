@@ -318,17 +318,26 @@ def build_sampling_context(
     def tile(t: Float[torch.Tensor, "..."]) -> Float[torch.Tensor, "B ..."]:
         return repeat(t, "... -> b ...", b=B)
 
+    packed_t_hat = 1.0 * torch.ones(B)
+    # Apply zero-centered noise to turn r_gt into r_input.
+    noise = torch.randn_like(aa_ctx.r_gt)
+    noise = noise - reduce(noise, "b n d -> b 1 d", "mean")  # match sampling convention
+    r_input: Float[torch.Tensor, "B N_atom 3"] = (
+        aa_ctx.r_gt + rearrange(packed_t_hat, "b -> b 1 1") * noise
+    )
+
     return FeaturizedBatch(
         ref_pos=tile(ref_pos_single),
         ref_element=tile(ref_element_single),
         ref_space_uid=tile(ref_space_uid_single),
-        t_hat=1.0 * torch.ones(B),  # these are spoofed inputs, they modified during sampling
+        t_hat=packed_t_hat,  # these are spoofed inputs, they modified during sampling
         t_normalized=0.5 * torch.ones(B, N_res, N_res),  # spoofed inputs, modified during sampling
         tok_idx=tile(tok_idx_single),
         center_uid=tile(center_uid_single),
         gt_res_distogram=template_context.f_template_distogram,
         f_pseudo_beta_mask=template_context.f_pseudo_beta_mask,
         r_gt=aa_ctx.r_gt,
+        r_gt_noised=r_input,  # spoofed inputs, modified during sampling
         atom5_mask=aa_ctx.atom5_mask,
         gt_atom_distogram_sparse=aa_ctx.gt_atom_distogram_sparse,
         gt_atom_distogram_mask_sparse=aa_ctx.gt_atom_distogram_mask_sparse,
@@ -431,7 +440,7 @@ class EDMSampler:
 
         batch: FeaturizedBatch = dataclasses.replace(
             self.context,
-            r_gt=r_noisy,
+            r_gt_noised=r_noisy,
             t_hat=t_hat_batch,
             t_normalized=t_normalized,
         )
@@ -461,6 +470,7 @@ class EDMSampler:
         r_l: Float[torch.Tensor, "B N_atom 3"] = c_T * torch.randn((shape), device=self.device)
         r_l = r_l - reduce(r_l, "b n d -> b 1 d", "mean")
 
+        # init to sentinel values to please the type checker.
         r_denoised: Float[torch.Tensor, "B N_atom 3"] = r_l
         seq_logits: Float[torch.Tensor, "B N_res n_amino"] = torch.zeros(
             (shape[0], self.context.aa_indices.shape[1], 20), device=self.device

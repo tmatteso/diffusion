@@ -417,6 +417,13 @@ def featurize_batch(
     packed_gt_atom_distogram_mask_sparse = torch.stack(
         [it.gt_atom_distogram_mask_sparse for it in items]
     )
+    # step 0:
+    # Apply zero-centered noise to turn r_gt into r_input
+    noise = torch.randn_like(packed_flat_pos)
+    noise = noise - reduce(noise, "b n d -> b 1 d", "mean")  # match sampling convention
+    r_input: Float[torch.Tensor, "B N_atom 3"] = (
+        packed_flat_pos + rearrange(packed_t_hat, "b -> b 1 1") * noise
+    )
 
     return FeaturizedBatch(
         ref_pos=packed_ref_pos,
@@ -426,6 +433,7 @@ def featurize_batch(
         f_pseudo_beta_mask=packed_pseudo_beta,
         f_residue_idx=packed_res_idx,
         r_gt=packed_flat_pos,
+        r_gt_noised=r_input,
         atom5_mask=packed_atom_mask,
         aa_indices=packed_aa,
         t_hat=packed_t_hat,

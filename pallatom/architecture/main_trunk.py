@@ -28,7 +28,7 @@ from architecture.node_update import NodeUpdate
 from architecture.pair_update import PairUpdate
 from architecture.template_embedder import TemplateEmbedder
 from beartype import beartype
-from einops import rearrange, reduce, repeat
+from einops import rearrange, repeat
 from helpers.batch_types import FeaturizedBatch
 from jaxtyping import Bool, Float, Int, jaxtyped
 
@@ -530,24 +530,18 @@ class MainTrunk(nn.Module):
         f_pseudo_beta_mask: Float[torch.Tensor, "B N_res"] = batch.f_pseudo_beta_mask.float()
         f_residue_idx: Int[torch.Tensor, "B N_res"] = batch.f_residue_idx
 
-        r_gt: Float[torch.Tensor, "B N_atom 3"] = batch.r_gt
+        r_input: Float[torch.Tensor, "B N_atom 3"] = batch.r_gt_noised
         t_hat: Float[torch.Tensor, "B"] = batch.t_hat
         t: Float[torch.Tensor, "B N_res N_res"] = batch.t_normalized
         tok_idx: Int[torch.Tensor, "B N_atom"] = batch.tok_idx
         center_uid: Int[torch.Tensor, "B N_atom"] = batch.center_uid
         aa_indices: Int[torch.Tensor, "B N_res"] = batch.aa_indices
 
-        B = r_gt.size(0)
-        N_atom = r_gt.size(1)
+        B = r_input.size(0)
+        N_atom = r_input.size(1)
         N_res = f_residue_idx.size(1)
-        device = r_gt.device
+        device = r_input.device
         sd = self.sigma_data
-
-        # step 0:
-        # Apply zero-centered noise to turn r_gt into r_input
-        noise = torch.randn_like(r_gt)
-        noise = noise - reduce(noise, "b n d -> b 1 d", "mean")  # match sampling convention
-        r_input: Float[torch.Tensor, "B N_atom 3"] = r_gt + rearrange(t_hat, "b -> b 1 1") * noise
 
         # ------------------------------------------------------------------
         # Step 1: r_scaled = r_input / sqrt(sigma_data² + t̂²)    [B, N_atom, 3]

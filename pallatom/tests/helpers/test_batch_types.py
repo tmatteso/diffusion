@@ -244,6 +244,7 @@ def featurized_batch() -> FeaturizedBatch:
         f_pseudo_beta_mask=torch.zeros(B, N_RES, dtype=torch.long),
         f_residue_idx=repeat(torch.arange(N_RES, dtype=torch.long), "n -> b n", b=B),
         r_gt=torch.randn(B, N_ATOM, 3),
+        r_gt_noised=torch.randn(B, N_ATOM, 3),
         atom5_mask=torch.ones(B, N_ATOM, dtype=torch.bool),
         aa_indices=torch.zeros(B, N_RES, dtype=torch.long),
         t_hat=torch.randn(B),

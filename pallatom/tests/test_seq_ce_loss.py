@@ -47,6 +47,7 @@ def minimal_batch() -> FeaturizedBatch:
         f_pseudo_beta_mask=torch.ones(_B, _N_RES, dtype=torch.long),
         f_residue_idx=torch.zeros(_B, _N_RES, dtype=torch.long),
         r_gt=torch.randn(_B, _N_ATOM, 3),
+        r_gt_noised=torch.randn(_B, _N_ATOM, 3),
         atom5_mask=torch.ones(_B, _N_ATOM, dtype=torch.bool),
         aa_indices=torch.randint(0, _N_AMINO, (_B, _N_RES), dtype=torch.long),
         t_hat=torch.randn(_B),

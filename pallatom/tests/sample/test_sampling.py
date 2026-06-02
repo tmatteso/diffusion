@@ -49,7 +49,7 @@ def _make_trunk_mock() -> MagicMock:
         n_atom = batch.r_gt.shape[1]
         n_res = int(batch.tok_idx.max().item()) + 1
         return PredictedOutputs(
-            r_denoised=batch.r_gt.clone(),
+            r_denoised=batch.r_gt_noised.clone(),
             seq_logits=torch.zeros(B_local, n_res, 20),
             residue_distogram_logits=torch.zeros(B_local, n_res, n_res, 38),
             atom_distogram_logits=torch.zeros(B_local, n_atom, 1, 38),
@@ -149,7 +149,7 @@ def half_denoiser_mock() -> MagicMock:
         n_atom = batch.r_gt.shape[1]
         n_res = int(batch.tok_idx.max().item()) + 1
         return PredictedOutputs(
-            r_denoised=batch.r_gt.clone() * 0.5,
+            r_denoised=batch.r_gt_noised.clone() * 0.5,
             seq_logits=torch.zeros(B_local, n_res, 20),
             residue_distogram_logits=torch.zeros(B_local, n_res, n_res, 38),
             atom_distogram_logits=torch.zeros(B_local, n_atom, 1, 38),

@@ -605,6 +605,7 @@ def test_featurized_batch_wrong_shape() -> None:
             f_pseudo_beta_mask=torch.zeros(B, N_RES, dtype=torch.long),
             f_residue_idx=torch.zeros(B, N_RES, C_RES),
             r_gt=torch.zeros(B, n_atom, 3),
+            r_gt_noised=torch.zeros(B, n_atom, 3),
             atom5_mask=torch.zeros(B, n_atom, dtype=torch.bool),
             aa_indices=torch.zeros(B, N_RES, dtype=torch.long),
             t_hat=torch.zeros(B, dtype=torch.long),

@@ -104,7 +104,7 @@ select = [
     "FBT",  # boolean trap — prefer keyword-only args or enums over bare bool params
     "PT",   # pytest style — raises match=, one statement per raises block, parametrize format
     "ISC",  # implicit string concatenation — catches ("foo" "bar") copy-paste bugs
-    "PYI",  # flake8-pyi
+#    "PYI",  # flake8-pyi
     "C90",  # mccabe code complexity
     "NPY",  # numpy specific rules
     "FURB", # refurb

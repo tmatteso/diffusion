@@ -52,6 +52,7 @@ class FeaturizedBatch:
     f_pseudo_beta_mask: Int[torch.Tensor, "B N_res"]
     f_residue_idx: Int[torch.Tensor, "B N_res"]
     r_gt: Float[torch.Tensor, "B N_atom 3"]
+    r_gt_noised: Float[torch.Tensor, "B N_atom 3"]
     atom5_mask: Bool[torch.Tensor, "B N_atom"]
     aa_indices: Int[torch.Tensor, "B N_res"]
     t_hat: Float[torch.Tensor, "B"]

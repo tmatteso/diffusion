@@ -1,19 +1,31 @@
-fix: correct noise injection, c_noise formula, and sampler clamp
+refactor: lift noise injection out of MainTrunk
 
-Training forward pass was missing three pieces needed to match the
-EDM/AF3 diffusion specification:
+Previously, MainTrunk.forward() sampled random noise and added it to
+r_gt to produce r_input internally. This meant the actual denoiser
+input was generated inside the forward pass — invisible in the batch,
+impossible to inspect or reproduce independently, and untestable in
+isolation.
 
-Noise injection: MainTrunk received r_gt but never perturbed it.
-Now internally samples zero-CoM Gaussian noise and scales by t_hat
-(r_input = r_gt + t_hat * ε), consistent with the sampling loop.
-The variable was also renamed from r_input to r_gt at the call site
-to make the distinction between clean and noised coordinates clear.
+Introduce r_gt_noised as an explicit FeaturizedBatch field that holds
+the noisy coordinates at the current diffusion step. Noise injection
+is now performed in featurize_batch() during training and in
+build_sampling_context() during inference. MainTrunk.forward() reads
+batch.r_gt_noised directly as r_input; it no longer generates noise.
 
-c_noise formula: was 0.25 * log(t̂/σ_data + ε), which is wrong.
-The correct AF3 formula is 0.25 * log(t̂); σ_data is already
-absorbed into t̂ through the definition t̂ = σ_data * σ, so
-dividing by σ_data again double-corrects the scale.
+Fix a latent semantic bug in EDMSampler.denoise(): per-step noisy
+coordinates were stored in r_gt, silently overwriting the ground-truth
+field across sampling steps. The EDM loop now updates r_gt_noised
+instead, keeping r_gt as the immutable clean reference throughout.
 
-Sampler t_hat clamp: the S_churn augmented noise level is now
-clamped to σ_data * σ_max so the sampler never injects noise that
-falls outside the training distribution.
+Correct a wrong einops pattern introduced in the moved noise code:
+"1 -> b 1 1" fails because b appears only on the right side and einops
+cannot resolve its size. The correct pattern is "b -> b 1 1", which
+names the existing batch axis on both sides and appends two singleton
+dimensions for broadcasting against [B, N_atom, 3].
+
+Update all test fixtures that construct FeaturizedBatch directly
+(test_batch_types, test_featurize, test_main_trunk, test_seq_ce_loss)
+to supply r_gt_noised. Fix the identity and half-denoiser mocks in
+test_sampling to echo batch.r_gt_noised rather than batch.r_gt, since
+r_gt is now the all-zeros ground truth and no longer carries the
+evolving trajectory.
