@@ -9,7 +9,9 @@ import pytest
 from helpers.cluster_index import ClusterIndex
 
 _Entry = Mapping[str, str | Mapping[str, list[list[float]]]]
-
+SEQ_LEN = 512
+MIN_CLUSTER_REP_SEQ_LEN = 8
+CLUSTER_COUNT = 64
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -37,30 +39,30 @@ def _write_jsonl(
 def test_assign_cluster_first_bin(tmp_path: pathlib.Path) -> None:
     """Length 1 maps to cluster 0 (first bin [1-8])."""
     _write_jsonl(tmp_path / "p.jsonl", [{"name": "p1", "seq": "A", "coords": _make_coords(1)}])
-    idx = ClusterIndex(tmp_path / "p.jsonl", ["p1"], token_budget=512, n_clusters=64)
+    idx = ClusterIndex(tmp_path / "p.jsonl", ["p1"], token_budget=SEQ_LEN, n_clusters=64)
     assert idx.assign_cluster(1) == 0
 
 
 def test_assign_cluster_last_regular_bin(tmp_path: pathlib.Path) -> None:
     """Length 512 maps to cluster 63 (last regular bin [505-512])."""
-    seq = "A" * 512
+    seq = "A" * SEQ_LEN
     _write_jsonl(
         tmp_path / "p.jsonl",
-        [{"name": "p1", "seq": seq, "coords": _make_coords(512)}],
+        [{"name": "p1", "seq": seq, "coords": _make_coords(SEQ_LEN)}],
     )
-    idx = ClusterIndex(tmp_path / "p.jsonl", ["p1"], token_budget=512, n_clusters=64)
-    assert idx.assign_cluster(512) == 63
+    idx = ClusterIndex(tmp_path / "p.jsonl", ["p1"], token_budget=SEQ_LEN, n_clusters=CLUSTER_COUNT)
+    assert idx.assign_cluster(SEQ_LEN) == CLUSTER_COUNT - 1
 
 
 def test_assign_cluster_overflow(tmp_path: pathlib.Path) -> None:
     """Length > 512 maps to overflow cluster 64."""
-    seq = "A" * 513
+    seq = "A" * (SEQ_LEN + 1)
     _write_jsonl(
         tmp_path / "p.jsonl",
         [{"name": "p1", "seq": seq, "coords": _make_coords(513)}],
     )
-    idx = ClusterIndex(tmp_path / "p.jsonl", ["p1"], token_budget=512, n_clusters=64)
-    assert idx.assign_cluster(513) == 64
+    idx = ClusterIndex(tmp_path / "p.jsonl", ["p1"], token_budget=SEQ_LEN, n_clusters=CLUSTER_COUNT)
+    assert idx.assign_cluster(SEQ_LEN + 1) == CLUSTER_COUNT
 
 
 # ---------------------------------------------------------------------------
@@ -71,16 +73,16 @@ def test_assign_cluster_overflow(tmp_path: pathlib.Path) -> None:
 def test_cluster_rep_len_regular(tmp_path: pathlib.Path) -> None:
     """cluster_rep_len[0] == 8, cluster_rep_len[63] == 512."""
     _write_jsonl(tmp_path / "p.jsonl", [{"name": "p1", "seq": "A", "coords": _make_coords(1)}])
-    idx = ClusterIndex(tmp_path / "p.jsonl", ["p1"], token_budget=512, n_clusters=64)
-    assert idx.cluster_rep_len[0] == 8
-    assert idx.cluster_rep_len[63] == 512
+    idx = ClusterIndex(tmp_path / "p.jsonl", ["p1"], token_budget=SEQ_LEN, n_clusters=CLUSTER_COUNT)
+    assert idx.cluster_rep_len[0] == MIN_CLUSTER_REP_SEQ_LEN
+    assert idx.cluster_rep_len[CLUSTER_COUNT - 1] == SEQ_LEN
 
 
 def test_cluster_rep_len_overflow(tmp_path: pathlib.Path) -> None:
     """cluster_rep_len[64] == token_budget + 1 == 513."""
     _write_jsonl(tmp_path / "p.jsonl", [{"name": "p1", "seq": "A", "coords": _make_coords(1)}])
-    idx = ClusterIndex(tmp_path / "p.jsonl", ["p1"], token_budget=512, n_clusters=64)
-    assert idx.cluster_rep_len[64] == 513
+    idx = ClusterIndex(tmp_path / "p.jsonl", ["p1"], token_budget=SEQ_LEN, n_clusters=CLUSTER_COUNT)
+    assert idx.cluster_rep_len[CLUSTER_COUNT] == SEQ_LEN + 1
 
 
 # ---------------------------------------------------------------------------
@@ -112,7 +114,7 @@ def test_cluster_index_flat_to_cluster_correct(tmp_path: pathlib.Path) -> None:
     _write_jsonl(tmp_path / "proteins.jsonl", entries)
     idx = ClusterIndex(tmp_path / "proteins.jsonl", ["p1", "p2", "p3"])
     cluster_ids = sorted(idx.flat_to_cluster[i] for i in range(len(idx)))
-    assert cluster_ids == [0, 1, 64]
+    assert cluster_ids == [0, 1, CLUSTER_COUNT]
 
 
 def test_cluster_index_len(tmp_path: pathlib.Path) -> None:
@@ -122,7 +124,7 @@ def test_cluster_index_len(tmp_path: pathlib.Path) -> None:
     ]
     _write_jsonl(tmp_path / "proteins.jsonl", entries)
     idx = ClusterIndex(tmp_path / "proteins.jsonl", [f"p{i}" for i in range(10)])
-    assert len(idx) == 10
+    assert len(idx) == len(entries)
 
 
 def test_cluster_index_name_filter(tmp_path: pathlib.Path) -> None:
@@ -133,8 +135,9 @@ def test_cluster_index_name_filter(tmp_path: pathlib.Path) -> None:
         {"name": "p3", "seq": "A" * 8, "coords": _make_coords(8)},
     ]
     _write_jsonl(tmp_path / "proteins.jsonl", entries)
-    idx = ClusterIndex(tmp_path / "proteins.jsonl", ["p1", "p3"])
-    assert len(idx) == 2
+    subset = ["p1", "p3"]
+    idx = ClusterIndex(tmp_path / "proteins.jsonl", subset)
+    assert len(idx) == len(subset)
 
 
 # ---------------------------------------------------------------------------
@@ -167,7 +170,7 @@ def test_cluster_index_cache_hit_same_result(tmp_path: pathlib.Path) -> None:
 def test_assign_cluster_raises_on_zero(tmp_path: pathlib.Path) -> None:
     """assign_cluster raises ValueError for seq_len <= 0."""
     _write_jsonl(tmp_path / "p.jsonl", [{"name": "p1", "seq": "A", "coords": _make_coords(1)}])
-    idx = ClusterIndex(tmp_path / "p.jsonl", ["p1"], token_budget=512, n_clusters=64)
+    idx = ClusterIndex(tmp_path / "p.jsonl", ["p1"], token_budget=SEQ_LEN, n_clusters=CLUSTER_COUNT)
     with pytest.raises(ValueError, match="seq_len must be positive"):
         idx.assign_cluster(0)
 

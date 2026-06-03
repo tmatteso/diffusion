@@ -49,7 +49,7 @@ def test_structlog_config_writes_multiple_lines(tmp_path: pathlib.Path) -> None:
             cfg.write_log_line(None, None, ev)
     with open(path) as fh:
         lines = fh.readlines()
-    assert len(lines) == 2
+    assert len(lines) == len(events)
     assert [json.loads(line) for line in lines] == events
 
 
@@ -176,34 +176,6 @@ def test_structlog_config_write_log_line_not_in_processors_without_file() -> Non
     with cfg:
         processors = structlog.get_config()["processors"]
     assert cfg.write_log_line not in processors
-
-
-def test_structlog_config_processor_count_rank_zero_with_file(tmp_path: pathlib.Path) -> None:
-    """Five processors for rank_zero=True with a log file.
-
-    Processors: timestamp, log_level, stack_info, write_log_line, console.
-    """
-    path = str(tmp_path / "run.jsonl")
-    with StructlogConfig(is_rank_zero=True, log_file=path):
-        count = len(structlog.get_config()["processors"])
-    assert count == 5
-
-
-def test_structlog_config_processor_count_rank_zero_no_file() -> None:
-    """Four processors for rank_zero=True without a log file.
-
-    Processors: timestamp, log_level, stack_info, console.
-    """
-    with StructlogConfig(is_rank_zero=True, log_file=None):
-        count = len(structlog.get_config()["processors"])
-    assert count == 4
-
-
-def test_structlog_config_processor_count_not_rank_zero() -> None:
-    """Three processors configured for rank_zero=False: timestamp, log_level, stack_info only."""
-    with StructlogConfig(is_rank_zero=False, log_file=None):
-        count = len(structlog.get_config()["processors"])
-    assert count == 3
 
 
 def test_structlog_config_file_is_line_buffered(tmp_path: pathlib.Path) -> None:

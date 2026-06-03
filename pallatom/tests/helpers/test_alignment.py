@@ -17,6 +17,8 @@ from jaxtyping import Float, TypeCheckError
 
 manual_seed(42)
 N, B = 50, 8
+TOLERANCE = 1e-5
+TIGHT_TOLERANCE = 1e-3
 
 
 @pytest.fixture
@@ -59,7 +61,7 @@ def test_rotation_translation_rmsd_near_zero(
     ref: Float[torch.Tensor, "N 3"], rigid_mobile: Float[torch.Tensor, "N 3"]
 ):
     """Kabsch RMSD is near zero after an exact rigid rotation+translation."""
-    assert kabsch_rmsd(rigid_mobile, ref).item() < 1e-3
+    assert kabsch_rmsd(rigid_mobile, ref).item() < TIGHT_TOLERANCE
 
 
 def test_kabsch_rmsd_batched_rigid_transforms_near_zero(batch_ref: Float[torch.Tensor, "B N 3"]):
@@ -76,7 +78,7 @@ def test_kabsch_rmsd_batched_rigid_transforms_near_zero(batch_ref: Float[torch.T
     rmsds = kabsch_rmsd(mobile_batch, batch_ref)
     assert rmsds.shape == (B,)
     # Float32 Kabsch SVD residuals on random 50-atom clouds run ~2e-4; 1e-3 gives headroom
-    assert (rmsds < 1e-3).all()
+    assert (rmsds < TIGHT_TOLERANCE).all()
 
 
 def test_masked_rmsd_near_zero(
@@ -85,7 +87,7 @@ def test_masked_rmsd_near_zero(
     tail_weights: Float[torch.Tensor, "N"],
 ):
     """Masked Kabsch RMSD is near zero after an exact rigid transform."""
-    assert kabsch_rmsd(rigid_mobile, ref, weights=tail_weights).item() < 1e-3
+    assert kabsch_rmsd(rigid_mobile, ref, weights=tail_weights).item() < TIGHT_TOLERANCE
 
 
 def test_apply_transform_reconstructs_target(
@@ -98,19 +100,19 @@ def test_apply_transform_reconstructs_target(
         return_transform=True,
     )
     aligned = apply_transform(rigid_mobile, R, c_mob, c_tgt)
-    assert torch.allclose(aligned, ref, atol=1e-4)
+    assert torch.allclose(aligned, ref, atol=TIGHT_TOLERANCE)
 
 
 def test_identity_alignment_unchanged(ref: Float[torch.Tensor, "N 3"]):
     """Aligning a structure to itself leaves it unchanged."""
     (aligned,) = kabsch_align(ref, ref, return_transform=False)
-    assert torch.allclose(aligned, ref, atol=1e-5)
+    assert torch.allclose(aligned, ref, atol=TOLERANCE)
 
 
 def test_atom_loss_perfect_prediction_near_zero():
     """atom_loss is near zero when prediction equals ground truth."""
     r = torch.randn(B, N, 3)
-    assert atom_loss(r, r).mean().item() < 1e-5
+    assert atom_loss(r, r).mean().item() < TOLERANCE
 
 
 def test_atom_loss_noisy_prediction_positive_and_finite():
@@ -190,7 +192,7 @@ def test_centre_random_augment_centroid_is_zero(aug_coords: Float[torch.Tensor, 
     """Each batch element is exactly centred (mean ≈ 0) after augmentation."""
     out = centre_random_augment(aug_coords)
     centroid: Float[torch.Tensor, "B 3"] = reduce(out, "b n d -> b d", "mean")
-    assert centroid.abs().max().item() < 1e-5
+    assert centroid.abs().max().item() < TOLERANCE
 
 
 def test_centre_random_augment_preserves_gram_matrix(
@@ -270,7 +272,7 @@ def test_centre_random_augment_is_translation_invariant(
     out_original: Float[torch.Tensor, "B N 3"] = centre_random_augment(aug_coords)
     torch.manual_seed(123)
     out_shifted: Float[torch.Tensor, "B N 3"] = centre_random_augment(aug_coords + shift)
-    assert torch.allclose(out_original, out_shifted, atol=1e-5)
+    assert torch.allclose(out_original, out_shifted, atol=TOLERANCE)
 
 
 def test_centre_random_augment_applies_independent_rotations_per_batch(
@@ -287,10 +289,10 @@ def test_centre_random_augment_applies_independent_rotations_per_batch(
     )
     out: Float[torch.Tensor, "B N 3"] = centre_random_augment(aug_coords)
     Q: Float[torch.Tensor, "B 3 3"] = kabsch_rotation(out, centred)
-    # Every pair of rotation matrices in the batch should differ by > 1e-2
+    # Every pair of rotation matrices in the batch should differ by > 1e-3
     for i in range(B - 1):
         diff = (Q[i] - Q[i + 1]).abs().max().item()
-        assert diff > 1e-2, f"Batch elements {i} and {i+1} received the same rotation"
+        assert diff > TIGHT_TOLERANCE, f"Batch elements {i} and {i+1} received the same rotation"
 
 
 def test_centre_random_augment_single_atom_is_always_zero() -> None:

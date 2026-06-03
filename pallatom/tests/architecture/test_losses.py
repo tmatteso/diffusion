@@ -27,7 +27,8 @@ LAM, ALPHA, GAMMA = 1.0, 0.1, 0.99
 L_RES, B_RES = 32, 64
 ATOMS_PER_RES, B_ATOM = 14, 22
 N_ATOMS = 8 * ATOMS_PER_RES  # 112
-
+TOLERANCE = 1e-5
+TIGHT_TOLERANCE = 1e-3
 
 # ---------------------------------------------------------------------------
 # Typed helpers
@@ -212,7 +213,7 @@ def test_atom_loss_perfect_near_zero(coords: Float[torch.Tensor, "B N_atoms 3"])
     """Passing identical coords as both pred and GT yields loss indistinguishable from zero."""
     loss = atom_loss(coords, coords)
     assert loss.shape == (B,)
-    assert loss.max().item() < 1e-5
+    assert loss.max().item() < TOLERANCE
 
 
 def test_atom_loss_known_translation_near_zero(coords: Float[torch.Tensor, "B N_atoms 3"]):
@@ -220,7 +221,7 @@ def test_atom_loss_known_translation_near_zero(coords: Float[torch.Tensor, "B N_
     translation = rearrange(torch.tensor([10.0, 5.0, -3.0]), "d -> 1 1 d")
     r_translated = coords + translation
     loss = atom_loss(r_translated, coords)
-    assert (loss < 1e-4).all()
+    assert (loss < TIGHT_TOLERANCE).all()
 
 
 def test_atom_loss_full_mask_matches_no_mask(
@@ -231,7 +232,7 @@ def test_atom_loss_full_mask_matches_no_mask(
     assert torch.allclose(
         atom_loss(coords, noisy_coords, mask=mask_all),
         atom_loss(coords, noisy_coords),
-        atol=1e-5,
+        atol=TOLERANCE,
     )
 
 
@@ -276,8 +277,8 @@ def test_pairwise_sq_dist_shape_symmetric():
     x = torch.randn(N, 3)
     D = pairwise_sq_dist(x)
     assert D.shape == (N, N)
-    assert D.diagonal().abs().max().item() < 1e-5
-    assert torch.allclose(D, D.T, atol=1e-5)
+    assert D.diagonal().abs().max().item() < TOLERANCE
+    assert torch.allclose(D, D.T, atol=TOLERANCE)
 
 
 # ---------------------------------------------------------------------------
@@ -321,7 +322,7 @@ def test_med_loss_perfect_struct_near_zero(
         alpha_0=0.0,
         gamma=GAMMA,
     )
-    assert loss.item() < 1e-5
+    assert loss.item() < TOLERANCE
 
 
 def test_med_loss_block_weights_strictly_increasing():
@@ -329,7 +330,7 @@ def test_med_loss_block_weights_strictly_increasing():
     w = block_decay_weights(K, GAMMA)
     assert w.shape == (K,)
     assert (w[1:] > w[:-1]).all()
-    assert abs(w[-1].item() - 1.0) < 1e-6
+    assert abs(w[-1].item() - 1.0) < TOLERANCE
 
 
 def test_med_loss_mismatched_blocks_raises(
@@ -408,7 +409,7 @@ def test_smooth_lddt_identical_coords_expected_value():
     r = torch.randn(10, 3) * 0.1
     loss = smooth_lddt_loss(r, r)
     expected = 1.0 - 0.25 * sum(torch.sigmoid(torch.tensor(t)).item() for t in [0.5, 1.0, 2.0, 4.0])
-    assert abs(loss.item() - expected) < 1e-4
+    assert abs(loss.item() - expected) < TIGHT_TOLERANCE
 
 
 def test_smooth_lddt_noisy_exceeds_identical(coords: Float[torch.Tensor, "B N_atoms 3"]):
@@ -471,7 +472,7 @@ def test_distogram_residue_perfect_logits_near_zero(
     res_onehot: Float[torch.Tensor, "B L_res L_res B_res"],
 ):
     """Extremely high logits concentrated on the correct bin drive the cross-entropy near zero."""
-    assert distogram_loss_residue(res_onehot * 1e6, res_onehot).max().item() < 1e-3
+    assert distogram_loss_residue(res_onehot * 1e6, res_onehot).max().item() < TIGHT_TOLERANCE
 
 
 def test_distogram_residue_mask_changes_loss(
@@ -509,7 +510,7 @@ def test_distogram_residue_ce_einsum_matches(
     logits, y = res_logits[0], res_onehot[0]
     loss_ref = distogram_loss_residue(logits, y).item()
     loss_manual = ce_via_einsum(logits, y).sum() / (L_RES * L_RES)
-    assert abs(loss_ref - loss_manual.item()) < 1e-5
+    assert abs(loss_ref - loss_manual.item()) < TOLERANCE
 
 
 def test_distogram_residue_unbatched_scalar():
@@ -551,7 +552,10 @@ def test_distogram_atom_perfect_logits_near_zero(
     atom_local_mask: Bool[torch.Tensor, "B N_atoms N_atoms"],
 ):
     """Extremely high logits concentrated on correct bin drive the atom distogram CE near zero."""
-    assert distogram_loss_atom(atom_onehot * 1e6, atom_onehot, atom_local_mask).max().item() < 1e-3
+    assert (
+        distogram_loss_atom(atom_onehot * 1e6, atom_onehot, atom_local_mask).max().item()
+        < TIGHT_TOLERANCE
+    )
 
 
 def test_distogram_atom_gradient_flows(
@@ -582,7 +586,7 @@ def test_distogram_atom_ce_einsum_matches(
     logits, y = atom_logits[0], atom_onehot[0]
     loss_ref = distogram_loss_atom(logits, y).item()
     loss_manual = ce_via_einsum(logits, y).sum() / (N_ATOMS * N_ATOMS)
-    assert abs(loss_ref - loss_manual.item()) < 1e-5
+    assert abs(loss_ref - loss_manual.item()) < TOLERANCE
 
 
 def test_distogram_atom_onehot_index_same_loss(

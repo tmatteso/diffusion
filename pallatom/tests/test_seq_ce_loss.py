@@ -4,6 +4,7 @@ import pytest
 import torch
 from architecture.losses import seq_ce_loss
 from einops import repeat
+from helpers.atom_utils import RESTYPE_NUM_NO_X
 from helpers.featurize import (
     Distogram,
     FeaturizedBatch,
@@ -22,7 +23,8 @@ _ATOMS_PER_RES = 5
 _N_ATOM = _N_RES * _ATOMS_PER_RES  # 25
 _N_BINS = 16
 _N_AMINO_BINS = 22
-_N_AMINO = 20
+_N_AMINO = RESTYPE_NUM_NO_X
+PADDING_DROPOUT_TOKEN = -100
 
 
 @pytest.fixture
@@ -90,14 +92,14 @@ def test_conditioning_dropout_uses_index_20_not_minus_100(
         minimal_batch, p_distogram=0.0, p_atom=0.0, p_seq=1.0, device="cpu"
     )
     valid: Bool[torch.Tensor, "1 5"] = minimal_batch.f_pseudo_beta_mask.bool()
-    assert (out.aa_indices[valid] == 20).all()
-    assert not (out.aa_indices[valid] == -100).any()
+    assert (out.aa_indices[valid] == _N_AMINO).all()
+    assert not (out.aa_indices[valid] == PADDING_DROPOUT_TOKEN).any()
 
 
 def test_seq_ce_loss_ignores_minus_100() -> None:
     """seq_ce_loss on a tensor with padding equals seq_ce_loss on the non-padded subset."""
     logits: Float[torch.Tensor, "1 6 20"] = torch.randn(1, 6, _N_AMINO)
-    aa_full: Int[torch.Tensor, "1 6"] = torch.full((1, 6), -100, dtype=torch.long)
+    aa_full: Int[torch.Tensor, "1 6"] = torch.full((1, 6), PADDING_DROPOUT_TOKEN, dtype=torch.long)
     aa_full[0, :3] = torch.randint(0, _N_AMINO, (3,))
 
     loss_full: Float[torch.Tensor, ""] = seq_ce_loss(logits, aa_full)
@@ -138,13 +140,13 @@ def test_pipeline_preserves_pdb_x_as_index_20(
         max_seq_len_in_batch=n_res,
     )
 
-    assert item.aa_indices[x_pos].item() == 20
+    assert item.aa_indices[x_pos].item() == _N_AMINO
 
 
 def test_seq_ce_loss_all_ignored_returns_zero() -> None:
     """seq_ce_loss returns 0.0 when every position is masked (no valid targets)."""
     logits: Float[torch.Tensor, "1 5 20"] = torch.randn(1, 5, _N_AMINO)
-    aa_all_x: Int[torch.Tensor, "1 5"] = torch.full((1, 5), 20, dtype=torch.long)  # all X/null
+    aa_all_x: Int[torch.Tensor, "1 5"] = torch.full((1, 5), _N_AMINO, dtype=torch.long)  # all X
 
     loss: Float[torch.Tensor, ""] = seq_ce_loss(logits, aa_all_x)
 

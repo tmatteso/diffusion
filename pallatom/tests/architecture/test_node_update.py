@@ -21,6 +21,7 @@ B = 2
 N_RES_LARGE = 20  # total atom / node count
 K_SPARSE = 6  # neighbour count strictly less than N_RES_LARGE
 
+RMS_GAIN = 5.0
 
 # ---------------------------------------------------------------------------
 # Typed helpers
@@ -578,7 +579,7 @@ def test_attn_pair_bias_repeated_application_bounded(
         for _ in range(20):
             s_cycle = s_cycle + attn(s_cycle, t, z)
     rms_final = float(torch.sqrt(reduce(s_cycle**2, "... -> ", "mean")))
-    assert rms_final / rms_initial < 5.0
+    assert rms_final / rms_initial < RMS_GAIN
 
 
 def test_attn_pair_bias_param_grads_finite_after_recycling(

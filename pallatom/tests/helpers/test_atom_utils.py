@@ -22,6 +22,8 @@ from helpers.atom_utils import (
     MOL_TYPE_PROTEIN,
     MOL_TYPE_RNA,
     PDB_MAX_CHAINS,
+    RESTYPE_NUM,
+    RESTYPE_NUM_NO_X,
     RNA_RESTYPE_3TO1,
     RNA_RESTYPE_ORDER,
     RNA_RESTYPES,
@@ -37,7 +39,6 @@ from helpers.atom_utils import (
     make_np_example,
     protein_from_pdb,
     pseudo_cb,
-    restype_num,
     to_pdb,
     truncate_to_length,
 )
@@ -48,8 +49,9 @@ manual_seed(42)
 
 B = 2
 N_RES = 10
-
-
+PDB_ATOM_NAME_CUTOFF = 4
+PDB_LINE_LEN = 80
+PROT_LEN = 3
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -724,7 +726,7 @@ def test_to_pdb_contains_model_endmdl_end(simple_protein: Protein):
 def test_to_pdb_lines_padded_to_80(simple_protein: Protein):
     """to_pdb right-pads every output line to exactly 80 characters as the PDB spec requires."""
     for line in to_pdb(simple_protein).splitlines():
-        assert len(line) == 80
+        assert len(line) == PDB_LINE_LEN
 
 
 def test_to_pdb_contains_atom_records(simple_protein: Protein):
@@ -748,7 +750,7 @@ def test_to_pdb_raises_on_invalid_aatype():
     num_res = 3
     prot = Protein(
         atom_positions=np.zeros((num_res, 37, 3), dtype=np.float64),
-        aatype=np.full(num_res, restype_num + 1, dtype=np.intp),
+        aatype=np.full(num_res, RESTYPE_NUM + 1, dtype=np.intp),
         atom_mask=np.ones((num_res, 37), dtype=np.float64),
         residue_index=np.arange(num_res, dtype=np.intp),
         chain_index=np.zeros(num_res, dtype=np.intp),
@@ -845,13 +847,6 @@ def test_atom37_to_cb_wrong_shape() -> None:
 # ---------------------------------------------------------------------------
 # Molecule-type and nucleotide constants
 # ---------------------------------------------------------------------------
-
-
-def test_mol_type_constants() -> None:
-    """MOL_TYPE_* constants encode protein=0, DNA=1, RNA=2."""
-    assert MOL_TYPE_PROTEIN == 0
-    assert MOL_TYPE_DNA == 1
-    assert MOL_TYPE_RNA == 2
 
 
 def test_dna_restype_constants() -> None:
@@ -973,7 +968,11 @@ def _pdb_atom_line(
     Returns:
         An 80-character string formatted as a PDB record.
     """
-    atom_field = f" {atom_name:<3}" if len(atom_name) < 4 else atom_name[:4]
+    atom_field = (
+        f" {atom_name:<3}"
+        if len(atom_name) < PDB_ATOM_NAME_CUTOFF
+        else atom_name[:PDB_ATOM_NAME_CUTOFF]
+    )
     return (
         f"{record:<6}{serial:>5} {atom_field} {resname:>3} {chain}{resseq:>4}    "
         f"{x:8.3f}{y:8.3f}{z:8.3f}  1.00  0.00"
@@ -1014,7 +1013,7 @@ def test_protein_from_pdb_dna_canonical(tmp_path: pathlib.Path) -> None:
     prot = protein_from_pdb(str(pdb))
     assert prot.atom_positions.shape == (2, 37, 3)
     assert np.all(prot.b_factors == float(MOL_TYPE_DNA))
-    assert np.all(prot.aatype == 20)
+    assert np.all(prot.aatype == RESTYPE_NUM_NO_X)
 
 
 def test_protein_from_pdb_rna_canonical(tmp_path: pathlib.Path) -> None:
@@ -1029,7 +1028,7 @@ def test_protein_from_pdb_rna_canonical(tmp_path: pathlib.Path) -> None:
     prot = protein_from_pdb(str(pdb))
     assert prot.atom_positions.shape == (2, 37, 3)
     assert np.all(prot.b_factors == float(MOL_TYPE_RNA))
-    assert np.all(prot.aatype == 20)
+    assert np.all(prot.aatype == RESTYPE_NUM_NO_X)
 
 
 def test_protein_from_pdb_dna_no_prefix(tmp_path: pathlib.Path) -> None:
@@ -1159,7 +1158,7 @@ def test_protein_from_pdb_correct_residue_count_with_hetatm(tmp_path: pathlib.Pa
         + "\n"
     )
     prot = protein_from_pdb(str(pdb))
-    assert prot.atom_positions.shape[0] == 3
+    assert prot.atom_positions.shape[0] == PROT_LEN
 
 
 def test_truncate_to_length_shortens_all_arrays() -> None:

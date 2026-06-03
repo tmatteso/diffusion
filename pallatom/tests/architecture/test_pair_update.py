@@ -23,7 +23,7 @@ C = 32
 N_HEADS = 4
 B = 2
 
-
+TOLERANCE = 1e-5
 # ---------------------------------------------------------------------------
 # Typed helpers
 # ---------------------------------------------------------------------------
@@ -163,7 +163,7 @@ def test_transform_rbf_symmetric_distance_gives_symmetric_output(
     # d is a Euclidean distance matrix, so d[b,i,j] == d[b,j,i]; output must match
     with torch.no_grad():
         out = rbf(d)
-    assert mean_abs_asymmetry(out).item() < 1e-5
+    assert mean_abs_asymmetry(out).item() < TOLERANCE
 
 
 # ---------------------------------------------------------------------------
@@ -220,7 +220,7 @@ def test_tri_start_row_independence(
     with torch.no_grad():
         out_orig = tri_start(z, b)
         out_mod = tri_start(z_mod, b)
-    assert torch.allclose(out_orig[:, 1:], out_mod[:, 1:], atol=1e-5)
+    assert torch.allclose(out_orig[:, 1:], out_mod[:, 1:], atol=TOLERANCE)
 
 
 # ---------------------------------------------------------------------------
@@ -277,7 +277,7 @@ def test_tri_end_col_independence(
     with torch.no_grad():
         out_orig = tri_end(z, b)
         out_mod = tri_end(z_mod, b)
-    assert torch.allclose(out_orig[:, :, 1:, :], out_mod[:, :, 1:, :], atol=1e-5)
+    assert torch.allclose(out_orig[:, :, 1:, :], out_mod[:, :, 1:, :], atol=TOLERANCE)
 
 
 # ---------------------------------------------------------------------------
@@ -488,7 +488,7 @@ def test_distance_translation_invariant(
     with torch.no_grad():
         d_orig = compute_dij(r_center)
         d_shift = compute_dij(r_center + t)
-    assert torch.allclose(d_orig, d_shift, atol=1e-5)
+    assert torch.allclose(d_orig, d_shift, atol=TOLERANCE)
 
 
 def test_distance_rotation_invariant(
@@ -499,7 +499,7 @@ def test_distance_rotation_invariant(
     with torch.no_grad():
         d_orig = compute_dij(r_center)
         d_rot = compute_dij(apply_rotation(r_center, R))
-    assert torch.allclose(d_orig, d_rot, atol=1e-5)
+    assert torch.allclose(d_orig, d_rot, atol=TOLERANCE)
 
 
 def test_rbf_translation_invariant(
@@ -511,7 +511,7 @@ def test_rbf_translation_invariant(
     with torch.no_grad():
         b_orig = rbf(compute_dij(r_center))
         b_shift = rbf(compute_dij(r_center + t))
-    assert torch.allclose(b_orig, b_shift, atol=1e-5)
+    assert torch.allclose(b_orig, b_shift, atol=TOLERANCE)
 
 
 def test_rbf_rotation_invariant(
@@ -523,7 +523,7 @@ def test_rbf_rotation_invariant(
     with torch.no_grad():
         b_orig = rbf(compute_dij(r_center))
         b_rot = rbf(compute_dij(apply_rotation(r_center, R)))
-    assert torch.allclose(b_orig, b_rot, atol=1e-5)
+    assert torch.allclose(b_orig, b_rot, atol=TOLERANCE)
 
 
 def test_pair_update_translation_invariant(
@@ -536,7 +536,7 @@ def test_pair_update_translation_invariant(
     with torch.no_grad():
         out_orig = pair_update(z, r_center)
         out_shift = pair_update(z, r_center + t)
-    assert torch.allclose(out_orig, out_shift, atol=1e-5)
+    assert torch.allclose(out_orig, out_shift, atol=TOLERANCE)
 
 
 def test_pair_update_rotation_invariant(
@@ -549,7 +549,7 @@ def test_pair_update_rotation_invariant(
     with torch.no_grad():
         out_orig = pair_update(z, r_center)
         out_rot = pair_update(z, apply_rotation(r_center, R))
-    assert torch.allclose(out_orig, out_rot, atol=1e-5)
+    assert torch.allclose(out_orig, out_rot, atol=TOLERANCE)
 
 
 # ---------------------------------------------------------------------------

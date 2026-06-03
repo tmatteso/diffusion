@@ -31,6 +31,10 @@ C_PAIR = 32
 F_REF_DIM = ATOMS_PER_RES * (3 + E)
 B = 1
 N_HEADS = 4
+NON_ZERO_BETA = -1e10
+ATOM_TRANSFORMER_BLOCKS = 3
+ATOM_TRANSFORMER_HEADS = 4
+DIFFUSION_TRANSFORMER_BLOCKS = 3
 
 # K is dynamic — pre-compute once from the canonical tok_idx
 _base_tok = torch.repeat_interleave(torch.arange(N_RES), ATOMS_PER_RES)
@@ -307,7 +311,7 @@ def test_compute_beta_values_are_binary(
     """Every element of beta is exactly 0.0 or -1e10; no intermediate values."""
     ref = torch.randn(B, N_ATOM, C_ATOM)
     beta = compute_beta(neighbor_idx, valid_mask, n_queries=32, n_keys=128, ref=ref)
-    assert ((beta == 0.0) | (beta == -1e10)).all()
+    assert ((beta == 0.0) | (beta == NON_ZERO_BETA)).all()
 
 
 def test_compute_beta_zero_for_near_atoms() -> None:
@@ -338,7 +342,7 @@ def test_compute_beta_large_neg_for_far_atoms() -> None:
     valid_mask_t = torch.ones(B_t, N_t, N_t, dtype=torch.bool)
     ref = torch.zeros(B_t, N_t, C_ATOM)
     beta = compute_beta(neighbor_idx_t, valid_mask_t, n_queries=n_q, n_keys=n_k, ref=ref)
-    assert beta[0, 0, 7].item() == -1e10
+    assert beta[0, 0, 7].item() == NON_ZERO_BETA
 
 
 def test_compute_beta_valid_mask_forces_neg() -> None:
@@ -349,7 +353,7 @@ def test_compute_beta_valid_mask_forces_neg() -> None:
     valid_mask_t[0, 0, 1] = False  # pair (l=0, m=1) is in-window but masked
     ref = torch.zeros(B_t, N_t, C_ATOM)
     beta = compute_beta(neighbor_idx_t, valid_mask_t, n_queries=n_q, n_keys=n_k, ref=ref)
-    assert beta[0, 0, 1].item() == -1e10  # mask wins over geometry
+    assert beta[0, 0, 1].item() == NON_ZERO_BETA  # mask wins over geometry
     assert beta[0, 0, 0].item() == 0.0  # unmasked in-window pair is unaffected
 
 
@@ -369,7 +373,7 @@ def test_compute_beta_boundary_exclusive() -> None:
     valid_mask_t = torch.ones(B_t, N_t, N_t, dtype=torch.bool)
     ref = torch.zeros(B_t, N_t, C_ATOM)
     beta = compute_beta(neighbor_idx_t, valid_mask_t, n_queries=n_q, n_keys=n_k, ref=ref)
-    assert beta[0, 3, 4].item() == -1e10
+    assert beta[0, 3, 4].item() == NON_ZERO_BETA
     assert beta[0, 3, 3].item() == 0.0
 
 
@@ -444,7 +448,9 @@ def test_compute_beta_asymmetric() -> None:
     ref = torch.zeros(B_t, N_t, C_ATOM)
     beta = compute_beta(neighbor_idx_t, valid_mask_t, n_queries=n_q, n_keys=n_k, ref=ref)
     assert beta[0, 0, 4].item() == 0.0, "pair (0,4) should be admitted by centre 0"
-    assert beta[0, 4, 0].item() == -1e10, "pair (4,0) blocked: m=0 outside key window of centre 2"
+    assert (
+        beta[0, 4, 0].item() == NON_ZERO_BETA
+    ), "pair (4,0) blocked: m=0 outside key window of centre 2"
 
 
 def test_compute_beta_all_neighbors_masked_row(
@@ -455,7 +461,7 @@ def test_compute_beta_all_neighbors_masked_row(
     valid_mask[0, 0, :] = False
     ref = torch.randn(B, N_ATOM, C_ATOM)
     beta = compute_beta(neighbor_idx, valid_mask, n_queries=32, n_keys=128, ref=ref)
-    assert (beta[0, 0, :] == -1e10).all()
+    assert (beta[0, 0, :] == NON_ZERO_BETA).all()
     assert (beta[0, 1, :][valid_mask[0, 1, :]] == 0.0).all()
 
 
@@ -469,7 +475,7 @@ def test_compute_beta_batch_independence(
     neighbor_idx_two: Int[torch.Tensor, "2 N_atom K"] = repeat(neighbor_idx, "1 n k -> b n k", b=2)
     # n_queries=32 > N_ATOM=24: single window covers all atoms; all valid pairs get 0.0
     beta = compute_beta(neighbor_idx_two, valid_mask_two, n_queries=32, n_keys=128, ref=ref)
-    assert (beta[1] == -1e10).all()
+    assert (beta[1] == NON_ZERO_BETA).all()
     assert (beta[0][valid_mask_two[0]] == 0.0).all()
 
 
@@ -546,8 +552,10 @@ def test_diffusion_transformer_output_finite(
 
 def test_diffusion_transformer_n_block_stored():
     """The N_block constructor argument is stored and determines iteration depth."""
-    dt = DiffusionTransformer(c_a=C_ATOM, c_s=C_ATOM, c_pair=C_PAIR, N_block=3, N_head=N_HEADS)
-    assert dt.N_block == 3
+    dt = DiffusionTransformer(
+        c_a=C_ATOM, c_s=C_ATOM, c_pair=C_PAIR, N_block=DIFFUSION_TRANSFORMER_BLOCKS, N_head=N_HEADS
+    )
+    assert dt.N_block == DIFFUSION_TRANSFORMER_BLOCKS
 
 
 def test_diffusion_transformer_gradient_flows(
@@ -600,8 +608,13 @@ def test_atom_transformer_output_finite(
 
 def test_atom_transformer_block_count():
     """The n_blocks constructor argument is forwarded to DiffusionTransformer.N_block."""
-    t = AtomTransformer(C_ATOM, C_ATOMPAIR, n_blocks=3, n_heads=4)
-    assert t.blocks.N_block == 3
+    t = AtomTransformer(
+        C_ATOM,
+        C_ATOMPAIR,
+        n_blocks=ATOM_TRANSFORMER_BLOCKS,
+        n_heads=ATOM_TRANSFORMER_HEADS,
+    )
+    assert t.blocks.N_block == ATOM_TRANSFORMER_BLOCKS
 
 
 def test_atom_transformer_gradient_flows(

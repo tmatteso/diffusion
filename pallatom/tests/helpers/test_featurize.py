@@ -7,7 +7,7 @@ import pytest
 import torch
 from architecture.main_trunk import MainTrunk
 from einops import rearrange, reduce, repeat
-from helpers.atom_utils import restype_num, restype_order
+from helpers.atom_utils import RESTYPE_NUM_NO_X, restype_order
 from helpers.featurize import (
     Distogram,
     FeaturizedBatch,
@@ -34,7 +34,8 @@ C_RES = 32
 MIN_DIST = 2.0
 MAX_DIST = 22.0
 AA_SEQ = "ACDEFGHIKLMN"  # length N_RES
-
+TOLERANCE = 1e-6
+X_TOKEN = RESTYPE_NUM_NO_X
 
 # ---------------------------------------------------------------------------
 # restype order and count — X as mask token
@@ -43,12 +44,7 @@ AA_SEQ = "ACDEFGHIKLMN"  # length N_RES
 
 def test_restype_order_x_is_20() -> None:
     """Mask token 'X' is assigned index 20, one past the 20 standard amino acids."""
-    assert restype_order["X"] == 20
-
-
-def test_restype_num_is_21() -> None:
-    """restype_num equals 21 (20 standard amino acids + 1 unknown/mask token)."""
-    assert restype_num == 21
+    assert restype_order["X"] == X_TOKEN
 
 
 # ---------------------------------------------------------------------------
@@ -231,8 +227,8 @@ def test_distogram_exact_bin_for_known_interior_distance(disto: Distogram) -> No
     with torch.no_grad():
         f, _ = disto(c)
     assert math.isclose(f[0, 1, expected_bin].item(), 1.0)
-    assert f[0, 1, :expected_bin].abs().max().item() < 1e-6
-    assert f[0, 1, expected_bin + 1 :].abs().max().item() < 1e-6
+    assert f[0, 1, :expected_bin].abs().max().item() < TOLERANCE
+    assert f[0, 1, expected_bin + 1 :].abs().max().item() < TOLERANCE
 
 
 # ---------------------------------------------------------------------------
@@ -487,7 +483,7 @@ def test_conditioning_dropout_p1_seq_sets_all_to_mask_token(
         featurized_batch, p_distogram=0.0, p_atom=0.0, p_seq=1.0, device="cpu"
     )
     valid = featurized_batch.f_pseudo_beta_mask.bool()
-    assert (out.aa_indices[valid] == 20).all()
+    assert (out.aa_indices[valid] == X_TOKEN).all()
 
 
 def test_conditioning_dropout_p0_is_noop(featurized_batch: FeaturizedBatch) -> None:

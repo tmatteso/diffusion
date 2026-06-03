@@ -9,7 +9,7 @@ import pytest
 import torch
 from architecture.main_trunk import PredictedOutputs
 from einops import rearrange, reduce
-from helpers.atom_utils import Protein, restype_order, to_pdb
+from helpers.atom_utils import RESTYPE_NUM_NO_X, Protein, restype_order, to_pdb
 from helpers.featurize import Distogram, FeaturizedBatch
 from helpers.useful_objects import manual_seed
 from jaxtyping import Float, TypeCheckError
@@ -29,11 +29,14 @@ from train.train_config import NoiseScheduleParams
 
 manual_seed(0)
 
+B = 2
 N_RES = 4
 N_ATOM = N_RES * NATOM  # 20
 SIGMA_MIN = 0.002
 SIGMA_MAX = 80.0
-
+N_ATOM_BINS = 22
+T_HAT_INIT = 1.0
+T_NORM_INIT = 0.5
 
 # ---------------------------------------------------------------------------
 # Mock factories
@@ -347,7 +350,7 @@ def test_build_sampling_context_center_uid_shape(context: FeaturizedBatch):
 
 def test_build_sampling_context_f_residue_idx_shape(context: FeaturizedBatch):
     """The residue index must have shape (B, N_RES)."""
-    assert context.f_residue_idx.ndim == 2
+    assert context.f_residue_idx.ndim == B
     assert context.f_residue_idx.shape[1] == N_RES
 
 
@@ -409,8 +412,8 @@ def test_build_sampling_context_atom5_mask_all_true(context: FeaturizedBatch):
 
 def test_build_sampling_context_placeholder_scalars(context: FeaturizedBatch):
     """The placeholder diffusion scalars must be initialised to t_hat=1.0 and t_normalized=0.5."""
-    assert (context.t_hat == 1.0).all()
-    assert (context.t_normalized == 0.5).all()
+    assert (context.t_hat == T_HAT_INIT).all()
+    assert (context.t_normalized == T_NORM_INIT).all()
 
 
 def test_build_sampling_context_n_atom_scales_linearly_with_n_res():
@@ -466,7 +469,7 @@ def test_build_sampling_context_custom_n_templ_bins():
 
 def test_build_sampling_context_custom_n_atom_bins():
     """A custom atom distogram with n_bins=10 must propagate that bin count to the sparse tensor."""
-    a_fn = Distogram(n_bins=10, min_dist=2.0, max_dist=22.0, overflow_bin=False)
+    a_fn = Distogram(n_bins=N_ATOM_BINS, min_dist=2.0, max_dist=22.0, overflow_bin=False)
     t_fn = Distogram(n_bins=38, min_dist=3.25, max_dist=50.75, overflow_bin=True)
     with torch.no_grad():
         ctx = build_sampling_context(
@@ -480,7 +483,7 @@ def test_build_sampling_context_custom_n_atom_bins():
             batch_size=1,
             device="cpu",
         )
-    assert ctx.gt_atom_distogram_sparse.shape[3] == 10  # (B, N_atom, K, n_atom_bins)
+    assert ctx.gt_atom_distogram_sparse.shape[3] == N_ATOM_BINS  # (B, N_atom, K, n_atom_bins)
 
 
 # ---------------------------------------------------------------------------
@@ -718,7 +721,7 @@ def test_build_sampling_context_gt_atom_distogram_sparse_leading_dim_is_n_atom(
 ):
     """Sparse distogram atom axis must equal N_ATOM and bin axis must equal the default 22 bins."""
     assert context.gt_atom_distogram_sparse.shape[1] == N_ATOM  # (B, N_atom, K, n_atom_bins)
-    assert context.gt_atom_distogram_sparse.shape[3] == 22  # default n_atom_bins
+    assert context.gt_atom_distogram_sparse.shape[3] == N_ATOM_BINS  # default n_atom_bins
 
 
 def test_build_sampling_context_tensors_on_cpu_by_default(context: FeaturizedBatch):
@@ -948,11 +951,11 @@ def test_build_aa_context_batch_size_controls_leading_dim(
             residue_idx_aa,
             AA_SEQ_AA,
             atom_disto_fn,
-            batch_size=3,
+            batch_size=B,
             device="cpu",
         )
-    assert ctx.r_gt.shape[0] == 3
-    assert ctx.aa_indices.shape[0] == 3
+    assert ctx.r_gt.shape[0] == B
+    assert ctx.aa_indices.shape[0] == B
 
 
 # ---------------------------------------------------------------------------
@@ -1411,7 +1414,7 @@ def test_build_aa_context_x_maps_to_index_20(
             batch_size=1,
             device="cpu",
         )
-    assert (ctx.aa_indices == 20).all()
+    assert (ctx.aa_indices == RESTYPE_NUM_NO_X).all()
 
 
 def test_build_aa_context_x_is_distinct_from_alanine(

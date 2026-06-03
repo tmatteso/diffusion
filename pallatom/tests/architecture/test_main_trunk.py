@@ -22,6 +22,7 @@ from architecture.main_trunk import (
 )
 from beartype import beartype
 from einops import einsum, rearrange, reduce, repeat
+from helpers.atom_utils import RESTYPE_NUM_NO_X
 from helpers.featurize import FeaturizedBatch, sinusoidal_encoding
 from helpers.useful_objects import manual_seed
 from jaxtyping import Bool, Float, Int, TypeCheckError, jaxtyped
@@ -53,8 +54,10 @@ N_HEADS_ATOM_TRANSFORMER_DECODER = 4
 N_PAIRFORMER_BLOCKS_TEMPLATE_EMBEDDER = 2
 N_PAIFORMER_HEADS_TEMPLATE_EMBEDDER = 16
 SIGMA_DATA = 16
-N_AMINO = 20
+N_AMINO = RESTYPE_NUM_NO_X
+TOLERANCE = 1e-5
 RESIDUE_NUMBER = 50
+DISTOGRAM_RANK = 4
 manual_seed(42)
 
 # @pytest.fixture(autouse=True)
@@ -474,7 +477,7 @@ def test_residue_distogram_head_output_symmetric():
     """The head symmetrises the pair embedding before projection so logits[i,j] == logits[j,i]."""
     head = ResidueDistogramHead(C_PAIR, n_bins=N_BINS)
     logits = head(torch.randn(B, N_RES, N_RES, C_PAIR))
-    assert mean_abs_asymmetry(logits).item() < 1e-5
+    assert mean_abs_asymmetry(logits).item() < TOLERANCE
 
 
 # ---------------------------------------------------------------------------
@@ -535,7 +538,7 @@ def test_main_trunk_atom_distogram_shape_finite(
 ):
     """Atom distogram output shape is [B, N_ATOM, ..., N_ATOM_BINS]."""
     out = _forward(model, featurized_batch)
-    assert out.atom_distogram_logits.ndim == 4
+    assert out.atom_distogram_logits.ndim == DISTOGRAM_RANK
     assert out.atom_distogram_logits.shape[0] == B
     assert out.atom_distogram_logits.shape[1] == N_ATOM
     assert out.atom_distogram_logits.shape[3] == N_ATOM_BINS
@@ -572,15 +575,15 @@ def test_main_trunk_sequence_head_shapes_and_vocab_bound(
     """Sequence head output has correct shape, is finite, and never predicts the X/null slot."""
     out = _forward(model, featurized_batch)
 
-    assert out.seq_logits.shape == (B, N_RES, 20)
+    assert out.seq_logits.shape == (B, N_RES, N_AMINO)
     assert torch.isfinite(out.seq_logits).all()
-    assert out.seq_logits.argmax(dim=-1).max() < 20  # X is never the argmax
+    assert out.seq_logits.argmax(dim=-1).max() < N_AMINO  # X is never the argmax
 
     assert len(out.intermediate_denoised_coord_stack) == K_UNIT
     assert len(out.intermediate_pred_aa_logit_stack) == K_UNIT
     for inter_logits in out.intermediate_pred_aa_logit_stack:
-        assert inter_logits.shape == (B, N_RES, 20)
-        assert inter_logits.argmax(dim=-1).max() < 20  # X is never the argmax
+        assert inter_logits.shape == (B, N_RES, N_AMINO)
+        assert inter_logits.argmax(dim=-1).max() < N_AMINO  # X is never the argmax
 
 
 def test_main_trunk_intermediate_coords_shape_finite(
@@ -600,7 +603,7 @@ def test_main_trunk_forward_with_mask_token_aa_indices(
     # aa_indices containing 20 (mask token "X") must not raise IndexError
     masked_batch = dataclasses.replace(
         featurized_batch,
-        aa_indices=torch.full((B, N_RES), 20, dtype=torch.long),
+        aa_indices=torch.full((B, N_RES), N_AMINO, dtype=torch.long),
     )
     with torch.no_grad():
         out = model(masked_batch)

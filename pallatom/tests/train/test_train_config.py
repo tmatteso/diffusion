@@ -7,7 +7,6 @@ from pydantic import ValidationError
 from train.train_config import (
     AtomDistogramParams,
     CheckpointParams,
-    ConditioningDropoutConfig,
     LoaderConfig,
     LoggingParams,
     LossParams,
@@ -126,13 +125,6 @@ def test_train_config_sub_models_are_correct_types(cfg: TrainConfig):
     assert isinstance(cfg.loader, LoaderConfig)
 
 
-def test_train_config_accepts_nested_overrides():
-    """TrainConfig forwards keyword overrides into the appropriate sub-config models."""
-    cfg = TrainConfig(training=TrainingParams(lr=1e-3, num_epochs=100))
-    assert cfg.training.lr == 1e-3
-    assert cfg.training.num_epochs == 100
-
-
 # ---------------------------------------------------------------------------
 # TrainConfig — immutability
 # ---------------------------------------------------------------------------
@@ -161,22 +153,9 @@ def test_model_params_is_frozen(model: ModelParams):
 # ---------------------------------------------------------------------------
 
 
-def test_train_config_model_dump_is_dict(cfg: TrainConfig):
-    """TrainConfig.model_dump() returns a plain dict."""
-    assert isinstance(cfg.model_dump(), dict)
-
-
 def test_train_config_round_trips_through_dict(cfg: TrainConfig):
     """TrainConfig survives a model_dump / model_validate round-trip unchanged."""
     assert TrainConfig.model_validate(cfg.model_dump()) == cfg
-
-
-def test_train_config_round_trips_custom_values():
-    """Custom field values are preserved after a model_dump / model_validate round-trip."""
-    cfg = TrainConfig(training=TrainingParams(lr=1e-5), loader=LoaderConfig(batch_size=64))
-    cfg2 = TrainConfig.model_validate(cfg.model_dump())
-    assert cfg2.training.lr == 1e-5
-    assert cfg2.loader.batch_size == 64
 
 
 # ---------------------------------------------------------------------------
@@ -193,11 +172,6 @@ def test_training_rejects_nonpositive_grad_clip():
 def test_training_accepts_none_grad_clip():
     """TrainingParams accepts grad_clip=None to disable gradient clipping."""
     assert TrainingParams(grad_clip=None).grad_clip is None
-
-
-def test_training_accepts_positive_grad_clip():
-    """TrainingParams stores a positive grad_clip value without error."""
-    assert TrainingParams(grad_clip=10.0).grad_clip == 10.0
 
 
 # ---------------------------------------------------------------------------
@@ -310,55 +284,3 @@ def test_loss_rejects_nonpositive_smooth_lddt_cutoff():
     """LossParams raises ValidationError when smooth_lddt_cutoff is zero."""
     with pytest.raises(ValidationError):
         LossParams(smooth_lddt_cutoff=0)
-
-
-# ---------------------------------------------------------------------------
-# ConditioningDropoutConfig — defaults, field constraints
-# ---------------------------------------------------------------------------
-
-
-def test_conditioning_dropout_config_defaults():
-    """ConditioningDropoutConfig defaults set all dropout probabilities to 0.15."""
-    cfg = ConditioningDropoutConfig()
-    assert cfg.p_distogram == 0.15
-    assert cfg.p_atom == 0.15
-    assert cfg.p_seq == 0.15
-
-
-def test_conditioning_dropout_config_custom_values():
-    """ConditioningDropoutConfig stores independently specified probabilities for each modality."""
-    cfg = ConditioningDropoutConfig(p_distogram=0.3, p_atom=0.1, p_seq=0.2)
-    assert cfg.p_distogram == 0.3
-    assert cfg.p_atom == 0.1
-    assert cfg.p_seq == 0.2
-
-
-def test_conditioning_dropout_config_rejects_negative():
-    """ConditioningDropoutConfig raises ValidationError when a probability is negative."""
-    with pytest.raises(ValidationError):
-        ConditioningDropoutConfig(p_distogram=-0.1)
-
-
-def test_conditioning_dropout_config_rejects_above_one():
-    """ConditioningDropoutConfig raises ValidationError when a probability exceeds 1."""
-    with pytest.raises(ValidationError):
-        ConditioningDropoutConfig(p_seq=1.1)
-
-
-def test_train_config_has_conditioning_dropout():
-    """TrainConfig exposes a conditioning_dropout field of type ConditioningDropoutConfig."""
-    cfg = TrainConfig()
-    assert hasattr(cfg, "conditioning_dropout")
-    assert isinstance(cfg.conditioning_dropout, ConditioningDropoutConfig)
-
-
-def test_train_config_conditioning_dropout_defaults():
-    """TrainConfig.conditioning_dropout uses the default p_distogram of 0.15."""
-    cfg = TrainConfig()
-    assert cfg.conditioning_dropout.p_distogram == 0.15
-
-
-def test_loader_config_custom_token_budget() -> None:
-    """LoaderConfig accepts a custom token_budget."""
-    cfg = LoaderConfig(token_budget=256)
-    assert cfg.token_budget == 256

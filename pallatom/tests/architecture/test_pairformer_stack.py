@@ -20,7 +20,9 @@ N_RES = 8
 C = 32
 N_HEADS = 4
 N_BLOCKS = 3
-
+TOLERANCE = 1e-6
+TIGHT_TOLERANCE = 1e-3
+PAIRFORMER_BLOCK_NUM = 5
 # Constants used exclusively by the TriangleMultiplicationOutgoing tests
 _N = 6
 _C = 16
@@ -173,8 +175,8 @@ def test_pairformer_stack_output_finite(
 
 def test_pairformer_stack_block_count() -> None:
     """The n_blocks constructor argument creates exactly that many PairformerBlock instances."""
-    s = PairformerStack(C, n_blocks=5, n_heads=N_HEADS)
-    assert len(s.blocks) == 5
+    s = PairformerStack(C, n_blocks=PAIRFORMER_BLOCK_NUM, n_heads=N_HEADS)
+    assert len(s.blocks) == PAIRFORMER_BLOCK_NUM
 
 
 def test_pairformer_stack_depth_changes_output() -> None:
@@ -209,7 +211,7 @@ def test_pairformer_stack_single_block_matches_pairformer_block() -> None:
     with torch.no_grad():
         _, block_z = block(s=None, z=v)
         stack_z = stack(s=None, z=v)
-        assert torch.allclose(block_z, stack_z, atol=1e-6)
+        assert torch.allclose(block_z, stack_z, atol=TOLERANCE)
 
 
 # ===========================================================================
@@ -329,7 +331,7 @@ def test_tmo_gate_near_zero_suppresses_output(
         tmo.gate.weight.fill_(0.0)
     with torch.no_grad():
         out = tmo(z_pair)
-    assert out.abs().max().item() < 1e-6
+    assert out.abs().max().item() < TOLERANCE
 
 
 def test_tmo_gate_near_one_passes_output_through(
@@ -341,7 +343,7 @@ def test_tmo_gate_near_one_passes_output_through(
         tmo.gate.weight.fill_(0.0)
     with torch.no_grad():
         out = tmo(z_pair)
-    assert out.abs().mean().item() > 1e-3
+    assert out.abs().mean().item() > TIGHT_TOLERANCE
 
 
 # ---------------------------------------------------------------------------
@@ -650,7 +652,7 @@ def test_tmi_gate_near_zero_suppresses_output(
         tmi.gate.weight.fill_(0.0)
     with torch.no_grad():
         out = tmi(z_pair)
-    assert out.abs().max().item() < 1e-6
+    assert out.abs().max().item() < TOLERANCE
 
 
 def test_tmi_gate_near_one_passes_output_through(
@@ -662,7 +664,7 @@ def test_tmi_gate_near_one_passes_output_through(
         tmi.gate.weight.fill_(0.0)
     with torch.no_grad():
         out = tmi(z_pair)
-    assert out.abs().mean().item() > 1e-3
+    assert out.abs().mean().item() > TIGHT_TOLERANCE
 
 
 # ---------------------------------------------------------------------------

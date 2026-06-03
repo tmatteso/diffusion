@@ -119,7 +119,7 @@ select = [
 ignore = [
     "F722", "F821", "UP037", # jaxtyping shape strings are runtime-parsed, not forward refs
     "D107",                  # __init__ docstring — use class docstring instead
-    "PLR2004",               # magic values — common in ML constants
+#    "PLR2004",               # magic values — common in ML constants
     "PLR0913",               # forces 5 arg or less for each function, not always a good idea
     "PLR0402",               # would eliminate standard import pattern torch.nn as nn
     "N812",                  # would eliminate standard import pattern torch.nn.functional as F

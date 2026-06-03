@@ -46,6 +46,11 @@ ATOM5_C = 2
 ATOM5_CB = 4
 ATOM5_O = 3
 
+# PDB constants
+PDB_ATOM_NAME_CUTOFF_LEN = 4
+PDB_LINE_CUTOFF_LEN = 80
+PDB_LINE_NO_B_FACTOR = 66
+ATOM_DNE = 0.5
 
 atom_types = [
     "N",
@@ -87,7 +92,7 @@ atom_types = [
     "OXT",
 ]
 
-restypes = [
+RESTYPES_NO_X = [
     "A",
     "R",
     "N",
@@ -108,10 +113,14 @@ restypes = [
     "W",
     "Y",
     "V",
-    "X",  # mask token: unknown / conditioning-dropout placeholder
 ]
-restype_order = {restype: i for i, restype in enumerate(restypes)}
-restype_num = len(restypes)  # := 21.
+RESTYPE_NUM_NO_X = len(RESTYPES_NO_X)  # :=20
+RESTYPES = [*RESTYPES_NO_X, "X"]
+# mask token: unknown / conditioning-dropout placeholder
+
+
+restype_order = {restype: i for i, restype in enumerate(RESTYPES)}
+RESTYPE_NUM = len(RESTYPES)  # := 21.
 
 restype_1to3 = {
     "A": "ALA",
@@ -579,7 +588,7 @@ def _parse_pdb_atoms(
             x = float(line[30:38])
             y = float(line[38:46])
             z = float(line[46:54])
-            bfac = float(line[60:66]) if len(line) > 66 else 0.0
+            bfac = float(line[60:66]) if len(line) > PDB_LINE_NO_B_FACTOR else 0.0
             key = (chain_id, resseq, icode)
             if key not in residue_atoms:
                 residue_atoms[key] = {}
@@ -684,32 +693,9 @@ def to_pdb(prot: Protein) -> str:
     Returns:
       PDB string.
     """
-    restypes = [
-        "A",
-        "R",
-        "N",
-        "D",
-        "C",
-        "Q",
-        "E",
-        "G",
-        "H",
-        "I",
-        "L",
-        "K",
-        "M",
-        "F",
-        "P",
-        "S",
-        "T",
-        "W",
-        "Y",
-        "V",
-        "X",
-    ]
 
     def res_1to3(r: int) -> str:
-        return restype_1to3.get(restypes[r], "UNK")
+        return restype_1to3.get(RESTYPES[r], "UNK")
 
     pdb_lines: list[str] = []
 
@@ -720,7 +706,7 @@ def to_pdb(prot: Protein) -> str:
     chain_index = prot.chain_index.astype(np.int32)
     b_factors = prot.b_factors
 
-    if np.any(aatype > restype_num):
+    if np.any(aatype > RESTYPE_NUM):
         raise ValueError("Invalid aatypes.")
 
     # Construct a mapping from chain integer indices to chain ID strings.
@@ -759,11 +745,11 @@ def to_pdb(prot: Protein) -> str:
             pos = cast(npt.NDArray[np.float64], atom_pos_i[j])
             mask = cast(float, atom_mask_i[j])
             b_factor = cast(float, b_factors_i[j])
-            if mask < 0.5:
+            if mask < ATOM_DNE:
                 continue
 
             record_type = "ATOM"
-            name = atom_name if len(atom_name) == 4 else f" {atom_name}"
+            name = atom_name if len(atom_name) == PDB_ATOM_NAME_CUTOFF_LEN else f" {atom_name}"
             alt_loc = ""
             insertion_code = ""
             occupancy = 1.00
@@ -794,7 +780,7 @@ def to_pdb(prot: Protein) -> str:
     pdb_lines.append("END")
 
     # Pad all lines to 80 characters.
-    pdb_lines = [line.ljust(80) for line in pdb_lines]
+    pdb_lines = [line.ljust(PDB_LINE_CUTOFF_LEN) for line in pdb_lines]
     return "\n".join(pdb_lines) + "\n"  # Add terminating newline.
 
 

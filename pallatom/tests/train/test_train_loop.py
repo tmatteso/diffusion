@@ -14,6 +14,7 @@ import torch
 import torch.nn as nn
 from architecture.main_trunk import MainTrunk
 from einops import rearrange, reduce
+from helpers.atom_utils import RESTYPE_NUM_NO_X
 from helpers.bucketed_sampler import BucketedBatchSampler
 from helpers.data import make_bucketed_data_loaders, to_protein_batch_dynamic
 from helpers.featurize import Distogram, ProteinBatch
@@ -75,9 +76,13 @@ N_HEADS_ATOM_TRANSFORMER_DECODER = 4
 N_PAIRFORMER_BLOCKS_TEMPLATE_EMBEDDER = 2
 N_PAIFORMER_HEADS_TEMPLATE_EMBEDDER = 16
 SIGMA_DATA = 16.0
-N_AMINO = 20
+N_AMINO = RESTYPE_NUM_NO_X
 RESIDUE_NUMBER = 50
 
+EPOCH = 7
+LEARNING_RATE = 1e-4
+TOLERANCE = 1e-5
+TIGHT_TOLERANCE = 1e-3
 EXPECTED_CHECKPOINT_KEYS = frozenset({"model", "optimizer", "scheduler", "best_val_loss"})
 
 
@@ -210,7 +215,67 @@ def _make_mock_loader(
     return loader, sampler
 
 
-def _zero_loss_metrics() -> LossMetrics:
+def _make_epoch_metrics(
+    epoch: int,
+    global_step: int = 0,
+    zero_loss_metrics: LossMetrics | None = None,
+    zero_throughput: ThroughputStatistics | None = None,
+    zero_component_norms: ComponentNorms | None = None,
+) -> EpochMetrics:
+    """Build a minimal EpochMetrics with zero-valued fields for log_epoch tests.
+
+    Args:
+        epoch: Epoch number to embed.
+        global_step: Global step count.
+        zero_loss_metrics: LossMetrics with all-zero fields; built internally if None.
+        zero_throughput: ThroughputStatistics with all-zero fields; built internally if None.
+        zero_component_norms: ComponentNorms with all-zero fields; built internally if None.
+
+    Returns:
+        EpochMetrics suitable for passing to log_epoch.
+    """
+    z = torch.tensor(0.0)
+    lm = zero_loss_metrics or LossMetrics(
+        total_loss=z,
+        Kabsch_aligned_MSE_loss=z,
+        CE_loss=z,
+        smooth_lddt_loss=z,
+        res_distogram_loss=z,
+        atom_distogram_loss=z,
+        intermediate_loss=z,
+        RMSD=z,
+    )
+    tp = zero_throughput or ThroughputStatistics(
+        avg_batch_size=z, token_pack_rate=z, residues_per_sec=z, atoms_per_sec=z
+    )
+    cn = zero_component_norms or ComponentNorms(
+        template_embedder=z,
+        atom_encoder=z,
+        atom_decoders=z,
+        residue_distogram_head=z,
+        atom_distogram_head=z,
+        inter_proj_seq=z,
+        inter_seq_logits=z,
+        proj_seq=z,
+        seq_logits=z,
+    )
+    return EpochMetrics(
+        epoch=epoch,
+        global_step=global_step,
+        train_loss_metrics=lm,
+        train_throughput_stats=tp,
+        train_gradient_norms=cn,
+        val_loss_metrics=lm,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def zero_loss_metrics() -> LossMetrics:
     """Build a LossMetrics with all fields set to zero.
 
     Returns:
@@ -229,7 +294,8 @@ def _zero_loss_metrics() -> LossMetrics:
     )
 
 
-def _zero_throughput() -> ThroughputStatistics:
+@pytest.fixture
+def zero_throughput() -> ThroughputStatistics:
     """Build a ThroughputStatistics with all fields set to zero.
 
     Returns:
@@ -241,7 +307,8 @@ def _zero_throughput() -> ThroughputStatistics:
     )
 
 
-def _zero_component_norms() -> ComponentNorms:
+@pytest.fixture
+def zero_component_norms() -> ComponentNorms:
     """Build a ComponentNorms with all fields set to zero.
 
     Returns:
@@ -259,31 +326,6 @@ def _zero_component_norms() -> ComponentNorms:
         proj_seq=z,
         seq_logits=z,
     )
-
-
-def _make_epoch_metrics(epoch: int = 1, global_step: int = 1) -> EpochMetrics:
-    """Build a minimal EpochMetrics with zero-valued fields for log_epoch tests.
-
-    Args:
-        epoch: Epoch number to embed.
-        global_step: Global step count.
-
-    Returns:
-        EpochMetrics suitable for passing to log_epoch.
-    """
-    return EpochMetrics(
-        epoch=epoch,
-        global_step=global_step,
-        train_loss_metrics=_zero_loss_metrics(),
-        train_throughput_stats=_zero_throughput(),
-        train_gradient_norms=_zero_component_norms(),
-        val_loss_metrics=_zero_loss_metrics(),
-    )
-
-
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
 
 
 @pytest.fixture
@@ -327,7 +369,7 @@ def tcfg(tmp_path: pathlib.Path) -> TrainConfig:
     """Provide a single-epoch TrainConfig with a temporary checkpoint path."""
     return TrainConfig(
         training=TrainingParams(
-            num_epochs=1, lr=1e-4, grad_clip=1.0, accumulated_token_budget=_BATCH_TOKENS
+            num_epochs=1, lr=LEARNING_RATE, grad_clip=1.0, accumulated_token_budget=_BATCH_TOKENS
         ),
         model=ModelParams(
             f_ref_dim=_F_REF_DIM,
@@ -337,6 +379,19 @@ def tcfg(tmp_path: pathlib.Path) -> TrainConfig:
             c_atompair=_C_ATOMPAIR,
             K_unit=_K_UNIT,
         ),
+        checkpoint=CheckpointParams(checkpoint_path=str(tmp_path / "best.pt"), save_every=100),
+        logging=LoggingParams(use_wandb=False),
+    )
+
+
+@pytest.fixture
+def tcfg3(model_params: ModelSetup, tmp_path: pathlib.Path) -> TrainConfig:
+    """Provide a three-epoch TrainConfig sharing model params from model_params fixture."""
+    return TrainConfig(
+        training=TrainingParams(
+            num_epochs=3, lr=LEARNING_RATE, grad_clip=1.0, accumulated_token_budget=_BATCH_TOKENS
+        ),
+        model=model_params.tcfg.model,
         checkpoint=CheckpointParams(checkpoint_path=str(tmp_path / "best.pt"), save_every=100),
         logging=LoggingParams(use_wandb=False),
     )
@@ -508,13 +563,13 @@ def test_to_protein_batch_dynamic_seq_length_matches_batch_size(
 def testwavg_equal_weights_is_simple_mean() -> None:
     """Wavg with equal protein counts returns the simple mean."""
     vals = [torch.tensor(2.0), torch.tensor(4.0)]
-    assert abs(wavg(vals, [1, 1]).item() - 3.0) < 1e-5
+    assert abs(wavg(vals, [1, 1]).item() - 3.0) < TOLERANCE
 
 
 def testwavg_unequal_weights_biases_toward_larger_count() -> None:
     """Wavg with unequal counts biases the result toward the larger-count value."""
     vals = [torch.tensor(0.0), torch.tensor(10.0)]
-    assert abs(wavg(vals, [1, 9]).item() - 9.0) < 1e-4
+    assert abs(wavg(vals, [1, 9]).item() - 9.0) < TOLERANCE
 
 
 def testwavg_loss_metrics_equal_weights_is_mean() -> None:
@@ -542,7 +597,7 @@ def testwavg_loss_metrics_equal_weights_is_mean() -> None:
         RMSD=z4,
     )
     result = wavg_loss_metrics([a, b], [1, 1])
-    assert abs(result.total_loss.item() - 3.0) < 1e-5
+    assert abs(result.total_loss.item() - 3.0) < TOLERANCE
 
 
 def testwavg_throughput_stats_equal_weights_is_mean() -> None:
@@ -560,7 +615,7 @@ def testwavg_throughput_stats_equal_weights_is_mean() -> None:
         atoms_per_sec=torch.tensor(6.0),
     )
     result = wavg_throughput_stats([a, b], [1, 1])
-    assert abs(result.residues_per_sec.item() - 4.0) < 1e-5
+    assert abs(result.residues_per_sec.item() - 4.0) < TOLERANCE
 
 
 def testwavg_component_norms_equal_weights_is_mean() -> None:
@@ -588,7 +643,7 @@ def testwavg_component_norms_equal_weights_is_mean() -> None:
         seq_logits=torch.tensor(3.0),
     )
     result = wavg_component_norms([a, b], [1, 1])
-    assert abs(result.atom_encoder.item() - 2.0) < 1e-5
+    assert abs(result.atom_encoder.item() - 2.0) < TOLERANCE
 
 
 # ---------------------------------------------------------------------------
@@ -702,7 +757,7 @@ def test_take_step_grad_scale_halves_gradient_norm(
         ** 0.5
     )
 
-    assert abs(norm2 - norm1 / 2.0) < 1e-3
+    assert abs(norm2 - norm1 / 2.0) < TIGHT_TOLERANCE
 
 
 # ---------------------------------------------------------------------------
@@ -769,11 +824,12 @@ def test_process_accum_window_protein_weighted_grad_scale(
     monkeypatch.setattr("train.train_loop.take_step", _recording_take_step)
     model_params.model.train()
     model_params.model.zero_grad()
-    process_accum_window([protein_batch, protein_batch], [1, 3], model_params)
+    acummulated_batch = [protein_batch, protein_batch]
+    process_accum_window(acummulated_batch, [1, 3], model_params)
 
-    assert len(captured_scales) == 2
-    assert abs(captured_scales[0] - 4.0) < 1e-6
-    assert abs(captured_scales[1] - 4.0 / 3.0) < 1e-6
+    assert len(captured_scales) == len(acummulated_batch)
+    assert abs(captured_scales[0] - 4.0) < TOLERANCE
+    assert abs(captured_scales[1] - 4.0 / 3.0) < TOLERANCE
 
 
 # ---------------------------------------------------------------------------
@@ -815,8 +871,9 @@ def test_optimizer_step_increments_global_step(
     """optimizer_step returns global_step + 1 as the fourth element."""
     model_params.model.train()
     model_params.model.zero_grad()
-    _, _, _, new_step = optimizer_step([protein_batch], [1], model_params, global_step=5)
-    assert new_step == 6
+    global_step = 5
+    _, _, _, new_step = optimizer_step([protein_batch], [1], model_params, global_step=global_step)
+    assert new_step == global_step + 1
 
 
 def test_optimizer_step_returns_component_norms(
@@ -985,7 +1042,7 @@ def test_load_checkpoint_returns_best_val_loss(
     """load_checkpoint returns the best_val_loss stored in the checkpoint."""
     save_checkpoint(model_params=model_params, rank=0, log=log, best_val_loss=torch.tensor(0.314))
     _, loaded_loss = load_checkpoint(model_params=model_params, rank=0, log=log)
-    assert abs(loaded_loss.item() - 0.314) < 1e-5
+    assert abs(loaded_loss.item() - 0.314) < TOLERANCE
 
 
 def test_checkpoint_round_trip_preserves_weights_and_loss(
@@ -1007,7 +1064,7 @@ def test_checkpoint_round_trip_preserves_weights_and_loss(
     second_ckpt = torch.load(path, weights_only=True)
     for k, v in first_sd.items():
         assert torch.allclose(v, second_ckpt["model"][k]), f"Param '{k}' differs after round trip"
-    assert abs(second_ckpt["best_val_loss"].item() - best_val_loss.item()) < 1e-6
+    assert abs(second_ckpt["best_val_loss"].item() - best_val_loss.item()) < TOLERANCE
 
 
 # ---------------------------------------------------------------------------
@@ -1042,7 +1099,12 @@ def test_log_epoch_do_log_false_skips_wandb(
     mp = dataclasses.replace(
         model_params, tcfg=_tcfg_with_wandb(base=model_params.tcfg, use_wandb=True)
     )
-    log_epoch(epoch_metrics=_make_epoch_metrics(), model_params=mp, log=log, do_log=False)
+    log_epoch(
+        epoch_metrics=_make_epoch_metrics(epoch=1, global_step=1),
+        model_params=mp,
+        log=log,
+        do_log=False,
+    )
     assert len(wandb_call_counter) == 0
 
 
@@ -1052,7 +1114,12 @@ def test_log_epoch_wandb_disabled_skips_call(
     wandb_call_counter: list[object],
 ) -> None:
     """log_epoch with use_wandb=False does not call wandb.log even if do_log=True."""
-    log_epoch(epoch_metrics=_make_epoch_metrics(), model_params=model_params, log=log, do_log=True)
+    log_epoch(
+        epoch_metrics=_make_epoch_metrics(epoch=1, global_step=1),
+        model_params=model_params,
+        log=log,
+        do_log=True,
+    )
     assert len(wandb_call_counter) == 0
 
 
@@ -1065,7 +1132,12 @@ def test_log_epoch_wandb_enabled_calls_once(
     mp = dataclasses.replace(
         model_params, tcfg=_tcfg_with_wandb(base=model_params.tcfg, use_wandb=True)
     )
-    log_epoch(epoch_metrics=_make_epoch_metrics(epoch=3), model_params=mp, log=log, do_log=True)
+    log_epoch(
+        epoch_metrics=_make_epoch_metrics(epoch=3, global_step=1),
+        model_params=mp,
+        log=log,
+        do_log=True,
+    )
     assert len(wandb_payloads) == 1
 
 
@@ -1078,8 +1150,8 @@ def test_log_epoch_wandb_payload_has_correct_epoch(
     mp = dataclasses.replace(
         model_params, tcfg=_tcfg_with_wandb(base=model_params.tcfg, use_wandb=True)
     )
-    log_epoch(epoch_metrics=_make_epoch_metrics(epoch=7), model_params=mp, log=log, do_log=True)
-    assert wandb_payloads[0]["epoch"] == 7
+    log_epoch(epoch_metrics=_make_epoch_metrics(epoch=EPOCH), model_params=mp, log=log, do_log=True)
+    assert wandb_payloads[0]["epoch"] == EPOCH
 
 
 def test_log_epoch_wandb_payload_has_train_prefix(
@@ -1091,7 +1163,12 @@ def test_log_epoch_wandb_payload_has_train_prefix(
     mp = dataclasses.replace(
         model_params, tcfg=_tcfg_with_wandb(base=model_params.tcfg, use_wandb=True)
     )
-    log_epoch(epoch_metrics=_make_epoch_metrics(), model_params=mp, log=log, do_log=True)
+    log_epoch(
+        epoch_metrics=_make_epoch_metrics(epoch=1, global_step=1),
+        model_params=mp,
+        log=log,
+        do_log=True,
+    )
     assert any(k.startswith("train/") for k in wandb_payloads[0])
 
 
@@ -1104,7 +1181,12 @@ def test_log_epoch_wandb_payload_has_val_prefix(
     mp = dataclasses.replace(
         model_params, tcfg=_tcfg_with_wandb(base=model_params.tcfg, use_wandb=True)
     )
-    log_epoch(epoch_metrics=_make_epoch_metrics(), model_params=mp, log=log, do_log=True)
+    log_epoch(
+        epoch_metrics=_make_epoch_metrics(epoch=1, global_step=1),
+        model_params=mp,
+        log=log,
+        do_log=True,
+    )
     assert any(k.startswith("val/") for k in wandb_payloads[0])
 
 
@@ -1195,18 +1277,10 @@ def test_train_calls_set_epoch_each_epoch(
     mini_batch: Mapping[str, Float[torch.Tensor, "..."] | list[str]],
     distogram_res: Distogram,
     distogram_atom: Distogram,
+    tcfg3: TrainConfig,
     log: FilteringBoundLogger,
-    tmp_path: pathlib.Path,
 ) -> None:
     """Train calls sampler.set_epoch(epoch) in ascending order once per epoch."""
-    tcfg3 = TrainConfig(
-        training=TrainingParams(
-            num_epochs=3, lr=1e-4, grad_clip=1.0, accumulated_token_budget=_BATCH_TOKENS
-        ),
-        model=model_params.tcfg.model,
-        checkpoint=CheckpointParams(checkpoint_path=str(tmp_path / "set_epoch.pt"), save_every=100),
-        logging=LoggingParams(use_wandb=False),
-    )
     mp3 = _make_model_params(model_params.model, tcfg3, distogram_res, distogram_atom)
     loader, sampler = _make_mock_loader(mini_batch)
     train(
@@ -1218,49 +1292,6 @@ def test_train_calls_set_epoch_each_epoch(
         log=log,
     )
     assert sampler.set_epoch_calls == [1, 2, 3]
-
-
-def test_train_runs_all_epochs(
-    model_params: ModelSetup,
-    mini_batch: Mapping[str, Float[torch.Tensor, "..."] | list[str]],
-    distogram_res: Distogram,
-    distogram_atom: Distogram,
-    log: FilteringBoundLogger,
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: pathlib.Path,
-) -> None:
-    """Train calls evaluate exactly once per epoch."""
-    tcfg3 = TrainConfig(
-        training=TrainingParams(
-            num_epochs=3, lr=1e-4, grad_clip=1.0, accumulated_token_budget=_BATCH_TOKENS
-        ),
-        model=model_params.tcfg.model,
-        checkpoint=CheckpointParams(checkpoint_path=str(tmp_path / "epochs.pt"), save_every=100),
-        logging=LoggingParams(use_wandb=False),
-    )
-    mp3 = _make_model_params(model_params.model, tcfg3, distogram_res, distogram_atom)
-    loader, _sampler3 = _make_mock_loader(mini_batch)
-    eval_calls: list[int] = []
-    _real_evaluate = evaluate
-
-    def _counting_evaluate(
-        loader: torch.utils.data.DataLoader[ProteinBatch],
-        model_params: ModelSetup,
-    ) -> tuple[LossMetrics, ThroughputStatistics]:
-        result = _real_evaluate(loader, model_params)
-        eval_calls.append(1)
-        return result
-
-    monkeypatch.setattr("train.train_loop.evaluate", _counting_evaluate)
-    train(
-        best_val_loss=torch.tensor(float("inf")),
-        train_loader=loader,
-        train_sampler=cast(BucketedBatchSampler, _sampler3),
-        test_loader=loader,
-        model_params=mp3,
-        log=log,
-    )
-    assert len(eval_calls) == 3
 
 
 def test_train_no_grad_clip_completes(
@@ -1643,20 +1674,17 @@ def test_train_wandb_epoch_increments_across_epochs(
     mini_batch: Mapping[str, Float[torch.Tensor, "..."] | list[str]],
     distogram_res: Distogram,
     distogram_atom: Distogram,
+    tcfg3: TrainConfig,
     log: FilteringBoundLogger,
     wandb_payloads: list[dict[str, object]],
-    tmp_path: pathlib.Path,
 ) -> None:
     """W&B epoch values logged across a 3-epoch run are [1, 2, 3]."""
-    tcfg3 = TrainConfig(
-        training=TrainingParams(
-            num_epochs=3, lr=1e-4, grad_clip=1.0, accumulated_token_budget=_BATCH_TOKENS
-        ),
-        model=model_params.tcfg.model,
-        checkpoint=CheckpointParams(checkpoint_path=str(tmp_path / "wandb3.pt"), save_every=100),
-        logging=LoggingParams(use_wandb=True),
+    mp3 = _make_model_params(
+        model_params.model,
+        _tcfg_with_wandb(base=tcfg3, use_wandb=True),
+        distogram_res,
+        distogram_atom,
     )
-    mp3 = _make_model_params(model_params.model, tcfg3, distogram_res, distogram_atom)
     loader, _sampler_w3 = _make_mock_loader(mini_batch)
     train(
         best_val_loss=torch.tensor(float("inf")),

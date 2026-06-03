@@ -27,6 +27,13 @@ _TRAIN_NAMES = ["1aa.A", "2bb.A", "3cc.A"]
 _VAL_NAMES = ["4dd.A"]
 _TEST_NAMES = ["5ee.A"]
 _N_DEBUG = 252  # debug_run sampler uses SubsetRandomSampler(range(252))
+PROT_1_LEN = 8
+PROT_2_LEN = 16
+PROT_3_LEN = 24
+PROT_4_LEN = 32
+PROT_5_LEN = 40
+B = 5
+MAX_SEQ_LENGTH = 128
 
 
 def _make_coords(n: int) -> Mapping[str, list[list[float]]]:
@@ -156,8 +163,8 @@ def test_protein_dataset_seq_truncated_to_max_seq_length(tmp_path: pathlib.Path)
     with open(path, "w") as f:
         entry = {"name": "long.A", "seq": "A" * 100, "coords": _make_coords(100)}
         f.write(json.dumps(entry) + "\n")
-    ds = ProteinDataset(path, ["long.A"], max_seq_length=10)
-    assert len(ds[0]["seq"]) == 10
+    ds = ProteinDataset(path, ["long.A"], max_seq_length=PROT_1_LEN)
+    assert len(ds[0]["seq"]) == PROT_1_LEN
 
 
 def test_protein_dataset_all_items_accessible(train_dataset: ProteinDataset):
@@ -245,15 +252,15 @@ def _write_jsonl(path: pathlib.Path, entries: list[dict[str, object]]) -> None:
 
 def test_clustered_dataset_len(tmp_path: pathlib.Path) -> None:
     """ClusteredProteinDataset.__len__ returns the number of included proteins."""
-    entries = [_make_entry(f"p{i}", 8) for i in range(5)]
+    entries = [_make_entry(f"p{i}", PROT_1_LEN) for i in range(B)]
     _write_jsonl(tmp_path / "p.jsonl", entries)
-    ds = ClusteredProteinDataset(tmp_path / "p.jsonl", [f"p{i}" for i in range(5)])
-    assert len(ds) == 5
+    ds = ClusteredProteinDataset(tmp_path / "p.jsonl", [f"p{i}" for i in range(B)])
+    assert len(ds) == B
 
 
 def test_clustered_dataset_item_keys(tmp_path: pathlib.Path) -> None:
     """__getitem__ returns a dict with atom_positions, atom_mask, residue_index, seq."""
-    entries = [_make_entry("p1", 10)]
+    entries = [_make_entry("p1", PROT_1_LEN)]
     _write_jsonl(tmp_path / "p.jsonl", entries)
     ds = ClusteredProteinDataset(tmp_path / "p.jsonl", ["p1"])
     item = ds[0]
@@ -262,11 +269,15 @@ def test_clustered_dataset_item_keys(tmp_path: pathlib.Path) -> None:
 
 def test_clustered_dataset_variable_lengths(tmp_path: pathlib.Path) -> None:
     """Items have their actual length, not a fixed padded length."""
-    entries = [_make_entry("p1", 8), _make_entry("p2", 16), _make_entry("p3", 32)]
+    entries = [
+        _make_entry("p1", PROT_1_LEN),
+        _make_entry("p2", PROT_2_LEN),
+        _make_entry("p3", PROT_3_LEN),
+    ]
     _write_jsonl(tmp_path / "p.jsonl", entries)
     ds = ClusteredProteinDataset(tmp_path / "p.jsonl", ["p1", "p2", "p3"])
     lengths = {cast(torch.Tensor, ds[i]["atom_positions"]).shape[0] for i in range(len(ds))}
-    assert lengths == {8, 16, 32}
+    assert lengths == {8, 16, 24}
 
 
 def test_clustered_dataset_truncates_to_max_seq_length(tmp_path: pathlib.Path) -> None:
@@ -274,17 +285,17 @@ def test_clustered_dataset_truncates_to_max_seq_length(tmp_path: pathlib.Path) -
     entries = [_make_entry("p1", 600)]
     _write_jsonl(tmp_path / "p.jsonl", entries)
     ds = ClusteredProteinDataset(tmp_path / "p.jsonl", ["p1"], max_seq_length=128, token_budget=512)
-    assert cast(torch.Tensor, ds[0]["atom_positions"]).shape[0] == 128
+    assert cast(torch.Tensor, ds[0]["atom_positions"]).shape[0] == MAX_SEQ_LENGTH
 
 
 def test_clustered_dataset_pickles(tmp_path: pathlib.Path) -> None:
     """ClusteredProteinDataset survives pickle round-trip (for DataLoader workers)."""
-    entries = [_make_entry("p1", 8)]
+    entries = [_make_entry("p1", PROT_1_LEN)]
     _write_jsonl(tmp_path / "p.jsonl", entries)
     ds = ClusteredProteinDataset(tmp_path / "p.jsonl", ["p1"])
     restored = pickle.loads(pickle.dumps(ds))
     item = restored[0]
-    assert item["atom_positions"].shape[0] == 8
+    assert item["atom_positions"].shape[0] == PROT_1_LEN
 
 
 # ---------------------------------------------------------------------------

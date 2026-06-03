@@ -1,45 +1,18 @@
-refactor: wrap PyTorch nn.Module calls to eliminate Any propagation
+chore: enforce PLR2004 magic-value comparison checks
 
-PyTorch's built-in nn.Module subclasses (nn.Linear, nn.Embedding,
-nn.LayerNorm, nn.Sequential, nn.ModuleList) declare __call__ with
-return type Any. Under basedpyright's reportAny rule every call-site
-that binds the result inherits that Any, silently defeating the type
-checker for the rest of the expression chain. No amount of annotation
-at the call site can fix it — the poison comes from the stub.
+Previously PLR2004 was listed in ruff's `ignore` array on the grounds
+that magic numbers are common in ML code. That blanket waiver was too
+broad: it silenced legitimate style issues alongside the genuinely
+necessary numeric literals (e.g. normalisation constants, fixed
+mathematical coefficients).
 
-Introduce five thin typed wrappers in layers.py:
+Remove the waiver by commenting out the entry. Ruff will now flag
+comparisons against unnamed literal values, encouraging named constants
+where the number's meaning is non-obvious. The existing PLR2004-exempt
+numeric literals that are truly self-evident (or already documented via
+variable names and jaxtyping annotations) should pass without change;
+any that do surface are worth naming explicitly.
 
-  TypedLinear      — nn.Linear with a jaxtyped __call__
-  TypedEmbedding   — nn.Embedding with a jaxtyped __call__
-  LayerNorm        — nn.LayerNorm with a jaxtyped __call__
-  TypedSequential  — nn.Sequential with a jaxtyped __call__
-  TypedModuleList  — nn.ModuleList with typed __iter__ / __getitem__
-                     via Generic[TypedModule]
-
-Each wrapper adds only a one-line __call__ override; it delegates to
-self.forward(), which is already annotated. The wrappers carry no
-logic of their own — they exist purely to propagate concrete types to
-callers.
-
-Propagate these wrappers throughout every architecture module (atom
-transformers, main trunk, node/pair update, pairformer stack, template
-embedder). Replace bare nn.* instantiations with the typed equivalents,
-add explicit instance-variable annotations on every attribute that was
-previously inferred, and decorate forward() and __call__() with
-@override to satisfy reportImplicitOverride.
-
-Move scatter_mean from main_trunk.py to atom_transformers.py, which is
-where it is defined and consumed. Update test_main_trunk.py and
-test_atom_transformers.py accordingly so the tests live next to the
-code they cover.
-
-Tighten the helper layer (bucketed_sampler, cluster_index, data) with
-explicit instance-variable types and cast() calls to resolve opaque
-numpy-indexing return types without suppressing any checks.
-
-Elevate basedpyright's typeCheckingMode from "strict" to "all" in
-pyproject.toml. The "all" mode activates every available check,
-including reportAny and the other basedpyright-specific rules that
-"strict" leaves disabled. The typed wrappers introduced here were the
-last blocker preventing this upgrade; the codebase now passes cleanly
-under the stricter setting.
+The basedpyright config already carries an equivalent note at line 176
+acknowledging the prior waiver; that comment remains as documentation
+of the historical reasoning.
