@@ -73,8 +73,9 @@ def load_checkpoint(
         The same ``model_params`` with model, optimizer, and scheduler state restored.
     """
     path: str = model_params.tcfg.checkpoint.checkpoint_path
-    ckpt: dict[str, dict[str, Float[torch.Tensor, "..."]] | Float[torch.Tensor, ""]] = torch.load(
-        path, map_location=model_params.device, weights_only=True
+    ckpt = cast(
+        dict[str, dict[str, Float[torch.Tensor, "..."]] | Float[torch.Tensor, ""]],
+        torch.load(path, map_location=model_params.device, weights_only=True),
     )
     model_sd = cast(dict[str, Float[torch.Tensor, "..."]], ckpt["model"])
     if isinstance(model_params.model, DDP):

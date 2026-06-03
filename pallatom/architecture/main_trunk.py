@@ -23,7 +23,14 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from architecture.atom_transformers import AtomAttentionDecoder, AtomFeatureEncoder, LinearNoBias
+from architecture.atom_transformers import AtomAttentionDecoder, AtomFeatureEncoder, scatter_mean
+from architecture.layers import (
+    LayerNorm,
+    LinearNoBias,
+    TypedEmbedding,
+    TypedModuleList,
+    TypedSequential,
+)
 from architecture.node_update import NodeUpdate
 from architecture.pair_update import PairUpdate
 from architecture.template_embedder import TemplateEmbedder
@@ -31,6 +38,7 @@ from beartype import beartype
 from einops import rearrange, repeat
 from helpers.batch_types import FeaturizedBatch
 from jaxtyping import Bool, Float, Int, jaxtyped
+from typing_extensions import override
 
 # ---------------------------------------------------------------------------
 # EmbeddedInputs — output of MainTrunk.embed_inputs (steps 1-8)
@@ -72,39 +80,6 @@ class PredictedOutputs:
     intermediate_pred_aa_logit_stack: list[Float[torch.Tensor, "B N_res n_amino"]]
 
 
-@jaxtyped(typechecker=beartype)
-def scatter_mean(
-    src: Float[torch.Tensor, "B N_src C"],
-    index: Int[torch.Tensor, "B N_src"],
-    num_segments: int,
-    B: int,
-) -> Float[torch.Tensor, "B N_target C"]:
-    """Per-segment mean pooling via scatter.
-
-    Maps atom-level features to residue-level by averaging all atoms that share
-    the same flat segment index.  `index` must already encode the batch offset
-    (i.e. atom j in batch item b maps to index[b, j] = tok_idx[b, j] + b * N_tgt).
-    """
-    C: int = src.size(-1)
-    device = src.device
-
-    flat_index: Int[torch.Tensor, "BN_src"] = rearrange(index, "b n -> (b n)")
-    flat_src: Float[torch.Tensor, "BN_src C"] = rearrange(src, "b n c -> (b n) c")
-
-    sum_flat: Float[torch.Tensor, "BN_target C"] = torch.zeros(num_segments, C, device=device)
-    sum_flat.scatter_add_(0, repeat(flat_index, "n -> n c", c=C), flat_src)
-
-    cnt_flat: Float[torch.Tensor, "BN_target 1"] = torch.zeros(num_segments, 1, device=device)
-    cnt_flat.scatter_add_(
-        0, rearrange(flat_index, "n -> n 1"), torch.ones(flat_index.size(0), 1, device=device)
-    )
-
-    result: Float[torch.Tensor, "B N_target C"] = rearrange(
-        sum_flat / cnt_flat.clamp(min=1), "(b n) c -> b n c", b=B
-    )
-    return result
-
-
 # ---------------------------------------------------------------------------
 # TimeFourierEmbedding  (used in step 3)
 # ---------------------------------------------------------------------------
@@ -123,6 +98,13 @@ class TimeFourierEmbedding(nn.Module):
         self.register_buffer("freqs", torch.randn(c_res))
         self.register_buffer("phases", torch.randn(c_res))
 
+    @override
+    def __call__(self, x: Float[torch.Tensor, "..."]) -> Float[torch.Tensor, "... c_res"]:
+        """Call forward; typed override so call-site return types are not Any."""
+        return self.forward(x)
+
+    @override
+    @jaxtyped(typechecker=beartype)
     def forward(self, x: Float[torch.Tensor, "..."]) -> Float[torch.Tensor, "... c_res"]:
         """Map noise-level scalar to a Fourier feature vector.
 
@@ -152,12 +134,32 @@ class RelativePositionEncoding(nn.Module):
 
     def __init__(self, c_pair: int, r_max: int = 32, s_max: int = 2) -> None:
         super().__init__()
-        self.r_max = r_max
-        self.s_max = s_max
+        self.r_max: int = r_max
+        self.s_max: int = s_max
         # Input dim: a_rel_pos (2r+2) + a_rel_token (2r+2) + b_same_entity (1) + a_rel_chain (2s+2)
         in_dim = (2 * r_max + 2) + (2 * r_max + 2) + 1 + (2 * s_max + 2)
-        self.proj = LinearNoBias(in_dim, c_pair)
+        self.proj: LinearNoBias = LinearNoBias(in_dim, c_pair)
 
+    @override
+    def __call__(
+        self,
+        *,
+        residue_index: Int[torch.Tensor, "B N_res"],
+        asym_id: Int[torch.Tensor, "B N_res"],
+        entity_id: Int[torch.Tensor, "B N_res"],
+        token_index: Int[torch.Tensor, "B N_res"],
+        sym_id: Int[torch.Tensor, "B N_res"],
+    ) -> Float[torch.Tensor, "B N_res N_res c_pair"]:
+        """Call forward; typed override so call-site return types are not Any."""
+        return self.forward(
+            residue_index=residue_index,
+            asym_id=asym_id,
+            entity_id=entity_id,
+            token_index=token_index,
+            sym_id=sym_id,
+        )
+
+    @override
     @jaxtyped(typechecker=beartype)
     def forward(
         self,
@@ -280,14 +282,23 @@ class ResidueDistogramHead(nn.Module):
         d_max: float = 22.0,
     ) -> None:
         super().__init__()
-        self.n_bins = n_bins
-        self.d_min = d_min
-        self.d_max = d_max
+        self.n_bins: int = n_bins
+        self.d_min: float = d_min
+        self.d_max: float = d_max
 
-        self.layer_norm = nn.LayerNorm(c_pair)
-        self.proj1 = LinearNoBias(c_pair, c_pair)
-        self.proj2 = LinearNoBias(c_pair, n_bins)
+        self.layer_norm: LayerNorm = LayerNorm(c_pair)
+        self.proj1: LinearNoBias = LinearNoBias(c_pair, c_pair)
+        self.proj2: LinearNoBias = LinearNoBias(c_pair, n_bins)
 
+    @override
+    def __call__(
+        self, z: Float[torch.Tensor, "... N_res N_res c_pair"]
+    ) -> Float[torch.Tensor, "... N_res N_res n_bins"]:
+        """Call forward; typed override so call-site return types are not Any."""
+        return self.forward(z)
+
+    @override
+    @jaxtyped(typechecker=beartype)
     def forward(
         self, z: Float[torch.Tensor, "... N_res N_res c_pair"]
     ) -> Float[torch.Tensor, "... N_res N_res n_bins"]:
@@ -345,14 +356,14 @@ class AtomDistogramHead(nn.Module):
         atoms_per_res: int = 3,
     ) -> None:
         super().__init__()
-        self.n_bins = n_bins
-        self.d_min = d_min
-        self.d_max = d_max
-        self.window = 5 * atoms_per_res  # 5L
+        self.n_bins: int = n_bins
+        self.d_min: float = d_min
+        self.d_max: float = d_max
+        self.window: int = 5 * atoms_per_res  # 5L
 
-        self.layer_norm = nn.LayerNorm(c_atompair)
-        self.proj1 = LinearNoBias(c_atompair, c_atompair)
-        self.proj2 = LinearNoBias(c_atompair, n_bins)
+        self.layer_norm: LayerNorm = LayerNorm(c_atompair)
+        self.proj1: LinearNoBias = LinearNoBias(c_atompair, c_atompair)
+        self.proj2: LinearNoBias = LinearNoBias(c_atompair, n_bins)
 
     def _local_mask(self, N_atom: int, device: torch.device) -> Bool[torch.Tensor, "N_atom N_atom"]:
         """Boolean mask (N_atom, N_atom): True where |i-j| <= window//2."""
@@ -360,6 +371,16 @@ class AtomDistogramHead(nn.Module):
         dist = (rearrange(idx, "n -> 1 n") - rearrange(idx, "n -> n 1")).abs()  # (N, N)
         return dist <= (self.window // 2)  # (N, N) bool
 
+    @override
+    def __call__(
+        self,
+        p: Float[torch.Tensor, "N_atom N_atom c_atompair"],
+    ) -> tuple[Float[torch.Tensor, "N_atom N_atom n_bins"], Bool[torch.Tensor, "N_atom N_atom"]]:
+        """Call forward; typed override so call-site return types are not Any."""
+        return self.forward(p)
+
+    @override
+    @jaxtyped(typechecker=beartype)
     def forward(
         self,
         p: Float[torch.Tensor, "N_atom N_atom c_atompair"],
@@ -436,21 +457,21 @@ class MainTrunk(nn.Module):
         residue_number: int,
     ) -> None:
         super().__init__()
-        self.sigma_data = sigma_data
-        self.K_unit = K_unit
+        self.sigma_data: float = sigma_data
+        self.K_unit: int = K_unit
 
         # Step 2: residue-idx feature → s_init
-        self.proj_residue_idx = LinearNoBias(residue_number, c_res)
+        self.proj_residue_idx: LinearNoBias = LinearNoBias(residue_number, c_res)
         # Step 3: time Fourier embedding
-        self.time_fourier = TimeFourierEmbedding(c_res)
+        self.time_fourier: TimeFourierEmbedding = TimeFourierEmbedding(c_res)
         # Amino-acid sequence conditioning: 21 entries (0-19 = amino acids, 20 = mask token "X")
-        self.aa_embedding = nn.Embedding(21, c_res)
+        self.aa_embedding: TypedEmbedding = TypedEmbedding(21, c_res)
 
         # Step 5: relative position encoding → z_init
-        self.rel_pos_enc = RelativePositionEncoding(c_pair)
+        self.rel_pos_enc: RelativePositionEncoding = RelativePositionEncoding(c_pair)
 
         # Step 6: template embedder
-        self.template_embedder = TemplateEmbedder(
+        self.template_embedder: TemplateEmbedder = TemplateEmbedder(
             n_bins=n_bins,
             c_z=c_pair,
             c=64,
@@ -460,7 +481,7 @@ class MainTrunk(nn.Module):
         )
 
         # Step 7: atom feature encoder
-        self.atom_encoder = AtomFeatureEncoder(
+        self.atom_encoder: AtomFeatureEncoder = AtomFeatureEncoder(
             f_ref_dim=f_ref_dim,
             c_token=c_res,
             c_pair=c_pair,
@@ -472,12 +493,14 @@ class MainTrunk(nn.Module):
         )
 
         # Step 8: project s_init → s_i addition
-        self.norm_s_init = nn.LayerNorm(c_res)
-        self.proj_s_init = LinearNoBias(c_res, c_res)
+        self.norm_s_init: LayerNorm = LayerNorm(c_res)
+        self.proj_s_init: LinearNoBias = LinearNoBias(c_res, c_res)
 
         # Per-unit modules (steps 11, 12, 16)
-        self.node_updates = nn.ModuleList([NodeUpdate(c_res, c_pair) for _ in range(K_unit)])
-        self.atom_decoders = nn.ModuleList(
+        self.node_updates: TypedModuleList[NodeUpdate] = TypedModuleList(
+            [NodeUpdate(c_res, c_pair) for _ in range(K_unit)]
+        )
+        self.atom_decoders: TypedModuleList[AtomAttentionDecoder] = TypedModuleList(
             [
                 AtomAttentionDecoder(
                     c_token=c_res,
@@ -490,29 +513,35 @@ class MainTrunk(nn.Module):
                 for _ in range(K_unit)
             ]
         )
-        self.pair_updates = nn.ModuleList([PairUpdate(c_pair) for _ in range(K_unit)])
+        self.pair_updates: TypedModuleList[PairUpdate] = TypedModuleList(
+            [PairUpdate(c_pair) for _ in range(K_unit)]
+        )
 
-        self.residue_distogram_head = nn.Sequential(
-            nn.LayerNorm(c_pair),
+        self.residue_distogram_head: TypedSequential = TypedSequential(
+            LayerNorm(c_pair),
             LinearNoBias(c_pair, c_pair),
             nn.ReLU(),
             LinearNoBias(c_pair, n_bins),
         )
 
-        self.atom_distogram_head = nn.Sequential(
-            nn.LayerNorm(c_atompair),
+        self.atom_distogram_head: TypedSequential = TypedSequential(
+            LayerNorm(c_atompair),
             LinearNoBias(c_atompair, c_atompair),
             nn.ReLU(),
             LinearNoBias(c_atompair, n_atom_bins),
         )
 
         # Per-decoder-unit sequence heads for intermediate aa logit supervision
-        self.inter_proj_seq = nn.ModuleList([LinearNoBias(c_atom, c_res) for _ in range(K_unit)])
-        self.inter_seq_logits = nn.ModuleList([LinearNoBias(c_res, n_amino) for _ in range(K_unit)])
+        self.inter_proj_seq: TypedModuleList[LinearNoBias] = TypedModuleList(
+            [LinearNoBias(c_atom, c_res) for _ in range(K_unit)]
+        )
+        self.inter_seq_logits: TypedModuleList[LinearNoBias] = TypedModuleList(
+            [LinearNoBias(c_res, n_amino) for _ in range(K_unit)]
+        )
 
         # Step 18-19: SeqHead (final)
-        self.proj_seq = LinearNoBias(c_atom, c_res)
-        self.seq_logits = LinearNoBias(c_res, n_amino)
+        self.proj_seq: LinearNoBias = LinearNoBias(c_atom, c_res)
+        self.seq_logits: LinearNoBias = LinearNoBias(c_res, n_amino)
 
     # ----------------------------------------------------------------------
     @jaxtyped(typechecker=beartype)
@@ -657,7 +686,13 @@ class MainTrunk(nn.Module):
             denom=denom,
         )
 
+    @override
+    def __call__(self, batch: FeaturizedBatch) -> PredictedOutputs:
+        """Call forward; typed override so call-site return types are not Any."""
+        return self.forward(batch)
+
     # ----------------------------------------------------------------------
+    @override
     @jaxtyped(typechecker=beartype)
     def forward(self, batch: FeaturizedBatch) -> PredictedOutputs:
         """Run full denoising trunk and return predicted coords, sequence and distogram logits."""

@@ -16,10 +16,11 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from architecture.layers import LinearNoBias
+from architecture.layers import LayerNorm, LinearNoBias, TypedLinear
 from beartype import beartype
 from einops import einsum, rearrange, reduce
 from jaxtyping import Float, jaxtyped
+from typing_extensions import override
 
 # ---------------------------------------------------------------------------
 # RBF transform  (Transform_RBF in step 2)
@@ -37,9 +38,18 @@ class TransformRBF(nn.Module):
         centers: Float[torch.Tensor, "n_rbf"] = torch.linspace(d_min, d_max, n_rbf)
         self.centers: Float[torch.Tensor, "n_rbf"]
         self.register_buffer("centers", centers)
-        self.sigma = (d_max - d_min) / n_rbf
-        self.proj = LinearNoBias(n_rbf, c)
+        self.sigma: float = (d_max - d_min) / n_rbf
+        self.proj: LinearNoBias = LinearNoBias(n_rbf, c)
 
+    @override
+    def __call__(
+        self,
+        d: Float[torch.Tensor, "B N_res N_res"],
+    ) -> Float[torch.Tensor, "B N_res N_res c_pair"]:
+        """Call forward; typed override so call-site return types are not Any."""
+        return self.forward(d)
+
+    @override
     @jaxtyped(typechecker=beartype)
     def forward(
         self,
@@ -49,7 +59,8 @@ class TransformRBF(nn.Module):
         rbf: Float[torch.Tensor, "B N_res N_res n_rbf"] = torch.exp(
             -((rearrange(d, "b n_i n_j -> b n_i n_j 1") - self.centers) ** 2) / self.sigma**2
         )
-        return self.proj(rbf)
+        result: Float[torch.Tensor, "B N_res N_res c_pair"] = self.proj(rbf)
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -70,16 +81,26 @@ class TriangleAttentionStartingNodeWithBias(nn.Module):
     def __init__(self, c_pair: int, n_heads: int = 4) -> None:
         super().__init__()
         assert c_pair % n_heads == 0
-        self.n_heads = n_heads
-        self.head_dim = c_pair // n_heads
+        self.n_heads: int = n_heads
+        self.head_dim: int = c_pair // n_heads
 
-        self.layer_norm = nn.LayerNorm(c_pair)
-        self.to_q = LinearNoBias(c_pair, c_pair)
-        self.to_k = LinearNoBias(c_pair, c_pair)
-        self.to_v = LinearNoBias(c_pair, c_pair)
-        self.to_g = nn.Linear(c_pair, c_pair)  # gating (bias allowed)
-        self.to_out = LinearNoBias(c_pair, c_pair)
+        self.layer_norm: LayerNorm = LayerNorm(c_pair)
+        self.to_q: LinearNoBias = LinearNoBias(c_pair, c_pair)
+        self.to_k: LinearNoBias = LinearNoBias(c_pair, c_pair)
+        self.to_v: LinearNoBias = LinearNoBias(c_pair, c_pair)
+        self.to_g: TypedLinear = TypedLinear(c_pair, c_pair)  # gating (bias allowed)
+        self.to_out: LinearNoBias = LinearNoBias(c_pair, c_pair)
 
+    @override
+    def __call__(
+        self,
+        z: Float[torch.Tensor, "B N_res N_res c_pair"],
+        b: Float[torch.Tensor, "B N_res N_res n_heads"],
+    ) -> Float[torch.Tensor, "B N_res N_res c_pair"]:
+        """Call forward; typed override so call-site return types are not Any."""
+        return self.forward(z, b)
+
+    @override
     @jaxtyped(typechecker=beartype)
     def forward(
         self,
@@ -138,16 +159,26 @@ class TriangleAttentionEndingNodeWithBias(nn.Module):
     def __init__(self, c_pair: int, n_heads: int = 4) -> None:
         super().__init__()
         assert c_pair % n_heads == 0
-        self.n_heads = n_heads
-        self.head_dim = c_pair // n_heads
+        self.n_heads: int = n_heads
+        self.head_dim: int = c_pair // n_heads
 
-        self.layer_norm = nn.LayerNorm(c_pair)
-        self.to_q = LinearNoBias(c_pair, c_pair)
-        self.to_k = LinearNoBias(c_pair, c_pair)
-        self.to_v = LinearNoBias(c_pair, c_pair)
-        self.to_g = nn.Linear(c_pair, c_pair)
-        self.to_out = LinearNoBias(c_pair, c_pair)
+        self.layer_norm: LayerNorm = LayerNorm(c_pair)
+        self.to_q: LinearNoBias = LinearNoBias(c_pair, c_pair)
+        self.to_k: LinearNoBias = LinearNoBias(c_pair, c_pair)
+        self.to_v: LinearNoBias = LinearNoBias(c_pair, c_pair)
+        self.to_g: TypedLinear = TypedLinear(c_pair, c_pair)
+        self.to_out: LinearNoBias = LinearNoBias(c_pair, c_pair)
 
+    @override
+    def __call__(
+        self,
+        z: Float[torch.Tensor, "B N_res N_res c_pair"],
+        b: Float[torch.Tensor, "B N_res N_res n_heads"],
+    ) -> Float[torch.Tensor, "B N_res N_res c_pair"]:
+        """Call forward; typed override so call-site return types are not Any."""
+        return self.forward(z, b)
+
+    @override
     @jaxtyped(typechecker=beartype)
     def forward(
         self,
@@ -200,11 +231,18 @@ class Transition(nn.Module):
 
     def __init__(self, c: int, expansion: int = 4) -> None:
         super().__init__()
-        self.layer_norm = nn.LayerNorm(c)
-        self.x_to_a = LinearNoBias(c, c * expansion)
-        self.x_to_b = LinearNoBias(c, c * expansion)
-        self.hidden_to_out = LinearNoBias(c * expansion, c)
+        self.layer_norm: LayerNorm = LayerNorm(c)
+        self.x_to_a: LinearNoBias = LinearNoBias(c, c * expansion)
+        self.x_to_b: LinearNoBias = LinearNoBias(c, c * expansion)
+        self.hidden_to_out: LinearNoBias = LinearNoBias(c * expansion, c)
 
+    @override
+    def __call__(self, x: Float[torch.Tensor, "..."]) -> Float[torch.Tensor, "..."]:
+        """Call forward; typed override so call-site return types are not Any."""
+        return self.forward(x)
+
+    @override
+    @jaxtyped(typechecker=beartype)
     def forward(self, x: Float[torch.Tensor, "..."]) -> Float[torch.Tensor, "..."]:
         """Apply two-layer FFN with ReLU activation to any leading-dim tensor."""
         # Works for any leading dims (B N_res N_res c) or (B N_res c)
@@ -225,8 +263,15 @@ class DropoutRowwise(nn.Module):
 
     def __init__(self, p: float = 0.25) -> None:
         super().__init__()
-        self.p = p
+        self.p: float = p
 
+    @override
+    def __call__(self, x: Float[torch.Tensor, "..."]) -> Float[torch.Tensor, "..."]:
+        """Call forward; typed override so call-site return types are not Any."""
+        return self.forward(x)
+
+    @override
+    @jaxtyped(typechecker=beartype)
     def forward(self, x: Float[torch.Tensor, "..."]) -> Float[torch.Tensor, "..."]:
         """Drop entire rows of x with probability p during training."""
         if not self.training or self.p == 0:
@@ -242,8 +287,15 @@ class DropoutColumnwise(nn.Module):
 
     def __init__(self, p: float = 0.25) -> None:
         super().__init__()
-        self.p = p
+        self.p: float = p
 
+    @override
+    def __call__(self, x: Float[torch.Tensor, "..."]) -> Float[torch.Tensor, "..."]:
+        """Call forward; typed override so call-site return types are not Any."""
+        return self.forward(x)
+
+    @override
+    @jaxtyped(typechecker=beartype)
     def forward(self, x: Float[torch.Tensor, "..."]) -> Float[torch.Tensor, "..."]:
         """Drop entire columns of x with probability p during training."""
         if not self.training or self.p == 0:
@@ -279,20 +331,34 @@ class PairUpdate(nn.Module):
         super().__init__()
 
         # Step 2
-        self.rbf = TransformRBF(c, n_rbf=n_rbf)
-        self.b_proj = LinearNoBias(c, n_heads)
+        self.rbf: TransformRBF = TransformRBF(c, n_rbf=n_rbf)
+        self.b_proj: LinearNoBias = LinearNoBias(c, n_heads)
 
         # Step 3
-        self.tri_start = TriangleAttentionStartingNodeWithBias(c, n_heads)
-        self.drop_row = DropoutRowwise(dropout)
+        self.tri_start: TriangleAttentionStartingNodeWithBias = (
+            TriangleAttentionStartingNodeWithBias(c, n_heads)
+        )
+        self.drop_row: DropoutRowwise = DropoutRowwise(dropout)
 
         # Step 4
-        self.tri_end = TriangleAttentionEndingNodeWithBias(c, n_heads)
-        self.drop_col = DropoutColumnwise(dropout)
+        self.tri_end: TriangleAttentionEndingNodeWithBias = TriangleAttentionEndingNodeWithBias(
+            c, n_heads
+        )
+        self.drop_col: DropoutColumnwise = DropoutColumnwise(dropout)
 
         # Step 5
-        self.transition = Transition(c)
+        self.transition: Transition = Transition(c)
 
+    @override
+    def __call__(
+        self,
+        z: Float[torch.Tensor, "B N_res N_res c_pair"],
+        r_center: Float[torch.Tensor, "B N_res 3"],
+    ) -> Float[torch.Tensor, "B N_res N_res c_pair"]:
+        """Call forward; typed override so call-site return types are not Any."""
+        return self.forward(z, r_center)
+
+    @override
     @jaxtyped(typechecker=beartype)
     def forward(
         self,

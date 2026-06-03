@@ -379,7 +379,7 @@ rigid_group_atom_positions = {
 
 
 def make_np_example(
-    coords_dict: Mapping[str, npt.NDArray[np.float64]],
+    coords_dict: Mapping[str, npt.ArrayLike],
 ) -> Mapping[str, npt.NDArray[np.float64] | npt.NDArray[np.intp]]:
     """Make a dictionary of non-batched numpy protein features."""
     bb_atom_types = ["N", "CA", "C", "O"]

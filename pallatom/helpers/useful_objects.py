@@ -24,7 +24,7 @@ def manual_seed(seed: int) -> torch.Generator:
     Returns:
         A torch.Generator whose state is set.
     """
-    return torch.manual_seed(seed)  # type: ignore[reportUnknownMemberType]
+    return torch.manual_seed(seed)  # pyright: ignore[reportUnknownMemberType]
 
 
 @dataclasses.dataclass(frozen=True)

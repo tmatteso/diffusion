@@ -7,13 +7,14 @@ import os
 import traceback
 from collections.abc import Callable
 from types import TracebackType
+from typing import cast
 
 import structlog
 import torch
 import torch.distributed as dist
-from structlog.typing import EventDict, Processor, WrappedLogger
+from structlog.typing import EventDict, FilteringBoundLogger, Processor
 
-log = structlog.get_logger()
+log: FilteringBoundLogger = cast(FilteringBoundLogger, structlog.get_logger())
 
 
 class DistProcessGroup:
@@ -28,7 +29,7 @@ class DistProcessGroup:
         Args:
             backend: Distributed backend passed to ``dist.init_process_group``.
         """
-        self.backend = backend
+        self.backend: str = backend
         self.rank: int = -1
         self.local_rank: int = -1
         self.world_size: int = -1
@@ -87,8 +88,8 @@ class StructlogConfig:
             is_rank_zero: Whether this process should emit console and file output.
             log_file: Optional path to write structured JSON log lines.
         """
-        self._is_rank_zero = is_rank_zero
-        self._log_file = log_file
+        self._is_rank_zero: bool = is_rank_zero
+        self._log_file: str | None = log_file
         self.f: io.TextIOWrapper | None = None
 
     def __enter__(self) -> "StructlogConfig":
@@ -112,11 +113,11 @@ class StructlogConfig:
         return self
 
     def write_log_line(
-        self, _logger: WrappedLogger, _method: str | None, event_dict: EventDict
+        self, _logger: object, _method: str | None, event_dict: EventDict
     ) -> EventDict:
         """Structlog processor: write the event dict as a JSON line and pass it through."""
         if self.f is not None:
-            self.f.write(json.dumps(event_dict) + "\n")
+            _ = self.f.write(json.dumps(event_dict) + "\n")
         return event_dict
 
     def __exit__(
@@ -166,7 +167,7 @@ class DDPNoSync:
         exc_tb: TracebackType | None,
     ) -> None:
         """Exit the inner context manager."""
-        self._ctx.__exit__(exc_type, exc_val, exc_tb)
+        _ = self._ctx.__exit__(exc_type, exc_val, exc_tb)
 
 
 class StepContext:
@@ -184,16 +185,16 @@ class StepContext:
             model: The model to manage (plain ``nn.Module`` or DDP-wrapped).
             train: Pass ``True`` for a training step, ``False`` for eval.
         """
-        self.model = model
-        self._train = train  # desired state during the context.
+        self.model: torch.nn.Module = model
+        self._train: bool = train  # desired state during the context.
         self._was_training: bool = False  # state to restore to on exit
 
     def __enter__(self) -> "StepContext":
         """Switch model to eval mode and disable autograd if not training."""
         self._was_training = self.model.training
         if not self._train:
-            self.model.eval()
-        torch.set_grad_enabled(self._train)
+            _ = self.model.eval()
+        _ = torch.set_grad_enabled(self._train)
         return self
 
     def __exit__(
@@ -203,5 +204,5 @@ class StepContext:
         exc_tb: TracebackType | None,
     ) -> None:
         """Restore the model's original training state and re-enable autograd."""
-        self.model.train(self._was_training)
-        torch.set_grad_enabled(True)
+        _ = self.model.train(self._was_training)
+        _ = torch.set_grad_enabled(True)

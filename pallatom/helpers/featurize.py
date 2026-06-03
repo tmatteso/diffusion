@@ -21,6 +21,7 @@ from helpers.atom_utils import (
 from helpers.batch_types import FeaturizedBatch, FeaturizedItem, ProteinBatch
 from jaxtyping import Bool, Float, Int, jaxtyped
 from train.train_config import TrainConfig
+from typing_extensions import override
 
 _DEFAULT_DEVICE: str = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -65,16 +66,17 @@ class Distogram(nn.Module):
         max_dist: float = 22.0,
     ) -> None:
         super().__init__()
-        self.n_bins = n_bins
-        self.min_dist = min_dist
-        self.max_dist = max_dist
-        self.overflow_bin = overflow_bin
-        self.edges: Float[torch.Tensor, "n_bins_plus_1"]
+        self.n_bins: int = n_bins
+        self.min_dist: float = min_dist
+        self.max_dist: float = max_dist
+        self.overflow_bin: bool = overflow_bin
 
         edges: Float[torch.Tensor, "n_bins_plus_1"] = torch.linspace(min_dist, max_dist, n_bins + 1)
+        self.edges: Float[torch.Tensor, "n_bins_plus_1"]
         self.register_buffer("edges", edges)
 
     # ------------------------------------------------------------------
+    @override
     def extra_repr(self) -> str:
         """Return a human-readable summary of the binning configuration."""
         return (
@@ -85,6 +87,20 @@ class Distogram(nn.Module):
         )
 
     # ------------------------------------------------------------------
+    @override
+    def __call__(
+        self,
+        coords: Float[torch.Tensor, "... total_atom_count 3"],
+        coords_mask: Bool[torch.Tensor, "... total_atom_count"] | None = None,
+    ) -> tuple[
+        Float[torch.Tensor, "... total_atom_count total_atom_count n_bins"],
+        Bool[torch.Tensor, "... total_atom_count total_atom_count"],
+    ]:
+        """Call forward; typed override so call-site return types are not Any."""
+        return self.forward(coords, coords_mask)
+
+    # ------------------------------------------------------------------
+    @override
     @jaxtyped(typechecker=beartype)
     def forward(
         self,

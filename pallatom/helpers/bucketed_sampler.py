@@ -7,12 +7,14 @@ import queue
 from collections.abc import Iterator
 from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass
+from typing import cast
 
 import numpy as np
 import numpy.typing as npt
 import torch
 import torch.utils.data
 from helpers.cluster_index import ClusterIndex
+from typing_extensions import override
 
 # Compact batch plan: flat protein indices concatenated across all batches, plus
 # exclusive end positions marking where each batch ends in the flat array.
@@ -89,15 +91,15 @@ def compute_batch_plan(
     Returns:
         List of batches; each batch is a list of flat protein indices.
     """
-    ftc = np.asarray(flat_to_cluster, dtype=np.int32)
-    crl = np.asarray(cluster_rep_len, dtype=np.int32)
+    ftc: npt.NDArray[np.int32] = np.asarray(flat_to_cluster, dtype=np.int32)
+    crl: npt.NDArray[np.int32] = np.asarray(cluster_rep_len, dtype=np.int32)
 
     rng = np.random.default_rng(seed)
-    indices = np.arange(n_proteins, dtype=np.int32)
+    indices: npt.NDArray[np.int32] = np.arange(n_proteins, dtype=np.int32)
     rng.shuffle(indices)  # in-place, avoids int64 intermediate
 
     n_regular = len(crl) - 1
-    median_rep_len = int(crl[n_regular // 2])
+    median_rep_len = cast(int, crl[n_regular // 2])
     avg_per_budget = max(1, token_budget // median_rep_len)
     chunk_size = chunk_multiplier * avg_per_budget
 
@@ -113,8 +115,8 @@ def compute_batch_plan(
         chunk = indices[start : start + chunk_size]
         eff = np.minimum(crl[ftc[chunk]], max_seq_len)
         order = np.argsort(eff, kind="stable")  # releases GIL
-        sorted_chunk = chunk[order].tolist()
-        sorted_eff = eff[order].tolist()
+        sorted_chunk = cast(list[int], chunk[order].tolist())
+        sorted_eff = cast(list[int], eff[order].tolist())
 
         batches: list[list[int]] = []
         current: list[int] = []
@@ -247,19 +249,19 @@ class BucketedBatchSampler(torch.utils.data.Sampler[list[int]]):
         prefetch_epochs: int = 5,
         n_threads: int | None = None,
     ) -> None:
-        self._cluster_index = cluster_index
-        self._token_budget = token_budget
-        self._max_seq_len = max_seq_len
-        self._chunk_multiplier = chunk_multiplier
-        self._world_size = world_size
-        self._rank = rank
-        self._seed = seed
-        self._prefetch_epochs = prefetch_epochs
-        self._n_threads = n_threads if n_threads is not None else (os.cpu_count() or 4)
-        self._epoch = 0
+        self._cluster_index: ClusterIndex = cluster_index
+        self._token_budget: int = token_budget
+        self._max_seq_len: int = max_seq_len
+        self._chunk_multiplier: int = chunk_multiplier
+        self._world_size: int = world_size
+        self._rank: int = rank
+        self._seed: int = seed
+        self._prefetch_epochs: int = prefetch_epochs
+        self._n_threads: int = n_threads if n_threads is not None else (os.cpu_count() or 4)
+        self._epoch: int = 0
         self._current_batches: BatchPlan | None = None
 
-        self._executor = ProcessPoolExecutor(
+        self._executor: ProcessPoolExecutor = ProcessPoolExecutor(
             max_workers=1,
             mp_context=mp.get_context("spawn"),
             initializer=_worker_init,
@@ -306,6 +308,7 @@ class BucketedBatchSampler(torch.utils.data.Sampler[list[int]]):
         self._current_batches = self._queue.get().result()
         self._queue.put_nowait(self._submit(self._seed + epoch + self._prefetch_epochs))
 
+    @override
     def __iter__(self) -> Iterator[list[int]]:
         """Yield batches for this rank.
 
@@ -321,8 +324,8 @@ class BucketedBatchSampler(torch.utils.data.Sampler[list[int]]):
         for global_i in range(self._rank, n_padded, self._world_size):
             # Wrap padded indices back to existing batches (repeat leading batches).
             i = global_i if global_i < n_batches else global_i - n_batches
-            start = int(ends[i - 1]) if i > 0 else 0
-            yield flat[start : int(ends[i])].tolist()
+            start = cast(int, ends[i - 1]) if i > 0 else 0
+            yield flat[start : cast(int, ends[i])].tolist()
 
     def __len__(self) -> int:
         """Return the number of batches this rank will yield.
@@ -339,7 +342,7 @@ class BucketedBatchSampler(torch.utils.data.Sampler[list[int]]):
             return n_total // self._world_size
         n = len(self._cluster_index)
         n_regular = len(self._cluster_index.cluster_rep_len) - 1
-        median_rep = int(self._cluster_index.cluster_rep_len[n_regular // 2])
+        median_rep = cast(int, self._cluster_index.cluster_rep_len[n_regular // 2])
         avg_per_batch = max(1, self._token_budget // median_rep)
         return math.ceil(math.ceil(n / avg_per_batch) / self._world_size)
 

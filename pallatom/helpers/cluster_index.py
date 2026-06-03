@@ -1,11 +1,22 @@
 """ClusterIndex: partitions a protein JSONL into 64 length-based cluster files."""
 
-import json
-from collections.abc import Mapping
 from pathlib import Path
+from typing import ClassVar, cast
 
 import numpy as np
 import numpy.typing as npt
+from pydantic import BaseModel, ConfigDict, TypeAdapter
+
+
+class _ProteinEntry(BaseModel):
+    """Minimal schema for protein JSONL entries; extra fields are ignored."""
+
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="allow")
+    name: str
+    seq: str
+
+
+_names_adapter: TypeAdapter[list[str]] = TypeAdapter(list[str])
 
 
 class ClusterIndex:
@@ -39,11 +50,11 @@ class ClusterIndex:
         token_budget: int = 512,
         n_clusters: int = 64,
     ) -> None:
-        self._jsonl_path = Path(jsonl_path)
-        self._names = names
-        self._token_budget = token_budget
-        self._n_clusters = n_clusters
-        self._cluster_dir = self._jsonl_path.parent / (self._jsonl_path.stem + "_clusters")
+        self._jsonl_path: Path = Path(jsonl_path)
+        self._names: list[str] = names
+        self._token_budget: int = token_budget
+        self._n_clusters: int = n_clusters
+        self._cluster_dir: Path = self._jsonl_path.parent / (self._jsonl_path.stem + "_clusters")
 
         # Representative lengths: regular clusters have rep_len = bin_width * (k+1).
         # Overflow cluster (index n_clusters) has rep_len = token_budget + 1 so that
@@ -110,7 +121,9 @@ class ClusterIndex:
             return False
         if not self._manifest_path().exists():
             return False
-        return json.loads(self._manifest_path().read_text()) == sorted(self._names)
+        return _names_adapter.validate_json(self._manifest_path().read_bytes()) == sorted(
+            self._names
+        )
 
     def _build_and_cache(self) -> None:
         """Partition source JSONL by length, write cluster files, build offset arrays."""
@@ -121,10 +134,10 @@ class ClusterIndex:
         cluster_lines: list[list[bytes]] = [[] for _ in range(self._n_clusters + 1)]
         with open(self._jsonl_path, "rb") as f:
             for raw_line in f:
-                entry: Mapping[str, object] = json.loads(raw_line)
-                if entry["name"] not in name_set:
+                entry = _ProteinEntry.model_validate_json(raw_line)
+                if entry.name not in name_set:
                     continue
-                seq_len = len(entry["seq"])  # type: ignore[arg-type]
+                seq_len = len(entry.seq)
                 k = self.assign_cluster(seq_len)
                 cluster_lines[k].append(raw_line)
 
@@ -136,11 +149,11 @@ class ClusterIndex:
                 pos = 0
                 for raw_line in cluster_lines[k]:
                     raw_offsets.append(pos)
-                    f.write(raw_line)
+                    _ = f.write(raw_line)
                     pos += len(raw_line)
             self.cluster_offsets.append(np.array(raw_offsets, dtype=np.int64))
 
-        self._manifest_path().write_text(json.dumps(sorted(self._names)))
+        _ = self._manifest_path().write_bytes(_names_adapter.dump_json(sorted(self._names)))
         self._build_flat_index()
 
     def _load_from_cache(self) -> None:
@@ -168,4 +181,6 @@ class ClusterIndex:
         self.flat_to_cluster = np.repeat(
             np.arange(len(self.cluster_offsets), dtype=np.int32), counts
         )
-        self.flat_to_local = np.concatenate([np.arange(int(c), dtype=np.int32) for c in counts])
+        self.flat_to_local = np.concatenate(
+            [np.arange(n, dtype=np.int32) for n in cast(list[int], counts.tolist())]
+        )

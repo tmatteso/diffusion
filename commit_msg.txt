@@ -1,31 +1,45 @@
-refactor: lift noise injection out of MainTrunk
+refactor: wrap PyTorch nn.Module calls to eliminate Any propagation
 
-Previously, MainTrunk.forward() sampled random noise and added it to
-r_gt to produce r_input internally. This meant the actual denoiser
-input was generated inside the forward pass — invisible in the batch,
-impossible to inspect or reproduce independently, and untestable in
-isolation.
+PyTorch's built-in nn.Module subclasses (nn.Linear, nn.Embedding,
+nn.LayerNorm, nn.Sequential, nn.ModuleList) declare __call__ with
+return type Any. Under basedpyright's reportAny rule every call-site
+that binds the result inherits that Any, silently defeating the type
+checker for the rest of the expression chain. No amount of annotation
+at the call site can fix it — the poison comes from the stub.
 
-Introduce r_gt_noised as an explicit FeaturizedBatch field that holds
-the noisy coordinates at the current diffusion step. Noise injection
-is now performed in featurize_batch() during training and in
-build_sampling_context() during inference. MainTrunk.forward() reads
-batch.r_gt_noised directly as r_input; it no longer generates noise.
+Introduce five thin typed wrappers in layers.py:
 
-Fix a latent semantic bug in EDMSampler.denoise(): per-step noisy
-coordinates were stored in r_gt, silently overwriting the ground-truth
-field across sampling steps. The EDM loop now updates r_gt_noised
-instead, keeping r_gt as the immutable clean reference throughout.
+  TypedLinear      — nn.Linear with a jaxtyped __call__
+  TypedEmbedding   — nn.Embedding with a jaxtyped __call__
+  LayerNorm        — nn.LayerNorm with a jaxtyped __call__
+  TypedSequential  — nn.Sequential with a jaxtyped __call__
+  TypedModuleList  — nn.ModuleList with typed __iter__ / __getitem__
+                     via Generic[TypedModule]
 
-Correct a wrong einops pattern introduced in the moved noise code:
-"1 -> b 1 1" fails because b appears only on the right side and einops
-cannot resolve its size. The correct pattern is "b -> b 1 1", which
-names the existing batch axis on both sides and appends two singleton
-dimensions for broadcasting against [B, N_atom, 3].
+Each wrapper adds only a one-line __call__ override; it delegates to
+self.forward(), which is already annotated. The wrappers carry no
+logic of their own — they exist purely to propagate concrete types to
+callers.
 
-Update all test fixtures that construct FeaturizedBatch directly
-(test_batch_types, test_featurize, test_main_trunk, test_seq_ce_loss)
-to supply r_gt_noised. Fix the identity and half-denoiser mocks in
-test_sampling to echo batch.r_gt_noised rather than batch.r_gt, since
-r_gt is now the all-zeros ground truth and no longer carries the
-evolving trajectory.
+Propagate these wrappers throughout every architecture module (atom
+transformers, main trunk, node/pair update, pairformer stack, template
+embedder). Replace bare nn.* instantiations with the typed equivalents,
+add explicit instance-variable annotations on every attribute that was
+previously inferred, and decorate forward() and __call__() with
+@override to satisfy reportImplicitOverride.
+
+Move scatter_mean from main_trunk.py to atom_transformers.py, which is
+where it is defined and consumed. Update test_main_trunk.py and
+test_atom_transformers.py accordingly so the tests live next to the
+code they cover.
+
+Tighten the helper layer (bucketed_sampler, cluster_index, data) with
+explicit instance-variable types and cast() calls to resolve opaque
+numpy-indexing return types without suppressing any checks.
+
+Elevate basedpyright's typeCheckingMode from "strict" to "all" in
+pyproject.toml. The "all" mode activates every available check,
+including reportAny and the other basedpyright-specific rules that
+"strict" leaves disabled. The typed wrappers introduced here were the
+last blocker preventing this upgrade; the codebase now passes cleanly
+under the stricter setting.

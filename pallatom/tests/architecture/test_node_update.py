@@ -367,9 +367,9 @@ def test_attn_pair_bias_sparse_equals_dense(
     z: Float[torch.Tensor, "B N_res N_res C_pair"],
 ) -> None:
     """Sparse path with neighbor_idx=[0..N-1] per query matches the dense path exactly."""
-    # neighbor_idx[i, j] = j — each query sees all N_RES keys in order
-    neighbor_idx: Int[torch.Tensor, "N_res N_res"] = repeat(
-        torch.arange(N_RES), "k -> n k", n=N_RES
+    # neighbor_idx[b, i, j] = j — each query sees all N_RES keys in order
+    neighbor_idx: Int[torch.Tensor, "B N_res N_res"] = repeat(
+        torch.arange(N_RES), "k -> b n k", b=B, n=N_RES
     )
     with torch.no_grad():
         out_dense = attn(s, t, z)
@@ -426,15 +426,15 @@ def z_sparse() -> Float[torch.Tensor, "B N_res_large K_sparse C_pair"]:
 
 
 @pytest.fixture
-def neighbor_idx_sparse() -> Int[torch.Tensor, "N_res_large K_sparse"]:
-    """Neighbour index [N_RES_LARGE, K_SPARSE] — each node's K_SPARSE nearest neighbours."""
+def neighbor_idx_sparse() -> Int[torch.Tensor, "B N_res_large K_sparse"]:
+    """Neighbour index [B, N_RES_LARGE, K_SPARSE] — each node's K_SPARSE nearest neighbours."""
     idx = torch.zeros(N_RES_LARGE, K_SPARSE, dtype=torch.long)
     for i in range(N_RES_LARGE):
         neighbours = torch.arange(max(0, i - K_SPARSE // 2), max(K_SPARSE, i + K_SPARSE // 2 + 1))[
             :K_SPARSE
         ]
         idx[i] = neighbours.clamp(0, N_RES_LARGE - 1)
-    return idx
+    return repeat(idx, "n k -> b n k", b=B)
 
 
 @pytest.fixture
@@ -448,7 +448,7 @@ def test_attn_pair_bias_sparse_output_shape(
     a_large: Float[torch.Tensor, "B N_res_large C_res"],
     s_large: Float[torch.Tensor, "B N_res_large C_res"],
     z_sparse: Float[torch.Tensor, "B N_res_large K_sparse C_pair"],
-    neighbor_idx_sparse: Int[torch.Tensor, "N_res_large K_sparse"],
+    neighbor_idx_sparse: Int[torch.Tensor, "B N_res_large K_sparse"],
 ) -> None:
     """Sparse attention (K < N) returns the correct [B, N, C_res] shape without RuntimeError."""
     with torch.no_grad():
@@ -461,7 +461,7 @@ def test_attn_pair_bias_sparse_output_finite(
     a_large: Float[torch.Tensor, "B N_res_large C_res"],
     s_large: Float[torch.Tensor, "B N_res_large C_res"],
     z_sparse: Float[torch.Tensor, "B N_res_large K_sparse C_pair"],
-    neighbor_idx_sparse: Int[torch.Tensor, "N_res_large K_sparse"],
+    neighbor_idx_sparse: Int[torch.Tensor, "B N_res_large K_sparse"],
 ) -> None:
     """Sparse attention output contains no NaN or Inf values."""
     with torch.no_grad():
@@ -475,7 +475,7 @@ def test_attn_pair_bias_sparse_with_beta(
     s_large: Float[torch.Tensor, "B N_res_large C_res"],
     z_sparse: Float[torch.Tensor, "B N_res_large K_sparse C_pair"],
     beta_sparse: Float[torch.Tensor, "B N_res_large K_sparse"],
-    neighbor_idx_sparse: Int[torch.Tensor, "N_res_large K_sparse"],
+    neighbor_idx_sparse: Int[torch.Tensor, "B N_res_large K_sparse"],
 ) -> None:
     """Sparse attention works when both beta and neighbor_idx are provided."""
     with torch.no_grad():
@@ -491,7 +491,7 @@ def test_attn_pair_bias_sparse_gradient_flows(
     a_large: Float[torch.Tensor, "B N_res_large C_res"],
     s_large: Float[torch.Tensor, "B N_res_large C_res"],
     z_sparse: Float[torch.Tensor, "B N_res_large K_sparse C_pair"],
-    neighbor_idx_sparse: Int[torch.Tensor, "N_res_large K_sparse"],
+    neighbor_idx_sparse: Int[torch.Tensor, "B N_res_large K_sparse"],
 ) -> None:
     """Gradients flow through sparse attention back to the node embedding input."""
     a_g = a_large.clone().requires_grad_(True)

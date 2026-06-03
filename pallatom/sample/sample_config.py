@@ -1,5 +1,7 @@
 """Pydantic configuration models for conditional sampling."""
 
+from typing import ClassVar
+
 from pydantic import BaseModel, ConfigDict, Field
 from train.train_config import (
     AtomDistogramParams,
@@ -12,7 +14,7 @@ from train.train_config import (
 class SamplerParams(BaseModel):
     """Hyperparameters for the stochastic DDIM sampler."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True)
 
     rho: float = Field(default=7.0, gt=0)
     S_churn: float = Field(default=0.2, ge=0)
@@ -27,7 +29,7 @@ class SamplerParams(BaseModel):
 class GenerationParams(BaseModel):
     """Parameters controlling the size and count of generated structures."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True)
 
     n_res: int = Field(default=100, gt=0)
     n_samples: int = Field(default=1, gt=0)
@@ -36,7 +38,7 @@ class GenerationParams(BaseModel):
 class SampleCheckpointParams(BaseModel):
     """Path configuration for loading a model checkpoint during sampling."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True)
 
     checkpoint_path: str = "pallatom_best.pt"
 
@@ -44,7 +46,7 @@ class SampleCheckpointParams(BaseModel):
 class SampleOutputParams(BaseModel):
     """Path configuration for writing sampling results to disk."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True)
 
     output_path: str = "samples.json"
 
@@ -52,7 +54,7 @@ class SampleOutputParams(BaseModel):
 class SampleConfig(BaseModel):
     """Top-level configuration for a conditional sampling run."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True)
 
     model: ModelParams = Field(default_factory=ModelParams)
     distogram_res: ResidueDistogramParams = Field(default_factory=ResidueDistogramParams)

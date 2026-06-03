@@ -11,6 +11,7 @@ from architecture.atom_transformers import (
     DiffusionTransformer,
     build_sparse_pairs,
     compute_beta,
+    scatter_mean,
 )
 from beartype import beartype
 from einops import einsum, rearrange, reduce, repeat
@@ -133,10 +134,10 @@ def tok_idx_batched(tok_idx: Int[torch.Tensor, "N_atom"]) -> Int[torch.Tensor, "
 
 
 @pytest.fixture
-def neighbor_idx(tok_idx: Int[torch.Tensor, "N_atom"]) -> Int[torch.Tensor, "N_atom K"]:
-    """Sparse neighbor index tensor [N_atom, K] computed from the canonical tok_idx."""
+def neighbor_idx(tok_idx: Int[torch.Tensor, "N_atom"]) -> Int[torch.Tensor, "B N_atom K"]:
+    """Sparse neighbor index tensor [B=1, N_atom, K] computed from the canonical tok_idx."""
     nbrs, _ = build_sparse_pairs(tok_idx)
-    return nbrs
+    return rearrange(nbrs, "n k -> 1 n k")
 
 
 @pytest.fixture
@@ -289,7 +290,7 @@ def test_build_sparse_pairs_window_excludes_far_atoms():
 
 
 def test_compute_beta_output_shape(
-    neighbor_idx: Int[torch.Tensor, "N_atom K"],
+    neighbor_idx: Int[torch.Tensor, "B N_atom K"],
     valid_mask: Bool[torch.Tensor, "B N_atom K"],
 ) -> None:
     """compute_beta returns a float tensor of shape [B, N_atom, K] with matching dtype."""
@@ -300,7 +301,7 @@ def test_compute_beta_output_shape(
 
 
 def test_compute_beta_values_are_binary(
-    neighbor_idx: Int[torch.Tensor, "N_atom K"],
+    neighbor_idx: Int[torch.Tensor, "B N_atom K"],
     valid_mask: Bool[torch.Tensor, "B N_atom K"],
 ) -> None:
     """Every element of beta is exactly 0.0 or -1e10; no intermediate values."""
@@ -316,7 +317,7 @@ def test_compute_beta_zero_for_near_atoms() -> None:
     l=0: |0-1.5|=1.5 < 2.0 → query; m=1: |1-1.5|=0.5 < 4.0 → key → beta=0.0.
     """
     N_t, n_q, n_k, B_t = 8, 4, 8, 1
-    neighbor_idx_t = repeat(torch.arange(N_t), "k -> n k", n=N_t)
+    neighbor_idx_t = repeat(torch.arange(N_t), "k -> b n k", b=B_t, n=N_t)
     valid_mask_t = torch.ones(B_t, N_t, N_t, dtype=torch.bool)
     ref = torch.zeros(B_t, N_t, C_ATOM)
     beta = compute_beta(neighbor_idx_t, valid_mask_t, n_queries=n_q, n_keys=n_k, ref=ref)
@@ -333,7 +334,7 @@ def test_compute_beta_large_neg_for_far_atoms() -> None:
     No centre admits this pair → beta=-1e10.
     """
     N_t, n_q, n_k, B_t = 8, 4, 4, 1
-    neighbor_idx_t = repeat(torch.arange(N_t), "k -> n k", n=N_t)
+    neighbor_idx_t = repeat(torch.arange(N_t), "k -> b n k", b=B_t, n=N_t)
     valid_mask_t = torch.ones(B_t, N_t, N_t, dtype=torch.bool)
     ref = torch.zeros(B_t, N_t, C_ATOM)
     beta = compute_beta(neighbor_idx_t, valid_mask_t, n_queries=n_q, n_keys=n_k, ref=ref)
@@ -343,7 +344,7 @@ def test_compute_beta_large_neg_for_far_atoms() -> None:
 def test_compute_beta_valid_mask_forces_neg() -> None:
     """valid_mask=False gives -1e10 even if the pair is geometrically in-window."""
     N_t, n_q, n_k, B_t = 8, 4, 8, 1
-    neighbor_idx_t = repeat(torch.arange(N_t), "k -> n k", n=N_t)
+    neighbor_idx_t = repeat(torch.arange(N_t), "k -> b n k", b=B_t, n=N_t)
     valid_mask_t = torch.ones(B_t, N_t, N_t, dtype=torch.bool)
     valid_mask_t[0, 0, 1] = False  # pair (l=0, m=1) is in-window but masked
     ref = torch.zeros(B_t, N_t, C_ATOM)
@@ -364,7 +365,7 @@ def test_compute_beta_boundary_exclusive() -> None:
     Pair (l=3, m=3): centre 0 admits both → beta=0.0.
     """
     N_t, n_q, n_k, B_t = 8, 4, 4, 1
-    neighbor_idx_t = repeat(torch.arange(N_t), "k -> n k", n=N_t)
+    neighbor_idx_t = repeat(torch.arange(N_t), "k -> b n k", b=B_t, n=N_t)
     valid_mask_t = torch.ones(B_t, N_t, N_t, dtype=torch.bool)
     ref = torch.zeros(B_t, N_t, C_ATOM)
     beta = compute_beta(neighbor_idx_t, valid_mask_t, n_queries=n_q, n_keys=n_k, ref=ref)
@@ -382,7 +383,7 @@ def test_compute_beta_cross_window_centre_admits_pair() -> None:
     → beta=0.0 because centre 1 admits both. Tests multi-centre reduce logic.
     """
     N_t, n_q, n_k, B_t = 8, 4, 8, 1
-    neighbor_idx_t = repeat(torch.arange(N_t), "k -> n k", n=N_t)
+    neighbor_idx_t = repeat(torch.arange(N_t), "k -> b n k", b=B_t, n=N_t)
     valid_mask_t = torch.ones(B_t, N_t, N_t, dtype=torch.bool)
     ref = torch.zeros(B_t, N_t, C_ATOM)
     beta = compute_beta(neighbor_idx_t, valid_mask_t, n_queries=n_q, n_keys=n_k, ref=ref)
@@ -390,7 +391,7 @@ def test_compute_beta_cross_window_centre_admits_pair() -> None:
 
 
 def test_compute_beta_all_zero_when_n_leq_n_queries(
-    neighbor_idx: Int[torch.Tensor, "N_atom K"],
+    neighbor_idx: Int[torch.Tensor, "B N_atom K"],
     valid_mask: Bool[torch.Tensor, "B N_atom K"],
 ) -> None:
     """When N <= n_queries every valid pair is in the single window → no -1e10 entries.
@@ -413,7 +414,7 @@ def test_compute_beta_wrong_shape_raises() -> None:
 
 
 def test_compute_beta_no_inf_in_output(
-    neighbor_idx: Int[torch.Tensor, "N_atom K"],
+    neighbor_idx: Int[torch.Tensor, "B N_atom K"],
     valid_mask: Bool[torch.Tensor, "B N_atom K"],
 ) -> None:
     """compute_beta output contains no -inf values when ref dtype is float16.
@@ -436,7 +437,9 @@ def test_compute_beta_asymmetric() -> None:
     l=4 queries centre 2 (|4-4.5|=0.5 < 1.0); m=0 NOT a key (|0-4.5|=4.5 > 4.0) -> -1e10.
     """
     N_t, n_q, n_k, B_t = 8, 2, 8, 1
-    neighbor_idx_t: Int[torch.Tensor, "N_t K_t"] = repeat(torch.arange(N_t), "k -> n k", n=N_t)
+    neighbor_idx_t: Int[torch.Tensor, "B_t N_t K_t"] = repeat(
+        torch.arange(N_t), "k -> b n k", b=B_t, n=N_t
+    )
     valid_mask_t: Bool[torch.Tensor, "B_t N_t N_t"] = torch.ones(B_t, N_t, N_t, dtype=torch.bool)
     ref = torch.zeros(B_t, N_t, C_ATOM)
     beta = compute_beta(neighbor_idx_t, valid_mask_t, n_queries=n_q, n_keys=n_k, ref=ref)
@@ -445,7 +448,7 @@ def test_compute_beta_asymmetric() -> None:
 
 
 def test_compute_beta_all_neighbors_masked_row(
-    neighbor_idx: Int[torch.Tensor, "N_atom K"],
+    neighbor_idx: Int[torch.Tensor, "B N_atom K"],
 ) -> None:
     """A query whose entire valid_mask row is False gets all -1e10; adjacent rows unaffected."""
     valid_mask = torch.ones(B, N_ATOM, K, dtype=torch.bool)
@@ -457,14 +460,15 @@ def test_compute_beta_all_neighbors_masked_row(
 
 
 def test_compute_beta_batch_independence(
-    neighbor_idx: Int[torch.Tensor, "N_atom K"],
+    neighbor_idx: Int[torch.Tensor, "B N_atom K"],
 ) -> None:
     """Batch elements with different valid_masks produce fully independent beta values."""
     valid_mask_two: Bool[torch.Tensor, "2 N_atom K"] = torch.zeros(2, N_ATOM, K, dtype=torch.bool)
     valid_mask_two[0] = True  # batch 0: all valid; batch 1: all masked
     ref = torch.randn(2, N_ATOM, C_ATOM)
+    neighbor_idx_two: Int[torch.Tensor, "2 N_atom K"] = repeat(neighbor_idx, "1 n k -> b n k", b=2)
     # n_queries=32 > N_ATOM=24: single window covers all atoms; all valid pairs get 0.0
-    beta = compute_beta(neighbor_idx, valid_mask_two, n_queries=32, n_keys=128, ref=ref)
+    beta = compute_beta(neighbor_idx_two, valid_mask_two, n_queries=32, n_keys=128, ref=ref)
     assert (beta[1] == -1e10).all()
     assert (beta[0][valid_mask_two[0]] == 0.0).all()
 
@@ -571,7 +575,7 @@ def test_atom_transformer_output_shape(
     q_batched: Float[torch.Tensor, "B N_atom C_atom"],
     c_batched: Float[torch.Tensor, "B N_atom C_atom"],
     p_batched: Float[torch.Tensor, "B N_atom K C_atompair"],
-    neighbor_idx: Int[torch.Tensor, "N_atom K"],
+    neighbor_idx: Int[torch.Tensor, "B N_atom K"],
     valid_mask: Bool[torch.Tensor, "B N_atom K"],
 ):
     """Stacking multiple blocks leaves the output shape [B, N_atom, C_atom] unchanged."""
@@ -585,7 +589,7 @@ def test_atom_transformer_output_finite(
     q_batched: Float[torch.Tensor, "B N_atom C_atom"],
     c_batched: Float[torch.Tensor, "B N_atom C_atom"],
     p_batched: Float[torch.Tensor, "B N_atom K C_atompair"],
-    neighbor_idx: Int[torch.Tensor, "N_atom K"],
+    neighbor_idx: Int[torch.Tensor, "B N_atom K"],
     valid_mask: Bool[torch.Tensor, "B N_atom K"],
 ):
     """Running two stacked blocks in sequence does not accumulate NaN or Inf values."""
@@ -605,7 +609,7 @@ def test_atom_transformer_gradient_flows(
     q_batched: Float[torch.Tensor, "B N_atom C_atom"],
     c_batched: Float[torch.Tensor, "B N_atom C_atom"],
     p_batched: Float[torch.Tensor, "B N_atom K C_atompair"],
-    neighbor_idx: Int[torch.Tensor, "N_atom K"],
+    neighbor_idx: Int[torch.Tensor, "B N_atom K"],
     valid_mask: Bool[torch.Tensor, "B N_atom K"],
 ):
     """Gradients propagate through all stacked blocks back to the query input without vanishing."""
@@ -627,7 +631,7 @@ def test_atom_transformer_block_isolation() -> None:
     model = AtomTransformer(
         C_ATOM, C_ATOMPAIR, n_blocks=1, n_heads=1, n_queries=n_q, n_keys=n_q
     ).eval()
-    neighbor_idx_t = repeat(torch.arange(N_t), "k -> n k", n=N_t)
+    neighbor_idx_t = repeat(torch.arange(N_t), "k -> b n k", b=B_t, n=N_t)
     valid_mask_t = torch.ones(B_t, N_t, N_t, dtype=torch.bool)
 
     manual_seed(0)
@@ -662,7 +666,7 @@ def test_atom_transformer_gradient_isolation() -> None:
     model = AtomTransformer(
         C_ATOM, C_ATOMPAIR, n_blocks=1, n_heads=1, n_queries=n_q, n_keys=n_q
     ).eval()
-    neighbor_idx_t = repeat(torch.arange(N_t), "k -> n k", n=N_t)
+    neighbor_idx_t = repeat(torch.arange(N_t), "k -> b n k", b=B_t, n=N_t)
     valid_mask_t = torch.ones(B_t, N_t, N_t, dtype=torch.bool)
 
     manual_seed(0)
@@ -911,9 +915,9 @@ def test_atom_attention_decoder_gradient_flows_to_q_skip(
 
 
 @pytest.fixture
-def sparse_neighbor_idx() -> Int[torch.Tensor, "N_atom_sparse K_sparse"]:
-    """Sparse neighbour index [N_ATOM_SPARSE, K_SPARSE] with K_SPARSE < N_ATOM_SPARSE."""
-    return _sparse_nbrs
+def sparse_neighbor_idx() -> Int[torch.Tensor, "B N_atom_sparse K_sparse"]:
+    """Sparse neighbour index [B=1, N_ATOM_SPARSE, K_SPARSE] with K_SPARSE < N_ATOM_SPARSE."""
+    return repeat(_sparse_nbrs, "n k -> 1 n k")
 
 
 @pytest.fixture
@@ -949,7 +953,7 @@ def beta_sparse_dt() -> Float[torch.Tensor, "B N_atom_sparse K_sparse"]:
 def test_diffusion_transformer_sparse_no_shape_mismatch(
     z_sparse_dt: Float[torch.Tensor, "B N_atom_sparse K_sparse C_atom"],
     beta_sparse_dt: Float[torch.Tensor, "B N_atom_sparse K_sparse"],
-    sparse_neighbor_idx: Int[torch.Tensor, "N_atom_sparse K_sparse"],
+    sparse_neighbor_idx: Int[torch.Tensor, "B N_atom_sparse K_sparse"],
 ) -> None:
     """DiffusionTransformer with sparse z (K<N) and neighbor_idx raises no RuntimeError."""
     model = DiffusionTransformer(
@@ -966,7 +970,7 @@ def test_diffusion_transformer_sparse_no_shape_mismatch(
 def test_atom_transformer_sparse_k_lt_n_no_shape_mismatch(
     q_sparse: Float[torch.Tensor, "B N_atom_sparse C_atom"],
     p_sparse: Float[torch.Tensor, "B N_atom_sparse K_sparse C_atompair"],
-    sparse_neighbor_idx: Int[torch.Tensor, "N_atom_sparse K_sparse"],
+    sparse_neighbor_idx: Int[torch.Tensor, "B N_atom_sparse K_sparse"],
     sparse_valid_mask: Bool[torch.Tensor, "B N_atom_sparse K_sparse"],
 ) -> None:
     """AtomTransformer with K_SPARSE < N_ATOM_SPARSE raises no RuntimeError.
@@ -984,7 +988,7 @@ def test_atom_transformer_sparse_k_lt_n_no_shape_mismatch(
 
 def test_atom_transformer_sparse_gradient_flows(
     p_sparse: Float[torch.Tensor, "B N_atom_sparse K_sparse C_atompair"],
-    sparse_neighbor_idx: Int[torch.Tensor, "N_atom_sparse K_sparse"],
+    sparse_neighbor_idx: Int[torch.Tensor, "B N_atom_sparse K_sparse"],
     sparse_valid_mask: Bool[torch.Tensor, "B N_atom_sparse K_sparse"],
 ) -> None:
     """Gradients flow through the sparse attention path when K < N."""
@@ -995,6 +999,96 @@ def test_atom_transformer_sparse_gradient_flows(
     reduce(out, "b n c -> ", "sum").backward()
     assert q_g.grad is not None
     assert torch.isfinite(q_g.grad).all()
+
+
+# ---------------------------------------------------------------------------
+# scatter_mean
+# ---------------------------------------------------------------------------
+
+
+def test_scatter_mean_known_values_uniform() -> None:
+    """With two atoms per residue, scatter_mean produces mean of each pair."""
+    src = torch.tensor([[[0.0], [2.0], [4.0], [6.0]]])  # (1, 4, 1)
+    index = torch.tensor([[0, 0, 1, 1]])  # (1, 4)
+    out = scatter_mean(src, index, 2, 1)
+    expected = torch.tensor([[[1.0], [5.0]]])  # mean(0,2)=1, mean(4,6)=5
+    assert torch.allclose(out, expected)
+
+
+def test_scatter_mean_known_values_nonuniform() -> None:
+    """scatter_mean handles variable group sizes: residue 0 gets 3 atoms and residue 1 gets 2."""
+    src = torch.tensor([[[1.0], [3.0], [5.0], [7.0], [9.0]]])  # (1, 5, 1)
+    index = torch.tensor([[0, 0, 0, 1, 1]])  # (1, 5)
+    out = scatter_mean(src, index, 2, 1)
+    expected = torch.tensor([[[3.0], [8.0]]])  # mean(1,3,5)=3, mean(7,9)=8
+    assert torch.allclose(out, expected)
+
+
+def test_scatter_mean_one_atom_per_residue() -> None:
+    """When each residue has exactly one atom, scatter_mean is identity over the atom dimension."""
+    B_sm, N_sm, C_sm = 2, 4, 6
+    src = torch.randn(B_sm, N_sm, C_sm)
+    base = repeat(torch.arange(N_sm), "n -> b n", b=B_sm)
+    offset = repeat(torch.arange(B_sm) * N_sm, "b -> b n", n=N_sm)
+    index = base + offset  # [[0,1,2,3],[4,5,6,7]]
+    out = scatter_mean(src, index, B_sm * N_sm, B_sm)
+    assert torch.allclose(out, src)
+
+
+def test_scatter_mean_constant_src_returns_that_constant() -> None:
+    """Averaging constant val across any number of atoms in residue still returns that constant."""
+    B_sm, N_tgt, atoms_per, C_sm = 2, 2, 3, 4
+    N_src = N_tgt * atoms_per
+    val = 3.14
+    src = torch.full((B_sm, N_src, C_sm), val)
+    tok_idx = torch.repeat_interleave(torch.arange(N_tgt), atoms_per)
+    tok_idx = repeat(tok_idx, "n -> b n", b=B_sm)
+    offset = repeat(torch.arange(B_sm) * N_tgt, "b -> b n", n=N_src)
+    index = tok_idx + offset
+    out = scatter_mean(src, index, B_sm * N_tgt, B_sm)
+    assert torch.allclose(out, torch.full((B_sm, N_tgt, C_sm), val))
+
+
+def test_scatter_mean_batch_items_independent() -> None:
+    """Zeroing one item's source features must not affect scatter_mean output for other items."""
+    B_sm, N_src, N_tgt, C_sm = 2, 8, 4, 6
+    src = torch.randn(B_sm, N_src, C_sm)
+    src0 = src.clone()
+    src0[1] = 0.0
+
+    tok_base = torch.repeat_interleave(torch.arange(N_tgt), 2)  # [0,0,1,1,2,2,3,3]
+    tok_idx = repeat(tok_base, "n -> b n", b=B_sm)
+    offset = repeat(torch.arange(B_sm) * N_tgt, "b -> b n", n=N_src)
+    index = tok_idx + offset
+
+    out_full = scatter_mean(src, index, B_sm * N_tgt, B_sm)
+    out_zero = scatter_mean(src0, index, B_sm * N_tgt, B_sm)
+    assert torch.allclose(out_full[0], out_zero[0])
+
+
+def test_scatter_mean_multichannel_mean_matches_per_channel() -> None:
+    """scatter_mean agrees with reference reshape+reduce mean across all C channels."""
+    B_sm, N_tgt, atoms_per, C_sm = 1, 3, 4, 5
+    N_src = N_tgt * atoms_per
+    src = torch.randn(B_sm, N_src, C_sm)
+    tok_idx = torch.repeat_interleave(torch.arange(N_tgt), atoms_per)
+    index = repeat(tok_idx, "n -> b n", b=B_sm)
+
+    out = scatter_mean(src, index, B_sm * N_tgt, B_sm)
+
+    src_grouped: Float[torch.Tensor, "B N_tgt atoms_per C"] = rearrange(
+        src, "b (n a) c -> b n a c", n=N_tgt, a=atoms_per
+    )
+    expected: Float[torch.Tensor, "B N_tgt C"] = reduce(src_grouped, "b n a c -> b n c", "mean")
+    assert torch.allclose(out, expected, atol=1e-6)
+
+
+def test_scatter_mean_wrong_shape() -> None:
+    """Wrong src ndim (2-D instead of 3-D) triggers TypeCheckError."""
+    src_bad = torch.zeros(B, N_ATOM)  # missing channel dim C
+    index = torch.zeros(B, N_ATOM, dtype=torch.long)
+    with pytest.raises(TypeCheckError):
+        scatter_mean(src_bad, index, N_RES, B)
 
 
 # ---------------------------------------------------------------------------

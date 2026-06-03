@@ -4,13 +4,14 @@ import argparse
 import dataclasses
 import json
 from pathlib import Path
+from typing import cast
 
 import numpy as np
 import numpy.typing as npt
 import structlog
 import torch
 from architecture.atom_transformers import WINDOW_SIZE, build_sparse_pairs
-from architecture.main_trunk import MainTrunk
+from architecture.main_trunk import MainTrunk, PredictedOutputs
 from beartype import beartype
 from einops import rearrange, reduce, repeat
 from helpers.alignment import centre_random_augment
@@ -28,10 +29,12 @@ from helpers.atom_utils import (
     restype_order,
     to_pdb,
 )
+from helpers.batch_types import FeaturizedBatch
 from helpers.context_managers import FatalOnError, StructlogConfig
-from helpers.featurize import Distogram, FeaturizedBatch, ref_pos_for_residue
+from helpers.featurize import Distogram, ref_pos_for_residue
 from jaxtyping import Bool, Float, Int, jaxtyped
 from sample.sample_config import SampleConfig, SamplerParams
+from structlog.typing import FilteringBoundLogger
 from train.train_config import NoiseScheduleParams
 
 # atom5 slot → atom37 index (used when writing PDB via atom37 representation)
@@ -141,9 +144,14 @@ def build_AA_context(
     _tok_single: Int[torch.Tensor, "N_atom"] = torch.arange(
         N_res, dtype=torch.long, device=device
     ).repeat_interleave(NATOM)
+
+    # its okay that we repeat the unbatched neighbor_idx as all members of
+    # the sampling batch do not have padding
     neighbor_idx, _ = build_sparse_pairs(_tok_single, WINDOW_SIZE)  # (N_atom, K)
 
     # atom_distogram_fn supports batched input: (B, N_atom, 3) → (B, N_atom, N_atom, n_bins)
+    gt_atom_disto_dense: Float[torch.Tensor, "B N_atom N_atom n_atom_bins"]
+    gt_atom_mask_dense: Bool[torch.Tensor, "B N_atom N_atom"]
     gt_atom_disto_dense, gt_atom_mask_dense = atom_distogram_fn(r_gt, atom5_mask)
     n_atom_bins: int = gt_atom_disto_dense.shape[-1]
 
@@ -222,6 +230,7 @@ def build_template_context(
         atom37_mask=atom37_mask,
     )
 
+    f_disto: Float[torch.Tensor, "B N_res N_res n_templ_bins"]
     f_disto, _ = distogram_fn(pseudo_beta_carbon_positions, residue_mask)
 
     gt_res_distogram: Int[torch.Tensor, "B N_res N_res n_templ_bins"] = f_disto.long()
@@ -382,21 +391,21 @@ class EDMSampler:
         sampler_params: SamplerParams,
         noise_params: NoiseScheduleParams,
     ) -> None:
-        self.model = model
-        self.context = context
-        self.template_distogram_fn = template_distogram_fn
-        self.total_timesteps = sampler_params.ddim_steps
-        self.sigma_data = noise_params.sigma_data
-        self.sigma_min = noise_params.sigma_min
-        self.sigma_max = noise_params.sigma_max
-        self.rho = sampler_params.rho
-        self.S_churn = sampler_params.S_churn
-        self.S_tmin = sampler_params.S_tmin
-        self.S_tmax = sampler_params.S_tmax
-        self.S_noise = sampler_params.S_noise
-        self.eta_step_scale = sampler_params.eta_step_scale
-        self.seq_temperature = sampler_params.seq_temperature
-        self.device = context.r_gt.device
+        self.model: MainTrunk = model
+        self.context: FeaturizedBatch = context
+        self.template_distogram_fn: Distogram = template_distogram_fn
+        self.total_timesteps: int = sampler_params.ddim_steps
+        self.sigma_data: float = noise_params.sigma_data
+        self.sigma_min: float = noise_params.sigma_min
+        self.sigma_max: float = noise_params.sigma_max
+        self.rho: float = sampler_params.rho
+        self.S_churn: float = sampler_params.S_churn
+        self.S_tmin: float = sampler_params.S_tmin
+        self.S_tmax: float = sampler_params.S_tmax
+        self.S_noise: float = sampler_params.S_noise
+        self.eta_step_scale: float = sampler_params.eta_step_scale
+        self.seq_temperature: float = sampler_params.seq_temperature
+        self.device: torch.device = context.r_gt.device
 
     @jaxtyped(typechecker=beartype)
     def noise_schedule(self, timestep: Float[torch.Tensor, ""]) -> Float[torch.Tensor, ""]:
@@ -406,13 +415,14 @@ class EDMSampler:
 
         t_hat = sigma_data * (sigma_max^(1/rho) + t * (sigma_min^(1/rho) - sigma_max^(1/rho)))^rho
         """
-        t_hat: Float[torch.Tensor, ""] = (
+        t_hat: Float[torch.Tensor, ""] = cast(
+            Float[torch.Tensor, ""],
             self.sigma_data
             * (
                 self.sigma_max ** (1 / self.rho)
                 + timestep * (self.sigma_min ** (1 / self.rho) - self.sigma_max ** (1 / self.rho))
             )
-            ** self.rho
+            ** self.rho,
         )
 
         return t_hat
@@ -449,7 +459,7 @@ class EDMSampler:
                 batch,
                 gt_res_distogram=f_template_distogram.long(),
             )
-        predicted_outputs = self.model(batch)
+        predicted_outputs: PredictedOutputs = self.model(batch)
         return predicted_outputs.r_denoised, predicted_outputs.seq_logits
 
     @torch.no_grad()
@@ -574,10 +584,34 @@ def atom5_to_atom37(
     return x_37, mask_37
 
 
-def main(args: argparse.Namespace, scfg: SampleConfig, device: str) -> None:
+@dataclasses.dataclass
+class SamplingArgs:
+    """Parsed command-line arguments for the sampling entry point."""
+
+    config: str
+    log_file: str
+
+
+def _parse_args() -> SamplingArgs:
+    """Build the argument parser and return a fully typed SamplingArgs."""
+    _ = parser = argparse.ArgumentParser(
+        description="Sample protein structures from a trained PallAtom model"
+    )
+    _ = parser.add_argument("--config", required=True, help="path to SampleConfig JSON")
+    _ = parser.add_argument(
+        "--log_file", required=True, help="path to write structured JSON log lines"
+    )
+    ns = parser.parse_args()
+    return SamplingArgs(
+        config=cast(str, ns.config),
+        log_file=cast(str, ns.log_file),
+    )
+
+
+def main(args: SamplingArgs, scfg: SampleConfig, device: str) -> None:
     """Runs EDM Sampling for the Pallatom model."""
     with StructlogConfig(is_rank_zero=True, log_file=args.log_file), FatalOnError():
-        log = structlog.get_logger()
+        log: FilteringBoundLogger = cast(FilteringBoundLogger, structlog.get_logger())
         mp = scfg.model
         noise = scfg.noise
         gen = scfg.generation
@@ -602,9 +636,12 @@ def main(args: argparse.Namespace, scfg: SampleConfig, device: str) -> None:
             n_pairformer_blocks_template_embedder=mp.n_pairformer_blocks_template_embedder,
             n_paiformer_heads_template_embedder=mp.n_paiformer_heads_template_embedder,
         ).to(device)
-        ckpt = torch.load(scfg.checkpoint.checkpoint_path, map_location=device)
-        model.load_state_dict(ckpt["model"])
-        model.eval()
+        ckpt = cast(
+            dict[str, dict[str, Float[torch.Tensor, "..."]]],
+            torch.load(scfg.checkpoint.checkpoint_path, map_location=device),
+        )
+        _ = model.load_state_dict(ckpt["model"])
+        _ = model.eval()
         log.info("model loaded", checkpoint=scfg.checkpoint.checkpoint_path, device=device)
 
         N_RES: int = gen.n_res
@@ -669,7 +706,7 @@ def main(args: argparse.Namespace, scfg: SampleConfig, device: str) -> None:
             )
             pdb_strings.append(to_pdb(prot))
 
-        Path(scfg.output.output_path).write_text(json.dumps(pdb_strings))
+        _ = Path(scfg.output.output_path).write_text(json.dumps(pdb_strings))
         log.info("output written", path=scfg.output.output_path, n_structures=B_SAMPLE)
 
 
@@ -677,14 +714,7 @@ def main(args: argparse.Namespace, scfg: SampleConfig, device: str) -> None:
 # 5.  Main sampling script
 # ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Sample protein structures from a trained PallAtom model"
-    )
-    parser.add_argument("--config", required=True, help="path to SampleConfig JSON")
-    parser.add_argument("--log_file", required=True, help="path to write structured JSON log lines")
-    args = parser.parse_args()
-
+    args = _parse_args()
     scfg: SampleConfig = SampleConfig.model_validate(json.loads(Path(args.config).read_text()))
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
-
     main(args=args, scfg=scfg, device=device)

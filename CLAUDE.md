@@ -21,7 +21,7 @@ is accepted** — run `pre-commit run --all-files` locally to verify before push
 | `pre-commit` | **checkmake** | `Makefile` passes style checks |
 | `pre-commit` | **black** | Python code is formatted (line-length 100, Python 3.10+) |
 | `pre-commit` | **ruff** | Python linting (auto-fixes applied; remaining errors block commit) |
-| `pre-commit` | **pyright** | Type-checking of `pallatom/` and `REST_APIs/` |
+| `pre-commit` | **basedpyright** | Type-checking of `pallatom/` and `REST_APIs/` |
 | `pre-commit` | **enforce-einops** | Bans raw tensor ops (see below) |
 | `pre-commit` | **enforce-jaxtyping** | Bans bare `torch.Tensor` / `Tensor` annotations (see below) |
 | `pre-commit` | **pytest** | Full test suite must pass |
@@ -103,46 +103,31 @@ sections only when there are no arguments or the meaning is completely obvious f
 
 ---
 
-### Pyright
+### Basedpyright
 
-- **Mode:** `basic` (not strict; ~30 fundamental checks enabled)
+- **Tool:** `basedpyright` (a stricter superset of pyright)
+- **Mode:** `all` — every check is an error by default; `enableBasedFeatures = true` adds
+  basedpyright-specific rules on top.
+- **Python version:** 3.10
 - **`extraPaths = ["pallatom"]`** — first-party imports resolve without the `pallatom.` prefix
   (e.g. `from architecture.main_trunk import MainTrunk`).
+- **Excluded:** `**/*.ipynb` and `pallatom/tests/*` are not checked.
 
-**Enforced as errors:**
+**Notable basedpyright-specific rules (enabled by `enableBasedFeatures`):**
 
-| Setting | Meaning |
-|---------|---------|
-| `reportConstantRedefinition` | Reassigning a `Final` variable |
-| `reportMissingParameterType` | All parameters need type annotations |
-| `reportMissingTypeArgument` | Generics need type args — `dict[str, X]` not bare `dict` |
-| `reportUninitializedInstanceVariable` | Class attributes must be initialised in `__init__` |
-| `reportUnnecessaryCast` | `cast()` calls must do real work |
-| `reportUnnecessaryTypeIgnoreComment` | `# type: ignore` must suppress an actual error |
-| `reportIncompatibleMethodOverride` | Overrides must be covariant |
-| `reportIncompatibleVariableOverride` | Same for variable overrides |
-| `reportCallInDefaultInitializer` | No function calls in default argument values |
-| `reportReturnType` | All public functions must have explicit return type annotations |
-| `strictParameterNoneValue` | Prevents accessing attributes that might be `None` at runtime |
+| Rule | Meaning |
+|------|---------|
+| `reportAny` | Variables and arguments must not have type `Any`; numpy stubs often produce `Any` for array element access — this is a known limitation |
+| `reportImplicitOverride` | Methods that override a parent must be decorated with `@override` (import from `typing_extensions` for Python < 3.12) |
 
-**Enforced as warnings (pre-commit treats these as failures too):**
-
-| Setting | Meaning |
-|---------|---------|
-| `reportUnknownArgumentType` | Argument types must be resolvable |
-| `reportUnknownLambdaType` | Lambda return types must be resolvable |
-| `reportDeprecated` | Catches deprecated PyTorch/CUDA API usage early |
-
-**Disabled (contamination from untyped libraries):**
+**Disabled (ML / library compatibility):**
 
 | Setting | Reason |
 |---------|--------|
-| `reportUnknownVariableType` | torch/einops are partially untyped |
-| `reportUnknownParameterType` | same |
-| `reportUnknownMemberType` | same |
-| `reportPrivateImportUsage` | disabled by project choice |
-| `reportInvalidTypeForm` | jaxtyping shape strings |
+| `reportInvalidTypeForm` | jaxtyping shape strings are runtime-parsed, not forward refs |
 | `reportIndexIssue` | complex PyTorch tensor indexing patterns |
+| `reportUnknownVariableType` | jaxtyping interference |
+| `reportPrivateImportUsage` | disabled by project choice |
 
 ---
 
@@ -195,7 +180,7 @@ Commit messages must follow Conventional Commits. Examples of valid prefixes:
    helpers; full `Args`/`Returns` for anything non-obvious. This applies to test files too
    (the `ANN` waiver covers annotations only, not `D` docstring rules).
 
-2. **Type-annotate all parameters and return types** — even in test files, because pyright's
+2. **Type-annotate all parameters and return types** — even in test files, because basedpyright's
    `reportMissingParameterType` fires regardless of the `ANN` ruff waiver.
 
 3. **Sort imports** with isort ordering: stdlib → third-party → first-party (no `pallatom.`

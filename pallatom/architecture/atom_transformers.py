@@ -5,16 +5,57 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from architecture.layers import LinearNoBias
+from architecture.layers import LayerNorm, LinearNoBias, TypedLinear, TypedSequential
 from architecture.node_update import AdaLN, AttentionPairBias
 from beartype import beartype
 from einops import einsum, rearrange, reduce, repeat
 from jaxtyping import Bool, Float, Int, jaxtyped
+from typing_extensions import override
 
 # Local attention window size (residues), matching AlphaFold 3 atom transformer.
 # Each atom l attends only to atoms m where |tok_idx[l] - tok_idx[m]| < WINDOW_SIZE // 2,
 # giving each atom at most WINDOW_SIZE // 2 neighbours on each side.
 WINDOW_SIZE: int = 128
+
+
+@jaxtyped(typechecker=beartype)
+def scatter_mean(
+    src: Float[torch.Tensor, "B N_src C"],
+    index: Int[torch.Tensor, "B N_src"],
+    num_segments: int,
+    B: int,
+) -> Float[torch.Tensor, "B N_target C"]:
+    """Per-segment mean pooling via scatter.
+
+    Maps atom-level features to residue-level by averaging all atoms that share
+    the same flat segment index.  `index` must already encode the batch offset
+    (i.e. atom j in batch item b maps to index[b, j] = tok_idx[b, j] + b * N_tgt).
+
+    Args:
+        src: Source features of shape ``(B, N_src, C)``.
+        index: Flat segment indices of shape ``(B, N_src)``, already offset by
+            ``b * N_tgt`` so that they index into a ``(B * N_tgt)`` flat buffer.
+        num_segments: Total number of flat segments, i.e. ``B * N_tgt``.
+        B: Batch size, used to reshape the result back to ``(B, N_tgt, C)``.
+
+    Returns:
+        Mean-pooled features of shape ``(B, N_target, C)``.
+    """
+    C: int = src.size(-1)
+    device = src.device
+
+    flat_index: Int[torch.Tensor, "BN_src"] = rearrange(index, "b n -> (b n)")
+    flat_src: Float[torch.Tensor, "BN_src C"] = rearrange(src, "b n c -> (b n) c")
+
+    sum_flat: Float[torch.Tensor, "BN_target C"] = torch.zeros(num_segments, C, device=device)
+    _ = sum_flat.scatter_add_(0, repeat(flat_index, "n -> n c", c=C), flat_src)
+
+    cnt_flat: Float[torch.Tensor, "BN_target 1"] = torch.zeros(num_segments, 1, device=device)
+    _ = cnt_flat.scatter_add_(
+        0, rearrange(flat_index, "n -> n 1"), torch.ones(flat_index.size(0), 1, device=device)
+    )
+
+    return rearrange(sum_flat / cnt_flat.clamp(min=1), "(b n) c -> b n c", b=B)
 
 
 class ConditionedTransitionBlock(nn.Module):
@@ -32,13 +73,23 @@ class ConditionedTransitionBlock(nn.Module):
 
     def __init__(self, c_a: int, c_s: int, expansion: int = 2) -> None:
         super().__init__()
-        self.adaln = AdaLN(c_a=c_a, c_s=c_s)
-        self.a_to_b_1 = LinearNoBias(c_a, expansion * c_a)
-        self.a_to_b_2 = LinearNoBias(c_a, expansion * c_a)
-        self.s_to_a = nn.Linear(c_s, c_a)  # biasinit=-2.0
-        nn.init.constant_(self.s_to_a.bias, -2.0)
-        self.b_to_a = LinearNoBias(expansion * c_a, c_a)
+        self.adaln: AdaLN = AdaLN(c_a=c_a, c_s=c_s)
+        self.a_to_b_1: LinearNoBias = LinearNoBias(c_a, expansion * c_a)
+        self.a_to_b_2: LinearNoBias = LinearNoBias(c_a, expansion * c_a)
+        self.s_to_a: TypedLinear = TypedLinear(c_s, c_a)  # biasinit=-2.0
+        _ = nn.init.constant_(self.s_to_a.bias, -2.0)
+        self.b_to_a: LinearNoBias = LinearNoBias(expansion * c_a, c_a)
 
+    @override
+    def __call__(
+        self,
+        a: Float[torch.Tensor, "B N_res c_a"],
+        s: Float[torch.Tensor, "B N_res c_s"],
+    ) -> Float[torch.Tensor, "B N_res c_a"]:
+        """Call forward; typed override so call-site return types are not Any."""
+        return self.forward(a, s)
+
+    @override
     @jaxtyped(typechecker=beartype)
     def forward(
         self,
@@ -84,10 +135,27 @@ class DiffusionTransformer(nn.Module):
 
     def __init__(self, c_a: int, c_s: int, c_pair: int, N_block: int, N_head: int) -> None:
         super().__init__()
-        self.N_block = N_block
-        self.attn_pair_bias = AttentionPairBias(c_res=c_a, c_pair=c_pair, n_heads=N_head)
-        self.cond_trans_block = ConditionedTransitionBlock(c_a=c_a, c_s=c_s, expansion=2)
+        self.N_block: int = N_block
+        self.attn_pair_bias: AttentionPairBias = AttentionPairBias(
+            c_res=c_a, c_pair=c_pair, n_heads=N_head
+        )
+        self.cond_trans_block: ConditionedTransitionBlock = ConditionedTransitionBlock(
+            c_a=c_a, c_s=c_s, expansion=2
+        )
 
+    @override
+    def __call__(
+        self,
+        a: Float[torch.Tensor, "B N_res c_a"],
+        s: Float[torch.Tensor, "B N_res c_s"],
+        z: Float[torch.Tensor, "B N_res N_j c_pair"],
+        beta: Float[torch.Tensor, "B N_res N_j"] | None = None,
+        neighbor_idx: Int[torch.Tensor, "B N_res N_j"] | None = None,
+    ) -> Float[torch.Tensor, "B N_res c_a"]:
+        """Call forward; typed override so call-site return types are not Any."""
+        return self.forward(a, s, z, beta, neighbor_idx)
+
+    @override
     @jaxtyped(typechecker=beartype)  # q,c, p = a,s,z
     def forward(
         self,
@@ -95,7 +163,7 @@ class DiffusionTransformer(nn.Module):
         s: Float[torch.Tensor, "B N_res c_s"],
         z: Float[torch.Tensor, "B N_res N_j c_pair"],
         beta: Float[torch.Tensor, "B N_res N_j"] | None = None,
-        neighbor_idx: Int[torch.Tensor, "N_res N_j"] | None = None,
+        neighbor_idx: Int[torch.Tensor, "B N_res N_j"] | None = None,
     ) -> Float[torch.Tensor, "B N_res c_a"]:
         """Run N_block rounds of attention and transition over atom embeddings.
 
@@ -105,7 +173,7 @@ class DiffusionTransformer(nn.Module):
             z: Pair embeddings — dense ``(B, N_res, N_res, c_pair)`` or
                 sparse ``(B, N_res, K, c_pair)``.
             beta: Optional additive attention bias matching the pair dimension of ``z``.
-            neighbor_idx: Sparse neighbour indices ``(N_res, K)``; pass when z is sparse so
+            neighbor_idx: Sparse neighbour indices ``(B, N_res, K)``; pass when z is sparse so
                 attention is computed over K neighbours rather than all N positions.
 
         Returns:
@@ -173,7 +241,7 @@ def build_sparse_pairs(
 
 @jaxtyped(typechecker=beartype)
 def compute_beta(
-    neighbor_idx: Int[torch.Tensor, "N K"],
+    neighbor_idx: Int[torch.Tensor, "B N K"],
     valid_mask: Bool[torch.Tensor, "B N K"],
     n_queries: int,
     n_keys: int,
@@ -188,7 +256,7 @@ def compute_beta(
     for ``c = 0, 1, …, ⌈N / n_queries⌉ - 1``.
 
     Args:
-        neighbor_idx: Sparse neighbour indices [N, K].
+        neighbor_idx: Sparse neighbour indices [B, N, K].
         valid_mask: True where neighbour slot is a real atom [B, N, K].
         n_queries: Query-window full-width in atoms.
         n_keys: Key-window full-width in atoms.
@@ -198,7 +266,7 @@ def compute_beta(
         Additive attention bias [B, N, K]; 0.0 for admitted pairs, -1e10 elsewhere.
     """
     B, N = ref.shape[0], ref.shape[1]
-    K = neighbor_idx.shape[1]
+    K = neighbor_idx.shape[2]
     half_q = n_queries / 2.0
     half_k = n_keys / 2.0
 
@@ -210,7 +278,13 @@ def compute_beta(
     atom_idx: Float[torch.Tensor, "B N"] = repeat(
         torch.arange(N, device=ref.device, dtype=torch.float32), "N -> B N", B=B
     )
-    m_idx: Float[torch.Tensor, "B N K"] = atom_idx[:, neighbor_idx]
+    # neighbor_idx is (B, N, K) — each entry is an atom index in [0, N).
+    # We want m_idx[b, n, k] = atom_idx[b, neighbor_idx[b, n, k]].
+    # arange(B)[:, None, None] broadcasts to (B, N, K) to select the right batch row,
+    # while neighbor_idx selects the atom column — together they do per-batch gather.
+    m_idx: Float[torch.Tensor, "B N K"] = atom_idx[
+        torch.arange(B, device=ref.device)[:, None, None], neighbor_idx
+    ]
 
     l_in_window: Bool[torch.Tensor, "B N n_centres"] = (
         rearrange(atom_idx, "B N -> B N 1") - rearrange(centres, "c -> 1 1 c")
@@ -266,19 +340,32 @@ class AtomTransformer(nn.Module):
         n_keys: int = 128,
     ) -> None:
         super().__init__()
-        self.n_queries = n_queries
-        self.n_keys = n_keys
-        self.blocks = DiffusionTransformer(
+        self.n_queries: int = n_queries
+        self.n_keys: int = n_keys
+        self.blocks: DiffusionTransformer = DiffusionTransformer(
             c_a=c_atom, c_s=c_atom, c_pair=c_atompair, N_block=n_blocks, N_head=n_heads
         )
 
+    @override
+    def __call__(
+        self,
+        q: Float[torch.Tensor, "B N c_atom"],
+        c: Float[torch.Tensor, "B N c_atom"],
+        p: Float[torch.Tensor, "B N K c_atompair"],  # K should be 128 now!
+        neighbor_idx: Int[torch.Tensor, "B N K"],
+        valid_mask: Bool[torch.Tensor, "B N K"],
+    ) -> Float[torch.Tensor, "B N c_atom"]:
+        """Call forward; typed override so call-site return types are not Any."""
+        return self.forward(q, c, p, neighbor_idx, valid_mask)
+
+    @override
     @jaxtyped(typechecker=beartype)
     def forward(
         self,
         q: Float[torch.Tensor, "B N c_atom"],
         c: Float[torch.Tensor, "B N c_atom"],
         p: Float[torch.Tensor, "B N K c_atompair"],  # K should be 128 now!
-        neighbor_idx: Int[torch.Tensor, "N K"],
+        neighbor_idx: Int[torch.Tensor, "B N K"],
         valid_mask: Bool[torch.Tensor, "B N K"],
     ) -> Float[torch.Tensor, "B N c_atom"]:
         """Run Algorithm 7: construct beta then run the DiffusionTransformer loop.
@@ -287,7 +374,7 @@ class AtomTransformer(nn.Module):
             q            : atom query embeddings   [B, N, c_atom]
             c            : atom context embeddings [B, N, c_atom]
             p            : sparse pair embeddings  [B, N, K, c_atompair]
-            neighbor_idx : neighbour atom indices  [N, K]
+            neighbor_idx : neighbour atom indices  [B, N, K]
             valid_mask   : live-pair mask          [B, N, K]
 
         Returns:
@@ -352,26 +439,26 @@ class AtomFeatureEncoder(nn.Module):
         window_size: int = WINDOW_SIZE,
     ) -> None:
         super().__init__()
-        self.m = m
-        self.window_size = window_size
+        self.m: int = m
+        self.window_size: int = window_size
 
-        self.proj_fref_c = LinearNoBias(f_ref_dim, m)  # [f_ref_dim, m]
+        self.proj_fref_c: LinearNoBias = LinearNoBias(f_ref_dim, m)  # [f_ref_dim, m]
 
-        self.proj_d_vec = LinearNoBias(3, d)  # [3, d]
-        self.proj_inv_sq = LinearNoBias(1, d)  # [1, d]
-        self.proj_v = LinearNoBias(1, d)  # [1, d]
-        self.proj_cl_pair = LinearNoBias(m, d)  # [m, d]
-        self.proj_cm_pair = LinearNoBias(m, d)  # [m, d]
+        self.proj_d_vec: LinearNoBias = LinearNoBias(3, d)  # [3, d]
+        self.proj_inv_sq: LinearNoBias = LinearNoBias(1, d)  # [1, d]
+        self.proj_v: LinearNoBias = LinearNoBias(1, d)  # [1, d]
+        self.proj_cl_pair: LinearNoBias = LinearNoBias(m, d)  # [m, d]
+        self.proj_cm_pair: LinearNoBias = LinearNoBias(m, d)  # [m, d]
 
-        self.proj_r_scaled = LinearNoBias(3, m)  # [3, m]
+        self.proj_r_scaled: LinearNoBias = LinearNoBias(3, m)  # [3, m]
 
-        self.norm_s_init = nn.LayerNorm(c_token)
-        self.proj_s_init = LinearNoBias(c_token, m)  # [c_token, m]
+        self.norm_s_init: LayerNorm = LayerNorm(c_token)
+        self.proj_s_init: LinearNoBias = LinearNoBias(c_token, m)  # [c_token, m]
 
-        self.norm_z_init = nn.LayerNorm(c_pair)
-        self.proj_z_init = LinearNoBias(c_pair, d)  # [c_pair, d]
+        self.norm_z_init: LayerNorm = LayerNorm(c_pair)
+        self.proj_z_init: LinearNoBias = LinearNoBias(c_pair, d)  # [c_pair, d]
 
-        self.mlp_p = nn.Sequential(  # [d, d] each layer
+        self.mlp_p: TypedSequential = TypedSequential(  # [d, d] each layer
             LinearNoBias(d, d),
             nn.ReLU(),
             LinearNoBias(d, d),
@@ -381,7 +468,7 @@ class AtomFeatureEncoder(nn.Module):
             LinearNoBias(d, d),
         )
 
-        self.transformer = AtomTransformer(
+        self.transformer: AtomTransformer = AtomTransformer(
             c_atom=m,
             c_atompair=d,
             n_blocks=n_blocks,
@@ -390,8 +477,31 @@ class AtomFeatureEncoder(nn.Module):
             n_keys=window_size,
         )
 
-        self.proj_agg = LinearNoBias(m, c)  # [m, c]
+        self.proj_agg: LinearNoBias = LinearNoBias(m, c)  # [m, c]
 
+    @override
+    def __call__(
+        self,
+        ref_pos: Float[torch.Tensor, "B N_atom 3"],
+        ref_element: Float[torch.Tensor, "B N_atom E"],
+        ref_space_uid: Int[torch.Tensor, "B N_atom"],
+        s_input: Float[torch.Tensor, "B N_res c_token"],
+        z_input: Float[torch.Tensor, "B N_res N_res c_pair"],
+        r_scaled: Float[torch.Tensor, "B N_atom 3"],
+        tok_idx: Int[torch.Tensor, "B N_atom"],
+    ) -> tuple[
+        Float[torch.Tensor, "B N_res c_res"],
+        Float[torch.Tensor, "B N_atom c_atom"],
+        Float[torch.Tensor, "B N_atom c_atom"],
+        Float[torch.Tensor, "B N_atom K c_atompair"],
+        Float[torch.Tensor, "B N_atom c_atom"],
+    ]:
+        """Call forward; typed override so call-site return types are not Any."""
+        return self.forward(
+            ref_pos, ref_element, ref_space_uid, s_input, z_input, r_scaled, tok_idx
+        )
+
+    @override
     @jaxtyped(typechecker=beartype)
     def forward(
         self,
@@ -430,24 +540,33 @@ class AtomFeatureEncoder(nn.Module):
         N_atom = ref_pos.size(1)
         N_token = s_input.size(1)
 
-        # tok_idx is identical across batch items; use [0] for index builds.
-        tok: Int[torch.Tensor, "N_atom"] = tok_idx[0]  # [N_atom] This bothers me.
+        # ------------------------------------------------------------------
+        # Build sparse pair index per batch item and stack into (B, N, K).
+        # Every sequence has 5 atoms per residue, so K is identical across
+        # batch items and torch.stack works without padding.
+        # ------------------------------------------------------------------
+        per_batch_nidx: list[Int[torch.Tensor, "N_atom K"]] = []
+        per_batch_wvalid: list[Bool[torch.Tensor, "N_atom K"]] = []
+        for b in range(B):
+            nidx_b, wvalid_b = build_sparse_pairs(tok_idx[b], self.window_size)
+            per_batch_nidx.append(nidx_b)
+            per_batch_wvalid.append(wvalid_b)
 
-        # ------------------------------------------------------------------
-        # Build sparse pair index — O(N²) bool then O(N by K) permanently
-        # ------------------------------------------------------------------
-        neighbor_idx: Int[torch.Tensor, "N_atom K"]
-        window_valid: Bool[torch.Tensor, "N_atom K"]
-        neighbor_idx, window_valid = build_sparse_pairs(tok, self.window_size)
-        K = neighbor_idx.size(1)
+        neighbor_idx: Int[torch.Tensor, "B N_atom K"] = torch.stack(per_batch_nidx)
+        window_valid: Bool[torch.Tensor, "B N_atom K"] = torch.stack(per_batch_wvalid)
+        K = neighbor_idx.size(2)
+
+        # Reusable batch selectors for per-batch advanced indexing.
+        # arange(B)[:, None] → (B, 1) broadcasts against (B, N);
+        # sliced to (B, 1, 1) broadcasts against (B, N, K).
+        batch_idx_2d: Int[torch.Tensor, "B 1"] = torch.arange(B, device=ref_pos.device)[:, None]
+        batch_idx_3d: Int[torch.Tensor, "B 1 1"] = batch_idx_2d[:, :, None]
 
         # Chain constraint: same ref_space_uid per batch item — [B, N_atom, K]
         chain_valid: Bool[torch.Tensor, "B N_atom K"] = (
-            rearrange(ref_space_uid, "b n -> b n 1") == ref_space_uid[:, neighbor_idx]
+            rearrange(ref_space_uid, "b n -> b n 1") == ref_space_uid[batch_idx_3d, neighbor_idx]
         )
-        valid_mask: Bool[torch.Tensor, "B N_atom K"] = (
-            rearrange(window_valid, "n k -> 1 n k") & chain_valid
-        )
+        valid_mask: Bool[torch.Tensor, "B N_atom K"] = window_valid & chain_valid
 
         # ------------------------------------------------------------------
         # Step 1: f^ref — each atom sees all sibling atoms' pos+element
@@ -455,10 +574,10 @@ class AtomFeatureEncoder(nn.Module):
         n_per_res = N_atom // N_token
         ref_pos_grouped: Float[torch.Tensor, "B N_atom ref_pos_flat"] = rearrange(
             ref_pos, "b (n a) d -> b n (a d)", a=n_per_res
-        )[:, tok]
+        )[batch_idx_2d, tok_idx]
         ref_elem_grouped: Float[torch.Tensor, "B N_atom ref_elem_flat"] = rearrange(
             ref_element, "b (n a) d -> b n (a d)", a=n_per_res
-        )[:, tok]
+        )[batch_idx_2d, tok_idx]
         f_ref: Float[torch.Tensor, "B N_atom f_ref_dim"] = torch.cat(
             [ref_pos_grouped, ref_elem_grouped], dim=-1
         )
@@ -475,7 +594,7 @@ class AtomFeatureEncoder(nn.Module):
 
         # Step 5: d_lm = ref_pos[b, l] - ref_pos[b, m]  [B, N_atom, K, 3]
         d_lm: Float[torch.Tensor, "B N_atom K 3"] = (
-            rearrange(ref_pos, "b n d -> b n 1 d") - ref_pos[:, neighbor_idx]
+            rearrange(ref_pos, "b n d -> b n 1 d") - ref_pos[batch_idx_3d, neighbor_idx]
         )
 
         # Step 6: v_lm = same-chain flag                 [B, N_atom, K]
@@ -504,7 +623,7 @@ class AtomFeatureEncoder(nn.Module):
         # Step 10: p_lm += proj(ReLU(c_l)) + proj(ReLU(c_m))
         cl_proj: Float[torch.Tensor, "B N_atom d"] = self.proj_cl_pair(F.relu(c_l))
         cm_proj: Float[torch.Tensor, "B N_atom d"] = self.proj_cm_pair(F.relu(c_l))
-        cm_nbr: Float[torch.Tensor, "B N_atom K d"] = cm_proj[:, neighbor_idx]
+        cm_nbr: Float[torch.Tensor, "B N_atom K d"] = cm_proj[batch_idx_3d, neighbor_idx]
         p_lm = p_lm + rearrange(cl_proj, "b n d -> b n 1 d") + cm_nbr
 
         # Zero padding slots
@@ -519,15 +638,20 @@ class AtomFeatureEncoder(nn.Module):
         # ------------------------------------------------------------------
         # Step 13: c_l += proj(LayerNorm(s_input[tok_idx]))
         # ------------------------------------------------------------------
-        c_l = c_l + self.proj_s_init(self.norm_s_init(s_input[:, tok]))
+        c_l = c_l + self.proj_s_init(self.norm_s_init(s_input[batch_idx_2d, tok_idx]))
 
         # ------------------------------------------------------------------
         # Step 14: p_lm += proj(LayerNorm(z_input[tok_l, tok_m]))
         # ------------------------------------------------------------------
-        tok_nbr_shared: Int[torch.Tensor, "N_atom K"] = tok[neighbor_idx]
-        tok_l_shared: Int[torch.Tensor, "N_atom K"] = repeat(tok, "n -> n k", k=K)
+        # tok_idx[b, neighbor_idx[b, n, k]] — residue index of each neighbour atom
+        tok_nbr: Int[torch.Tensor, "B N_atom K"] = tok_idx[batch_idx_3d, neighbor_idx]
+        tok_l: Int[torch.Tensor, "B N_atom K"] = repeat(tok_idx, "b n -> b n k", k=K)
+        # z_input[b, tok_l[b,n,k], tok_nbr[b,n,k]] — needs an explicit batch index
+        batch_idx_full: Int[torch.Tensor, "B N_atom K"] = repeat(
+            torch.arange(B, device=z_input.device), "b -> b n k", n=N_atom, k=K
+        )
         z_gathered: Float[torch.Tensor, "B N_atom K c_pair"] = z_input[
-            :, tok_l_shared, tok_nbr_shared
+            batch_idx_full, tok_l, tok_nbr
         ]
         p_lm = p_lm + self.proj_z_init(self.norm_z_init(z_gathered))
 
@@ -552,27 +676,11 @@ class AtomFeatureEncoder(nn.Module):
         # Step 17: s_i = mean_{l: tok_idx(l)=i} ReLU(proj(q_skip))
         # ------------------------------------------------------------------
         proj_q: Float[torch.Tensor, "B N_atom c"] = F.relu(self.proj_agg(q_skip))
-        C = proj_q.size(-1)
 
-        # Vectorized scatter: offset tok_idx by b*N_token to flatten B by N_token → (B*N_token)
         tok_offset: Int[torch.Tensor, "B N_atom"] = (
             tok_idx + repeat(torch.arange(B, device=tok_idx.device), "b -> b n", n=N_atom) * N_token
         )
-        s_i_flat = torch.zeros(B * N_token, C, device=proj_q.device, dtype=proj_q.dtype)
-        s_i_flat.scatter_add_(
-            0,
-            repeat(rearrange(tok_offset, "b n -> (b n)"), "bn -> bn c", c=C),
-            rearrange(proj_q, "b n c -> (b n) c"),
-        )
-        counts_flat = torch.zeros(B * N_token, 1, device=proj_q.device, dtype=proj_q.dtype)
-        counts_flat.scatter_add_(
-            0,
-            rearrange(tok_offset, "b n -> (b n) 1"),
-            torch.ones(B * N_atom, 1, device=proj_q.device, dtype=proj_q.dtype),
-        )
-        s_i: Float[torch.Tensor, "B N_res c"] = rearrange(
-            s_i_flat / counts_flat.clamp(min=1), "(b n) c -> b n c", b=B
-        )
+        s_i: Float[torch.Tensor, "B N_res c"] = scatter_mean(proj_q, tok_offset, B * N_token, B)
 
         return s_i, q_skip, c_skip, p_skip, c_l
 
@@ -616,16 +724,16 @@ class AtomAttentionDecoder(nn.Module):
         window_size: int = WINDOW_SIZE,
     ) -> None:
         super().__init__()
-        self.n_keys = window_size
-        self.n_queries = window_size * 4
+        self.n_keys: int = window_size
+        self.n_queries: int = window_size * 4
 
-        self.norm_s_q = nn.LayerNorm(c_token)
-        self.proj_s_q = LinearNoBias(c_token, c_atom)  # [c_token, c_atom]
+        self.norm_s_q: LayerNorm = LayerNorm(c_token)
+        self.proj_s_q: LinearNoBias = LinearNoBias(c_token, c_atom)  # [c_token, c_atom]
 
-        self.norm_z = nn.LayerNorm(c_pair)
-        self.proj_z = LinearNoBias(c_pair, c_atompair)  # [c_pair, c_atompair]
+        self.norm_z: LayerNorm = LayerNorm(c_pair)
+        self.proj_z: LinearNoBias = LinearNoBias(c_pair, c_atompair)  # [c_pair, c_atompair]
 
-        self.mlp_p = nn.Sequential(  # [c_atompair, c_atompair] each
+        self.mlp_p: TypedSequential = TypedSequential(  # [c_atompair, c_atompair] each
             nn.ReLU(),
             LinearNoBias(c_atompair, c_atompair),
             nn.ReLU(),
@@ -634,7 +742,7 @@ class AtomAttentionDecoder(nn.Module):
             LinearNoBias(c_atompair, c_atompair),
         )
 
-        self.transformer = AtomTransformer(
+        self.transformer: AtomTransformer = AtomTransformer(
             c_atom=c_atom,
             c_atompair=c_atompair,
             n_blocks=n_blocks,
@@ -643,12 +751,32 @@ class AtomAttentionDecoder(nn.Module):
             n_keys=window_size,
         )
 
-        self.norm_q_out = nn.LayerNorm(c_atom)
-        self.proj_r = LinearNoBias(c_atom, 3)  # [c_atom, 3]
+        self.norm_q_out: LayerNorm = LayerNorm(c_atom)
+        self.proj_r: LinearNoBias = LinearNoBias(c_atom, 3)  # [c_atom, 3]
 
-        self.norm_s_c = nn.LayerNorm(c_token)
-        self.proj_s_c = LinearNoBias(c_token, c_atom)  # [c_token, c_atom]
+        self.norm_s_c: LayerNorm = LayerNorm(c_token)
+        self.proj_s_c: LinearNoBias = LinearNoBias(c_token, c_atom)  # [c_token, c_atom]
 
+    @override
+    def __call__(
+        self,
+        q_skip: Float[torch.Tensor, "B N_atom c_atom"],
+        p_skip: Float[torch.Tensor, "B N_atom K c_atompair"],
+        c_skip: Float[torch.Tensor, "B N_atom c_atom"],
+        c: Float[torch.Tensor, "B N_atom c_atom"],
+        s: Float[torch.Tensor, "B N_res c_token"],
+        z: Float[torch.Tensor, "B N_res N_res c_pair"],
+        tok_idx: Int[torch.Tensor, "B N_atom"],
+    ) -> tuple[
+        Float[torch.Tensor, "B N_atom c_atom"],
+        Float[torch.Tensor, "B N_atom K c_atompair"],
+        Float[torch.Tensor, "B N_atom 3"],
+        Float[torch.Tensor, "B N_atom c_atom"],
+    ]:
+        """Call forward; typed override so call-site return types are not Any."""
+        return self.forward(q_skip, p_skip, c_skip, c, s, z, tok_idx)
+
+    @override
     @jaxtyped(typechecker=beartype)
     def forward(
         self,
@@ -681,24 +809,37 @@ class AtomAttentionDecoder(nn.Module):
             r_update : per-atom position update  [B, N_atom, 3]
             c_out    : updated atom context      [B, N_atom, c_atom]
         """
-        # tok_idx identical across batch items; use [0] for index builds
-        tok = tok_idx[0]  # [N_atom]
-
-        # Build sparse pair index (window only; chain info lives in p_skip)
-        neighbor_idx: Int[torch.Tensor, "N_atom K"]
-        window_valid: Bool[torch.Tensor, "N_atom K"]
-        neighbor_idx, window_valid = build_sparse_pairs(tok, self.n_keys)
-        K_built = neighbor_idx.size(1)
         B = tok_idx.size(0)
-        valid_mask: Bool[torch.Tensor, "B N_atom K"] = repeat(window_valid, "n k -> b n k", b=B)
+        N_atom = tok_idx.size(1)
+
+        # Build sparse pair index per batch item and stack — K is identical
+        # across items since every residue has 5 atoms.
+        per_batch_nidx: list[Int[torch.Tensor, "N_atom K"]] = []
+        per_batch_wvalid: list[Bool[torch.Tensor, "N_atom K"]] = []
+        for b in range(B):
+            nidx_b, wvalid_b = build_sparse_pairs(tok_idx[b], self.n_keys)
+            per_batch_nidx.append(nidx_b)
+            per_batch_wvalid.append(wvalid_b)
+
+        neighbor_idx: Int[torch.Tensor, "B N_atom K"] = torch.stack(per_batch_nidx)
+        valid_mask: Bool[torch.Tensor, "B N_atom K"] = torch.stack(per_batch_wvalid)
+        K = neighbor_idx.size(2)
+
+        batch_idx_2d: Int[torch.Tensor, "B 1"] = torch.arange(B, device=tok_idx.device)[:, None]
+        batch_idx_3d: Int[torch.Tensor, "B 1 1"] = batch_idx_2d[:, :, None]
 
         # Step 1: q = proj(LayerNorm(s[tok_idx])) + q_skip   [B, N_atom, c_atom]
-        q: Float[torch.Tensor, "B N_atom c_atom"] = self.proj_s_q(self.norm_s_q(s[:, tok])) + q_skip
+        q: Float[torch.Tensor, "B N_atom c_atom"] = (
+            self.proj_s_q(self.norm_s_q(s[batch_idx_2d, tok_idx])) + q_skip
+        )
 
         # Step 2: p = proj(LayerNorm(z[tok_l, tok_m])) + p_skip  [B, N_atom, K, c_atompair]
-        tok_nbr_shared: Int[torch.Tensor, "N_atom K"] = tok[neighbor_idx]
-        tok_l_shared: Int[torch.Tensor, "N_atom K"] = repeat(tok, "n -> n k", k=K_built)
-        z_gathered: Float[torch.Tensor, "B N_atom K c_pair"] = z[:, tok_l_shared, tok_nbr_shared]
+        tok_nbr: Int[torch.Tensor, "B N_atom K"] = tok_idx[batch_idx_3d, neighbor_idx]
+        tok_l: Int[torch.Tensor, "B N_atom K"] = repeat(tok_idx, "b n -> b n k", k=K)
+        batch_idx_full: Int[torch.Tensor, "B N_atom K"] = repeat(
+            torch.arange(B, device=z.device), "b -> b n k", n=N_atom, k=K
+        )
+        z_gathered: Float[torch.Tensor, "B N_atom K c_pair"] = z[batch_idx_full, tok_l, tok_nbr]
         p: Float[torch.Tensor, "B N_atom K c_atompair"] = (
             self.proj_z(self.norm_z(z_gathered)) + p_skip
         )
@@ -720,7 +861,7 @@ class AtomAttentionDecoder(nn.Module):
 
         # Step 6: c_out = proj(LayerNorm(s[tok_idx])) + c_skip
         c_out: Float[torch.Tensor, "B N_atom c_atom"] = (
-            self.proj_s_c(self.norm_s_c(s[:, tok])) + c_skip
+            self.proj_s_c(self.norm_s_c(s[batch_idx_2d, tok_idx])) + c_skip
         )
 
         return q, p, r_update, c_out

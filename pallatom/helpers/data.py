@@ -1,11 +1,11 @@
 """Dataset and data loading utilities for protein structure files."""
 
 import io
-import json
 from collections.abc import Mapping
 from pathlib import Path
-from typing import cast
+from typing import ClassVar, cast
 
+import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -20,8 +20,22 @@ from helpers.batch_types import ProteinBatch
 from helpers.bucketed_sampler import BucketedBatchSampler
 from helpers.cluster_index import ClusterIndex
 from jaxtyping import Float
+from pydantic import BaseModel, ConfigDict, TypeAdapter
 from torch.utils.data.distributed import DistributedSampler
 from train.train_config import TrainConfig
+from typing_extensions import override
+
+
+class _ProteinEntry(BaseModel):
+    """Minimal schema for protein JSONL entries; unrecognised fields are ignored."""
+
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="ignore")
+    name: str
+    seq: str
+    coords: dict[str, list[list[float]]]
+
+
+_splits_adapter: TypeAdapter[dict[str, list[str]]] = TypeAdapter(dict[str, list[str]])
 
 
 class ProteinDataset(torch.utils.data.Dataset[Mapping[str, torch.Tensor | str]]):
@@ -51,8 +65,8 @@ class ProteinDataset(torch.utils.data.Dataset[Mapping[str, torch.Tensor | str]])
         names: list[str],
         max_seq_length: int = 256,
     ) -> None:
-        self.jsonl_path = Path(jsonl_path)
-        self.max_seq_length = max_seq_length
+        self.jsonl_path: Path = Path(jsonl_path)
+        self.max_seq_length: int = max_seq_length
         self._file: io.BufferedReader | None = None
 
         name_set = set(names)
@@ -60,11 +74,11 @@ class ProteinDataset(torch.utils.data.Dataset[Mapping[str, torch.Tensor | str]])
         byte_pos = 0
         with open(self.jsonl_path, "rb") as f:
             for raw_line in f:
-                if json.loads(raw_line)["name"] in name_set:
+                if _ProteinEntry.model_validate_json(raw_line).name in name_set:
                     offsets.append(byte_pos)
                 byte_pos += len(raw_line)
 
-        self._offsets = offsets
+        self._offsets: list[int] = offsets
 
     # ------------------------------------------------------------------
     # File-handle lifecycle — excluded from pickle so multiprocessing works
@@ -90,18 +104,22 @@ class ProteinDataset(torch.utils.data.Dataset[Mapping[str, torch.Tensor | str]])
         """Return the number of entries in the dataset."""
         return len(self._offsets)
 
+    @override
     def __getitem__(self, idx: int) -> Mapping[str, Float[torch.Tensor, "..."] | str]:
         """Return the parsed JSON entry at the given index."""
         self._open()
-        self._file.seek(self._offsets[idx])  # type: ignore[union-attr]
-        entry = json.loads(self._file.readline())  # type: ignore[union-attr]
+        assert self._file is not None
+        _ = self._file.seek(self._offsets[idx])
+        entry = _ProteinEntry.model_validate_json(self._file.readline())
 
-        np_example = make_np_example(entry["coords"])
+        np_example = make_np_example(entry.coords)
         center_positions(np_example)
-        make_fixed_size(np_example, self.max_seq_length)  # truncation
+        make_fixed_size(np_example, self.max_seq_length)
 
-        sample = {k: torch.tensor(v, dtype=torch.float32) for k, v in np_example.items()}
-        sample["seq"] = entry["seq"][: self.max_seq_length]  # padding?
+        sample: dict[str, torch.Tensor | str] = {
+            k: torch.tensor(v, dtype=torch.float32) for k, v in np_example.items()
+        }
+        sample["seq"] = entry.seq[: self.max_seq_length]
         return sample
 
 
@@ -136,9 +154,9 @@ class ClusteredProteinDataset(
         token_budget: int = 512,
         n_clusters: int = 64,
     ) -> None:
-        self.max_seq_length = max_seq_length
-        self.token_budget = token_budget
-        self.cluster_index = ClusterIndex(jsonl_path, names, token_budget, n_clusters)
+        self.max_seq_length: int = max_seq_length
+        self.token_budget: int = token_budget
+        self.cluster_index: ClusterIndex = ClusterIndex(jsonl_path, names, token_budget, n_clusters)
         self._files: list[io.BufferedReader | None] = [None] * (n_clusters + 1)
 
     def _open(self, k: int) -> None:
@@ -162,6 +180,7 @@ class ClusteredProteinDataset(
         """Return the total number of proteins across all clusters."""
         return len(self.cluster_index)
 
+    @override
     def __getitem__(self, idx: int) -> Mapping[str, Float[torch.Tensor, "..."] | str]:
         """Return the protein at flat index idx at its actual (un-padded) length.
 
@@ -172,24 +191,24 @@ class ClusteredProteinDataset(
             Dict with atom_positions (N, 37, 3), atom_mask (N, 37),
             residue_index (N,), and seq (str), where N <= token_budget.
         """
-        cluster_id = int(self.cluster_index.flat_to_cluster[idx])
-        local_idx = int(self.cluster_index.flat_to_local[idx])
-        offset = int(self.cluster_index.cluster_offsets[cluster_id][local_idx])
+        cluster_id = int(cast(np.int32, self.cluster_index.flat_to_cluster[idx]))
+        local_idx = int(cast(np.int32, self.cluster_index.flat_to_local[idx]))
+        offset = int(cast(np.int64, self.cluster_index.cluster_offsets[cluster_id][local_idx]))
 
         self._open(cluster_id)
-        self._files[cluster_id].seek(offset)  # type: ignore[union-attr]
-        raw = self._files[cluster_id].readline()  # type: ignore[union-attr]
-        entry: Mapping[str, object] = json.loads(raw)
+        f = self._files[cluster_id]
+        assert f is not None
+        _ = f.seek(offset)
+        entry = _ProteinEntry.model_validate_json(f.readline())
 
-        np_example = make_np_example(entry["coords"])  # type: ignore[arg-type]
+        np_example = make_np_example(entry.coords)
         center_positions(np_example)
         truncate_to_length(np_example, self.max_seq_length)
 
         sample: dict[str, Float[torch.Tensor, "..."] | str] = {
             k: torch.tensor(v, dtype=torch.float32) for k, v in np_example.items()
         }
-        seq = cast(str, entry["seq"])
-        sample["seq"] = seq[: self.max_seq_length]
+        sample["seq"] = entry.seq[: self.max_seq_length]
         return sample
 
 
@@ -271,8 +290,7 @@ def make_bucketed_data_loaders(
     rank: int = dist.get_rank() if is_ddp else 0
     world_size: int = dist.get_world_size() if is_ddp else 1
 
-    with open(splits_path) as f:
-        splits: dict[str, list[str]] = json.load(f)
+    splits = _splits_adapter.validate_json(Path(splits_path).read_bytes())
 
     train_names = splits["train"][:252] if debug_run else splits["train"]
 

@@ -175,8 +175,7 @@ def med_loss(
         raise ValueError("r_denoised_blocks must be non-empty.")
     if len(logits_aa_blocks) != K:
         raise ValueError(
-            f"r_denoised_blocks has {K} entries but "
-            f"logits_aa_blocks has {len(logits_aa_blocks)}."
+            f"r_denoised_blocks has {K} entries but logits_aa_blocks has {len(logits_aa_blocks)}."
         )
 
     total: Float[torch.Tensor, ""] | None = None

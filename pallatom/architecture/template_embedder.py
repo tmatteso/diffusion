@@ -3,11 +3,12 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from architecture.atom_transformers import LinearNoBias
+from architecture.layers import LayerNorm, LinearNoBias
 from architecture.pairformer_stack import PairformerStack
 from beartype import beartype
 from einops import einsum, rearrange
 from jaxtyping import Float, jaxtyped
+from typing_extensions import override
 
 # ---------------------------------------------------------------------------
 # TemplateEmbedder — Algorithm 3
@@ -40,17 +41,29 @@ class TemplateEmbedder(nn.Module):
         # Step 4 projections
         # a_ij dim = n_bins + 1 (b_mask) + 1 (b_time)
         a_dim = n_bins + 1 + 1
-        self.norm_z = nn.LayerNorm(c_z)
-        self.proj_z = LinearNoBias(c_z, c)  # LinearNoBias(LayerNorm(z_ij))
-        self.proj_a = LinearNoBias(a_dim, c)  # LinearNoBias(a_ij)
+        self.norm_z: LayerNorm = LayerNorm(c_z)
+        self.proj_z: LinearNoBias = LinearNoBias(c_z, c)  # LinearNoBias(LayerNorm(z_ij))
+        self.proj_a: LinearNoBias = LinearNoBias(a_dim, c)  # LinearNoBias(a_ij)
 
         # Step 5
-        self.pairformer = PairformerStack(c, n_blocks, n_heads)
+        self.pairformer: PairformerStack = PairformerStack(c, n_blocks, n_heads)
 
         # Step 6
-        self.norm_v = nn.LayerNorm(c)
-        self.proj_out = LinearNoBias(c, d)
+        self.norm_v: LayerNorm = LayerNorm(c)
+        self.proj_out: LinearNoBias = LinearNoBias(c, d)
 
+    @override
+    def __call__(
+        self,
+        f_distogram: Float[torch.Tensor, "B N_res N_res n_bins"],
+        f_pseudo_beta_mask: Float[torch.Tensor, "B N_res"],
+        z_ij: Float[torch.Tensor, "B N_res N_res c_z"],
+        t: Float[torch.Tensor, "B N_res N_res"],
+    ) -> Float[torch.Tensor, "B N_res N_res d"]:
+        """Call forward; typed override so call-site return types are not Any."""
+        return self.forward(f_distogram, f_pseudo_beta_mask, z_ij, t)
+
+    @override
     @jaxtyped(typechecker=beartype)
     def forward(
         self,
