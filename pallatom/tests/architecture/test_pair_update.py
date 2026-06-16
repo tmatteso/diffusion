@@ -1,4 +1,10 @@
-"""Tests for pair update modules."""
+"""Tests for the pair_update architecture module.
+
+Covers TransformRBF, TriangleAttentionStartingNodeWithBias,
+TriangleAttentionEndingNodeWithBias, Transition, DropoutRowwise,
+DropoutColumnwise, and PairUpdate including output shapes, finite-value
+checks, gradient flow, dropout semantics, and SE(3) geometric invariance.
+"""
 
 import pytest
 import torch
@@ -16,7 +22,7 @@ from einops import einsum, rearrange, reduce
 from helpers.useful_objects import manual_seed
 from jaxtyping import Float, TypeCheckError, jaxtyped
 
-manual_seed(42)
+_ = manual_seed(42)
 
 N_RES = 8
 C = 32
@@ -33,22 +39,40 @@ TOLERANCE = 1e-5
 def mean_abs_asymmetry(
     x: Float[torch.Tensor, "B N N C"],
 ) -> Float[torch.Tensor, ""]:
-    """Return mean absolute difference between x[b,i,j,c] and x[b,j,i,c]."""
-    return reduce((x - rearrange(x, "b i j c -> b j i c")).abs(), "b i j c -> ", "mean")
+    """Return mean absolute difference between x[b,i,j,c] and x[b,j,i,c].
+
+    Used to quantify how far a pair tensor is from being symmetric in its
+    spatial indices.
+    """
+    return reduce(
+        (x - rearrange(x, "b i j c -> b j i c")).abs(),
+        "b i j c -> ",
+        "mean",
+    )
 
 
 @jaxtyped(typechecker=beartype)
 def compute_dij(
     r: Float[torch.Tensor, "B N_res 3"],
 ) -> Float[torch.Tensor, "B N_res N_res"]:
-    """Compute the (B, N_res, N_res) Euclidean pairwise distance matrix."""
+    """Compute the (B, N_res, N_res) Euclidean pairwise distance matrix.
+
+    For each batch item and each pair of residue positions (i, j), computes
+    the L2 distance between the two 3-D coordinates.
+    """
     diff = rearrange(r, "b n d -> b n 1 d") - rearrange(r, "b n d -> b 1 n d")
-    return torch.sqrt(reduce(diff**2, "b n m d -> b n m", "sum").clamp(min=1e-8))
+    return torch.sqrt(
+        reduce(diff**2, "b n m d -> b n m", "sum").clamp(min=1e-8),
+    )
 
 
 @jaxtyped(typechecker=beartype)
 def random_rotation() -> Float[torch.Tensor, "3 3"]:
-    """Generate a uniformly random proper rotation matrix (det = +1)."""
+    """Generate a uniformly random proper rotation matrix (det = +1).
+
+    Uses QR decomposition of a Gaussian random matrix and corrects the sign
+    so the determinant is exactly +1.
+    """
     Q, _ = torch.qr(torch.randn(3, 3))
     if Q.det() < 0:
         Q[:, 0] = -Q[:, 0]
@@ -60,7 +84,11 @@ def apply_rotation(
     r: Float[torch.Tensor, "B N_res 3"],
     R: Float[torch.Tensor, "3 3"],
 ) -> Float[torch.Tensor, "B N_res 3"]:
-    """Apply rotation matrix R to every atom coordinate in r."""
+    """Apply rotation matrix R to every atom coordinate in r.
+
+    Each coordinate vector in the (B, N_res) batch is rotated by the same
+    global rotation R via a batched matrix-vector product.
+    """
     return einsum(r, R, "b n d, d e -> b n e")
 
 
@@ -71,31 +99,51 @@ def apply_rotation(
 
 @pytest.fixture
 def rbf() -> TransformRBF:
-    """Provide a TransformRBF module in eval mode."""
+    """Provide a TransformRBF module in eval mode.
+
+    Returns a freshly constructed TransformRBF with channel width C, switched
+    to evaluation mode so dropout and batch-norm are deterministic.
+    """
     return TransformRBF(C).eval()
 
 
 @pytest.fixture
 def tri_start() -> TriangleAttentionStartingNodeWithBias:
-    """Provide a TriangleAttentionStartingNodeWithBias module in eval mode."""
+    """Provide a TriangleAttentionStartingNodeWithBias module in eval mode.
+
+    Returns the module constructed with channel width C and N_HEADS attention
+    heads, switched to evaluation mode.
+    """
     return TriangleAttentionStartingNodeWithBias(C, n_heads=N_HEADS).eval()
 
 
 @pytest.fixture
 def tri_end() -> TriangleAttentionEndingNodeWithBias:
-    """Provide a TriangleAttentionEndingNodeWithBias module in eval mode."""
+    """Provide a TriangleAttentionEndingNodeWithBias module in eval mode.
+
+    Returns the module constructed with channel width C and N_HEADS attention
+    heads, switched to evaluation mode.
+    """
     return TriangleAttentionEndingNodeWithBias(C, n_heads=N_HEADS).eval()
 
 
 @pytest.fixture
 def transition() -> Transition:
-    """Provide a Transition module in eval mode."""
+    """Provide a Transition module in eval mode.
+
+    Returns a freshly constructed Transition MLP with channel width C,
+    switched to evaluation mode.
+    """
     return Transition(C).eval()
 
 
 @pytest.fixture
 def pair_update() -> PairUpdate:
-    """Provide a PairUpdate module (no dropout) in eval mode."""
+    """Provide a PairUpdate module (no dropout) in eval mode.
+
+    Returns a PairUpdate built with 16 RBF features and N_HEADS attention
+    heads, with dropout disabled (p=0.0) and switched to evaluation mode.
+    """
     return PairUpdate(C, n_rbf=16, n_heads=N_HEADS, dropout=0.0).eval()
 
 
@@ -106,27 +154,49 @@ def pair_update() -> PairUpdate:
 
 @pytest.fixture
 def z() -> Float[torch.Tensor, "B N_res N_res C"]:
-    """Provide a random pair-embedding tensor (B, N_RES, N_RES, C)."""
+    """Provide a random pair-embedding tensor (B, N_RES, N_RES, C).
+
+    The tensor is sampled from a standard normal distribution and is used as
+    the primary pair embedding input across multiple tests.
+    """
     return torch.randn(B, N_RES, N_RES, C)
 
 
 @pytest.fixture
 def b() -> Float[torch.Tensor, "B N_res N_res n_heads"]:
-    """Random pair bias tensor [B, N_RES, N_RES, n_heads]."""
+    """Provide a random pair bias tensor [B, N_RES, N_RES, n_heads].
+
+    The tensor is sampled from a standard normal distribution and serves as
+    the attention bias input to triangle attention modules.
+    """
     return torch.randn(B, N_RES, N_RES, N_HEADS)
 
 
 @pytest.fixture
 def d() -> Float[torch.Tensor, "B N_res N_res"]:
-    """Euclidean pairwise distance matrix [B, N_RES, N_RES] from random residue positions."""
+    """Provide a Euclidean pairwise distance matrix [B, N_RES, N_RES].
+
+    Distances are derived from random residue positions so the matrix is
+    symmetric with a zero diagonal, matching the expected input contract of
+    TransformRBF.
+    """
     pos = torch.randn(B, N_RES, 3)
-    diff = rearrange(pos, "b n c -> b n 1 c") - rearrange(pos, "b n c -> b 1 n c")
-    return torch.sqrt(reduce(diff**2, "b n m c -> b n m", "sum").clamp(min=1e-8))
+    diff = rearrange(pos, "b n c -> b n 1 c") - rearrange(
+        pos,
+        "b n c -> b 1 n c",
+    )
+    return torch.sqrt(
+        reduce(diff**2, "b n m c -> b n m", "sum").clamp(min=1e-8),
+    )
 
 
 @pytest.fixture
 def r_center() -> Float[torch.Tensor, "B N_res 3"]:
-    """Random center-atom positions [B, N_RES, 3] used as the geometric input to PairUpdate."""
+    """Provide random center-atom positions [B, N_RES, 3].
+
+    Used as the geometric coordinate input to PairUpdate; sampled from a
+    standard normal distribution.
+    """
     return torch.randn(B, N_RES, 3)
 
 
@@ -135,23 +205,18 @@ def r_center() -> Float[torch.Tensor, "B N_res 3"]:
 # ---------------------------------------------------------------------------
 
 
-def test_transform_rbf_output_shape(
+def test_transform_rbf_output(
     rbf: TransformRBF,
     d: Float[torch.Tensor, "B N_res N_res"],
 ) -> None:
-    """TransformRBF expands a [B, N, N] distance matrix to [B, N, N, C] RBF feature embeddings."""
+    """TransformRBF expands [B, N, N] dist matrix to [B, N, N, C] RBF features.
+
+    Verifies that the output shape is (B, N_RES, N_RES, C) and that all values
+    are finite for a valid distance matrix.
+    """
     with torch.no_grad():
         out = rbf(d)
     assert out.shape == (B, N_RES, N_RES, C)
-
-
-def test_transform_rbf_output_finite(
-    rbf: TransformRBF,
-    d: Float[torch.Tensor, "B N_res N_res"],
-) -> None:
-    """TransformRBF produces no NaN or Inf values for a valid distance matrix."""
-    with torch.no_grad():
-        out = rbf(d)
     assert torch.isfinite(out).all()
 
 
@@ -159,8 +224,12 @@ def test_transform_rbf_symmetric_distance_gives_symmetric_output(
     rbf: TransformRBF,
     d: Float[torch.Tensor, "B N_res N_res"],
 ) -> None:
-    """Because d[i,j] == d[j,i], the RBF output must also be symmetric in the spatial dimensions."""
-    # d is a Euclidean distance matrix, so d[b,i,j] == d[b,j,i]; output must match
+    """A symmetric distance matrix produces a symmetric RBF output tensor.
+
+    Because d[i,j] == d[j,i], the RBF output must also satisfy symmetry in
+    the spatial dimensions; mean absolute asymmetry must be below TOLERANCE.
+    """
+    # d is a Euclidean dist matrix, so d[b,i,j] == d[b,j,i]; output must match
     with torch.no_grad():
         out = rbf(d)
     assert mean_abs_asymmetry(out).item() < TOLERANCE
@@ -171,25 +240,19 @@ def test_transform_rbf_symmetric_distance_gives_symmetric_output(
 # ---------------------------------------------------------------------------
 
 
-def test_tri_start_output_shape(
+def test_tri_start_output(
     tri_start: TriangleAttentionStartingNodeWithBias,
     z: Float[torch.Tensor, "B N_res N_res C"],
     b: Float[torch.Tensor, "B N_res N_res n_heads"],
 ) -> None:
-    """TriangleAttentionStartingNode shape [B, N_res, N_res, C] same as input pair embedding."""
+    """TriangleAttentionStartingNode output shape and finite for random inputs.
+
+    Verifies that the output shape is (B, N_res, N_res, C) and that no NaN or
+    Inf values are produced for a standard-normal pair embedding and bias.
+    """
     with torch.no_grad():
         out = tri_start(z, b)
     assert out.shape == (B, N_RES, N_RES, C)
-
-
-def test_tri_start_output_finite(
-    tri_start: TriangleAttentionStartingNodeWithBias,
-    z: Float[torch.Tensor, "B N_res N_res C"],
-    b: Float[torch.Tensor, "B N_res N_res n_heads"],
-) -> None:
-    """TriangleAttentionStartingNode produces no NaN or Inf for random valid inputs."""
-    with torch.no_grad():
-        out = tri_start(z, b)
     assert torch.isfinite(out).all()
 
 
@@ -198,10 +261,14 @@ def test_tri_start_gradient_flows(
     z: Float[torch.Tensor, "B N_res N_res C"],
     b: Float[torch.Tensor, "B N_res N_res C"],
 ) -> None:
-    """Gradients flow back through TriangleAttentionStartingNode to the pair embedding z."""
-    z_g = z.clone().requires_grad_(True)
+    """Gradients flow through TriangleAttentionStartingNode to pair embedding.
+
+    Verifies that z.grad is non-None and contains only finite values after a
+    backward pass through the module.
+    """
+    z_g = z.clone().requires_grad_(True)  # noqa: FBT003
     out = tri_start(z_g, b)
-    reduce(out, "b n m c -> ", "sum").backward()
+    torch.autograd.backward([reduce(out, "b n m c -> ", "sum")])
     assert z_g.grad is not None
     assert torch.isfinite(z_g.grad).all()
 
@@ -211,7 +278,12 @@ def test_tri_start_row_independence(
     z: Float[torch.Tensor, "B N_res N_res C"],
     b: Float[torch.Tensor, "B N_res N_res C"],
 ) -> None:
-    """Modifying row 0 of z must not change output for rows 1..N_RES-1, each row is independent."""
+    """Modifying row 0 of z does not change output for rows 1..N_RES-1.
+
+    Starting-node attention fixes row i and attends over columns j. Q, K, V, G
+    for row i all come from z[:, i, :], so modifying row 0 must leave output
+    rows 1..N_RES-1 completely unchanged.
+    """
     # Starting-node attention fixes row i and attends over columns j.
     # Q, K, V, G for row i all come from z[:, i, :], so modifying row 0 must
     # leave output rows 1..N_RES-1 completely unchanged.
@@ -228,25 +300,19 @@ def test_tri_start_row_independence(
 # ---------------------------------------------------------------------------
 
 
-def test_tri_end_output_shape(
+def test_tri_end_output(
     tri_end: TriangleAttentionEndingNodeWithBias,
     z: Float[torch.Tensor, "B N_res N_res C"],
     b: Float[torch.Tensor, "B N_res N_res n_heads"],
 ) -> None:
-    """TriangleAttentionEndingNode out [B, N_res, N_res, C] shape same as input pair embedding."""
+    """TriangleAttentionEndingNode output shape and finite for random inputs.
+
+    Verifies that the output shape is (B, N_res, N_res, C) and that no NaN or
+    Inf values are produced for a standard-normal pair embedding and bias.
+    """
     with torch.no_grad():
         out = tri_end(z, b)
     assert out.shape == (B, N_RES, N_RES, C)
-
-
-def test_tri_end_output_finite(
-    tri_end: TriangleAttentionEndingNodeWithBias,
-    z: Float[torch.Tensor, "B N_res N_res C"],
-    b: Float[torch.Tensor, "B N_res N_res n_heads"],
-) -> None:
-    """TriangleAttentionEndingNode produces no NaN or Inf for random valid inputs."""
-    with torch.no_grad():
-        out = tri_end(z, b)
     assert torch.isfinite(out).all()
 
 
@@ -255,10 +321,14 @@ def test_tri_end_gradient_flows(
     z: Float[torch.Tensor, "B N_res N_res C"],
     b: Float[torch.Tensor, "B N_res N_res C"],
 ) -> None:
-    """Gradients flow back through TriangleAttentionEndingNode to the pair embedding z."""
-    z_g = z.clone().requires_grad_(True)
+    """Gradients flow through TriangleAttentionEndingNode to pair embedding z.
+
+    Verifies that z.grad is non-None and contains only finite values after a
+    backward pass through the module.
+    """
+    z_g = z.clone().requires_grad_(True)  # noqa: FBT003
     out = tri_end(z_g, b)
-    reduce(out, "b n m c -> ", "sum").backward()
+    torch.autograd.backward([reduce(out, "b n m c -> ", "sum")])
     assert z_g.grad is not None
     assert torch.isfinite(z_g.grad).all()
 
@@ -268,7 +338,12 @@ def test_tri_end_col_independence(
     z: Float[torch.Tensor, "B N_res N_res C"],
     b: Float[torch.Tensor, "B N_res N_res C"],
 ) -> None:
-    """Modifying column 0 of z not change output for columns 1..N_RES-1, each column independent."""
+    """Modifying column 0 of z does not change output for columns 1..N_RES-1.
+
+    Ending-node attention fixes column j and attends over rows i. Q, K, V, G
+    for column j all come from z[:, :, j], so modifying column 0 must leave
+    output columns 1..N_RES-1 completely unchanged.
+    """
     # Ending-node attention fixes column j and attends over rows i.
     # Q, K, V, G for column j all come from z[:, :, j], so modifying column 0
     # must leave output columns 1..N_RES-1 completely unchanged.
@@ -277,7 +352,11 @@ def test_tri_end_col_independence(
     with torch.no_grad():
         out_orig = tri_end(z, b)
         out_mod = tri_end(z_mod, b)
-    assert torch.allclose(out_orig[:, :, 1:, :], out_mod[:, :, 1:, :], atol=TOLERANCE)
+    assert torch.allclose(
+        out_orig[:, :, 1:, :],
+        out_mod[:, :, 1:, :],
+        atol=TOLERANCE,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -285,42 +364,45 @@ def test_tri_end_col_independence(
 # ---------------------------------------------------------------------------
 
 
-def test_transition_output_shape_3d(
+def test_transition_output_3d(
     transition: Transition,
     z: Float[torch.Tensor, "B N_res N_res C"],
 ) -> None:
-    """Transition applied to a 4-D pair tensor [B, N, N, C] returns the same shape."""
+    """Transition applied to pair tensor returns same shape and finite values.
+
+    Verifies that the MLP preserves the leading batch and spatial dimensions
+    while keeping channel width C, and produces no NaN or Inf values.
+    """
     with torch.no_grad():
         out = transition(z)
     assert out.shape == z.shape
+    assert torch.isfinite(out).all()
 
 
 def test_transition_output_shape_2d(transition: Transition) -> None:
-    """Transition applied to a 2-D tensor [N, C] also returns the same shape (broadcast-safe)."""
+    """Transition applied to a 2-D tensor [N, C] also returns the same shape.
+
+    Verifies that the MLP is broadcast-safe and can handle inputs without a
+    batch or pair dimension.
+    """
     x = torch.randn(N_RES, C)
     with torch.no_grad():
         out = transition(x)
     assert out.shape == (N_RES, C)
 
 
-def test_transition_output_finite(
-    transition: Transition,
-    z: Float[torch.Tensor, "B N_res N_res C"],
-) -> None:
-    """Transition produces no NaN or Inf values for random pair inputs."""
-    with torch.no_grad():
-        out = transition(z)
-    assert torch.isfinite(out).all()
-
-
 def test_transition_gradient_flows(
     transition: Transition,
     z: Float[torch.Tensor, "B N_res N_res C"],
 ) -> None:
-    """Gradients flow back through the Transition MLP to its input."""
-    z_g = z.clone().requires_grad_(True)
+    """Gradients flow back through the Transition MLP to its input.
+
+    Verifies that z.grad is non-None and contains only finite values after a
+    backward pass through the module.
+    """
+    z_g = z.clone().requires_grad_(True)  # noqa: FBT003
     out = transition(z_g)
-    reduce(out, "b n m c -> ", "sum").backward()
+    torch.autograd.backward([reduce(out, "b n m c -> ", "sum")])
     assert z_g.grad is not None
     assert torch.isfinite(z_g.grad).all()
 
@@ -333,35 +415,49 @@ def test_transition_gradient_flows(
 def test_dropout_rowwise_eval_is_identity(
     z: Float[torch.Tensor, "B N_res N_res C"],
 ) -> None:
-    """In eval mode DropoutRowwise passes its input through unchanged."""
+    """In eval mode DropoutRowwise passes its input through unchanged.
+
+    Verifies that the module acts as an identity function during inference,
+    producing output that is exactly equal to the input tensor.
+    """
     drop = DropoutRowwise(p=0.5)
-    drop.eval()
+    _ = drop.eval()
     assert torch.equal(drop(z), z)
 
 
 def test_dropout_rowwise_train_preserves_shape(
     z: Float[torch.Tensor, "B N_res N_res C"],
 ) -> None:
-    """DropoutRowwise in training mode returns a tensor of the same shape with finite values."""
+    """DropoutRowwise in train mode returns a finite tensor of correct shape.
+
+    Verifies that stochastic row dropping does not alter the output tensor
+    shape or introduce non-finite values.
+    """
     drop = DropoutRowwise(p=0.5)
-    drop.train()
+    _ = drop.train()
     out = drop(z)
     assert out.shape == z.shape
     assert torch.isfinite(out).all()
 
 
 def test_dropout_rowwise_train_zeroes_entire_rows() -> None:
-    """DropoutRowwise drops entire rows at once — row in output is either all-zero or all-ones."""
+    """DropoutRowwise drops entire row at once.
+
+    Uses a ones input so a dropped row becomes all-zero and a kept row remains
+    all-ones, verifying that the mask is applied uniformly across the entire
+    row rather than element-wise.
+    """
     # Use a ones input so a dropped row is all-zero and a kept row is all-ones.
-    manual_seed(0)
+    _ = manual_seed(0)
     x = torch.ones(B, N_RES, N_RES, C)
     drop = DropoutRowwise(p=0.5)
-    drop.train()
+    _ = drop.train()
     out = drop(x)
     for i in range(N_RES):
         row = out[0, i]  # shape (N_RES, C) — check first batch item
         assert torch.allclose(row, torch.zeros_like(row)) or torch.allclose(
-            row, torch.ones_like(row)
+            row,
+            torch.ones_like(row),
         )
 
 
@@ -373,34 +469,48 @@ def test_dropout_rowwise_train_zeroes_entire_rows() -> None:
 def test_dropout_columnwise_eval_is_identity(
     z: Float[torch.Tensor, "B N_res N_res C"],
 ) -> None:
-    """In eval mode DropoutColumnwise passes its input through unchanged."""
+    """In eval mode DropoutColumnwise passes its input through unchanged.
+
+    Verifies that the module acts as an identity function during inference,
+    producing output that is exactly equal to the input tensor.
+    """
     drop = DropoutColumnwise(p=0.5)
-    drop.eval()
+    _ = drop.eval()
     assert torch.equal(drop(z), z)
 
 
 def test_dropout_columnwise_train_preserves_shape(
     z: Float[torch.Tensor, "B N_res N_res C"],
 ) -> None:
-    """DropoutColumnwise in training mode returns a tensor of the same shape with finite values."""
+    """DropoutColumnwise in train returns a finite tensor of correct shape.
+
+    Verifies that stochastic column dropping does not alter the output tensor
+    shape or introduce non-finite values.
+    """
     drop = DropoutColumnwise(p=0.5)
-    drop.train()
+    _ = drop.train()
     out = drop(z)
     assert out.shape == z.shape
     assert torch.isfinite(out).all()
 
 
 def test_dropout_columnwise_train_zeroes_entire_cols() -> None:
-    """DropoutColumnwise drops entire columns at once — column in output either all zero or ones."""
-    manual_seed(0)
+    """DropoutColumnwise drops entire columns at once.
+
+    Uses a ones input so a dropped column becomes all-zero and a kept column
+    remains all-ones, verifying that the mask is applied uniformly across the
+    entire column rather than element-wise.
+    """
+    _ = manual_seed(0)
     x = torch.ones(B, N_RES, N_RES, C)
     drop = DropoutColumnwise(p=0.5)
-    drop.train()
+    _ = drop.train()
     out = drop(x)
     for j in range(N_RES):
         col = out[0, :, j, :]  # shape (N_RES, C) — check first batch item
         assert torch.allclose(col, torch.zeros_like(col)) or torch.allclose(
-            col, torch.ones_like(col)
+            col,
+            torch.ones_like(col),
         )
 
 
@@ -414,7 +524,11 @@ def test_pair_update_changes_input(
     z: Float[torch.Tensor, "B N_res N_res C"],
     r_center: Float[torch.Tensor, "B N_res 3"],
 ) -> None:
-    """PairUpdate is not an identity — the output pair embedding differs from the input."""
+    """PairUpdate is not an identity, output pair embedding differs from input.
+
+    Verifies that the module actually transforms z rather than passing it
+    through unchanged.
+    """
     with torch.no_grad():
         out = pair_update(z, r_center)
     assert not torch.allclose(out, z)
@@ -425,10 +539,14 @@ def test_pair_update_gradient_flows_to_z(
     z: Float[torch.Tensor, "B N_res N_res C"],
     r_center: Float[torch.Tensor, "B N_res 3"],
 ) -> None:
-    """Gradients flow back through PairUpdate to the input pair embedding z."""
-    z_g = z.clone().requires_grad_(True)
+    """Gradients flow back through PairUpdate to the input pair embedding z.
+
+    Verifies that z.grad is non-None and contains only finite values after a
+    backward pass through the full PairUpdate module.
+    """
+    z_g = z.clone().requires_grad_(True)  # noqa: FBT003
     out = pair_update(z_g, r_center)
-    reduce(out, "b n m c -> ", "sum").backward()
+    torch.autograd.backward([reduce(out, "b n m c -> ", "sum")])
     assert z_g.grad is not None
     assert torch.isfinite(z_g.grad).all()
 
@@ -438,10 +556,15 @@ def test_pair_update_gradient_flows_to_r_center(
     z: Float[torch.Tensor, "B N_res N_res C"],
     r_center: Float[torch.Tensor, "B N_res 3"],
 ) -> None:
-    """Gradients flow back through PairUpdate to the center-atom coordinates r_center."""
-    r_g = r_center.clone().requires_grad_(True)
+    """Gradients flow back through PairUpdate to center-atom coords r_center.
+
+    Verifies that r_center.grad is non-None and contains only finite values
+    after a backward pass, confirming end-to-end differentiability through
+    the distance computation.
+    """
+    r_g = r_center.clone().requires_grad_(True)  # noqa: FBT003
     out = pair_update(z, r_g)
-    reduce(out, "b n m c -> ", "sum").backward()
+    torch.autograd.backward([reduce(out, "b n m c -> ", "sum")])
     assert r_g.grad is not None
     assert torch.isfinite(r_g.grad).all()
 
@@ -449,12 +572,17 @@ def test_pair_update_gradient_flows_to_r_center(
 def test_pair_update_no_nan_grad_from_zero_diagonal_distance(
     pair_update: PairUpdate,
 ) -> None:
-    """Gradient with respect to r_center is finite even at the zero-distance diagonal (d[i,i]=0)."""
+    """Gradient w.r.t. r_center is finite at zero-distance diagonal (d[i,i]=0).
+
+    d_ij[b, i, i] = 0 always; verifies that the backward pass clamps the
+    denominator so the gradient is finite rather than NaN at the zero-distance
+    diagonal.
+    """
     # d_ij[b, i, i] = 0 always; torch.norm's backward clamps the denominator so
     # the gradient must be finite rather than nan at the zero-distance diagonal.
     r_g = torch.randn(B, N_RES, 3, requires_grad=True)
     out = pair_update(torch.randn(B, N_RES, N_RES, C), r_g)
-    reduce(out, "b n m c -> ", "sum").backward()
+    torch.autograd.backward([reduce(out, "b n m c -> ", "sum")])
     assert r_g.grad is not None
     assert torch.isfinite(r_g.grad).all()
 
@@ -463,7 +591,11 @@ def test_tri_start_changes_with_pair_bias(
     tri_start: TriangleAttentionStartingNodeWithBias,
     z: Float[torch.Tensor, "B N_res N_res C"],
 ) -> None:
-    """Different pair bias tensors produce different triangle attention starting-node outputs."""
+    """Pair bias tensors produce triangle attention starting-node outputs.
+
+    Verifies that the pair bias b is actually used in the attention computation
+    and that varying it causes the output to change.
+    """
     b1 = torch.randn(B, N_RES, N_RES, N_HEADS)
     b2 = torch.randn(B, N_RES, N_RES, N_HEADS)
     with torch.no_grad():
@@ -474,16 +606,20 @@ def test_tri_start_changes_with_pair_bias(
 
 # ---------------------------------------------------------------------------
 # Geometric Invariance
-# Layer 1: distance computation is invariant to translation and rotation.
-# Layer 2: TransformRBF output is invariant (invariant input → invariant output).
-# Layer 3: PairUpdate end-to-end output is invariant (coordinates enter only through b_ij).
+# Layer 1: distance computation invariant to translation and rotation.
+# Layer 2: TransformRBF output invariant (invariant input -> invariant output).
+# Layer 3: PairUpdate end-to-end output invariant.
 # ---------------------------------------------------------------------------
 
 
 def test_distance_translation_invariant(
     r_center: Float[torch.Tensor, "B N_res 3"],
 ) -> None:
-    """Pairwise Euclidean distances are unchanged by a global translation of all coordinates."""
+    """Pairwise Euclidean distances unchanged by global translation of coords.
+
+    Verifies that adding a constant offset to every coordinate in r_center
+    leaves the distance matrix identical up to TOLERANCE.
+    """
     t = torch.randn(1, 1, 3)
     with torch.no_grad():
         d_orig = compute_dij(r_center)
@@ -494,7 +630,11 @@ def test_distance_translation_invariant(
 def test_distance_rotation_invariant(
     r_center: Float[torch.Tensor, "B N_res 3"],
 ) -> None:
-    """Pairwise Euclidean distances are unchanged by a global rotation of all coordinates."""
+    """Pairwise Euclidean distances unchanged by global rotation of all coords.
+
+    Verifies that applying a proper orthogonal rotation to every coordinate in
+    r_center leaves the distance matrix identical up to TOLERANCE.
+    """
     R = random_rotation()
     with torch.no_grad():
         d_orig = compute_dij(r_center)
@@ -506,7 +646,12 @@ def test_rbf_translation_invariant(
     rbf: TransformRBF,
     r_center: Float[torch.Tensor, "B N_res 3"],
 ) -> None:
-    """TransformRBF output is unchanged by a global translation because distances are invariant."""
+    """TransformRBF output is unchanged by a global translation of coordinates.
+
+    Verifies the composition: translation-invariant distances feed into a
+    deterministic RBF projection, so final output is also
+    translation-invariant.
+    """
     t = torch.randn(1, 1, 3)
     with torch.no_grad():
         b_orig = rbf(compute_dij(r_center))
@@ -518,7 +663,11 @@ def test_rbf_rotation_invariant(
     rbf: TransformRBF,
     r_center: Float[torch.Tensor, "B N_res 3"],
 ) -> None:
-    """TransformRBF output is unchanged by a global rotation because distances are invariant."""
+    """TransformRBF output is unchanged by a global rotation of coordinates.
+
+    Verifies the composition: rotation-invariant distances feed into a
+    deterministic RBF projection, so final output is also rotation-invariant.
+    """
     R = random_rotation()
     with torch.no_grad():
         b_orig = rbf(compute_dij(r_center))
@@ -531,7 +680,12 @@ def test_pair_update_translation_invariant(
     z: Float[torch.Tensor, "B N_res N_res C"],
     r_center: Float[torch.Tensor, "B N_res 3"],
 ) -> None:
-    """PairUpdate output is unchanged by a global translation of center-atom coordinates."""
+    """PairUpdate output unchanged by global translation of center-atom coords.
+
+    Verifies end-to-end translational invariance: coordinates enter PairUpdate
+    only through the pairwise distance b_ij, so a global offset must not change
+    the output.
+    """
     t = torch.randn(1, 1, 3)
     with torch.no_grad():
         out_orig = pair_update(z, r_center)
@@ -544,7 +698,12 @@ def test_pair_update_rotation_invariant(
     z: Float[torch.Tensor, "B N_res N_res C"],
     r_center: Float[torch.Tensor, "B N_res 3"],
 ) -> None:
-    """PairUpdate output is unchanged by a global rotation of center-atom coordinates."""
+    """PairUpdate output unchanged by global rotation of center-atom coords.
+
+    Verifies end-to-end rotational invariance: coordinates enter PairUpdate
+    only through the pairwise distance b_ij, so a global rotation must not
+    change the output.
+    """
     R = random_rotation()
     with torch.no_grad():
         out_orig = pair_update(z, r_center)
@@ -558,37 +717,55 @@ def test_pair_update_rotation_invariant(
 
 
 def test_transform_rbf_forward_wrong_shape(rbf: TransformRBF) -> None:
-    """Wrong d ndim (2-D instead of 3-D) triggers TypeCheckError."""
+    """Wrong d ndim (2-D instead of 3-D) triggers TypeCheckError.
+
+    Verifies that the jaxtyping shape contract on TransformRBF.forward
+    rejects a distance tensor that is missing its last N_res dimension.
+    """
     d_bad = torch.zeros(B, N_RES)  # missing last N_res dim
     with pytest.raises(TypeCheckError):
-        rbf(d_bad)
+        _ = rbf(d_bad)
 
 
 def test_triangle_attn_starting_node_forward_wrong_shape(
     tri_start: TriangleAttentionStartingNodeWithBias,
     b: Float[torch.Tensor, "B N_res N_res n_heads"],
 ) -> None:
-    """Wrong z ndim (3-D instead of 4-D) triggers TypeCheckError."""
+    """Wrong z ndim (3-D instead of 4-D) triggers TypeCheckError.
+
+    Verifies that the jaxtyping shape contract on
+    TriangleAttentionStartingNodeWithBias.forward rejects a pair tensor that
+    is missing its channel dimension.
+    """
     z_bad = torch.zeros(B, N_RES, N_RES)  # missing c_pair dim
     with pytest.raises(TypeCheckError):
-        tri_start(z_bad, b)
+        _ = tri_start(z_bad, b)
 
 
 def test_triangle_attn_ending_node_forward_wrong_shape(
     tri_end: TriangleAttentionEndingNodeWithBias,
     b: Float[torch.Tensor, "B N_res N_res n_heads"],
 ) -> None:
-    """Wrong z ndim (3-D instead of 4-D) triggers TypeCheckError."""
+    """Wrong z ndim (3-D instead of 4-D) triggers TypeCheckError.
+
+    Verifies that the jaxtyping shape contract on
+    TriangleAttentionEndingNodeWithBias.forward rejects a pair tensor that
+    is missing its channel dimension.
+    """
     z_bad = torch.zeros(B, N_RES, N_RES)  # missing c_pair dim
     with pytest.raises(TypeCheckError):
-        tri_end(z_bad, b)
+        _ = tri_end(z_bad, b)
 
 
 def test_pair_update_forward_wrong_shape(
     pair_update: PairUpdate,
     r_center: Float[torch.Tensor, "B N_res 3"],
 ) -> None:
-    """Wrong z ndim (3-D instead of 4-D) triggers TypeCheckError."""
+    """Wrong z ndim (3-D instead of 4-D) triggers TypeCheckError.
+
+    Verifies that the jaxtyping shape contract on PairUpdate.forward rejects
+    a pair tensor that is missing its channel dimension.
+    """
     z_bad = torch.zeros(B, N_RES, N_RES)  # missing c_pair dim
     with pytest.raises(TypeCheckError):
-        pair_update(z_bad, r_center)
+        _ = pair_update(z_bad, r_center)

@@ -1,4 +1,9 @@
-"""Template embedder for encoding structural template information."""
+"""Template embedder for encoding structural template information.
+
+Contains ``TemplateEmbedder``, which implements Algorithm 3 of the Pallatom
+architecture: it projects distogram-based template representation together with
+time-conditioning and trunk pair embedding into fixed-size pair output tensor.
+"""
 
 import torch
 import torch.nn as nn
@@ -42,7 +47,10 @@ class TemplateEmbedder(nn.Module):
         # a_ij dim = n_bins + 1 (b_mask) + 1 (b_time)
         a_dim = n_bins + 1 + 1
         self.norm_z: LayerNorm = LayerNorm(c_z)
-        self.proj_z: LinearNoBias = LinearNoBias(c_z, c)  # LinearNoBias(LayerNorm(z_ij))
+        self.proj_z: LinearNoBias = LinearNoBias(
+            c_z,
+            c,
+        )  # LinearNoBias(LayerNorm(z_ij))
         self.proj_a: LinearNoBias = LinearNoBias(a_dim, c)  # LinearNoBias(a_ij)
 
         # Step 5
@@ -60,7 +68,10 @@ class TemplateEmbedder(nn.Module):
         z_ij: Float[torch.Tensor, "B N_res N_res c_z"],
         t: Float[torch.Tensor, "B N_res N_res"],
     ) -> Float[torch.Tensor, "B N_res N_res d"]:
-        """Call forward; typed override so call-site return types are not Any."""
+        """Call forward; typed override so call-site return types are not Any.
+
+        See ``forward`` for full documentation of arguments and return values.
+        """
         return self.forward(f_distogram, f_pseudo_beta_mask, z_ij, t)
 
     @override
@@ -72,7 +83,28 @@ class TemplateEmbedder(nn.Module):
         z_ij: Float[torch.Tensor, "B N_res N_res c_z"],
         t: Float[torch.Tensor, "B N_res N_res"],
     ) -> Float[torch.Tensor, "B N_res N_res d"]:
-        """Embed template distogram and pair features into time-conditioned pair representation."""
+        """Embed distogram and pair features into pair representation.
+
+        Implements Algorithm 3: constructs a per-pair feature vector ``a_ij``
+        from the distogram bins, pseudo-beta mask outer product, and
+        time-conditioned mask, adds a projected trunk pair embedding, runs a
+        ``PairformerStack``, and projects the result to the output
+        dimension ``d``.
+
+        Args:
+            f_distogram: Pairwise C-beta distance distribution over ``n_bins``,
+                shape ``(B, N_res, N_res, n_bins)``.
+            f_pseudo_beta_mask: Binary mask indicating residues with a valid
+                pseudo-beta carbon in the template, shape ``(B, N_res)``.
+            z_ij: Trunk pair embedding to be combined with template features,
+                shape ``(B, N_res, N_res, c_z)``.
+            t: Time-conditioning signal broadcast over the pair dimension,
+                shape ``(B, N_res, N_res)``.
+
+        Returns:
+            Time-conditioned template pair embedding of shape
+                ``(B, N_res, N_res, d)``.
+        """
         # ------------------------------------------------------------------
         # Step 1: b_ij^mask = f_i^mask · f_j^mask
         # ------------------------------------------------------------------
@@ -85,14 +117,16 @@ class TemplateEmbedder(nn.Module):
         # Step 2: b_ij^time = t ⊙ f_i^mask    (broadcast t over j)
         # ------------------------------------------------------------------
         b_time: Float[torch.Tensor, "B N_res N_res 1"] = rearrange(
-            t * rearrange(f_pseudo_beta_mask, "b i -> b i 1"), "b i j -> b i j 1"
+            t * rearrange(f_pseudo_beta_mask, "b i -> b i 1"),
+            "b i j -> b i j 1",
         )
 
         # ------------------------------------------------------------------
         # Step 3: a_ij = concat(f_distogram, b_mask, b_time)
         # ------------------------------------------------------------------
         a_ij: Float[torch.Tensor, "B N_res N_res a_dim"] = torch.cat(
-            [f_distogram, b_mask, b_time], dim=-1
+            [f_distogram, b_mask, b_time],
+            dim=-1,
         )
 
         # This part has to be done once for each template.
@@ -100,9 +134,9 @@ class TemplateEmbedder(nn.Module):
         # ------------------------------------------------------------------
         # Step 4: v_ij = LinearNoBias(LayerNorm(z_ij)) + LinearNoBias(a_ij)
         # ------------------------------------------------------------------
-        v_ij: Float[torch.Tensor, "B N_res N_res c"] = self.proj_z(self.norm_z(z_ij)) + self.proj_a(
-            a_ij
-        )
+        v_ij: Float[torch.Tensor, "B N_res N_res c"] = self.proj_z(
+            self.norm_z(z_ij),
+        ) + self.proj_a(a_ij)
 
         # ------------------------------------------------------------------
         # Step 5: v_ij = PairformerStack(v_ij, N_block)
@@ -112,7 +146,9 @@ class TemplateEmbedder(nn.Module):
         # ------------------------------------------------------------------
         # Step 6: u_ij = LinearNoBias(ReLU(LayerNorm(v_ij)))
         # ------------------------------------------------------------------
-        u_ij: Float[torch.Tensor, "B N_res N_res d"] = self.proj_out(F.relu(self.norm_v(v_ij)))
+        u_ij: Float[torch.Tensor, "B N_res N_res d"] = self.proj_out(
+            F.relu(self.norm_v(v_ij)),
+        )
 
         # if you had multiple templates,
         # you would average the u_ij across templates after the layer norm

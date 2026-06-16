@@ -1,10 +1,22 @@
-"""Pairformer stack layers for pair and single representation refinement."""
+"""Pairformer stack layers for pair and single representation refinement.
+
+This module contains the triangle multiplicative update modules
+(``TriangleMultiplicationOutgoing``, ``TriangleMultiplicationIncoming``),
+the full ``PairformerBlock`` implementing the AF3 update sequence, and the
+``PairformerStack`` that chains those blocks sequentially.
+"""
 
 from typing import overload
 
 import torch
 import torch.nn as nn
-from architecture.layers import LayerNorm, LinearNoBias, TypedLinear, TypedModuleList
+from architecture.errors import InvalidPairHeadDimensionError
+from architecture.layers import (
+    LayerNorm,
+    LinearNoBias,
+    TypedLinear,
+    TypedModuleList,
+)
 from architecture.node_update import AttentionPairBias
 from architecture.pair_update import (
     DropoutColumnwise,
@@ -24,7 +36,12 @@ from typing_extensions import override
 # m_ij = gate(z_ij) · out(norm(Σ_k a_ik ⊙ b_kj))
 # ---------------------------------------------------------------------------
 class TriangleMultiplicationOutgoing(nn.Module):
-    """Outgoing triangle multiplicative update on pair embeddings."""
+    """Outgoing triangle multiplicative update on pair embeddings.
+
+    Implements Algorithm 17 step 2: for each (i, j) pair the output is
+    ``gate(z_ij) · proj_out(norm(Σ_k a_ik ⊙ b_kj))``, where ``a`` and ``b``
+    are gated projections of the layer-normalised pair embedding ``z``.
+    """
 
     def __init__(self, c: int, c_hidden: int | None = None) -> None:
         super().__init__()
@@ -43,7 +60,10 @@ class TriangleMultiplicationOutgoing(nn.Module):
         self,
         z: Float[torch.Tensor, "B N_res N_res c_pair"],
     ) -> Float[torch.Tensor, "B N_res N_res c_pair"]:
-        """Call forward; typed override so call-site return types are not Any."""
+        """Call forward; typed override so call-site return types are not Any.
+
+        See ``forward`` for full documentation of arguments and return values.
+        """
         return self.forward(z)
 
     @override
@@ -52,17 +72,28 @@ class TriangleMultiplicationOutgoing(nn.Module):
         self,
         z: Float[torch.Tensor, "B N_res N_res c_pair"],
     ) -> Float[torch.Tensor, "B N_res N_res c_pair"]:
-        """Compute outgoing triangle product: m[i,j] = Σ_k a[i,k] ⊙ b[k,j]."""
+        """Compute outgoing triangle product: m[i,j] = Σ_k a[i,k] ⊙ b[k,j].
+
+        Args:
+            z: Pair embedding of shape ``(B, N_res, N_res, c_pair)``.
+
+        Returns:
+            Updated pair embedding of the same shape as ``z``.
+        """
         zn: Float[torch.Tensor, "B N_res N_res c_pair"] = self.norm_z(z)
         a: Float[torch.Tensor, "B N_res N_res c_hidden"] = torch.sigmoid(
-            self.gate_a(zn)
+            self.gate_a(zn),
         ) * self.proj_a(zn)
         b: Float[torch.Tensor, "B N_res N_res c_hidden"] = torch.sigmoid(
-            self.gate_b(zn)
+            self.gate_b(zn),
         ) * self.proj_b(zn)
-        g: Float[torch.Tensor, "B N_res N_res c_pair"] = torch.sigmoid(self.gate(z))
+        g: Float[torch.Tensor, "B N_res N_res c_pair"] = torch.sigmoid(
+            self.gate(z),
+        )
         m: Float[torch.Tensor, "B N_res N_res c_hidden"] = einsum(
-            a, b, "b i k c, b k j c -> b i j c"
+            a,
+            b,
+            "b i k c, b k j c -> b i j c",
         )
         return g * self.proj_out(self.norm_out(m))
 
@@ -74,7 +105,12 @@ class TriangleMultiplicationOutgoing(nn.Module):
 
 
 class TriangleMultiplicationIncoming(nn.Module):
-    """Incoming triangle multiplicative update on pair embeddings."""
+    """Incoming triangle multiplicative update on pair embeddings.
+
+    Implements Algorithm 17 step 3: for each (i, j) pair the output is
+    ``gate(z_ij) · proj_out(norm(Σ_k a_ki ⊙ b_jk))``, where ``a`` and ``b``
+    are gated projections of the layer-normalised pair embedding ``z``.
+    """
 
     def __init__(self, c: int, c_hidden: int | None = None) -> None:
         super().__init__()
@@ -93,7 +129,10 @@ class TriangleMultiplicationIncoming(nn.Module):
         self,
         z: Float[torch.Tensor, "B N_res N_res c_pair"],
     ) -> Float[torch.Tensor, "B N_res N_res c_pair"]:
-        """Call forward; typed override so call-site return types are not Any."""
+        """Call forward; typed override so call-site return types are not Any.
+
+        See ``forward`` for full documentation of arguments and return values.
+        """
         return self.forward(z)
 
     @override
@@ -102,23 +141,34 @@ class TriangleMultiplicationIncoming(nn.Module):
         self,
         z: Float[torch.Tensor, "B N_res N_res c_pair"],
     ) -> Float[torch.Tensor, "B N_res N_res c_pair"]:
-        """Compute incoming triangle product: m[i,j] = Σ_k a[k,i] ⊙ b[j,k]."""
+        """Compute incoming triangle product: m[i,j] = Σ_k a[k,i] ⊙ b[j,k].
+
+        Args:
+            z: Pair embedding of shape ``(B, N_res, N_res, c_pair)``.
+
+        Returns:
+            Updated pair embedding of the same shape as ``z``.
+        """
         zn: Float[torch.Tensor, "B N_res N_res c_pair"] = self.norm_z(z)
         a: Float[torch.Tensor, "B N_res N_res c_hidden"] = torch.sigmoid(
-            self.gate_a(zn)
+            self.gate_a(zn),
         ) * self.proj_a(zn)
         b: Float[torch.Tensor, "B N_res N_res c_hidden"] = torch.sigmoid(
-            self.gate_b(zn)
+            self.gate_b(zn),
         ) * self.proj_b(zn)
-        g: Float[torch.Tensor, "B N_res N_res c_pair"] = torch.sigmoid(self.gate(z))
+        g: Float[torch.Tensor, "B N_res N_res c_pair"] = torch.sigmoid(
+            self.gate(z),
+        )
         m: Float[torch.Tensor, "B N_res N_res c_hidden"] = einsum(
-            a, b, "b k i c, b j k c -> b i j c"
+            a,
+            b,
+            "b k i c, b j k c -> b i j c",
         )
         return g * self.proj_out(self.norm_out(m))
 
 
 class PairformerBlock(nn.Module):
-    """One block of the Pairformer, refining pair and optional single embeddings.
+    """One block of Pairformer, refines pair and optional single embeddings.
 
     Applies the full AF3 Pairformer update sequence to the pair representation
     ``z`` and, when provided, the residue single representation ``s``:
@@ -128,18 +178,30 @@ class PairformerBlock(nn.Module):
     3. Triangle attention starting node  (row dropout)
     4. Triangle attention ending node    (column dropout)
     5. Transition FFN on ``z``
-    6. Attention with pair bias on ``s`` + transition FFN on ``s``  (if ``s`` given)
+    6. Attention with pair bias on ``s`` + transition FFN on ``s`` (if ``s``
+    given)
 
     Args:
         c_pair: Channel dimension of the pair embedding ``z``.
-        c_res: Channel dimension of the residue single embedding ``s``. Optional
+        c_res: Channel dimension of the residue single embedding ``s``.
+            Optional
         n_heads: Number of attention heads for triangle attention and pair-bias
             attention.  Must evenly divide ``c_pair``.
+
+    Raises:
+        InvalidPairHeadDimensionError: If ``c_pair`` is not divisible by
+            ``n_heads``.
     """
 
-    def __init__(self, c_pair: int, c_res: int | None, n_heads: int = 4) -> None:
+    def __init__(
+        self,
+        c_pair: int,
+        c_res: int | None,
+        n_heads: int = 4,
+    ) -> None:
         super().__init__()
-        assert c_pair % n_heads == 0
+        if c_pair % n_heads != 0:
+            raise InvalidPairHeadDimensionError(c_pair, n_heads)
         self.n_heads: int = n_heads
         self.head_dim: int = c_pair // n_heads
         self.c_hidden: int = c_pair // 2
@@ -155,17 +217,25 @@ class PairformerBlock(nn.Module):
         self.traingle_mult_incoming: TriangleMultiplicationIncoming = (
             TriangleMultiplicationIncoming(c=c_pair, c_hidden=self.c_hidden)
         )
-        self.triangle_attn_starting_node: TriangleAttentionStartingNodeWithBias = (
-            TriangleAttentionStartingNodeWithBias(c_pair=c_pair, n_heads=n_heads // 4)
+        self.triangle_attn_starting_node: (
+            TriangleAttentionStartingNodeWithBias
+        ) = TriangleAttentionStartingNodeWithBias(
+            c_pair=c_pair,
+            n_heads=n_heads // 4,
         )
         self.triangle_attn_ending_node: TriangleAttentionEndingNodeWithBias = (
-            TriangleAttentionEndingNodeWithBias(c_pair=c_pair, n_heads=n_heads // 4)
+            TriangleAttentionEndingNodeWithBias(
+                c_pair=c_pair,
+                n_heads=n_heads // 4,
+            )
         )
         self.transition1: Transition = Transition(c_pair)
 
         if c_res is not None:
             self.attn_pair_bias: AttentionPairBias = AttentionPairBias(
-                c_res=c_res, c_pair=c_pair, n_heads=self.n_heads
+                c_res=c_res,
+                c_pair=c_pair,
+                n_heads=self.n_heads,
             )  # n head = 16 as per AF3.
 
             self.transition2: Transition = Transition(c_res)
@@ -176,9 +246,13 @@ class PairformerBlock(nn.Module):
         s: Float[torch.Tensor, "B N_res c_res"] | None,
         z: Float[torch.Tensor, "B N_res N_res c_pair"],
     ) -> tuple[
-        Float[torch.Tensor, "B N_res c_res"] | None, Float[torch.Tensor, "B N_res N_res c_pair"]
+        Float[torch.Tensor, "B N_res c_res"] | None,
+        Float[torch.Tensor, "B N_res N_res c_pair"],
     ]:
-        """Call forward; typed override so call-site return types are not Any."""
+        """Call forward; typed override so call-site return types are not Any.
+
+        See ``forward`` for full documentation of arguments and return values.
+        """
         return self.forward(s, z)
 
     @override
@@ -188,9 +262,23 @@ class PairformerBlock(nn.Module):
         s: Float[torch.Tensor, "B N_res c_res"] | None,
         z: Float[torch.Tensor, "B N_res N_res c_pair"],
     ) -> tuple[
-        Float[torch.Tensor, "B N_res c_res"] | None, Float[torch.Tensor, "B N_res N_res c_pair"]
+        Float[torch.Tensor, "B N_res c_res"] | None,
+        Float[torch.Tensor, "B N_res N_res c_pair"],
     ]:
-        """Apply row-wise and column-wise triangle attention with transition FFN."""
+        """Apply row and column wise triangle attention with transition FFN.
+
+        Args:
+            s: Optional residue single embedding of shape
+                ``(B, N_res, c_res)``.  When provided the block also updates
+                ``s`` via attention with pair bias and a transition FFN.
+                Pass ``None`` to update ``z`` only.
+            z: Pair embedding of shape ``(B, N_res, N_res, c_pair)``.
+
+        Returns:
+            A tuple ``(s_out, z_out)`` where ``s_out`` is the updated single
+            embedding (or ``None`` if ``s`` was ``None``) and ``z_out`` is the
+            updated pair embedding.
+        """
         z = z + self.row_dropout(self.triangle_mult_outgoing(z))
         z = z + self.row_dropout(self.traingle_mult_incoming(z))
         b: Float[torch.Tensor, "B N_res N_res n_heads"] = self.b_proj_start(z)
@@ -206,14 +294,23 @@ class PairformerBlock(nn.Module):
 
 
 class PairformerStack(nn.Module):
-    """Stack of PairformerBlock modules applied sequentially to pair embeddings."""
+    """Stack of PairformerBlock modules applied sequentially to pair embeddings.
+
+    Chains ``n_blocks`` ``PairformerBlock`` instances, passing the outputs of
+    each block as inputs to the next.  Supports operation on the pair embedding
+    ``z`` alone or jointly on ``z`` and the residue single embedding ``s``.
+    """
 
     def __init__(
-        self, c: int, n_blocks: int = 2, n_heads: int = 4, c_res: int | None = None
+        self,
+        c: int,
+        n_blocks: int = 2,
+        n_heads: int = 4,
+        c_res: int | None = None,
     ) -> None:
         super().__init__()
         self.blocks: TypedModuleList[PairformerBlock] = TypedModuleList(
-            [PairformerBlock(c, c_res, n_heads) for _ in range(n_blocks)]
+            [PairformerBlock(c, c_res, n_heads) for _ in range(n_blocks)],
         )
 
     @overload
@@ -229,7 +326,8 @@ class PairformerStack(nn.Module):
         s: Float[torch.Tensor, "B N_res c_res"],
         z: Float[torch.Tensor, "B N_res N_res c_pair"],
     ) -> tuple[
-        Float[torch.Tensor, "B N_res c_res"], Float[torch.Tensor, "B N_res N_res c_pair"]
+        Float[torch.Tensor, "B N_res c_res"],
+        Float[torch.Tensor, "B N_res N_res c_pair"],
     ]: ...
 
     @override
@@ -238,10 +336,16 @@ class PairformerStack(nn.Module):
         s: Float[torch.Tensor, "B N_res c_res"] | None,
         z: Float[torch.Tensor, "B N_res N_res c_pair"],
     ) -> (
-        tuple[Float[torch.Tensor, "B N_res c_res"], Float[torch.Tensor, "B N_res N_res c_pair"]]
+        tuple[
+            Float[torch.Tensor, "B N_res c_res"],
+            Float[torch.Tensor, "B N_res N_res c_pair"],
+        ]
         | Float[torch.Tensor, "B N_res N_res c_pair"]
     ):
-        """Call forward; typed override so call-site return types are not Any."""
+        """Call forward; typed override so call-site return types are not Any.
+
+        See ``forward`` for full documentation of arguments and return values.
+        """
         return self.forward(s, z)
 
     @override
@@ -251,12 +355,29 @@ class PairformerStack(nn.Module):
         s: Float[torch.Tensor, "B N_res c_res"] | None,
         z: Float[torch.Tensor, "B N_res N_res c_pair"],
     ) -> (
-        tuple[Float[torch.Tensor, "B N_res c_res"], Float[torch.Tensor, "B N_res N_res c_pair"]]
+        tuple[
+            Float[torch.Tensor, "B N_res c_res"],
+            Float[torch.Tensor, "B N_res N_res c_pair"],
+        ]
         | Float[torch.Tensor, "B N_res N_res c_pair"]
     ):
-        """Pass pair embeddings through all Pairformer blocks sequentially."""
+        """Pass pair embeddings through all Pairformer blocks sequentially.
+
+        Args:
+            s: Optional residue single embedding of shape
+                ``(B, N_res, c_res)``.  When provided every block also
+                updates ``s``; pass ``None`` to process ``z`` alone.
+            z: Pair embedding of shape ``(B, N_res, N_res, c_pair)``.
+
+        Returns:
+            When ``s`` is not ``None``: a tuple ``(s_out, z_out)`` with the
+            refined single and pair embeddings.  When ``s`` is ``None``:
+            just the refined pair embedding ``z_out``.
+        """
         for block in self.blocks:
             s, z = block(s=s, z=z)
         if s is not None:
             return s, z
-        return z  # the PairformerStack in AF3 can operate on z alone or z and s.
+        return (
+            z  # the PairformerStack in AF3 can operate on z alone or z and s.
+        )

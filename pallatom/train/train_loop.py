@@ -1,4 +1,8 @@
-"""Training loop implementation for the diffusion model."""
+"""Training loop implementation for the diffusion model.
+
+Provides functions for checkpoint I/O, gradient accumulation, evaluation,
+metric logging, and the main per-epoch training loop.
+"""
 
 import argparse
 import contextlib
@@ -7,6 +11,7 @@ import math
 import os
 import time
 from collections.abc import Iterable
+from pathlib import Path
 from typing import NoReturn, cast
 
 import structlog
@@ -18,6 +23,7 @@ from architecture.losses import (
     atom_loss,
     distogram_loss_atom,
     distogram_loss_residue,
+    med_loss,
     seq_ce_loss,
     smooth_lddt_loss,
 )
@@ -25,8 +31,8 @@ from architecture.main_trunk import MainTrunk, PredictedOutputs
 from beartype import beartype
 from einops import reduce
 from helpers.alignment import kabsch_align
-from helpers.batch_types import FeaturizedBatch, ProteinBatch
-from helpers.bucketed_sampler import BucketedBatchSampler
+from helpers.atom_utils import Protein
+from helpers.batch_types import FeaturizedBatch
 from helpers.context_managers import (
     DDPNoSync,
     DistProcessGroup,
@@ -47,6 +53,7 @@ from helpers.useful_objects import (
     ModelSetup,
     StepProgress,
     ThroughputStatistics,
+    TrainArgs,
 )
 from jaxtyping import Float, Int, jaxtyped
 from structlog.typing import FilteringBoundLogger
@@ -57,6 +64,23 @@ from tqdm import tqdm
 from train.train_config import TrainConfig
 
 
+@dataclasses.dataclass
+class Checkpoint:
+    """Serialisable snapshot of model, optimizer, and scheduler state.
+
+    Attributes:
+        model: Model parameter state dict.
+        optimizer: Optimizer state dict.
+        scheduler: LR scheduler state dict.
+        best_val_loss: Best validation loss seen so far.
+    """
+
+    model: dict[str, Float[torch.Tensor, "..."]]
+    optimizer: dict[str, Float[torch.Tensor, "..."]]
+    scheduler: dict[str, Float[torch.Tensor, "..."]]
+    best_val_loss: Float[torch.Tensor, ""]
+
+
 def load_checkpoint(
     model_params: ModelSetup,
     rank: int,
@@ -65,34 +89,44 @@ def load_checkpoint(
     """Load a checkpoint and restore all mutable training state.
 
     Args:
-        model_params: ModelSetup holding the model, optimizer, and scheduler to restore.
+        model_params: ModelSetup holding the model, optimizer, and scheduler to
+            restore.
         rank: Current process rank; info log emitted only on rank 0.
         log: Bound structlog logger.
 
     Returns:
-        The same ``model_params`` with model, optimizer, and scheduler state restored.
+        The same ``model_params`` with model, optimizer, and scheduler state
+        restored.
     """
-    path: str = model_params.tcfg.checkpoint.checkpoint_path
-    ckpt = cast(
-        dict[str, dict[str, Float[torch.Tensor, "..."]] | Float[torch.Tensor, ""]],
+    path: Path = model_params.tcfg.checkpoint.checkpoint_path
+    raw: dict[str, object] = cast(
+        dict[str, object],
         torch.load(path, map_location=model_params.device, weights_only=True),
     )
-    model_sd = cast(dict[str, Float[torch.Tensor, "..."]], ckpt["model"])
-    if isinstance(model_params.model, DDP):
-        _ = cast(MainTrunk, getattr(model_params.model, "module")).load_state_dict(  # noqa: B009
-            model_sd
+    ckpt = Checkpoint(
+        model=cast(dict[str, Float[torch.Tensor, "..."]], raw["model"]),
+        optimizer=cast(
+            dict[str, Float[torch.Tensor, "..."]],
+            raw["optimizer"],
+        ),
+        scheduler=cast(
+            dict[str, Float[torch.Tensor, "..."]],
+            raw["scheduler"],
+        ),
+        best_val_loss=cast(Float[torch.Tensor, ""], raw["best_val_loss"]),
+    )
+    _ = (
+        cast(MainTrunk, model_params.model.module).load_state_dict(
+            ckpt.model,
         )
-    else:
-        _ = model_params.model.load_state_dict(model_sd)
-    model_params.optimizer.load_state_dict(
-        cast(dict[str, Float[torch.Tensor, "..."]], ckpt["optimizer"])
+        if isinstance(model_params.model, DDP)
+        else model_params.model.load_state_dict(ckpt.model)
     )
-    model_params.scheduler.load_state_dict(
-        cast(dict[str, Float[torch.Tensor, "..."]], ckpt["scheduler"])
-    )
+    model_params.optimizer.load_state_dict(ckpt.optimizer)
+    model_params.scheduler.load_state_dict(ckpt.scheduler)
     if rank == 0:
         log.info("resumed from checkpoint", path=path)
-    return model_params, cast(Float[torch.Tensor, ""], ckpt["best_val_loss"])
+    return model_params, ckpt.best_val_loss
 
 
 def save_checkpoint(
@@ -104,43 +138,62 @@ def save_checkpoint(
     """Save a checkpoint with all mutable training state.
 
     Only rank 0 writes to disk; other ranks return immediately so there are no
-    concurrent-write races under DDP.  The DDP wrapper is stripped before calling
-    ``state_dict()`` so the checkpoint is loadable by ``load_checkpoint`` regardless
+    concurrent-write races under DDP. The DDP wrapper is stripped before
+    calling
+    ``state_dict()`` so the checkpoint is loadable by ``load_checkpoint``
+    regardless
     of whether the next run uses DDP.
 
     Args:
-        model_params: ModelSetup holding the model, optimizer, and scheduler to save.
+        model_params: ModelSetup holding the model, optimizer, and scheduler to
+            save.
         rank: Current process rank; I/O is performed only on rank 0.
         log: Bound structlog logger.
         best_val_loss: best val loss encountered so far.
     """
-    path: str = model_params.tcfg.checkpoint.checkpoint_path
+    path: Path = model_params.tcfg.checkpoint.checkpoint_path
     if rank != 0:
         return
     if isinstance(model_params.model, DDP):
-        inner = cast(MainTrunk, getattr(model_params.model, "module"))  # noqa: B009
+        inner = cast(
+            MainTrunk,
+            model_params.model.module,
+        )
     else:
         inner: MainTrunk = model_params.model
-    ckpt: dict[str, dict[str, Float[torch.Tensor, "..."]] | Float[torch.Tensor, ""]] = {
-        "model": cast(dict[str, Float[torch.Tensor, "..."]], inner.state_dict()),
-        "optimizer": cast(
-            dict[str, Float[torch.Tensor, "..."]], model_params.optimizer.state_dict()
+    ckpt = Checkpoint(
+        model=cast(
+            dict[str, Float[torch.Tensor, "..."]],
+            inner.state_dict(),
         ),
-        "scheduler": cast(
-            dict[str, Float[torch.Tensor, "..."]], model_params.scheduler.state_dict()
+        optimizer=cast(
+            dict[str, Float[torch.Tensor, "..."]],
+            model_params.optimizer.state_dict(),
         ),
-        "best_val_loss": best_val_loss,
-    }
-    torch.save(ckpt, path)
+        scheduler=cast(
+            dict[str, Float[torch.Tensor, "..."]],
+            model_params.scheduler.state_dict(),
+        ),
+        best_val_loss=best_val_loss,
+    )
+    torch.save(
+        {
+            "model": ckpt.model,
+            "optimizer": ckpt.optimizer,
+            "scheduler": ckpt.scheduler,
+            "best_val_loss": ckpt.best_val_loss,
+        },
+        path,
+    )
     log.info("saved checkpoint", path=path)
 
 
 @jaxtyped(typechecker=beartype)
 def take_step(
     *,
-    batch: ProteinBatch,
+    batch: list[Protein],
     model_params: ModelSetup,
-    train: bool,
+    train_mode: bool,
     grad_scale: float = 1.0,
 ) -> tuple[LossMetrics, ThroughputStatistics]:
     """Forward and backward pass for one micro-batch.
@@ -152,78 +205,81 @@ def take_step(
     Args:
         batch: Raw protein micro-batch.
         model_params: Bundled model, optimizer, config, and device.
-        train: If True, enables dropout, conditioning dropout, and backward pass.
-        grad_scale: Divide total loss by this value before backward (default 1.0).
+        train_mode: If True, enables dropout, conditioning dropout, and backward
+            pass.
+        grad_scale: Divide total loss by this value before backward (default
+            1.0).
 
     Returns:
         Tuple of step-level loss metrics and throughput statistics.
     """
-    featurized_batch: FeaturizedBatch = featurize_batch(
-        batch, model_params.tcfg, model_params.distogram_res, model_params.distogram_atom
+    t0 = time.perf_counter()
+
+    cpu_batch: FeaturizedBatch = featurize_batch(
+        batch,
+        model_params.tcfg,
+        model_params.distogram_res,
+        model_params.distogram_atom,
     )
     sigma_data = model_params.tcfg.noise.sigma_data
 
     lp = model_params.tcfg.loss
 
-    if train:
-        featurized_batch = apply_conditioning_dropout(
-            featurized_batch,
+    if train_mode:
+        cpu_batch = apply_conditioning_dropout(
+            cpu_batch,
             p_distogram=model_params.tcfg.conditioning_dropout.p_distogram,
             p_atom=model_params.tcfg.conditioning_dropout.p_atom,
             p_seq=model_params.tcfg.conditioning_dropout.p_seq,
-            device=model_params.device,
+            device="cpu",
         )
 
-    t0 = time.perf_counter()
+    featurized_batch: FeaturizedBatch = cpu_batch.to(
+        model_params.device,
+        non_blocking=True,
+    )
 
-    with StepContext(model=model_params.model, train=train):
+    with StepContext(model=model_params.model, train_mode=train_mode):
         # Elucidating diffusion model loss weighting:
         lambda_sigma_loss_weight: Float[torch.Tensor, ""] = (
             featurized_batch.t_hat**2 + sigma_data**2
         ) / (featurized_batch.t_hat * sigma_data) ** 2
 
-        pred_outputs = cast(PredictedOutputs, model_params.model(featurized_batch))
+        pred_outputs = cast(
+            PredictedOutputs,
+            model_params.model(featurized_batch),
+        )
 
         Kabsch_aligned_MSE_loss: Float[torch.Tensor, ""] = atom_loss(
-            pred_outputs.r_denoised, featurized_batch.r_gt, featurized_batch.atom5_mask
+            pred_outputs.r_denoised,
+            featurized_batch.r_gt,
+            featurized_batch.atom5_mask,
         )
-        Kabsch_aligned_MSE_loss = (Kabsch_aligned_MSE_loss * lambda_sigma_loss_weight).mean()
-
-        K_unit: int = len(pred_outputs.intermediate_denoised_coord_stack)
-        intermediate_med_loss: Float[torch.Tensor, ""] = torch.tensor(
-            0.0, device=model_params.device
-        )
-        for k_idx, intermediate_denoised_coord in enumerate(
-            pred_outputs.intermediate_denoised_coord_stack
-        ):
-            intermediate_denoised_coord: Float[torch.Tensor, "B N_atom 3"]
-            gamma_K_minus_k: float = lp.gamma ** (K_unit - k_idx - 1)
-            inter_ce: Float[torch.Tensor, ""] = seq_ce_loss(
-                pred_outputs.intermediate_pred_aa_logit_stack[k_idx],
-                featurized_batch.aa_indices,
-            )
-
-            k_loss: Float[torch.Tensor, ""] = (
-                lp.lam
-                * atom_loss(
-                    intermediate_denoised_coord, featurized_batch.r_gt, featurized_batch.atom5_mask
-                )
-                + lp.alpha_0 * inter_ce
-            )
-            intermediate_med_loss = intermediate_med_loss + gamma_K_minus_k * k_loss
-        intermediate_med_loss = (intermediate_med_loss / max(K_unit, 1)).mean()
-
-        gt_res_bin_idx: Int[torch.Tensor, "B N_res N_res"] = (
-            featurized_batch.gt_res_distogram.argmax(dim=-1).clamp(
-                0, pred_outputs.residue_distogram_logits.size(-1) - 1
-            )
-        )
-
-        residue_distogram_loss: Float[torch.Tensor, ""] = distogram_loss_residue(
-            pred_outputs.residue_distogram_logits,
-            gt_res_bin_idx,
-            featurized_batch.f_pseudo_beta_mask.bool(),
+        Kabsch_aligned_MSE_loss = (
+            Kabsch_aligned_MSE_loss * lambda_sigma_loss_weight
         ).mean()
+
+        intermediate_loss = med_loss(
+            r_denoised_blocks=pred_outputs.intermediate_denoised_coord_stack,
+            logits_aa_blocks=pred_outputs.intermediate_pred_aa_logit_stack,
+            batch=featurized_batch,
+            loss_params=model_params.tcfg.loss,
+        )
+        gt_res_bin_idx: Int[
+            torch.Tensor,
+            "B N_res N_res",
+        ] = featurized_batch.gt_res_distogram.argmax(dim=-1).clamp(
+            0,
+            pred_outputs.residue_distogram_logits.size(-1) - 1,
+        )
+
+        residue_distogram_loss: Float[torch.Tensor, ""] = (
+            distogram_loss_residue(
+                pred_outputs.residue_distogram_logits,
+                gt_res_bin_idx,
+                featurized_batch.f_pseudo_beta_mask.bool(),
+            ).mean()
+        )
 
         atom_distogram_loss: Float[torch.Tensor, ""] = distogram_loss_atom(
             pred_outputs.atom_distogram_logits,
@@ -238,7 +294,8 @@ def take_step(
             cutoff=float(lp.smooth_lddt_cutoff),
         )
         CE_loss: Float[torch.Tensor, ""] = seq_ce_loss(
-            pred_outputs.seq_logits, featurized_batch.aa_indices
+            pred_outputs.seq_logits,
+            featurized_batch.aa_indices,
         )
 
         total_loss: Float[torch.Tensor, ""] = (
@@ -247,23 +304,26 @@ def take_step(
             + lp.alpha_1 * lddt_loss
             + lp.alpha_2 * residue_distogram_loss
             + lp.alpha_3 * atom_distogram_loss
-            + lp.alpha_4 * intermediate_med_loss
+            + lp.alpha_4 * intermediate_loss
         )
-    if train:
+    if train_mode:
         torch.autograd.backward([total_loss / grad_scale])
 
-    r_aligned: Float[torch.Tensor, "B N_atom 3"]
-    (r_aligned,) = kabsch_align(
+    (r_aligned,) = kabsch_align(  # pylint: disable=unpacking-non-sequence
         featurized_batch.r_gt,
         pred_outputs.r_denoised,
         weights=featurized_batch.atom5_mask.float(),
         return_transform=False,
     )
 
-    diff: Float[torch.Tensor, "B N_atom 3"] = pred_outputs.r_denoised - r_aligned
+    diff: Float[torch.Tensor, "B N_atom 3"] = (
+        pred_outputs.r_denoised - r_aligned
+    )
     sq: Float[torch.Tensor, "B N_atom"] = (diff * diff).sum(dim=-1)
     m: Float[torch.Tensor, "B N_atom"] = featurized_batch.atom5_mask.float()
-    rmsd: Float[torch.Tensor, ""] = ((sq * m).sum() / m.sum().clamp(min=1)).sqrt()
+    rmsd: Float[torch.Tensor, ""] = (
+        (sq * m).sum() / m.sum().clamp(min=1)
+    ).sqrt()
 
     t1 = time.perf_counter()
     step_time = t1 - t0
@@ -279,7 +339,7 @@ def take_step(
         smooth_lddt_loss=lddt_loss,
         res_distogram_loss=residue_distogram_loss,
         atom_distogram_loss=atom_distogram_loss,
-        intermediate_loss=intermediate_med_loss,
+        intermediate_loss=intermediate_loss,
         RMSD=rmsd,
     ), ThroughputStatistics(
         avg_batch_size=torch.tensor(float(b_size)),
@@ -290,39 +350,44 @@ def take_step(
 
 
 def process_accum_window(
-    micro_buffer: list[ProteinBatch], n_proteins_per_batch: list[int], model_params: ModelSetup
+    micro_buffer: list[list[Protein]],
+    n_proteins_per_batch: list[int],
+    model_params: ModelSetup,
 ) -> tuple[LossMetrics, ThroughputStatistics]:
-    """Forward + backward over one accumulation window; returns protein-weighted metrics.
+    """Forward + backward over one accumulation window; returns protein metrics.
 
-    Each micro-batch's loss is scaled by ``total_proteins / n_proteins_i`` so that the
-    accumulated gradient is equivalent to a single large-batch backward over all proteins
+    Each micro-batch's loss is scaled by ``total_proteins / n_proteins_i`` so
+    that the
+    accumulated gradient is equivalent to a single large-batch backward over
+    all proteins
     in the window.  Metrics are averaged with the same protein-count weights.
 
-    The ``no_sync()`` context manager is used on all but the last micro-batch when the
-    model exposes it (DDP), so gradient all-reduces happen only once per window.
+    The ``no_sync()`` context manager is used on all but the last micro-batch
+    when the
+    model exposes it (DDP), so gradient all-reduces happen only once per
+    window.
 
     Args:
         micro_buffer: Micro-batches to process.
-        n_proteins_per_batch: Protein count per micro-batch (``batch.atom_positions.shape[0]``).
-        model_params: Model and associated configuration (plain ``MainTrunk`` or DDP-wrapped).
+        n_proteins_per_batch: Protein count per micro-batch
+            (``batch.atom_positions.shape[0]``).
+        model_params: Model and associated configuration (plain ``MainTrunk``
+            or DDP-wrapped).
 
     Returns:
-        Protein-count-weighted loss metrics and throughput statistics aggregated over all
+        Protein-count-weighted loss metrics and throughput statistics
+        aggregated over all
         micro-batches in the window.
     """
     total_proteins: int = sum(n_proteins_per_batch)
     n_micro: int = len(micro_buffer)
-    loss_sums: dict[str, torch.Tensor] = {
-        f.name: torch.tensor(0.0, device=model_params.device)
-        for f in dataclasses.fields(LossMetrics)
-    }
-    tput_sums: dict[str, torch.Tensor] = {
-        f.name: torch.tensor(0.0, device=model_params.device)
-        for f in dataclasses.fields(ThroughputStatistics)
-    }
+    loss_sums: LossMetrics = LossMetrics.zero_init(model_params.device)
+    tput_sums: ThroughputStatistics = ThroughputStatistics.zero_init(
+        model_params.device,
+    )
 
     for micro_idx, (mb, n_proteins) in enumerate(
-        zip(micro_buffer, n_proteins_per_batch, strict=False)
+        zip(micro_buffer, n_proteins_per_batch, strict=False),
     ):
         is_last = micro_idx == n_micro - 1
         grad_scale: float = total_proteins / n_proteins
@@ -331,66 +396,65 @@ def process_accum_window(
                 batch=mb,
                 model_params=model_params,
                 grad_scale=grad_scale,
-                train=True,
+                train_mode=True,
             )
-        for f in dataclasses.fields(loss_metrics):
-            loss_sums[f.name] += getattr(loss_metrics, f.name) * n_proteins
-        for f in dataclasses.fields(throughput_statistics):
-            tput_sums[f.name] += getattr(throughput_statistics, f.name) * n_proteins
+        loss_sums += loss_metrics * n_proteins
+        tput_sums += throughput_statistics * n_proteins
 
-    for key, value in loss_sums.items():
-        loss_sums[key] = value / total_proteins
-    for key, value in tput_sums.items():
-        tput_sums[key] = value / total_proteins
+    loss_sums /= total_proteins
+    tput_sums /= total_proteins
 
     return (
-        LossMetrics(**loss_sums),
-        ThroughputStatistics(**tput_sums),
+        loss_sums,
+        tput_sums,
     )
 
 
 @torch.no_grad()
 @jaxtyped(typechecker=beartype)
 def evaluate(
-    loader: torch.utils.data.DataLoader[ProteinBatch], model_params: ModelSetup
+    loader: torch.utils.data.DataLoader[Protein],
+    model_params: ModelSetup,
 ) -> tuple[LossMetrics, ThroughputStatistics]:
-    """Full-dataset evaluation pass. Returns mean loss per metric."""
-    loss_sums: dict[str, Float[torch.Tensor, ""]] = {
-        f.name: torch.tensor(0.0, device=model_params.device)
-        for f in dataclasses.fields(LossMetrics)
-    }
-    tput_sums: dict[str, Float[torch.Tensor, ""]] = {
-        f.name: torch.tensor(0.0, device=model_params.device)
-        for f in dataclasses.fields(ThroughputStatistics)
-    }
+    """Full-dataset evaluation pass.
+
+    Args:
+        loader: DataLoader yielding ProteinBatch batches for evaluation.
+        model_params: Bundled model, optimizer, config, and device.
+
+    Returns:
+        Tuple of mean LossMetrics and mean ThroughputStatistics over the full
+        dataset, averaged across all batches and DDP ranks.
+    """
+    loss_sums = LossMetrics.zero_init(model_params.device)
+    tput_sums = ThroughputStatistics.zero_init(model_params.device)
+
     n_batches = 0
     is_ddp: bool = dist.is_initialized()
     world_size: int = dist.get_world_size() if is_ddp else 1
 
-    for batch in cast(Iterable[ProteinBatch], loader):
+    for batch in cast(Iterable[list[Protein]], loader):
         loss_metrics, throughput_statistics = take_step(
             batch=batch,
             model_params=model_params,
             grad_scale=0.0,
-            train=False,
+            train_mode=False,
         )
-        for f in dataclasses.fields(loss_metrics):
-            loss_sums[f.name] += getattr(loss_metrics, f.name)
-        for f in dataclasses.fields(throughput_statistics):
-            tput_sums[f.name] += getattr(throughput_statistics, f.name)
+        loss_sums += loss_metrics
+        tput_sums += throughput_statistics
         n_batches += 1
 
-    if is_ddp:
-        for t in loss_sums.values():
-            _ = dist.all_reduce(t, op=dist.ReduceOp.SUM)  # pyright: ignore[reportUnknownMemberType]
-        for t in tput_sums.values():
-            _ = dist.all_reduce(t, op=dist.ReduceOp.SUM)  # pyright: ignore[reportUnknownMemberType]
-
     n = max(n_batches, 1)
-    return (
-        LossMetrics(**{k: v / (n * world_size) for k, v in loss_sums.items()}),
-        ThroughputStatistics(**{k: v / (n * world_size) for k, v in tput_sums.items()}),
-    )
+    divisor = n * world_size
+
+    if is_ddp:
+        loss_sums.all_reduce_()
+        tput_sums.all_reduce_()
+
+    loss_sums /= divisor
+    tput_sums /= divisor
+
+    return (loss_sums, tput_sums)
 
 
 def component_grad_norms(model: MainTrunk | DDP) -> ComponentNorms:
@@ -400,7 +464,8 @@ def component_grad_norms(model: MainTrunk | DDP) -> ComponentNorms:
     backward pass and before ``clip_grad_norm_``.
 
     Args:
-        model: Plain ``MainTrunk`` or DDP-wrapped model; ``.module`` is unwrapped
+        model: Plain ``MainTrunk`` or DDP-wrapped model; ``.module`` is
+            unwrapped
             automatically.
 
     Returns:
@@ -435,34 +500,43 @@ def component_grad_norms(model: MainTrunk | DDP) -> ComponentNorms:
 
 
 def optimizer_step(
-    micro_buffer: list[ProteinBatch],
+    micro_buffer: list[list[Protein]],
     n_proteins_buffer: list[int],
     model_params: ModelSetup,
     global_step: int,
 ) -> tuple[LossMetrics, ThroughputStatistics, ComponentNorms, int]:
     """Run one accumulation window, clip gradients, and step the optimizer.
 
-    Processes all micro-batches in ``micro_buffer`` via ``process_accum_window``
-    (which accumulates gradients across micro-batches without stepping), captures
-    per-component gradient L2 norms before clipping, clips the total gradient norm
+    Processes all micro-batches in ``micro_buffer`` via
+    ``process_accum_window``
+    (which accumulates gradients across micro-batches without stepping),
+    captures
+    per-component gradient L2 norms before clipping, clips the total gradient
+    norm
     to ``training_cfg.grad_clip``, steps the optimizer, and zeros gradients.
     The LR scheduler is not stepped here.
 
     Args:
         micro_buffer: Micro-batches accumulated for this optimizer step.
-        n_proteins_buffer: Protein count per micro-batch, aligned with ``micro_buffer``.
+        n_proteins_buffer: Protein count per micro-batch, aligned with
+            ``micro_buffer``.
         model_params: Model, optimizer, scheduler, and training configuration.
         global_step: Current global step count before this flush.
 
     Returns:
-        A 4-tuple ``(loss_metrics, throughput_statistics, component_norms, next_step)``
+        A 4-tuple ``(loss_metrics, throughput_statistics, component_norms,
+        next_step)``
         where ``loss_metrics`` contains mean per-metric losses over the window,
-        ``throughput_statistics`` contains batch size and tokens-per-second stats,
-        ``component_norms`` contains per-module gradient L2 norms measured before clipping,
+        ``throughput_statistics`` contains batch size and tokens-per-second
+        stats,
+        ``component_norms`` contains per-module gradient L2 norms measured
+        before clipping,
         and ``next_step`` is ``global_step + 1``.
     """
     loss_metrics, throughput_statistics = process_accum_window(
-        micro_buffer=micro_buffer, n_proteins_per_batch=n_proteins_buffer, model_params=model_params
+        micro_buffer=micro_buffer,
+        n_proteins_per_batch=n_proteins_buffer,
+        model_params=model_params,
     )
     component_norms = component_grad_norms(model_params.model)
     tp = model_params.tcfg.training
@@ -471,93 +545,11 @@ def optimizer_step(
         tp.grad_clip if tp.grad_clip is not None else float("inf"),
     )
 
-    _ = model_params.optimizer.step()  # pyright: ignore[reportUnknownMemberType]
+    _ = (
+        model_params.optimizer.step()  # pyright: ignore[reportUnknownMemberType]
+    )
     model_params.optimizer.zero_grad()
     return loss_metrics, throughput_statistics, component_norms, global_step + 1
-
-
-@jaxtyped(typechecker=beartype)
-def wavg(values: list[Float[torch.Tensor, ""]], n_proteins: list[int]) -> Float[torch.Tensor, ""]:
-    """Protein-count-weighted average of scalar tensors.
-
-    Args:
-        values: Per-step scalar tensors to average.
-        n_proteins: Protein count for each step, used as weights.
-
-    Returns:
-        Weighted average scalar tensor.
-    """
-    total: int = sum(n_proteins)
-    weights: Float[torch.Tensor, "N"] = torch.tensor(
-        n_proteins, dtype=torch.float32, device=values[0].device
-    )
-    stacked: Float[torch.Tensor, "N"] = torch.stack(values)
-    return reduce(stacked * weights, "N ->", "sum") / total
-
-
-def wavg_loss_metrics(steps: list[LossMetrics], n_proteins: list[int]) -> LossMetrics:
-    """Protein-count-weighted average of per-step LossMetrics.
-
-    Args:
-        steps: Per-step LossMetrics instances.
-        n_proteins: Protein count for each step.
-
-    Returns:
-        Single LossMetrics with all fields weighted-averaged.
-    """
-    return LossMetrics(
-        total_loss=wavg([m.total_loss for m in steps], n_proteins),
-        Kabsch_aligned_MSE_loss=wavg([m.Kabsch_aligned_MSE_loss for m in steps], n_proteins),
-        CE_loss=wavg([m.CE_loss for m in steps], n_proteins),
-        smooth_lddt_loss=wavg([m.smooth_lddt_loss for m in steps], n_proteins),
-        res_distogram_loss=wavg([m.res_distogram_loss for m in steps], n_proteins),
-        atom_distogram_loss=wavg([m.atom_distogram_loss for m in steps], n_proteins),
-        intermediate_loss=wavg([m.intermediate_loss for m in steps], n_proteins),
-        RMSD=wavg([m.RMSD for m in steps], n_proteins),
-    )
-
-
-def wavg_throughput_stats(
-    steps: list[ThroughputStatistics], n_proteins: list[int]
-) -> ThroughputStatistics:
-    """Protein-count-weighted average of per-step ThroughputStatistics.
-
-    Args:
-        steps: Per-step ThroughputStatistics instances.
-        n_proteins: Protein count for each step.
-
-    Returns:
-        Single ThroughputStatistics with all fields weighted-averaged.
-    """
-    return ThroughputStatistics(
-        avg_batch_size=wavg([m.avg_batch_size for m in steps], n_proteins),
-        token_pack_rate=wavg([m.token_pack_rate for m in steps], n_proteins),
-        residues_per_sec=wavg([m.residues_per_sec for m in steps], n_proteins),
-        atoms_per_sec=wavg([m.atoms_per_sec for m in steps], n_proteins),
-    )
-
-
-def wavg_component_norms(steps: list[ComponentNorms], n_proteins: list[int]) -> ComponentNorms:
-    """Protein-count-weighted average of per-step ComponentNorms.
-
-    Args:
-        steps: Per-step ComponentNorms instances.
-        n_proteins: Protein count for each step.
-
-    Returns:
-        Single ComponentNorms with all fields weighted-averaged.
-    """
-    return ComponentNorms(
-        template_embedder=wavg([m.template_embedder for m in steps], n_proteins),
-        atom_encoder=wavg([m.atom_encoder for m in steps], n_proteins),
-        atom_decoders=wavg([m.atom_decoders for m in steps], n_proteins),
-        residue_distogram_head=wavg([m.residue_distogram_head for m in steps], n_proteins),
-        atom_distogram_head=wavg([m.atom_distogram_head for m in steps], n_proteins),
-        inter_proj_seq=wavg([m.inter_proj_seq for m in steps], n_proteins),
-        inter_seq_logits=wavg([m.inter_seq_logits for m in steps], n_proteins),
-        proj_seq=wavg([m.proj_seq for m in steps], n_proteins),
-        seq_logits=wavg([m.seq_logits for m in steps], n_proteins),
-    )
 
 
 def log_epoch(
@@ -569,61 +561,54 @@ def log_epoch(
 ) -> None:
     """Log metrics and save checkpoints for one completed epoch.
 
-    Writes structlog entries for train and val splits, optionally pushes to W&B, saves
-    the best-validation checkpoint, and saves a periodic epoch checkpoint when
-    ``tcfg.checkpoint.save_every`` divides ``epoch``.  Handles both plain ``nn.Module``
-    and DDP-wrapped models (accesses ``.module`` when present).  Pass ``do_log=False``
-    on non-rank-0 workers to skip all I/O.
+    Writes structlog entries for train and val splits, optionally pushes to
+    W&B, saves the best-validation checkpoint, and saves a periodic epoch
+    checkpoint when ``tcfg.checkpoint.save_every`` divides ``epoch``. Handles
+    both plain ``nn.Module`` and DDP-wrapped models (accesses ``.module`` when
+    present). Pass ``do_log=False`` on non-rank-0 workers to skip all I/O.
 
-    Checkpoints include model weights, optimizer state, scheduler state, and epoch number
-    so training can be resumed exactly via ``TrainingParams.resume_checkpoint``.
+    Checkpoints include model weights, optimizer state, scheduler state, and
+    epoch number so training can be resumed exactly via
+    ``TrainingParams.resume_checkpoint``.
 
     Args:
-        epoch_metrics: Aggregated metrics for this epoch, including epoch number,
-            global step, train/val loss metrics, throughput statistics, and gradient norms.
-        model_params: Model, optimizer, scheduler, and training configuration for this run.
-        best_val_loss: Best validation loss seen before this epoch.
+        epoch_metrics: Aggregated metrics for this epoch, including epoch
+            number,
+            global step, train/val loss metrics, throughput statistics, and
+            gradient norms.
+        model_params: Model, optimizer, scheduler, and training configuration
+            for this run.
         log: Bound structlog logger.
         do_log: If ``False``, skip all I/O (use on non-rank-0 workers).
-
-    Returns:
-        The (possibly updated) best validation loss.
     """
     if not do_log:
         return  # do nothing for non rank 0 workers
     lg = model_params.tcfg.logging
 
-    def _to_float_dict(dc: LossMetrics | ThroughputStatistics | ComponentNorms) -> dict[str, float]:
-        return {
-            f.name: cast(Float[torch.Tensor, ""], getattr(dc, f.name)).item()
-            for f in dataclasses.fields(dc)
-        }
-
-    val_dict = _to_float_dict(epoch_metrics.val_loss_metrics)
-    train_dict = _to_float_dict(epoch_metrics.train_loss_metrics)
-    thru_stats_dict = _to_float_dict(epoch_metrics.train_throughput_stats)
-
-    gradient_norm_dict = _to_float_dict(epoch_metrics.train_gradient_norms)
+    val_dict = epoch_metrics.val_loss_metrics.to_float_dict()
+    train_dict = epoch_metrics.train_loss_metrics.to_float_dict()
+    thru_stats_dict = epoch_metrics.train_throughput_stats.to_float_dict()
+    gradient_norm_dict = epoch_metrics.train_gradient_norms.to_float_dict()
 
     log.info(
         "train",
         epoch=epoch_metrics.epoch,
-        **{k.replace(" ", "_"): round(v, 6) for k, v in train_dict.items()},
+        **train_dict,
     )
     log.info(
         "throughput_statistics",
         epoch=epoch_metrics.epoch,
-        **{k.replace(" ", "_"): round(v, 6) for k, v in thru_stats_dict.items()},
+        **thru_stats_dict,
     )
     log.info(
         "gradient_norms",
         epoch=epoch_metrics.epoch,
-        **{k.replace(" ", "_"): round(v, 6) for k, v in gradient_norm_dict.items()},
+        **gradient_norm_dict,
     )
     log.info(
         "val",
         epoch=epoch_metrics.epoch,
-        **{k: round(v, 6) for k, v in val_dict.items()},
+        **val_dict,
     )
 
     if lg.use_wandb:
@@ -632,51 +617,56 @@ def log_epoch(
                 "epoch": epoch_metrics.epoch,
                 "global_step": epoch_metrics.global_step,
                 **{f"train/{k}": v for k, v in train_dict.items()},
-                **{f"throughput_statistics/{k}": v for k, v in thru_stats_dict.items()},
-                **{f"gradient_norms/{k}": v for k, v in gradient_norm_dict.items()},
+                **{
+                    f"throughput_statistics/{k}": v
+                    for k, v in thru_stats_dict.items()
+                },
+                **{
+                    f"gradient_norms/{k}": v
+                    for k, v in gradient_norm_dict.items()
+                },
                 **{f"val/{k}": v for k, v in val_dict.items()},
-            }
+            },
         )
 
 
-def _flush_micro_buffer(
-    micro_buffer: list[ProteinBatch],
+def flush_micro_buffer(
+    micro_buffer: list[list[Protein]],
     n_proteins_buffer: list[int],
     model_params: ModelSetup,
-    log: FilteringBoundLogger,
     step: StepProgress,
 ) -> StepProgress:
-    """Run one optimizer step over the buffered micro-batches, append results, and update pbar.
+    """Run one optimizer step over buffered micro-batches.
 
-    Appends loss metrics, throughput stats, gradient norms, and protein counts to the
-    corresponding lists in ``step``, increments ``step.global_step``, and returns ``step``.
+    Appends loss metrics, throughput stats, gradient norms, and protein
+    counts to the corresponding lists in ``step``, increments
+    ``step.global_step``, and returns ``step``.
 
     Args:
         micro_buffer: Accumulated micro-batches to flush.
         n_proteins_buffer: Per-micro-batch protein counts.
         model_params: Bundled model, optimizer, scheduler, and config.
-        log: Bound structlog logger.
-        step: Per-epoch accumulator holding running totals and the progress bar.
+        step: Per-epoch accumulator holding running totals and the
+            progress bar.
 
     Returns:
-        The same ``step`` object with updated ``global_step`` and appended metrics.
+        The same ``step`` object with updated ``global_step`` and
+        appended metrics.
     """
-    loss_metrics, throughput_stats, component_norms, new_global_step = optimizer_step(
-        micro_buffer=micro_buffer,
-        n_proteins_buffer=n_proteins_buffer,
-        model_params=model_params,
-        global_step=step.global_step,
+    loss_metrics, throughput_stats, component_norms, new_global_step = (
+        optimizer_step(
+            micro_buffer=micro_buffer,
+            n_proteins_buffer=n_proteins_buffer,
+            model_params=model_params,
+            global_step=step.global_step,
+        )
     )
-    loss_dict: dict[str, float] = {
-        f.name: cast(Float[torch.Tensor, ""], getattr(loss_metrics, f.name)).item()
-        for f in dataclasses.fields(loss_metrics)
-    }
-    if any(math.isnan(v) for v in loss_dict.values()) and step.rank == 0:
-        log.error("nan_loss", step=new_global_step, **{k: f"{v:.2f}" for k, v in loss_dict.items()})
-    _ = step.pbar.update(1)
+    loss_dict: dict[str, float] = loss_metrics.to_float_dict()
+
+    step.pbar.update(1)  # pyright: ignore[reportUnusedCallResult]
     if step.rank == 0:
         step.pbar.set_postfix(  # pyright: ignore[reportUnknownMemberType]
-            {k: f"{v:.2f}" for k, v in loss_dict.items()}
+            {k: f"{v:.2f}" for k, v in loss_dict.items()},
         )
     step.step_loss_metrics.append(loss_metrics)
     step.step_throughput_stats.append(throughput_stats)
@@ -685,15 +675,25 @@ def _flush_micro_buffer(
     return dataclasses.replace(step, global_step=new_global_step)
 
 
+def collect_distributed_vars() -> tuple[int, int, int]:
+    """Return (rank, world_size, local_rank) for the current DDP context."""
+    if not dist.is_initialized():
+        return 0, 1, 0
+    return (
+        dist.get_rank(),
+        dist.get_world_size(),
+        int(os.environ.get("LOCAL_RANK", "0")),
+    )
+
+
 def train(
     best_val_loss: Float[torch.Tensor, ""],
-    train_loader: torch.utils.data.DataLoader[ProteinBatch],
-    train_sampler: BucketedBatchSampler,
-    test_loader: torch.utils.data.DataLoader[ProteinBatch],
+    train_loader: torch.utils.data.DataLoader[list[Protein]],
+    test_loader: torch.utils.data.DataLoader[Protein],
     model_params: ModelSetup,
     log: FilteringBoundLogger,
 ) -> None:
-    """Training loop for the MainTrunk diffusion model; works with or without DDP.
+    """Training loop for the MainTrunk diffusion model; works with DDP.
 
     When called inside ``with DistProcessGroup():`` the loop detects an
     initialised process group, wraps the model in DDP, and divides the token
@@ -708,25 +708,26 @@ def train(
         best_val_loss: Incumbent best validation loss; updated and returned
             implicitly via ``log_epoch``.
         train_loader: DataLoader for training batches.
-        train_sampler: BucketedBatchSampler backing ``train_loader``; used to
-            call ``set_epoch`` each epoch for correct shuffling.
         test_loader: DataLoader for evaluation batches.
         model_params: Bundled model, optimizer, scheduler, and config.
         log: Bound structlog logger.
     """
-    is_ddp: bool = dist.is_initialized()
-    rank: int = dist.get_rank() if is_ddp else 0
-    world_size: int = dist.get_world_size() if is_ddp else 1
-    local_rank: int = int(os.environ.get("LOCAL_RANK", "0")) if is_ddp else 0
+    rank: int
+    world_size: int
+    local_rank: int
+    rank, world_size, local_rank = collect_distributed_vars()
 
-    if is_ddp:
+    if dist.is_initialized():
         ddp_wrapped: DDP = DDP(model_params.model, device_ids=[local_rank])
         model_params = dataclasses.replace(model_params, model=ddp_wrapped)
 
     tp = model_params.tcfg.training
-    per_rank_token_budget: int = max(1, tp.accumulated_token_budget // world_size)
+    per_rank_token_budget: int = max(
+        1,
+        tp.accumulated_token_budget // world_size,
+    )
     if rank == 0:
-        log.info("training", ddp=is_ddp)
+        log.info("training", ddp=dist.is_initialized())
         log.info(
             "gradient_accumulation",
             token_budget_per_rank=per_rank_token_budget,
@@ -736,18 +737,21 @@ def train(
     global_step = 0
 
     for epoch in range(1, tp.num_epochs + 1):
-        _ = model_params.model.train()  # returns "DistributedDataParallel | MainTrunk"
-        train_sampler.set_epoch(epoch)
+        _ = (
+            model_params.model.train()
+        )  # returns "DistributedDataParallel | MainTrunk"
         n_batches = 0
-        micro_buffer: list[ProteinBatch] = []
+        micro_buffer: list[list[Protein]] = []
         n_proteins_buffer: list[int] = []
         accum_tokens: int = 0
         model_params.optimizer.zero_grad()
 
         estimated_steps: int = math.ceil(
-            len(train_loader) * model_params.tcfg.train_loader.token_budget / per_rank_token_budget
+            len(train_loader)
+            * model_params.tcfg.train_loader.token_budget
+            / per_rank_token_budget,
         )
-        pbar: tqdm[NoReturn] = tqdm(
+        pbar: tqdm[NoReturn] = tqdm(  # pylint: disable=unsubscriptable-object
             desc=f"Epoch {epoch:03d}/{tp.num_epochs}",
             total=estimated_steps,
             leave=False,
@@ -763,13 +767,22 @@ def train(
             step_n_proteins=[],
         )
 
-        for batch in cast(Iterable[ProteinBatch], train_loader):
-            n_proteins: int = batch.atom_positions.shape[0]
-            n_all_tokens: int = n_proteins * batch.atom_positions.shape[1]
+        for batch in cast(Iterable[list[Protein]], train_loader):
 
-            # Pre-flush: if adding this batch would push tokens over the budget, flush first.
-            if micro_buffer and accum_tokens + n_all_tokens > per_rank_token_budget:
-                step = _flush_micro_buffer(micro_buffer, n_proteins_buffer, model_params, log, step)
+            n_proteins: int = len(batch)
+            n_all_tokens: int = sum(p.atom_positions.shape[0] for p in batch)
+
+            # if adding this batch would push tokens over the budget, flush.
+            if (
+                micro_buffer
+                and accum_tokens + n_all_tokens > per_rank_token_budget
+            ):
+                step = flush_micro_buffer(
+                    micro_buffer,
+                    n_proteins_buffer,
+                    model_params,
+                    step,
+                )
                 n_batches += 1
                 micro_buffer, n_proteins_buffer, accum_tokens = [], [], 0
 
@@ -777,9 +790,15 @@ def train(
             n_proteins_buffer.append(n_proteins)
             accum_tokens += n_all_tokens
 
-        # Flush any remaining micro-batches at epoch end, regardless of token count.
+        # Flush any remaining micro-batches at epoch end,
+        # regardless of token count.
         if micro_buffer:
-            step = _flush_micro_buffer(micro_buffer, n_proteins_buffer, model_params, log, step)
+            step = flush_micro_buffer(
+                micro_buffer,
+                n_proteins_buffer,
+                model_params,
+                step,
+            )
             n_batches += 1
             micro_buffer = []
 
@@ -794,12 +813,17 @@ def train(
         epoch_metrics = EpochMetrics(
             epoch=epoch,
             global_step=global_step,
-            train_loss_metrics=wavg_loss_metrics(step.step_loss_metrics, step.step_n_proteins),
-            train_throughput_stats=wavg_throughput_stats(
-                step.step_throughput_stats, step.step_n_proteins
+            train_loss_metrics=LossMetrics.weighted_avg(
+                step.step_loss_metrics,
+                step.step_n_proteins,
             ),
-            train_gradient_norms=wavg_component_norms(
-                step.step_component_norms, step.step_n_proteins
+            train_throughput_stats=ThroughputStatistics.weighted_avg(
+                step.step_throughput_stats,
+                step.step_n_proteins,
+            ),
+            train_gradient_norms=ComponentNorms.weighted_avg(
+                step.step_component_norms,
+                step.step_n_proteins,
             ),
             val_loss_metrics=epoch_val_metrics,
         )
@@ -820,107 +844,134 @@ def train(
         pbar.close()
 
 
-@dataclasses.dataclass
-class TrainArgs:
-    """Parsed command-line arguments for the training entry point."""
-
-    data: str
-    splits: str
-    config: str
-    log_file: str
-    num_workers: int
-    ddp: bool
-    debug_run: bool
-
-
 def _parse_args() -> TrainArgs:
-    """Build the argument parser and return a fully typed TrainArgs."""
-    _ = parser = argparse.ArgumentParser(description="Train PallAtom")
-    _ = parser.add_argument("--data", required=True, help="path to proteins.jsonl")
-    _ = parser.add_argument("--splits", required=True, help="path to splits.json")
-    _ = parser.add_argument("--config", required=True, help="path to TrainConfig JSON")
-    _ = parser.add_argument("--log_file", required=True, help="path to write structured JSON log")
-    _ = parser.add_argument("--num_workers", type=int, default=4)
-    _ = parser.add_argument("--ddp", action="store_true", help="DistributedDataParallel training")
-    _ = parser.add_argument(
-        "--debug_run", action="store_true", help="restrict to 252 proteins for fast iteration"
+    """Build the argument parser and return a fully typed TrainArgs.
+
+    Returns:
+        Fully typed TrainArgs populated from sys.argv.
+    """
+    parser = argparse.ArgumentParser(description="Train PallAtom")
+    parser.add_argument(  # pyright: ignore[reportUnusedCallResult]
+        "--dataset_jsonl",
+        required=True,
+        type=Path,
+        help="path to proteins.jsonl",
+    )
+    parser.add_argument(  # pyright: ignore[reportUnusedCallResult]
+        "--shard_dir",
+        required=True,
+        type=Path,
+        help="path to generate sharded protein dataset",
+    )
+    parser.add_argument(  # pyright: ignore[reportUnusedCallResult]
+        "--keys_for_splits_json",
+        required=True,
+        type=Path,
+        help="path to splits.json",
+    )
+    parser.add_argument(  # pyright: ignore[reportUnusedCallResult]
+        "--config",
+        required=True,
+        type=Path,
+        help="path to TrainConfig JSON",
+    )
+    parser.add_argument(  # pyright: ignore[reportUnusedCallResult]
+        "--structlog_jsonl",
+        required=True,
+        type=Path,
+        help="path to write structured JSON log",
+    )
+    parser.add_argument(  # pyright: ignore[reportUnusedCallResult]
+        "--ddp",
+        action="store_true",
+        help="DistributedDataParallel training",
+    )
+    parser.add_argument(  # pyright: ignore[reportUnusedCallResult]
+        "--debug_run",
+        action="store_true",
+        help="restrict to 252 proteins for fast iteration",
     )
     ns = parser.parse_args()
     return TrainArgs(
-        data=cast(str, ns.data),
-        splits=cast(str, ns.splits),
-        config=cast(str, ns.config),
-        log_file=cast(str, ns.log_file),
-        num_workers=cast(int, ns.num_workers),
-        ddp=cast(bool, ns.ddp),
-        debug_run=cast(bool, ns.debug_run),
+        dataset_jsonl=cast("Path", ns.dataset_jsonl),
+        shard_dir=cast("Path", ns.cluster_dir),
+        keys_for_splits_json=cast("Path", ns.keys_for_splits_json),
+        config=cast("Path", ns.config),
+        structlog_jsonl=cast("Path", ns.structlog_jsonl),
+        ddp=cast("bool", ns.ddp),
+        debug_run=cast("bool", ns.debug_run),
     )
 
 
 def main(args: TrainArgs, tcfg: TrainConfig) -> None:
-    """Entry point for training; dispatches to DDP or single-device based on args.ddp.
+    """Entry point for training; dispatches to DDP or not based on args.ddp.
 
-    Uses ExitStack so both paths share all setup code after context initialisation.
-    DistProcessGroup is only entered under --ddp; device/rank/world_size are resolved
-    to plain values before the shared path begins.
+    Uses ExitStack so both paths share all setup code after context init.
+    DistProcessGroup is only entered under --ddp; device/rank/world_size are
+    resolved to plain values before the shared path begins.
     """
     with contextlib.ExitStack() as stack:
         if args.ddp:
             dpg = stack.enter_context(DistProcessGroup("nccl"))
             rank: int = dpg.rank
             is_rank_zero: bool = dpg.is_rank_zero
-            device: str = dpg.device
+            device: torch.device = torch.device(dpg.device)
         else:
             rank = 0
             is_rank_zero = True
-            device = "cuda:0" if torch.cuda.is_available() else "cpu"
+            device = torch.device(
+                "cuda:0" if torch.cuda.is_available() else "cpu",
+            )
 
-        _ = stack.enter_context(StructlogConfig(is_rank_zero, args.log_file))
+        _ = stack.enter_context(
+            StructlogConfig(
+                is_rank_zero=is_rank_zero,
+                log_file=args.structlog_jsonl,
+            ),
+        )
         _ = stack.enter_context(FatalOnError())
 
         log = cast(FilteringBoundLogger, structlog.get_logger())
 
-        train_loader, val_loader, _, train_sampler = make_bucketed_data_loaders(
+        train_loader, val_loader, _ = make_bucketed_data_loaders(
             cfg=tcfg,
-            jsonl_path=args.data,
-            splits_path=args.splits,
-            num_workers=args.num_workers,
-            debug_run=args.debug_run,
+            extra_train_args=args,
         )
 
         mp = tcfg.model
         tp = tcfg.training
-        model: MainTrunk = MainTrunk(  # this be changed to init directly from the tcfg
-            f_ref_dim=mp.f_ref_dim,
-            n_bins=tcfg.distogram_res.n_bins,
-            n_atom_bins=tcfg.distogram_atom.n_bins,
-            c_atom=mp.c_atom,
-            c_pair=mp.c_pair,
-            c_res=mp.c_res,
-            c_atompair=mp.c_atompair,
-            K_unit=mp.K_unit,
-            sigma_data=tcfg.noise.sigma_data,
-            residue_number=mp.max_residues,
-            n_amino=mp.n_amino,
-            n_blocks_atom_transformer_encoder=mp.n_blocks_atom_transformer_encoder,
-            n_heads_atom_transformer_encoder=mp.n_heads_atom_transformer_encoder,
-            n_blocks_atom_transformer_decoder=mp.n_blocks_atom_transformer_decoder,
-            n_heads_atom_transformer_decoder=mp.n_heads_atom_transformer_decoder,
-            n_pairformer_blocks_template_embedder=mp.n_pairformer_blocks_template_embedder,
-            n_paiformer_heads_template_embedder=mp.n_paiformer_heads_template_embedder,
+        model: MainTrunk = MainTrunk(
+            model_params=mp,
+            res_distogram_params=tcfg.distogram_res,
+            atom_distogram_params=tcfg.distogram_atom,
+            noise_params=tcfg.noise,
         ).to(device)
 
-        optimizer = Adam(model.parameters(), lr=tp.lr, weight_decay=tp.weight_decay)
-        scheduler = CosineAnnealingLR(optimizer, T_max=tp.num_epochs, eta_min=tp.lr * 0.01)
+        optimizer = Adam(
+            model.parameters(),
+            lr=tp.lr,
+            weight_decay=tp.weight_decay,
+        )
+        scheduler = CosineAnnealingLR(
+            optimizer,
+            T_max=tp.num_epochs,
+            eta_min=tp.lr * 0.01,
+        )
 
         dr = tcfg.distogram_res
         da = tcfg.distogram_atom
         distogram_res = Distogram(
-            n_bins=dr.n_bins - 1, min_dist=dr.min_dist, max_dist=dr.max_dist, overflow_bin=True
-        ).to(device)
+            n_bins=dr.n_bins - 1,
+            min_dist=dr.min_dist,
+            max_dist=dr.max_dist,
+            overflow_bin=True,
+        )
         distogram_atom = Distogram(
-            n_bins=da.n_bins, min_dist=da.min_dist, max_dist=da.max_dist, overflow_bin=False
-        ).to(device)
+            n_bins=da.n_bins,
+            min_dist=da.min_dist,
+            max_dist=da.max_dist,
+            overflow_bin=False,
+        )
 
         model_params = ModelSetup(
             model=model,
@@ -942,12 +993,14 @@ def main(args: TrainArgs, tcfg: TrainConfig) -> None:
             best_val_loss = torch.tensor(float("inf"))
 
         if is_rank_zero and tcfg.logging.use_wandb:
-            _ = wandb.init(project=tcfg.logging.wandb_project, config=tcfg.model_dump())
+            _ = wandb.init(
+                project=tcfg.logging.wandb_project,
+                config=tcfg.model_dump(),
+            )
 
         train(
             best_val_loss=best_val_loss,
             train_loader=train_loader,
-            train_sampler=train_sampler,
             test_loader=val_loader,
             model_params=model_params,
             log=log,
@@ -955,7 +1008,7 @@ def main(args: TrainArgs, tcfg: TrainConfig) -> None:
 
 
 if __name__ == "__main__":
-    args = _parse_args()
-    with open(args.config) as _f:
-        tcfg = TrainConfig.model_validate_json(_f.read())
-    main(args, tcfg)
+    _args = _parse_args()
+    with _args.config.open(encoding="utf-8") as file:
+        _tcfg = TrainConfig.model_validate_json(file.read())
+    main(_args, _tcfg)

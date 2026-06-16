@@ -1,13 +1,15 @@
-"""PairUpdate — pure PyTorch implementation based on Algorithm 7 from the AlphaFold 3 paper.
+"""PairUpdate — based on Algorithm 7 from the AlphaFold 3 paper.
 
 Replaces the simplified PairUpdate stub in main_trunk.py.
 
 Steps
 -----
 1. d_ij = ||r_i^center - r_j^center||           scalar pairwise distances
-2. b_ij = LinearNoBias(Transform_RBF(d_ij))      RBF-discretized distance bias  ∈ R^c
-3. z_ij += DropoutRowwise_0.25(TriangleAttentionStartingNodeWithBias(z_ij, b_ij))
-4. z_ij += DropoutColumnwise_0.25(TriangleAttentionEndingNodeWithBias(z_ij, b_ij))
+2. b_ij = LinearNoBias(Transform_RBF(d_ij)) RBF-discretized distance bias ∈ R^c
+3. z_ij += DropoutRowwise_0.25(TriangleAttentionStartingNodeWithBias(z_ij,
+b_ij))
+4. z_ij += DropoutColumnwise_0.25(TriangleAttentionEndingNodeWithBias(z_ij,
+b_ij))
 5. z_ij += Transition(z_ij)
 """
 
@@ -16,6 +18,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from architecture.errors import InvalidPairHeadDimensionError
 from architecture.layers import LayerNorm, LinearNoBias, TypedLinear
 from beartype import beartype
 from einops import einsum, rearrange, reduce
@@ -28,14 +31,24 @@ from typing_extensions import override
 
 
 class TransformRBF(nn.Module):
-    """Converts scalar distance d into fixed-size RBF feature vector then project to pair embed dim.
+    """Converts scalar distance into RBF feature vector then to pair embed dim.
 
     Centers are evenly spaced in [d_min, d_max]; width = spacing.
     """
 
-    def __init__(self, c: int, n_rbf: int = 16, d_min: float = 0.0, d_max: float = 22.0) -> None:
+    def __init__(
+        self,
+        c: int,
+        n_rbf: int = 16,
+        d_min: float = 0.0,
+        d_max: float = 22.0,
+    ) -> None:
         super().__init__()
-        centers: Float[torch.Tensor, "n_rbf"] = torch.linspace(d_min, d_max, n_rbf)
+        centers: Float[torch.Tensor, "n_rbf"] = torch.linspace(
+            d_min,
+            d_max,
+            n_rbf,
+        )
         self.centers: Float[torch.Tensor, "n_rbf"]
         self.register_buffer("centers", centers)
         self.sigma: float = (d_max - d_min) / n_rbf
@@ -46,7 +59,10 @@ class TransformRBF(nn.Module):
         self,
         d: Float[torch.Tensor, "B N_res N_res"],
     ) -> Float[torch.Tensor, "B N_res N_res c_pair"]:
-        """Call forward; typed override so call-site return types are not Any."""
+        """Call forward; typed override so call-site return types are not Any.
+
+        See ``forward`` for full documentation of arguments and return values.
+        """
         return self.forward(d)
 
     @override
@@ -55,9 +71,17 @@ class TransformRBF(nn.Module):
         self,
         d: Float[torch.Tensor, "B N_res N_res"],
     ) -> Float[torch.Tensor, "B N_res N_res c_pair"]:
-        """Project pairwise distances through RBF basis into pair embedding space."""
+        """Project pairwise distances with RBF basis into pair embedding space.
+
+        Args:
+            d: Pairwise distance matrix of shape ``(B, N_res, N_res)``.
+
+        Returns:
+            Pair embeddings of shape ``(B, N_res, N_res, c_pair)``.
+        """
         rbf: Float[torch.Tensor, "B N_res N_res n_rbf"] = torch.exp(
-            -((rearrange(d, "b n_i n_j -> b n_i n_j 1") - self.centers) ** 2) / self.sigma**2
+            -((rearrange(d, "b n_i n_j -> b n_i n_j 1") - self.centers) ** 2)
+            / self.sigma**2,
         )
         result: Float[torch.Tensor, "B N_res N_res c_pair"] = self.proj(rbf)
         return result
@@ -80,7 +104,8 @@ class TriangleAttentionStartingNodeWithBias(nn.Module):
 
     def __init__(self, c_pair: int, n_heads: int = 4) -> None:
         super().__init__()
-        assert c_pair % n_heads == 0
+        if c_pair % n_heads != 0:
+            raise InvalidPairHeadDimensionError(c_pair, n_heads)
         self.n_heads: int = n_heads
         self.head_dim: int = c_pair // n_heads
 
@@ -88,7 +113,10 @@ class TriangleAttentionStartingNodeWithBias(nn.Module):
         self.to_q: LinearNoBias = LinearNoBias(c_pair, c_pair)
         self.to_k: LinearNoBias = LinearNoBias(c_pair, c_pair)
         self.to_v: LinearNoBias = LinearNoBias(c_pair, c_pair)
-        self.to_g: TypedLinear = TypedLinear(c_pair, c_pair)  # gating (bias allowed)
+        self.to_g: TypedLinear = TypedLinear(
+            c_pair,
+            c_pair,
+        )  # gating (bias allowed)
         self.to_out: LinearNoBias = LinearNoBias(c_pair, c_pair)
 
     @override
@@ -97,7 +125,10 @@ class TriangleAttentionStartingNodeWithBias(nn.Module):
         z: Float[torch.Tensor, "B N_res N_res c_pair"],
         b: Float[torch.Tensor, "B N_res N_res n_heads"],
     ) -> Float[torch.Tensor, "B N_res N_res c_pair"]:
-        """Call forward; typed override so call-site return types are not Any."""
+        """Call forward; typed override so call-site return types are not Any.
+
+        See ``forward`` for full documentation of arguments and return values.
+        """
         return self.forward(z, b)
 
     @override
@@ -107,7 +138,16 @@ class TriangleAttentionStartingNodeWithBias(nn.Module):
         z: Float[torch.Tensor, "B N_res N_res c_pair"],
         b: Float[torch.Tensor, "B N_res N_res n_heads"],
     ) -> Float[torch.Tensor, "B N_res N_res c_pair"]:
-        """Apply row-wise gated self-attention biased by b to update pair embeddings."""
+        """Apply row gated biased self-attention to update pair embeddings.
+
+        Args:
+            z: Pair embeddings of shape ``(B, N_res, N_res, c_pair)``.
+            b: Per-head additive attention bias of shape
+                ``(B, N_res, N_res, n_heads)``.
+
+        Returns:
+            Updated pair embeddings of shape ``(B, N_res, N_res, c_pair)``.
+        """
         zn: Float[torch.Tensor, "B N_res N_res c_pair"] = self.layer_norm(z)
         q: Float[torch.Tensor, "B N_res N_res n_heads head_dim"] = rearrange(
             self.to_q(zn),
@@ -132,16 +172,22 @@ class TriangleAttentionStartingNodeWithBias(nn.Module):
 
         # Starting node: fix i, attend j (queries) over k (keys)
         attn: Float[torch.Tensor, "B N_res n_heads N_res N_res"] = einsum(
-            q, k, "b i j h d, b i k h d -> b i h j k"
+            q,
+            k,
+            "b i j h d, b i k h d -> b i h j k",
         ) / math.sqrt(self.head_dim)
 
-        attn = F.softmax(attn + rearrange(b, "b n_j n_k h -> b 1 h n_j n_k"), dim=-1)
-        intermediate: Float[torch.Tensor, "B N_res N_res n_heads head_dim"] = einsum(
-            attn, v, "b i h j k, b i k h d -> b i j h d"
+        attn = F.softmax(
+            attn + rearrange(b, "b n_j n_k h -> b 1 h n_j n_k"),
+            dim=-1,
+        )
+        intermediate: Float[torch.Tensor, "B N_res N_res n_heads head_dim"] = (
+            einsum(attn, v, "b i h j k, b i k h d -> b i j h d")
         )
         intermediate = g * intermediate
         out: Float[torch.Tensor, "B N_res N_res c_pair"] = rearrange(
-            intermediate, "b i j h d -> b i j (h d)"
+            intermediate,
+            "b i j h d -> b i j (h d)",
         )
         return self.to_out(out)
 
@@ -154,11 +200,16 @@ class TriangleAttentionStartingNodeWithBias(nn.Module):
 
 
 class TriangleAttentionEndingNodeWithBias(nn.Module):
-    """For each column j, attend over all i using queries/keys/values from z_ij, biased by b_ij."""
+    """Column-wise triangle attention over pair embeddings, biased by b_ij.
+
+    For each column j, attends over all i using queries/keys/values from
+    z_ij with an additive per-head bias derived from b_ij.
+    """
 
     def __init__(self, c_pair: int, n_heads: int = 4) -> None:
         super().__init__()
-        assert c_pair % n_heads == 0
+        if c_pair % n_heads != 0:
+            raise InvalidPairHeadDimensionError(c_pair, n_heads)
         self.n_heads: int = n_heads
         self.head_dim: int = c_pair // n_heads
 
@@ -175,7 +226,10 @@ class TriangleAttentionEndingNodeWithBias(nn.Module):
         z: Float[torch.Tensor, "B N_res N_res c_pair"],
         b: Float[torch.Tensor, "B N_res N_res n_heads"],
     ) -> Float[torch.Tensor, "B N_res N_res c_pair"]:
-        """Call forward; typed override so call-site return types are not Any."""
+        """Call forward; typed override so call-site return types are not Any.
+
+        See ``forward`` for full documentation of arguments and return values.
+        """
         return self.forward(z, b)
 
     @override
@@ -185,17 +239,32 @@ class TriangleAttentionEndingNodeWithBias(nn.Module):
         z: Float[torch.Tensor, "B N_res N_res c_pair"],
         b: Float[torch.Tensor, "B N_res N_res n_heads"],
     ) -> Float[torch.Tensor, "B N_res N_res c_pair"]:
-        """Apply column-wise gated self-attention biased by b to update pair embeddings."""
+        """Apply column gated biased self-attention to update pair embeddings.
+
+        Args:
+            z: Pair embeddings of shape ``(B, N_res, N_res, c_pair)``.
+            b: Per-head additive attention bias of shape
+                ``(B, N_res, N_res, n_heads)``.
+
+        Returns:
+            Updated pair embeddings of shape ``(B, N_res, N_res, c_pair)``.
+        """
         zn: Float[torch.Tensor, "B N_res N_res c_pair"] = self.layer_norm(z)
         # Transpose to column-first so ending node j leads
         q: Float[torch.Tensor, "B N_res N_res n_heads head_dim"] = rearrange(
-            self.to_q(zn), "b n_i n_j (h d) -> b n_j n_i h d", h=self.n_heads
+            self.to_q(zn),
+            "b n_i n_j (h d) -> b n_j n_i h d",
+            h=self.n_heads,
         )
         k: Float[torch.Tensor, "B N_res N_res n_heads head_dim"] = rearrange(
-            self.to_k(zn), "b n_i n_j (h d) -> b n_j n_i h d", h=self.n_heads
+            self.to_k(zn),
+            "b n_i n_j (h d) -> b n_j n_i h d",
+            h=self.n_heads,
         )
         v: Float[torch.Tensor, "B N_res N_res n_heads head_dim"] = rearrange(
-            self.to_v(zn), "b n_i n_j (h d) -> b n_j n_i h d", h=self.n_heads
+            self.to_v(zn),
+            "b n_i n_j (h d) -> b n_j n_i h d",
+            h=self.n_heads,
         )
         g: Float[torch.Tensor, "B N_res N_res n_heads head_dim"] = rearrange(
             torch.sigmoid(self.to_g(zn)),
@@ -205,12 +274,17 @@ class TriangleAttentionEndingNodeWithBias(nn.Module):
 
         # Ending node: fix j, attend i (queries) over k (keys)
         attn: Float[torch.Tensor, "B N_res n_heads N_res N_res"] = einsum(
-            q, k, "b n_j n_i h d, b n_j n_k h d -> b n_j h n_i n_k"
+            q,
+            k,
+            "b n_j n_i h d, b n_j n_k h d -> b n_j h n_i n_k",
         ) / math.sqrt(self.head_dim)
 
-        attn = F.softmax(attn + rearrange(b, "b n_i n_k h -> b 1 h n_i n_k"), dim=-1)
-        intermediate: Float[torch.Tensor, "B N_res N_res n_heads head_dim"] = einsum(
-            attn, v, "b n_j h n_i n_k, b n_j n_k h d -> b n_j n_i h d"
+        attn = F.softmax(
+            attn + rearrange(b, "b n_i n_k h -> b 1 h n_i n_k"),
+            dim=-1,
+        )
+        intermediate: Float[torch.Tensor, "B N_res N_res n_heads head_dim"] = (
+            einsum(attn, v, "b n_j h n_i n_k, b n_j n_k h d -> b n_j n_i h d")
         )
         intermediate = g * intermediate
         # Weighted sum, then transpose back to (B, N_i, N_j, C)
@@ -227,7 +301,10 @@ class TriangleAttentionEndingNodeWithBias(nn.Module):
 
 
 class Transition(nn.Module):
-    """Two-layer feed-forward transition block applied to pair embeddings."""
+    """Two-layer feed-forward transition block applied to pair embeddings.
+
+    Uses a SwiGLU-style gate: ``silu(W1·x) ⊙ W2·x`` projected back to ``c``.
+    """
 
     def __init__(self, c: int, expansion: int = 4) -> None:
         super().__init__()
@@ -237,14 +314,34 @@ class Transition(nn.Module):
         self.hidden_to_out: LinearNoBias = LinearNoBias(c * expansion, c)
 
     @override
-    def __call__(self, x: Float[torch.Tensor, "..."]) -> Float[torch.Tensor, "..."]:
-        """Call forward; typed override so call-site return types are not Any."""
+    def __call__(
+        self,
+        x: Float[torch.Tensor, "..."],
+    ) -> Float[torch.Tensor, "..."]:
+        """Call forward; typed override so call-site return types are not Any.
+
+        See ``forward`` for full documentation of arguments and return values.
+        """
         return self.forward(x)
 
     @override
     @jaxtyped(typechecker=beartype)
-    def forward(self, x: Float[torch.Tensor, "..."]) -> Float[torch.Tensor, "..."]:
-        """Apply two-layer FFN with ReLU activation to any leading-dim tensor."""
+    def forward(
+        self,
+        x: Float[torch.Tensor, "..."],
+    ) -> Float[torch.Tensor, "..."]:
+        """Apply SwiGLU two-layer FFN to any leading-dimension tensor.
+
+        Normalises ``x``, computes ``silu(W1·x) ⊙ W2·x``, and projects the
+        result back to the original embedding dimension.
+
+        Args:
+            x: Input tensor of any shape ``(..., c)`` where the last dimension
+                matches the embedding size ``c`` supplied at construction.
+
+        Returns:
+            Tensor of the same shape as ``x`` after the feed-forward transform.
+        """
         # Works for any leading dims (B N_res N_res c) or (B N_res c)
         x = self.layer_norm(x)
         a = self.x_to_a(x)
@@ -266,14 +363,35 @@ class DropoutRowwise(nn.Module):
         self.p: float = p
 
     @override
-    def __call__(self, x: Float[torch.Tensor, "..."]) -> Float[torch.Tensor, "..."]:
-        """Call forward; typed override so call-site return types are not Any."""
+    def __call__(
+        self,
+        x: Float[torch.Tensor, "..."],
+    ) -> Float[torch.Tensor, "..."]:
+        """Call forward; typed override so call-site return types are not Any.
+
+        See ``forward`` for full documentation of arguments and return values.
+        """
         return self.forward(x)
 
     @override
     @jaxtyped(typechecker=beartype)
-    def forward(self, x: Float[torch.Tensor, "..."]) -> Float[torch.Tensor, "..."]:
-        """Drop entire rows of x with probability p during training."""
+    def forward(
+        self,
+        x: Float[torch.Tensor, "..."],
+    ) -> Float[torch.Tensor, "..."]:
+        """Drop entire rows of ``x`` with probability ``p`` during training.
+
+        At inference time (``self.training`` is ``False``) or when ``p == 0``
+        the input is returned unchanged.
+
+        Args:
+            x: Input tensor of shape ``(B, N_rows, ...)`` where dim 1 holds
+                the rows to be dropped.
+
+        Returns:
+            Tensor of the same shape as ``x`` with randomly zeroed rows (and
+            remaining rows rescaled to preserve expected values).
+        """
         if not self.training or self.p == 0:
             return x
         mask_shape = (x.size(0), x.size(1)) + (1,) * (x.dim() - 2)
@@ -290,14 +408,35 @@ class DropoutColumnwise(nn.Module):
         self.p: float = p
 
     @override
-    def __call__(self, x: Float[torch.Tensor, "..."]) -> Float[torch.Tensor, "..."]:
-        """Call forward; typed override so call-site return types are not Any."""
+    def __call__(
+        self,
+        x: Float[torch.Tensor, "..."],
+    ) -> Float[torch.Tensor, "..."]:
+        """Call forward; typed override so call-site return types are not Any.
+
+        See ``forward`` for full documentation of arguments and return values.
+        """
         return self.forward(x)
 
     @override
     @jaxtyped(typechecker=beartype)
-    def forward(self, x: Float[torch.Tensor, "..."]) -> Float[torch.Tensor, "..."]:
-        """Drop entire columns of x with probability p during training."""
+    def forward(
+        self,
+        x: Float[torch.Tensor, "..."],
+    ) -> Float[torch.Tensor, "..."]:
+        """Drop entire columns of ``x`` with probability ``p`` during training.
+
+        At inference time (``self.training`` is ``False``) or when ``p == 0``
+        the input is returned unchanged.
+
+        Args:
+            x: Input tensor of shape ``(B, N_rows, N_cols, ...)`` where dim 2
+                holds the columns to be dropped.
+
+        Returns:
+            Tensor of the same shape as ``x`` with randomly zeroed columns
+            (and remaining columns rescaled to preserve expected values).
+        """
         if not self.training or self.p == 0:
             return x
         mask_shape = (x.size(0), 1, x.size(2)) + (1,) * (x.dim() - 3)
@@ -341,8 +480,8 @@ class PairUpdate(nn.Module):
         self.drop_row: DropoutRowwise = DropoutRowwise(dropout)
 
         # Step 4
-        self.tri_end: TriangleAttentionEndingNodeWithBias = TriangleAttentionEndingNodeWithBias(
-            c, n_heads
+        self.tri_end: TriangleAttentionEndingNodeWithBias = (
+            TriangleAttentionEndingNodeWithBias(c, n_heads)
         )
         self.drop_col: DropoutColumnwise = DropoutColumnwise(dropout)
 
@@ -355,7 +494,10 @@ class PairUpdate(nn.Module):
         z: Float[torch.Tensor, "B N_res N_res c_pair"],
         r_center: Float[torch.Tensor, "B N_res 3"],
     ) -> Float[torch.Tensor, "B N_res N_res c_pair"]:
-        """Call forward; typed override so call-site return types are not Any."""
+        """Call forward; typed override so call-site return types are not Any.
+
+        See ``forward`` for full documentation of arguments and return values.
+        """
         return self.forward(z, r_center)
 
     @override
@@ -365,21 +507,38 @@ class PairUpdate(nn.Module):
         z: Float[torch.Tensor, "B N_res N_res c_pair"],
         r_center: Float[torch.Tensor, "B N_res 3"],
     ) -> Float[torch.Tensor, "B N_res N_res c_pair"]:
-        """Update pair embeddings with triangle attention and coordinate-based RBF bias."""
+        """Update pair embeddings with triangle attention and RBF bias.
+
+        Implements Algorithm 7 from the AlphaFold 3 paper in five steps:
+        compute pairwise distances, project them through an RBF bias, apply
+        rowwise triangle attention, apply columnwise triangle attention, and
+        apply a feed-forward transition.
+
+        Args:
+            z: Current pair embeddings of shape ``(B, N_res, N_res, c_pair)``.
+            r_center: Center atom coordinates per residue of shape
+                ``(B, N_res, 3)`` used to derive the coordinate pair bias.
+
+        Returns:
+            Updated pair embeddings of shape ``(B, N_res, N_res, c_pair)``.
+        """
         # ------------------------------------------------------------------
         # Step 1: d_ij = ||r_i^center - r_j^center||
         # ------------------------------------------------------------------
         diff: Float[torch.Tensor, "B N_res N_res 3"] = rearrange(
-            r_center, "b n d -> b n 1 d"
+            r_center,
+            "b n d -> b n 1 d",
         ) - rearrange(r_center, "b n d -> b 1 n d")
         d_ij: Float[torch.Tensor, "B N_res N_res"] = torch.sqrt(
-            reduce(diff**2, "b n m d -> b n m", "sum").clamp(min=1e-8)
+            reduce(diff**2, "b n m d -> b n m", "sum").clamp(min=1e-8),
         )
 
         # ------------------------------------------------------------------
         # Step 2: b_ij = LinearNoBias(Transform_RBF(d_ij))
         # ------------------------------------------------------------------
-        b_ij: Float[torch.Tensor, "B N_res N_res n_heads"] = self.b_proj(self.rbf(d_ij))
+        b_ij: Float[torch.Tensor, "B N_res N_res n_heads"] = self.b_proj(
+            self.rbf(d_ij),
+        )
 
         # ------------------------------------------------------------------
         # Step 3: z_ij += DropoutRowwise(TriangleAttentionStartingNode(z, b))

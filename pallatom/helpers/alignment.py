@@ -28,17 +28,17 @@ def kabsch_rotation(
     reference: Float[torch.Tensor, "... N 3"],
     weights: Float[torch.Tensor, "... N"] | None = None,
 ) -> Float[torch.Tensor, "... 3 3"]:
-    """Compute optimal rotation matrix R that minimises RMSD between P and Q after centering.
+    """Compute optimal rotation matrix that minimises RMSD after centering.
 
     The Singular Value Decomposition based algorithm finds R such that:
         ||W^(1/2) (P @ R.T - Q)||_F  is minimised
 
     Args:
-        mobile (P):        (..., N, 3) — mobile structure (will be rotated).
-        reference (Q):        (..., N, 3) — target/reference structure.
-        weights:  (..., N)    — per-residue weights (optional, non-negative).
-                               Useful for masking missing residues or
-                               down-weighting flexible loops.
+        mobile: Mobile structure P of shape (..., N, 3) — will be rotated.
+        reference: Target/reference structure Q of shape (..., N, 3).
+        weights: Per-residue weights of shape (..., N), optional,
+            non-negative. Useful for masking missing residues or
+            down-weighting flexible loops.
 
     Returns:
         R:  (..., 3, 3) — rotation matrix (det = +1, i.e. proper rotation).
@@ -53,7 +53,9 @@ def kabsch_rotation(
     if weights is not None:
         w = weights / (reduce(weights, "... n -> ... 1", "sum") + 1e-8)
         h = einsum(
-            mobile * rearrange(w, "... n -> ... n 1"), reference, "... n i, ... n j -> ... i j"
+            mobile * rearrange(w, "... n -> ... n 1"),
+            reference,
+            "... n i, ... n j -> ... i j",
         )
     else:
         h = einsum(mobile, reference, "... n i, ... n j -> ... i j")
@@ -62,13 +64,20 @@ def kabsch_rotation(
     u, _, v = torch.svd(h)  # (...,3,3), (...,3), (...,3,3)
 
     # Correct for improper rotation (reflection) when det < 0
-    det: Float[torch.Tensor, "..."] = einsum(v, u.mH, "... i j, ... j k -> ... i k").det()
+    det: Float[torch.Tensor, "..."] = einsum(
+        v,
+        u.mH,
+        "... i j, ... j k -> ... i k",
+    ).det()
     sign = torch.ones_like(det)
     sign[det < 0] = -1.0
 
     # Build diagonal correction matrix: diag(1, 1, sign)
     ones = torch.ones(*sign.shape, 2, device=mobile.device, dtype=mobile.dtype)
-    diag_vals = torch.cat([ones, rearrange(sign, "... -> ... 1")], dim=-1)  # (..., 3)
+    diag_vals = torch.cat(
+        [ones, rearrange(sign, "... -> ... 1")],
+        dim=-1,
+    )  # (..., 3)
     diag = torch.diag_embed(diag_vals)  # (..., 3, 3)
 
     v_diag = einsum(v, diag, "... i j, ... j k -> ... i k")
@@ -129,13 +138,13 @@ def kabsch_align(
         target:           (..., N, 3)  — reference coordinates.
         weights:          (..., N)     — optional per-residue weights
                                         (e.g. 1 for structured, 0 for missing).
-        return_transform: bool         — if True, also return (R, t_mobile, t_target).
+        return_transform: bool — if True, also return (R, t_mobile, t_target).
 
     Returns:
-        aligned:    (..., N, 3)  — mobile after optimal rigid alignment to target.
+        aligned: (..., N, 3) — mobile after optimal rigid alignment to target.
         R:          (..., 3, 3)  — rotation matrix  [only if return_transform]
-        t_mobile:   (..., 1, 3)  — centroid of mobile  [only if return_transform]
-        t_target:   (..., 1, 3)  — centroid of target  [only if return_transform]
+        t_mobile: (..., 1, 3) — centroid of mobile [only if return_transform]
+        t_target: (..., 1, 3) — centroid of target [only if return_transform]
     """
     # ---- 1. Centroids -------------------------------------------------
     if weights is not None:
@@ -144,8 +153,14 @@ def kabsch_align(
         c_mobile = reduce(mobile * w3, "... n d -> ... 1 d", "sum")
         c_target = reduce(target * w3, "... n d -> ... 1 d", "sum")
     else:
-        c_mobile = rearrange(reduce(mobile, "... n d -> ... d", "mean"), "... d -> ... 1 d")
-        c_target = rearrange(reduce(target, "... n d -> ... d", "mean"), "... d -> ... 1 d")
+        c_mobile = rearrange(
+            reduce(mobile, "... n d -> ... d", "mean"),
+            "... d -> ... 1 d",
+        )
+        c_target = rearrange(
+            reduce(target, "... n d -> ... d", "mean"),
+            "... d -> ... 1 d",
+        )
 
     # ---- 2. Centre ----------------------------------------------------
     P = mobile - c_mobile  # (..., N, 3)
@@ -155,7 +170,6 @@ def kabsch_align(
     R = kabsch_rotation(P, Q, weights=weights)  # (..., 3, 3)
 
     # ---- 4. Apply transform -------------------------------------------
-    # aligned = P @ R^T + c_target
     aligned = einsum(P, R.mH, "... n i, ... i j -> ... n j") + c_target
 
     if return_transform:
@@ -195,7 +209,11 @@ def rmsd(
         if weights is not None:
             weights = weights * mask.float()
 
-    sq_dev = reduce((predicted - reference) ** 2, "... n d -> ... n", "sum")  # (..., N)
+    sq_dev = reduce(
+        (predicted - reference) ** 2,
+        "... n d -> ... n",
+        "sum",
+    )  # (..., N)
 
     if weights is not None:
         w = weights / (reduce(weights, "... n -> ... 1", "sum") + 1e-8)
@@ -231,9 +249,16 @@ def kabsch_rmsd(
     """
     eff_weights = weights
     if mask is not None:
-        eff_weights = (weights * mask.float()) if weights is not None else mask.float()
+        eff_weights = (
+            (weights * mask.float()) if weights is not None else mask.float()
+        )
 
-    (aligned,) = kabsch_align(mobile, target, weights=eff_weights, return_transform=False)
+    (aligned,) = kabsch_align(
+        mobile,
+        target,
+        weights=eff_weights,
+        return_transform=False,
+    )
     return rmsd(aligned, target, weights=eff_weights, mask=mask)
 
 
@@ -270,21 +295,40 @@ def centre_random_augment(
     """
     B: int = coords.shape[0]
 
-    centroid: Float[torch.Tensor, "B 1 3"] = reduce(coords, "b n d -> b 1 d", "mean")
+    centroid: Float[torch.Tensor, "B 1 3"] = reduce(
+        coords,
+        "b n d -> b 1 d",
+        "mean",
+    )
     coords_centred: Float[torch.Tensor, "B N_atom 3"] = coords - centroid
 
-    z: Float[torch.Tensor, "B 3 3"] = torch.randn(B, 3, 3, device=coords.device, dtype=coords.dtype)
+    z: Float[torch.Tensor, "B 3 3"] = torch.randn(
+        B,
+        3,
+        3,
+        device=coords.device,
+        dtype=coords.dtype,
+    )
     q, r = torch.qr(z)
 
     # Fix sign ambiguity so R has a positive diagonal (Mezzadri 2007).
-    diag_sign: Float[torch.Tensor, "B 3"] = torch.sign(torch.diagonal(r, dim1=-2, dim2=-1))
+    diag_sign: Float[torch.Tensor, "B 3"] = torch.sign(
+        torch.diagonal(r, dim1=-2, dim2=-1),
+    )
     q = q * rearrange(diag_sign, "b d -> b 1 d")
 
     # Enforce det = +1 by negating the last column when det(Q) = -1.
     det: Float[torch.Tensor, "B"] = q.det()
-    last_col_sign: Float[torch.Tensor, "B 1"] = rearrange(torch.sign(det), "b -> b 1")
+    last_col_sign: Float[torch.Tensor, "B 1"] = rearrange(
+        torch.sign(det),
+        "b -> b 1",
+    )
     col_scale: Float[torch.Tensor, "B 3"] = torch.cat(
-        [torch.ones(B, 2, device=coords.device, dtype=coords.dtype), last_col_sign], dim=-1
+        [
+            torch.ones(B, 2, device=coords.device, dtype=coords.dtype),
+            last_col_sign,
+        ],
+        dim=-1,
     )
     q = q * rearrange(col_scale, "b d -> b 1 d")
 
@@ -294,22 +338,30 @@ def centre_random_augment(
 @jaxtyped(typechecker=beartype)
 def apply_transform(
     coords: Float[torch.Tensor, "... M 3"],
-    R: Float[torch.Tensor, "... 3 3"],
+    rotation_matrix: Float[torch.Tensor, "... 3 3"],
     t_from: Float[torch.Tensor, "... 1 3"],
     t_to: Float[torch.Tensor, "... 1 3"],
 ) -> Float[torch.Tensor, "... M 3"]:
-    """Apply a previously computed Kabsch rigid transform to a new set of coordinates.
+    """Apply previously computed Kabsch rigid transform to new coordinates.
 
     Transform:  coords_aligned = (coords - t_from) @ R^T + t_to
 
     Args:
         coords:  (..., M, 3) — coordinates to transform (can differ from
                                the N atoms used to compute the transform).
-        R:       (..., 3, 3) — rotation matrix from `kabsch_align`.
+        rotation_matrix:       (..., 3, 3) — rotation matrix from
+            `kabsch_align`.
         t_from:  (..., 1, 3) — centroid of the mobile set (c_mobile).
         t_to:    (..., 1, 3) — centroid of the target set (c_target).
 
     Returns:
         (..., M, 3) — transformed coordinates.
     """
-    return einsum(coords - t_from, R.mH, "... m i, ... i j -> ... m j") + t_to
+    return (
+        einsum(
+            coords - t_from,
+            rotation_matrix.mH,
+            "... m i, ... i j -> ... m j",
+        )
+        + t_to
+    )

@@ -103,11 +103,23 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
     atom_dist_params = AtomDistogramParams()
     residue_dist_params = ResidueDistogramParams()
 
-    model = _load_model(CHECKPOINT_PATH, mp, noise, atom_dist_params, residue_dist_params, DEVICE)
+    model = _load_model(
+        CHECKPOINT_PATH,
+        mp,
+        noise,
+        atom_dist_params,
+        residue_dist_params,
+        DEVICE,
+    )
     # this needs to get redone at some point. terrible
-    atom_disto = Distogram(n_bins=22, min_dist=2.0, max_dist=22.0, overflow_bin=False).to(DEVICE)
+    atom_disto = Distogram(
+        n_bins=22, min_dist=2.0, max_dist=22.0, overflow_bin=False
+    ).to(DEVICE)
     templ_disto = Distogram(
-        n_bins=residue_dist_params.n_bins - 1, min_dist=3.25, max_dist=50.75, overflow_bin=True
+        n_bins=residue_dist_params.n_bins - 1,
+        min_dist=3.25,
+        max_dist=50.75,
+        overflow_bin=True,
     ).to(DEVICE)
     _app.state.loaded = AppState(
         semaphore=asyncio.Semaphore(1),
@@ -137,7 +149,9 @@ class SampleRequest(BaseModel):
     """Request body for the /sample endpoint."""
 
     # --- target ---
-    n_res: int = Field(..., gt=0, le=512, description="Number of residues to generate")
+    n_res: int = Field(
+        ..., gt=0, le=512, description="Number of residues to generate"
+    )
 
     # --- conditioning (all optional) ---
     sequence: str | None = Field(
@@ -159,16 +173,25 @@ class SampleRequest(BaseModel):
 
     # --- sampler ---
     n_samples: int = Field(
-        default=1, gt=0, le=10, description="Number of structures to generate in parallel"
+        default=1,
+        gt=0,
+        le=10,
+        description="Number of structures to generate in parallel",
     )
     ddim_steps: int = Field(
         default=40, gt=1, description="ODE solver steps (more = higher quality)"
     )
-    rho: float = Field(default=7.0, gt=0, description="Karras noise-schedule exponent")
-    S_churn: float = Field(
-        default=0.0, ge=0, description="Stochasticity per step (0 = deterministic)"
+    rho: float = Field(
+        default=7.0, gt=0, description="Karras noise-schedule exponent"
     )
-    S_noise: float = Field(default=1.003, gt=0, description="Noise scaling for stochastic steps")
+    S_churn: float = Field(
+        default=0.0,
+        ge=0,
+        description="Stochasticity per step (0 = deterministic)",
+    )
+    S_noise: float = Field(
+        default=1.003, gt=0, description="Noise scaling for stochastic steps"
+    )
 
     @field_validator("sequence")
     @classmethod
@@ -177,14 +200,18 @@ class SampleRequest(BaseModel):
         if v is not None:
             invalid = set(v) - _VALID_AA
             if invalid:
-                raise ValueError(f"Invalid characters in sequence: {sorted(invalid)!r}")
+                raise ValueError(
+                    f"Invalid characters in sequence: {sorted(invalid)!r}"
+                )
         return v
 
     @model_validator(mode="after")
     def sequence_length_matches_n_res(self) -> "SampleRequest":
         """Ensure sequence length equals n_res when a sequence is provided."""
         if self.sequence is not None and len(self.sequence) != self.n_res:
-            raise ValueError(f"sequence length {len(self.sequence)} must equal n_res {self.n_res}")
+            raise ValueError(
+                f"sequence length {len(self.sequence)} must equal n_res {self.n_res}"
+            )
         return self
 
 
@@ -202,7 +229,9 @@ class SampleResponse(BaseModel):
 
 def _protein_from_pdb_string(pdb_string: str) -> Protein:
     """Write pdb_string to a temp file, parse it, delete the temp file."""
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".pdb", delete=False) as f:
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".pdb", delete=False
+    ) as f:
         f.write(pdb_string)
         path = f.name
     try:
@@ -220,7 +249,9 @@ def coords_to_pdb_strings(
     B = coords_batch.shape[0]
     pdb_strings: list[str] = []
     for b in range(B):
-        coords_tensor = rearrange(coords_batch[b].cpu(), "(n a) d -> n a d", n=N_res, a=NATOM)
+        coords_tensor = rearrange(
+            coords_batch[b].cpu(), "(n a) d -> n a d", n=N_res, a=NATOM
+        )
         x_37, mask_37 = atom5_to_atom37(coords_tensor)
         aatype = np.array(seq_logits[b].argmax(dim=-1).cpu()).astype(np.intp)
         prot_out = Protein(
@@ -265,12 +296,16 @@ def run_sampling(req: SampleRequest, state: AppState) -> list[str]:
             )
         atom_positions = torch.zeros(N_res, 37, 3)
         atom_mask = torch.zeros(N_res, 37)
-        atom_positions[:n_pdb] = torch.tensor(prot.atom_positions, dtype=torch.float32)
+        atom_positions[:n_pdb] = torch.tensor(
+            prot.atom_positions, dtype=torch.float32
+        )
         atom_mask[:n_pdb] = torch.tensor(prot.atom_mask, dtype=torch.float32)
         pdb_idx = torch.tensor(prot.residue_index, dtype=torch.float32)
         if n_pdb < N_res:
             last = int(pdb_idx[-1].item()) if n_pdb > 0 else -1
-            tail = torch.arange(last + 1, last + 1 + (N_res - n_pdb), dtype=torch.float32)
+            tail = torch.arange(
+                last + 1, last + 1 + (N_res - n_pdb), dtype=torch.float32
+            )
             residue_index = torch.cat([pdb_idx, tail])
         else:
             residue_index = pdb_idx
@@ -337,7 +372,9 @@ async def sample(request: Request, req: SampleRequest) -> SampleResponse:
     async with state.semaphore:
         loop = asyncio.get_event_loop()
         try:
-            pdb_strings = await loop.run_in_executor(None, partial(run_sampling, req, state))
+            pdb_strings = await loop.run_in_executor(
+                None, partial(run_sampling, req, state)
+            )
         except Exception as exc:
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 

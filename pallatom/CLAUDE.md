@@ -50,7 +50,7 @@ All tensors are **unbatched** (no leading `B` dimension) unless otherwise noted.
 | `f_residue_idx`      | `Float[Tensor, "N_res c_res"]`                            | Sinusoidal encoding of the per-residue index, projected to `c_res` dims to seed `s_init`. |
 | `r_input`            | `Float[Tensor, "N_atom 3"]`                               | Noisy atom positions at the current diffusion step (input to the denoiser). |
 | `t_hat`              | `float`                                                   | Noise level σ of the input noise (scalar, not a tensor). |
-| `t`                  | `float`                                                   | Diffusion time in `[0, 1)` passed to `TemplateEmbedder` for time-conditional template weighting. |
+| `t`                  | `Float[Tensor, "B N_res N_res"]`                          | Diffusion time in `[0, 1)` passed to `TemplateEmbedder` for time-conditional template weighting. |
 | `tok_idx`            | `Int[Tensor, "N_atom"]`                                   | Maps each atom to its parent residue index in `[0, N_res)`. |
 | `center_uid`         | `Int[Tensor, "N_atom"]`                                   | For each atom, the index of its residue's center atom; broadcast per-residue center into the atom dimension, used in step 15 to extract `r_center`. |
 

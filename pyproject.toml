@@ -16,6 +16,7 @@ dependencies = [
     "structlog>=24.0.0",
     "tqdm>=4.0.0",
     "fastapi>=0.115.0",
+    "pydantic>=2.0.0",
     "uvicorn[standard]>=0.30.0",
 ]
 
@@ -61,91 +62,68 @@ docs = [
 dev = [
     "black>=24.0.0",
     "ruff>=0.15.15",
-    "pytest>=7.0.0",
+    "pylint==3.3.0",
+    "pytest==8.2.0",
     "pytest-cov>=4.0.0",
     "pre-commit>=3.0.0",
     "ipykernel>=6.0.0",
     "ipywidgets>=8.0.0",
     "jupyter>=1.0.0",
     "basedpyright>=1.39.6",
-    "wemake-python-styleguide>=1.6.2",
-    "flake8-pyproject>=1.2.3",
+    "xenon>=0.9.0",
+
+    "pydoclint>=0.5.0",
+    "pylint-pydantic>=0.3.0",
+    "pylint-per-file-ignores>=1.3.0",
+    "pylint-pytest==1.1.8",
+    "webdataset>=0.2.0",
 ]
 
 [tool.black]
-line-length = 100
+line-length = 80
 target-version = ["py310"]
 
 [tool.ruff]
-line-length = 100
+line-length = 80
 target-version = "py310"
-extend-exclude = ["*.ipynb", "REST_APIs/**"]
+extend-exclude = ["*.ipynb", "REST_APIs/**",]
 
 [tool.ruff.lint]
 select = [
-    "E",    # pycodestyle errors
-    "W",    # pycodestyle warnings
-    "F",    # pyflakes
-    "I",    # isort
-    "B",    # flake8-bugbear
-    "C4",   # flake8-comprehensions
-    "UP",   # pyupgrade
-    "PL",   # pylint — semantic checks, forces dataclasses/objects
-    "D",    # pydocstyle — Google docstring convention
-    "N",    # pep8-naming — Google follows PEP8 naming
-    "ANN",  # flake8-annotations — enforce type hints on public APIs
-    "RET",  # flake8-return — return statement consistency
-    "SIM",  # flake8-simplify
-    "ARG",  # flake8-unused-arguments
-    "RUF",  # ruff-specific — RUF100 flags unused noqa comments
-    "TRY",  # exception handling hygiene
-    "PERF", # performance antipatterns in hot paths
-    "PGH",  # pygrep-hooks — requires specific codes on type: ignore comments
-    "FBT",  # boolean trap — prefer keyword-only args or enums over bare bool params
-    "PT",   # pytest style — raises match=, one statement per raises block, parametrize format
-    "ISC",  # implicit string concatenation — catches ("foo" "bar") copy-paste bugs
-#    "PYI",  # flake8-pyi
-    "C90",  # mccabe code complexity
-    "NPY",  # numpy specific rules
-    "FURB", # refurb
-#    "PTH",  # flake8-use-pathlib
-    "ASYNC",# flake8-async
-    "LOG",  # flake8-logging
-    "G",    # flake8-logging-format
-    "PIE",  # flake8-pie
-    "SLF",  # flake8-self
-    "FAST", # FastAPI
+    "ALL",
 ]
 ignore = [
-    "F722", "F821", "UP037", # jaxtyping shape strings are runtime-parsed, not forward refs
-    "D107",                  # __init__ docstring — use class docstring instead
-#    "PLR2004",               # magic values — common in ML constants
-    "PLR0913",               # forces 5 arg or less for each function, not always a good idea
-    "PLR0402",               # would eliminate standard import pattern torch.nn as nn
-    "N812",                  # would eliminate standard import pattern torch.nn.functional as F
-    "N817",                  # would eliminate standard import pattern DistributedDataParallel DDP
-    "N802",                  # lowercase function names, not always best in ML code
-    "N803",                  # lowercase argument names, not always best in ML code
-    "N806",                  # lowercase variable names, not always best in ML code
-    "TRY003",                # long exception messages are fine in ML code
-    "FBT003",                # boolean literals at call sites are unavoidable in ML code
+    "F722", "F821", "UP037",   # jaxtyping shape strings are runtime-parsed, not forward refs
+    "D107",                    # __init__ docstring — use class docstring instead
+    "PLR0402",                 # would eliminate standard import pattern torch.nn as nn
+    "N812",                    # would eliminate standard import pattern torch.nn.functional as F
+    "N817",                    # would eliminate standard import pattern DistributedDataParallel DDP
+    "N803",                    # lowercase argument names, not always best in ML code
+    "N806",                    # lowercase variable names, not always best in ML code
+    "TC002", "TC003", "TC006", # typechecking blocks are not a great idea
+    "ISC003",                 # conflicts with basedpyright reportImplicitStringConcatenation
 ]
 
-
 [tool.ruff.lint.per-file-ignores]
-"pallatom/tests/**/*.py" = ["ANN"]
+"**/tests/**/*.py" = ["S101"]  # assert is correct in test code
 
 [tool.ruff.lint.pydocstyle]
 convention = "google"        # auto-ignores rules that conflict with Google style
+
+[tool.ruff.lint.pylint]
+max-args = 6
 
 [tool.ruff.lint.isort]
 known-first-party = ["diffusion"]
 
 [tool.basedpyright]
 extraPaths = ["pallatom"]
+venvPath = "/opt"
+venv = "venv"
 pythonVersion = "3.10"
 typeCheckingMode = "all"
-exclude = ["**/*.ipynb", "pallatom/tests/*"] # ignore tests temporarily
+exclude = ["**/*.ipynb"]
+# Loosen rules specifically for your test files
 
 enableBasedFeatures = true
 reportInvalidTypeForm = "none" # allows shape strings for jaxtyping compatibility.
@@ -155,35 +133,242 @@ reportUnknownVariableType = "none" # does not play well with jaxtyping
 # Google style: don't reach into private members from outside their class/module.
 reportPrivateImportUsage = "none" # not sure I agree with this one
 
-[tool.flake8]
-#max-line-length = 100
-# wemake-python-styleguide (WPS) — ML-friendly ignores
-#extend-ignore = [
-    # Single-letter and short names are idiomatic in ML (x, y, z, B, N, i, j)
-#    "WPS110", "WPS111",
-    # Upper-case names in class bodies are fine for ML constants (D_MODEL, N_HEADS)
-#    "WPS115",
-    # ML forward() passes routinely have many imports, locals, args, methods, expressions
-#    "WPS201", "WPS210", "WPS211", "WPS212", "WPS213", "WPS214",
-    # Deep nesting and many conditions are unavoidable in training loops
-#   "WPS220", "WPS221", "WPS222",
-    # einops patterns repeat string specs; f-strings are fine
-#   "WPS226", "WPS305",
-    # jaxtyping false positives
-#   "F722",
-    # Plain dataclasses don't need an explicit base class
-#   "WPS306",
-    # Magic numbers already waived in ruff (PLR2004)
-#   "WPS432",
-    # Nested imports are sometimes needed for optional heavy deps
-#   "WPS433",
-    # Nested classes are common (e.g. Config inside nn.Module)
-#   "WPS431",
-    # Line-length is enforced by black at 100; let black own this
-#   "E501",
-    # Walrus operator (:=) is fine in Python 3.10+
-#   "WPS332",
-#]
+# ---------------------------------------------------------------------------
+# pylint — Google Python Style Guide configuration
+# Reference: https://google.github.io/styleguide/pylintrc
+# ---------------------------------------------------------------------------
+[tool.pylint.main]
+py-version = "3.10"
+source-roots = ["pallatom"]
+ignore = ["third_party"]
+ignore-patterns = []
+ignore-paths = []
+persistent = true
+load-plugins = [
+    "pylint.extensions.magic_value",
+    "pylint.extensions.code_style",
+    "pylint.extensions.comparison_placement",
+    "pylint.extensions.consider_refactoring_into_while_condition",
+    "pylint.extensions.consider_ternary_expression",
+    "pylint.extensions.dict_init_mutate",
+    "pylint.extensions.docparams",
+    "pylint.extensions.dunder",
+    "pylint.extensions.empty_comment",
+    "pylint.extensions.eq_without_hash",
+    "pylint.extensions.for_any_all",
+    "pylint.extensions.mccabe",
+    "pylint.extensions.no_self_use",
+    "pylint.extensions.overlapping_exceptions",
+    "pylint.extensions.private_import",
+    "pylint.extensions.redefined_loop_name",
+    "pylint.extensions.redefined_variable_type",
+    "pylint.extensions.set_membership",
+    "pylint.extensions.typing",
+    "pylint.extensions.check_elif",
+    "pylint.extensions.bad_builtin",
+    "pylint.extensions.broad_try_clause",
+    "pylint.extensions.while_used",
+    "pylint_pydantic",
+    "pylint_per_file_ignores",
+    "pylint_pytest",
+    ]
+jobs = 1
+unsafe-load-any-extension = false
+
+
+[tool.pylint."messages control"]
+disable = [
+    "R",                           # entire Refactor category (too-many-*, etc.)
+    "abstract-method",
+    "apply-builtin",
+    "arguments-differ",
+    "attribute-defined-outside-init",
+    "backtick",
+    "bad-option-value",
+    "basestring-builtin",
+    "buffer-builtin",
+    "c-extension-no-member",
+    "consider-using-enumerate",
+    "cmp-builtin",
+    "cmp-method",
+    "coerce-builtin",
+    "coerce-method",
+    "delslice-method",
+    "div-method",
+    "eq-without-hash",
+    "execfile-builtin",
+    "file-builtin",
+    "filter-builtin-not-iterating",
+    "fixme",
+    "getslice-method",
+    "global-statement",
+    "hex-method",
+    "idiv-method",
+    "implicit-str-concat",
+    "import-error",
+    "import-self",
+    "import-star-module-level",
+    "input-builtin",
+    "intern-builtin",
+    "invalid-str-codec",
+    "locally-disabled",
+    "long-builtin",
+    "long-suffix",
+    "map-builtin-not-iterating",
+    "misplaced-comparison-constant",
+    "missing-function-docstring",
+    "metaclass-assignment",
+    "next-method-called",
+    "next-method-defined",
+    "no-absolute-import",
+    "no-init",
+    "no-member",
+    "no-name-in-module",
+    "no-self-use",
+    "nonzero-method",
+    "oct-method",
+    "old-division",
+    "old-ne-operator",
+    "old-octal-literal",
+    "old-raise-syntax",
+    "parameter-unpacking",
+    "print-statement",
+    "raising-string",
+    "range-builtin-not-iterating",
+    "raw_input-builtin",
+    "rdiv-method",
+    "reduce-builtin",
+    "relative-import",
+    "reload-builtin",
+    "round-builtin",
+    "setslice-method",
+    "signature-differs",
+    "standarderror-builtin",
+    "suppressed-message",
+    "sys-max-int",
+    "trailing-newlines",
+    "unichr-builtin",
+    "unicode-builtin",
+    "unnecessary-pass",
+    "unpacking-in-except",
+    "useless-else-on-loop",
+    "useless-suppression",
+    "using-cmp-argument",
+    "wrong-import-order",
+    "xrange-builtin",
+    "zip-builtin-not-iterating",
+    # ML additions: uppercase and single-letter names are idiomatic (B, N, x, y)
+    "invalid-name",
+    # Docstrings duplicated by ruff D rules; avoid double-reporting
+    "missing-module-docstring",
+    "missing-class-docstring",
+    # Line length delegated to Black
+    "line-too-long",
+    # PyTorch false positives: nn.Module.forward and F.* are callable; pylint stubs are incomplete
+    "not-callable",
+    # PyTorch false positives: pylint infers None return when it cannot resolve torch function stubs
+    "assignment-from-no-return",
+]
+enable = [
+    "magic-value-comparison",  # R2004 — re-enabled from the blanket "R" disable
+]
+
+[tool.pylint.reports]
+output-format = "text"
+reports = false
+score = true
+evaluation = "10.0 - ((float(5 * error + warning + refactor + convention) / statement) * 10)"
+
+[tool.pylint.basic]
+good-names = ["main", "_"]
+bad-names = []
+name-group = ""
+include-naming-hint = false
+property-classes = [
+    "abc.abstractproperty",
+    "cached_property.cached_property",
+    "cached_property.threaded_cached_property",
+    "cached_property.cached_property_with_ttl",
+    "cached_property.threaded_cached_property_with_ttl",
+]
+function-rgx = '^(?:(?P<exempt>setUp|tearDown|setUpModule|tearDownModule)|(?P<camel_case>_?[A-Z][a-zA-Z0-9]*)|(?P<snake_case>_?[a-z][a-z0-9_]*))$'
+variable-rgx = '^[a-z][a-z0-9_]*$'
+const-rgx = '^(_?[A-Z][A-Z0-9_]*|__[a-z0-9_]+__|_?[a-z][a-z0-9_]*)$'
+attr-rgx = '^_{0,2}[a-z][a-z0-9_]*$'
+argument-rgx = '^[a-z][a-z0-9_]*$'
+class-attribute-rgx = '^(_?[A-Z][A-Z0-9_]*|__[a-z0-9_]+__|_?[a-z][a-z0-9_]*)$'
+inlinevar-rgx = '^[a-z][a-z0-9_]*$'
+class-rgx = '^_?[A-Z][a-zA-Z0-9]*$'
+module-rgx = '^(_?[a-z][a-z0-9_]*|__init__)$'
+method-rgx = '(?x)^(?:(?P<exempt>_[a-z0-9_]+__|runTest|setUp|tearDown|setUpTestCase|tearDownTestCase|setupSelf|tearDownClass|setUpClass|(test|assert)_*[A-Z0-9][a-zA-Z0-9_]*|next)|(?P<camel_case>_{0,2}[A-Z][a-zA-Z0-9_]*)|(?P<snake_case>_{0,2}[a-z][a-z0-9_]*))$'
+no-docstring-rgx = '(__.*__|main|test.*|.*test|.*Test)$'
+docstring-min-length = 12
+
+[tool.pylint.typecheck]
+contextmanager-decorators = ["contextlib.contextmanager", "contextlib2.contextmanager"]
+ignored-modules = []
+ignored-classes = ["optparse.Values", "thread._local", "_thread._local"]
+generated-members = ["torch.*"]
+
+[tool.pylint.format]
+max-line-length = 80
+ignore-long-lines = '''(?x)(
+  ^\s*(\#\ )?<?https?://\S+>?$|
+  ^\s*(from\s+\S+\s+)?import\s+.+$)'''
+single-line-if-stmt = true
+max-module-lines = 99999
+indent-string = "    "
+indent-after-paren = 4
+expected-line-ending-format = ""
+
+[tool.pylint.miscellaneous]
+notes = ["TODO"]
+
+[tool.pylint.string]
+check-quote-consistency = true
+
+[tool.pylint.spelling]
+spelling-dict = ""
+spelling-ignore-words = []
+spelling-private-dict-file = ""
+spelling-store-unknown-words = false
+
+[tool.pylint.variables]
+init-import = false
+dummy-variables-rgx = '^\*{0,2}(_$|unused_|dummy_)'
+additional-builtins = []
+callbacks = ["cb_", "_cb"]
+redefining-builtins-modules = ["six", "six.moves", "past.builtins", "future.builtins", "functools"]
+
+[tool.pylint.logging]
+logging-modules = ["logging", "absl.logging", "tensorflow.io.logging"]
+
+[tool.pylint.similarities]
+min-similarity-lines = 4
+ignore-comments = true
+ignore-docstrings = true
+ignore-imports = false
+
+[tool.pylint.imports]
+deprecated-modules = ["regsub", "TERMIOS", "Bastion", "rexec", "sets"]
+import-graph = ""
+ext-import-graph = ""
+int-import-graph = ""
+known-standard-library = []
+known-third-party = ["enchant", "absl"]
+analyse-fallback-blocks = false
+
+[tool.pylint.classes]
+defining-attr-methods = ["__init__", "__new__", "setUp"]
+exclude-protected = ["_asdict", "_fields", "_replace", "_source", "_make"]
+valid-classmethod-first-arg = ["cls", "class_"]
+valid-metaclass-classmethod-first-arg = ["mcs"]
+
+[tool.pydoclint]
+style = "google"
+arg-type-hints-in-docstring = false
+check-return-types = false
+require-return-section-when-returning-nothing = false
 
 [tool.pytest.ini_options]
 testpaths = ["pallatom/tests"]

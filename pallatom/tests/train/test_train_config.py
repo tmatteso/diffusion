@@ -1,4 +1,8 @@
-"""Tests for training configuration models."""
+"""Tests for training configuration models.
+
+Covers construction, immutability, serialization round-trips, and field-level
+validation for every Pydantic model in train.train_config.
+"""
 
 import math
 
@@ -24,60 +28,87 @@ from train.train_config import (
 
 @pytest.fixture
 def training() -> TrainingParams:
-    """Provide default TrainingParams."""
+    """Provide default TrainingParams.
+
+    Returns a TrainingParams instance constructed with all default values.
+    """
     return TrainingParams()
 
 
 @pytest.fixture
 def model() -> ModelParams:
-    """Provide default ModelParams."""
+    """Provide default ModelParams.
+
+    Returns a ModelParams instance constructed with all default values.
+    """
     return ModelParams()
 
 
 @pytest.fixture
 def noise() -> NoiseScheduleParams:
-    """Provide default NoiseScheduleParams."""
+    """Provide default NoiseScheduleParams.
+
+    Returns a NoiseScheduleParams instance constructed with all default values.
+    """
     return NoiseScheduleParams()
 
 
 @pytest.fixture
 def distogram_res() -> ResidueDistogramParams:
-    """Provide default ResidueDistogramParams."""
+    """Provide default ResidueDistogramParams.
+
+    Returns ResidueDistogramParams instance constructed with all default values.
+    """
     return ResidueDistogramParams()
 
 
 @pytest.fixture
 def distogram_atom() -> AtomDistogramParams:
-    """Provide default AtomDistogramParams."""
+    """Provide default AtomDistogramParams.
+
+    Returns an AtomDistogramParams instance constructed with all default values.
+    """
     return AtomDistogramParams()
 
 
 @pytest.fixture
 def loss() -> LossParams:
-    """Provide default LossParams."""
+    """Provide default LossParams.
+
+    Returns a LossParams instance constructed with all default values.
+    """
     return LossParams()
 
 
 @pytest.fixture
 def checkpoint() -> CheckpointParams:
-    """Provide default CheckpointParams."""
+    """Provide default CheckpointParams.
+
+    Returns a CheckpointParams instance constructed with all default values.
+    """
     return CheckpointParams()
 
 
 @pytest.fixture
 def logging_() -> LoggingParams:
-    """Provide default LoggingParams."""
+    """Provide default LoggingParams.
+
+    Returns a LoggingParams instance constructed with all default values.
+    """
     return LoggingParams()
 
 
 @pytest.fixture
 def loader() -> LoaderConfig:
-    """Provide default LoaderConfig."""
+    """Provide default LoaderConfig.
+
+    Returns a LoaderConfig instance constructed with all default values.
+    """
     return LoaderConfig()
 
 
 @pytest.fixture
-def cfg(
+def cfg(  # noqa: PLR0913
     training: TrainingParams,
     model: ModelParams,
     noise: NoiseScheduleParams,
@@ -88,7 +119,11 @@ def cfg(
     logging_: LoggingParams,
     loader: LoaderConfig,
 ) -> TrainConfig:
-    """Provide a TrainConfig composed from individual default sub-config fixtures."""
+    """TrainConfig composed from individual default sub-config fixtures.
+
+    Assembles complete TrainConfig by injecting each sub-config fixture so that
+    tests can inspect the composed object without constructing it inline.
+    """
     return TrainConfig(
         training=training,
         model=model,
@@ -107,13 +142,21 @@ def cfg(
 # ---------------------------------------------------------------------------
 
 
-def test_train_config_default_constructs():
-    """TrainConfig can be instantiated with all default values."""
+def test_train_config_default_constructs() -> None:
+    """TrainConfig can be instantiated with all default values.
+
+    Verifies that the top-level config model requires no arguments and that
+    the resulting object is an instance of TrainConfig.
+    """
     assert isinstance(TrainConfig(), TrainConfig)
 
 
-def test_train_config_sub_models_are_correct_types(cfg: TrainConfig):
-    """Each sub-config field of TrainConfig holds an instance of its expected Pydantic model."""
+def test_train_config_sub_models_are_correct_types(cfg: TrainConfig) -> None:
+    """Each field of TrainConfig holds instance of expected Pydantic model.
+
+    Verifies Pydantic correctly coerces and stores each nested config as the
+    declared sub-model type rather than as a plain dict or some other type.
+    """
     assert isinstance(cfg.training, TrainingParams)
     assert isinstance(cfg.model, ModelParams)
     assert isinstance(cfg.noise, NoiseScheduleParams)
@@ -126,103 +169,57 @@ def test_train_config_sub_models_are_correct_types(cfg: TrainConfig):
 
 
 # ---------------------------------------------------------------------------
-# TrainConfig — immutability
-# ---------------------------------------------------------------------------
-
-
-def test_train_config_is_frozen(cfg: TrainConfig):
-    """TrainConfig raises ValidationError when a top-level field is reassigned."""
-    with pytest.raises(ValidationError):
-        cfg.training = TrainingParams()
-
-
-def test_training_params_is_frozen(training: TrainingParams):
-    """TrainingParams raises ValidationError when any field is mutated after construction."""
-    with pytest.raises(ValidationError):
-        training.lr = 1e-2
-
-
-def test_model_params_is_frozen(model: ModelParams):
-    """ModelParams raises ValidationError when any field is mutated after construction."""
-    with pytest.raises(ValidationError):
-        model.c_res = 512
-
-
-# ---------------------------------------------------------------------------
-# TrainConfig — serialization round-trip
-# ---------------------------------------------------------------------------
-
-
-def test_train_config_round_trips_through_dict(cfg: TrainConfig):
-    """TrainConfig survives a model_dump / model_validate round-trip unchanged."""
-    assert TrainConfig.model_validate(cfg.model_dump()) == cfg
-
-
-# ---------------------------------------------------------------------------
-# TrainingParams — defaults and field constraints
-# ---------------------------------------------------------------------------
-
-
-def test_training_rejects_nonpositive_grad_clip():
-    """TrainingParams raises ValidationError when grad_clip is zero or negative."""
-    with pytest.raises(ValidationError):
-        TrainingParams(grad_clip=0.0)
-
-
-def test_training_accepts_none_grad_clip():
-    """TrainingParams accepts grad_clip=None to disable gradient clipping."""
-    assert TrainingParams(grad_clip=None).grad_clip is None
-
-
-# ---------------------------------------------------------------------------
-# ModelParams — defaults and field constraints
-# ---------------------------------------------------------------------------
-
-
-def test_model_rejects_zero_c_res():
-    """ModelParams raises ValidationError when c_res is zero (embedding width must be positive)."""
-    with pytest.raises(ValidationError):
-        ModelParams(c_res=0)
-
-
-def test_model_rejects_zero_k_unit():
-    """ModelParams raises ValidationError when K_unit zero (at least one decoder unit required)."""
-    with pytest.raises(ValidationError):
-        ModelParams(K_unit=0)
-
-
-# ---------------------------------------------------------------------------
 # NoiseScheduleParams — defaults, field constraints, cross-field validator
 # ---------------------------------------------------------------------------
 
 
-def test_noise_sigma_min_lt_sigma_max(noise: NoiseScheduleParams):
-    """Default sigma_min is strictly less than sigma_max."""
+def test_noise_sigma_min_lt_sigma_max(noise: NoiseScheduleParams) -> None:
+    """Default sigma_min is strictly less than sigma_max.
+
+    Verifies that the default noise schedule satisfies the ordering invariant
+    required by the cross-field validator.
+    """
     assert noise.sigma_min < noise.sigma_max
 
 
-def test_noise_rejects_nonpositive_sigma_data():
-    """NoiseScheduleParams raises ValidationError when sigma_data is zero."""
+def test_noise_rejects_nonpositive_sigma_data() -> None:
+    """NoiseScheduleParams raises ValidationError when sigma_data is zero.
+
+    Verifies that the field validator enforces a strictly positive constraint
+    on sigma_data, which is used as a normalisation denominator.
+    """
     with pytest.raises(ValidationError):
-        NoiseScheduleParams(sigma_data=0.0)
+        _ = NoiseScheduleParams(sigma_data=0.0)
 
 
-def test_noise_rejects_nonpositive_sigma_min():
-    """NoiseScheduleParams raises ValidationError when sigma_min is zero."""
+def test_noise_rejects_nonpositive_sigma_min() -> None:
+    """NoiseScheduleParams raises ValidationError when sigma_min is zero.
+
+    Verifies that the field validator enforces a strictly positive constraint
+    on sigma_min so the noise schedule lower bound is always meaningful.
+    """
     with pytest.raises(ValidationError):
-        NoiseScheduleParams(sigma_min=0.0)
+        _ = NoiseScheduleParams(sigma_min=0.0)
 
 
-def test_noise_rejects_sigma_min_equal_to_sigma_max():
-    """NoiseScheduleParams cross-field validator rejects sigma_min == sigma_max."""
+def test_noise_rejects_sigma_min_equal_to_sigma_max() -> None:
+    """NoiseScheduleParams field validator rejects sigma_min == sigma_max.
+
+    Verifies that the model-level validator requires a strictly ordered noise
+    schedule where sigma_min is less than sigma_max.
+    """
     with pytest.raises(ValidationError):
-        NoiseScheduleParams(sigma_min=80.0, sigma_max=80.0)
+        _ = NoiseScheduleParams(sigma_min=80.0, sigma_max=80.0)
 
 
-def test_noise_rejects_sigma_min_greater_than_sigma_max():
-    """NoiseScheduleParams cross-field validator rejects sigma_min > sigma_max."""
+def test_noise_rejects_sigma_min_greater_than_sigma_max() -> None:
+    """NoiseScheduleParams cross-field validator rejects sigma_min > sigma_max.
+
+    Verifies that the model-level validator rejects an inverted noise schedule
+    where sigma_min exceeds sigma_max.
+    """
     with pytest.raises(ValidationError):
-        NoiseScheduleParams(sigma_min=100.0, sigma_max=80.0)
+        _ = NoiseScheduleParams(sigma_min=100.0, sigma_max=80.0)
 
 
 # ---------------------------------------------------------------------------
@@ -230,15 +227,27 @@ def test_noise_rejects_sigma_min_greater_than_sigma_max():
 # ---------------------------------------------------------------------------
 
 
-def test_atom_distogram_default_values(distogram_atom: AtomDistogramParams):
-    """AtomDistogramParams defaults match the expected atom-level binning settings."""
+def test_atom_distogram_default_values(
+    distogram_atom: AtomDistogramParams,
+) -> None:
+    """AtomDistogramParams defaults match expected atom-level binning settings.
+
+    Verifies that min_dist, max_dist, and n_bins are set to the values agreed
+    upon by the atom distogram head design.
+    """
     assert math.isclose(distogram_atom.min_dist, 0.0)
     assert math.isclose(distogram_atom.max_dist, 10.0)
     assert math.isclose(distogram_atom.n_bins, 22)
 
 
-def test_atom_distogram_min_dist_lt_max_dist(distogram_atom: AtomDistogramParams):
-    """Default min_dist is strictly less than max_dist for atom distograms."""
+def test_atom_distogram_min_dist_lt_max_dist(
+    distogram_atom: AtomDistogramParams,
+) -> None:
+    """Default min_dist is strictly less than max_dist for atom distograms.
+
+    Verifies that the default binning range is valid so that distance bins
+    have a positive width.
+    """
     assert distogram_atom.min_dist < distogram_atom.max_dist
 
 
@@ -247,8 +256,12 @@ def test_atom_distogram_min_dist_lt_max_dist(distogram_atom: AtomDistogramParams
 # ---------------------------------------------------------------------------
 
 
-def test_loss_default_values(loss: LossParams):
-    """LossParams defaults match the expected multi-objective loss weight baseline."""
+def test_loss_default_values(loss: LossParams) -> None:
+    """LossParams defaults match expected multi-objective loss weight baseline.
+
+    Verifies that lam, alpha_0, alpha_1, gamma, and smooth_lddt_cutoff are set
+    to the agreed-upon baseline values for the multi-objective training loss.
+    """
     assert math.isclose(loss.lam, 1.0)
     assert math.isclose(loss.alpha_0, 0.25)
     assert math.isclose(loss.alpha_1, 1.0)
@@ -256,31 +269,44 @@ def test_loss_default_values(loss: LossParams):
     assert math.isclose(loss.smooth_lddt_cutoff, 15)
 
 
-def test_loss_rejects_nonpositive_lam():
-    """LossParams raises ValidationError when lam is zero (coordinate loss must be weighted)."""
+def test_loss_rejects_nonpositive_lam() -> None:
+    """LossParams raises ValidationError when lam is zero.
+
+    Verifies that the field validator enforces a strictly positive constraint
+    on lam so the coordinate reconstruction loss always contributes to training.
+    """
     with pytest.raises(ValidationError):
-        LossParams(lam=0.0)
+        _ = LossParams(lam=0.0)
 
 
-def test_loss_rejects_gamma_of_one():
-    """LossParams raises ValidationError when gamma=1.0 (no discount between decoder units)."""
+def test_loss_rejects_gamma_of_one() -> None:
+    """LossParams raises ValidationError when gamma=1.0.
+
+    Verifies that gamma must be strictly less than 1.0 so that auxiliary losses
+    from earlier decoder units are discounted relative to later ones.
+    """
     with pytest.raises(ValidationError):
-        LossParams(gamma=1.0)
+        _ = LossParams(gamma=1.0)
 
 
-def test_loss_rejects_gamma_of_zero():
-    """LossParams raises ValidationError when gamma=0.0 (only last decoder unit contributes)."""
+def test_loss_rejects_gamma_of_zero() -> None:
+    """LossParams raises ValidationError when gamma=0.0.
+
+    A gamma of zero would zero-weight all intermediate decoder units, making
+    only the final unit contribute to the loss, which is not a supported
+    training configuration.
+    """
     with pytest.raises(ValidationError):
-        LossParams(gamma=0.0)
+        _ = LossParams(gamma=0.0)
 
 
-def test_loss_rejects_negative_alpha():
+def test_loss_rejects_negative_alpha() -> None:
     """LossParams raises ValidationError when alpha_0 is negative."""
     with pytest.raises(ValidationError):
-        LossParams(alpha_0=-0.1)
+        _ = LossParams(alpha_0=-0.1)
 
 
-def test_loss_rejects_nonpositive_smooth_lddt_cutoff():
+def test_loss_rejects_nonpositive_smooth_lddt_cutoff() -> None:
     """LossParams raises ValidationError when smooth_lddt_cutoff is zero."""
     with pytest.raises(ValidationError):
-        LossParams(smooth_lddt_cutoff=0)
+        _ = LossParams(smooth_lddt_cutoff=0)

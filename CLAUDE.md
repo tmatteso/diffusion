@@ -15,16 +15,19 @@ is accepted** — run `pre-commit run --all-files` locally to verify before push
 | Stage | Hook | What it checks |
 |-------|------|----------------|
 | `commit-msg` | **commitlint** | Commit message follows [Conventional Commits](https://www.conventionalcommits.org/) (`feat:`, `fix:`, `docs:`, `test:`, `refactor:`, `chore:`, etc.) |
+| `pre-commit` | **black** | Python code is formatted (line-length 80, Python 3.10+) |
+| `pre-commit` | **checkmake** | `Makefile` passes style checks |
+| `pre-commit` | **check-yaml** | All YAML files parse without errors |
 | `pre-commit` | **check-github-workflows** | GitHub Actions YAML is schema-valid |
 | `pre-commit` | **check-taskfile** | `Taskfile.yml` is schema-valid |
-| `pre-commit` | **check-yaml** | All YAML files parse without errors |
-| `pre-commit` | **checkmake** | `Makefile` passes style checks |
-| `pre-commit` | **black** | Python code is formatted (line-length 100, Python 3.10+) |
-| `pre-commit` | **ruff** | Python linting (auto-fixes applied; remaining errors block commit) |
 | `pre-commit` | **basedpyright** | Type-checking of `pallatom/` and `REST_APIs/` |
+| `pre-commit` | **ruff** | Python linting (auto-fixes applied; remaining errors block commit) |
+| `pre-commit` | **xenon** | Cyclomatic complexity limits (`--max-absolute B --max-modules A --max-average A`) |
+| `pre-commit` | **pylint** | Google-style lint |
 | `pre-commit` | **enforce-einops** | Bans raw tensor ops (see below) |
 | `pre-commit` | **enforce-jaxtyping** | Bans bare `torch.Tensor` / `Tensor` annotations (see below) |
-| `pre-commit` | **pytest** | Full test suite must pass |
+| `pre-commit` | **pydoclint** | Google-style docstring linting |
+| `push` (CI) | **pytest** | Full test suite — runs in `.github/workflows/tests.yml` |
 
 ---
 
@@ -32,7 +35,7 @@ is accepted** — run `pre-commit run --all-files` locally to verify before push
 
 ### Black
 
-- **Line length:** 100
+- **Line length:** 80
 - **Target:** Python 3.10+
 - Standard Black formatting: double quotes, trailing commas in multi-line structures.
 
@@ -40,7 +43,7 @@ is accepted** — run `pre-commit run --all-files` locally to verify before push
 
 ### Ruff
 
-- **Line length:** 100, **target:** Python 3.10
+- **Line length:** 80, **target:** Python 3.10
 - Notebooks (`*.ipynb`) are excluded.
 
 **Active rule sets:**
@@ -191,7 +194,7 @@ Commit messages must follow Conventional Commits. Examples of valid prefixes:
    `.norm(`, `torch.linalg.vector_norm(`, or `torch.linalg.norm(`. For L2 norm use
    `torch.sqrt(reduce(x**2, "... -> ", "sum"))`.
 
-5. **Line length 100** — Black reformats automatically; keep manual line breaks at or under 100.
+5. **Line length 80** — Black reformats automatically; keep manual line breaks at or under 80.
 
 6. **Generics need type arguments** — write `dict[str, torch.Tensor]`, not `dict`;
    `list[str]`, not `list`.

@@ -1,7 +1,13 @@
-"""Utility dataclasses and functions for atom-level coordinate data."""
+"""Utility dataclasses and functions for atom-level coordinate data.
+
+Provides the Protein dataclass, atom-type constants, residue-type mappings,
+PDB I/O helpers, and tensor utilities for converting between atom37, atom5,
+and Cβ coordinate representations.
+"""
 
 import dataclasses
 from collections.abc import Mapping, MutableMapping
+from pathlib import Path
 from types import MappingProxyType
 from typing import Final, cast
 
@@ -10,16 +16,31 @@ import numpy.typing as npt
 import torch
 from beartype import beartype
 from einops import rearrange, reduce
+from helpers.errors import (
+    InvalidAAtypesError,
+    NoAtomRecordsError,
+    TooManyChainsError,
+)
 from jaxtyping import Bool, Float, Int, jaxtyped
 
 # Data utils
 
+DNA_THYMINE = "T"
+RNA_URACIL = "U"
+RNA_RIBOSE_OXYGEN = "O2'"
+PDB_REC_HETATM = "HETATM"
+PDB_REC_ATOM = "ATOM"
+PDB_REC_TER = "TER"
+PDB_REC_MODEL = "MODEL"
+PDB_REC_ENDMDL = "ENDMDL"
+PDB_REC_END = "END"
+
 # atom5 slot order: N=0, CA=1, C=2, O=3, CB=4
-ATOM5_NAMES = ["N", "CA", "C", "O", "CB"]
-ATOMS_PER_RES = 5
+ATOM5_NAMES: list[str] = ["N", "CA", "C", "O", "CB"]
+ATOMS_PER_RES: int = 5  # MANY, MANY THINGS SHOULD DEPEND ON THIS NUMBER
 
 # Element encoding: N=0, C=1, O=2, UNK=3 (side-chain placeholder)
-# Backbone slots: N→[1,0,0,0], CA→[0,1,0,0], C→[0,1,0,0], O→[0,0,1,0], CB→[0,0,0,1]
+# Backbone slots:
 ATOM5_ELEMENTS = torch.tensor(
     [
         [1, 0, 0, 0],  # N
@@ -33,26 +54,26 @@ ATOM5_ELEMENTS = torch.tensor(
 
 # ── atom37 index constants (standard residue_constants ordering) ──────────────
 # Matches OpenFold / AlphaFold2 residue_constants.atom_order
-ATOM37_N = 0
-ATOM37_CA = 1
-ATOM37_C = 2
-ATOM37_CB = 4
-ATOM37_O = 3
+ATOM37_N: int = 0
+ATOM37_CA: int = 1
+ATOM37_C: int = 2
+ATOM37_CB: int = 4
+ATOM37_O: int = 3
 
 # atom5 slot indices
-ATOM5_N = 0
-ATOM5_CA = 1
-ATOM5_C = 2
-ATOM5_CB = 4
-ATOM5_O = 3
+ATOM5_N: int = 0
+ATOM5_CA: int = 1
+ATOM5_C: int = 2
+ATOM5_CB: int = 4
+ATOM5_O: int = 3
 
 # PDB constants
-PDB_ATOM_NAME_CUTOFF_LEN = 4
-PDB_LINE_CUTOFF_LEN = 80
-PDB_LINE_NO_B_FACTOR = 66
-ATOM_DNE = 0.5
+PDB_ATOM_NAME_CUTOFF_LEN: int = 4
+PDB_LINE_CUTOFF_LEN: int = 80
+PDB_LINE_NO_B_FACTOR: int = 66
+ATOM_DNE: float = 0.5
 
-atom_types = [
+atom_types: list[str] = [
     "N",
     "CA",
     "C",
@@ -92,7 +113,7 @@ atom_types = [
     "OXT",
 ]
 
-RESTYPES_NO_X = [
+RESTYPES_NO_X: list[str] = [
     "A",
     "R",
     "N",
@@ -114,15 +135,17 @@ RESTYPES_NO_X = [
     "Y",
     "V",
 ]
-RESTYPE_NUM_NO_X = len(RESTYPES_NO_X)  # :=20
-RESTYPES = [*RESTYPES_NO_X, "X"]
+RESTYPE_NUM_NO_X: int = len(RESTYPES_NO_X)  # :=20
+RESTYPES: list[str] = [*RESTYPES_NO_X, "X"]
 # mask token: unknown / conditioning-dropout placeholder
 
 
-restype_order = {restype: i for i, restype in enumerate(RESTYPES)}
-RESTYPE_NUM = len(RESTYPES)  # := 21.
+restype_order: dict[str, int] = {
+    restype: i for i, restype in enumerate(RESTYPES)
+}
+RESTYPE_NUM: int = len(RESTYPES)  # := 21.
 
-restype_1to3 = {
+restype_1to3: dict[str, str] = {
     "A": "ALA",
     "R": "ARG",
     "N": "ASN",
@@ -147,7 +170,8 @@ restype_1to3 = {
 
 restype_3to1 = {v: k for k, v in restype_1to3.items()}
 
-# Molecule type encoding stored in Protein.b_factors (broadcast to all atom slots per residue).
+# Molecule type encoding stored in Protein.b_factors
+# (broadcast to all atom slots per residue).
 # 0.0 = amino-acid residue, 1.0 = DNA nucleotide, 2.0 = RNA nucleotide.
 MOL_TYPE_PROTEIN: Final[int] = 0
 MOL_TYPE_DNA: Final[int] = 1
@@ -157,25 +181,26 @@ MOL_TYPE_RNA: Final[int] = 2
 # Mirrors OpenFold's restype_3to1 / restype_order naming convention.
 DNA_RESTYPES: Final[tuple[str, ...]] = ("DA", "DC", "DG", "DT")
 DNA_RESTYPE_ORDER: Final[MappingProxyType[str, int]] = MappingProxyType(
-    {restype: i for i, restype in enumerate(DNA_RESTYPES)}
+    {restype: i for i, restype in enumerate(DNA_RESTYPES)},
 )
 DNA_RESTYPE_3TO1: Final[MappingProxyType[str, str]] = MappingProxyType(
-    {"DA": "a", "DC": "c", "DG": "g", "DT": "t"}
+    {"DA": "a", "DC": "c", "DG": "g", "DT": "t"},
 )
 
 # RNA monomers — PDB ATOM residue names for ribonucleotides.
 RNA_RESTYPES: Final[tuple[str, ...]] = ("A", "C", "G", "U")
 RNA_RESTYPE_ORDER: Final[MappingProxyType[str, int]] = MappingProxyType(
-    {restype: i for i, restype in enumerate(RNA_RESTYPES)}
+    {restype: i for i, restype in enumerate(RNA_RESTYPES)},
 )
 RNA_RESTYPE_3TO1: Final[MappingProxyType[str, str]] = MappingProxyType(
-    {"A": "a", "C": "c", "G": "g", "U": "u"}
+    {"A": "a", "C": "c", "G": "g", "U": "u"},
 )
 
+# this must be Final too.
 
-# Format: (atom_name, rigid_group_idx, (x, y, z))
-# rigid_group_idx: 0=backbone, 1=omega, 2=phi, 3=psi, 4=chi1, 5=chi2, 6=chi3, 7=chi4
-# Taken directly from AlphaFold2 / OpenFold residue_constants.py
+# Format is: (atom_name, rigid_group_idx, (x, y, z))
+# rigid_group_idx: 0=backbone, 1=omega, 2=phi, 3=psi, 4=chi1, 5=chi2, 6=chi3,
+# 7=chi4. Taken directly from AlphaFold2 / OpenFold residue_constants.py
 rigid_group_atom_positions = {
     "ALA": [
         ("N", 0, (-0.525, 1.363, 0.000)),
@@ -390,9 +415,25 @@ rigid_group_atom_positions = {
 def make_np_example(
     coords_dict: Mapping[str, npt.ArrayLike],
 ) -> Mapping[str, npt.NDArray[np.float64] | npt.NDArray[np.intp]]:
-    """Make a dictionary of non-batched numpy protein features."""
+    """Make a dictionary of non-batched numpy protein features.
+
+    Builds atom_positions (N, 37, 3), atom_mask (N, 37), and residue_index
+    arrays from a raw coordinate dict, masking out any NaN entries.
+
+    Args:
+        coords_dict: Mapping from atom-type name (e.g. "N", "CA") to an
+            array-like of shape (N_res, 3) with Cartesian coordinates.
+
+    Returns:
+        A dict with keys "atom_positions", "atom_mask", and "residue_index"
+        containing the corresponding numpy arrays.
+    """
     bb_atom_types = ["N", "CA", "C", "O"]
-    bb_idx = [i for i, atom_type in enumerate(atom_types) if atom_type in bb_atom_types]
+    bb_idx = [
+        i
+        for i, atom_type in enumerate(atom_types)
+        if atom_type in bb_atom_types
+    ]
 
     num_res = np.array(coords_dict["N"]).shape[0]
     atom_positions = np.zeros([num_res, 37, 3], dtype=float)
@@ -419,11 +460,24 @@ def make_fixed_size(
     np_example: Mapping[str, npt.NDArray[np.float64] | npt.NDArray[np.intp]],
     max_seq_length: int = 500,
 ) -> None:
-    """Pad features to fixed sequence length, i.e. currently axis=0."""
+    """Pad features to fixed sequence length, i.e. currently axis=0.
+
+    Pads each array in the mapping along axis 0 with zeros up to
+    max_seq_length, or truncates if the array is already longer.
+    Modifies np_example in-place.
+
+    Args:
+        np_example: Mutable mapping of feature arrays, all sharing the same
+            axis-0 size.
+        max_seq_length: Target sequence length to pad or truncate to.
+    """
     for k, v in np_example.items():
         pad = max_seq_length - v.shape[0]
         if pad > 0:
-            np_example[k] = np.pad(v, ((0, pad),) + ((0, 0),) * (len(v.shape) - 1))
+            np_example[k] = np.pad(
+                v,
+                ((0, pad),) + ((0, 0),) * (len(v.shape) - 1),
+            )
         elif pad < 0:
             np_example[k] = v[:max_seq_length]
 
@@ -446,18 +500,29 @@ def truncate_to_length(
 def center_positions(
     np_example: Mapping[str, npt.NDArray[np.float64] | npt.NDArray[np.intp]],
 ) -> None:
-    """Center 'atom_positions' on CA center of mass."""
+    """Center 'atom_positions' on CA center of mass.
+
+    Computes the masked mean of CA positions and subtracts it from all atom
+    coordinates, then re-applies the atom mask to zero out absent atoms.
+    Modifies np_example in-place.
+
+    Args:
+        np_example: Mutable mapping containing "atom_positions" (N, 37, 3)
+            and "atom_mask" (N, 37) arrays.
+    """
     atom_positions = np_example["atom_positions"]  # N, 37, 3
     atom_mask = np_example["atom_mask"]  # N, 37
     ca_positions = atom_positions[:, 1, :]  # N, 1, 3
     ca_mask = atom_mask[:, 1]  # N, 1
 
     ca_center = cast(
-        npt.NDArray[np.float64],
-        np.sum(ca_mask[..., None] * ca_positions, axis=0) / (np.sum(ca_mask, axis=0) + 1e-9),
-    )  # this is the masked mean of ca positions with a small epsilon. shape of 1, 1, 3
+        "npt.NDArray[np.float64]",
+        np.sum(ca_mask[..., None] * ca_positions, axis=0)
+        / (np.sum(ca_mask, axis=0) + 1e-9),
+    )  # masked mean of ca positions with a small epsilon. shape of 1, 1, 3
     atom_positions = (atom_positions - ca_center[None, ...]) * atom_mask[
-        ..., None
+        ...,
+        None,
     ]  # subtract the atom positions fromm this mean alpha carbon position.
     # N, 37, 3 - 1 expand to N, 1, 3  = N,37,3
     # / N, 37, expand to 3 -> N,37,3
@@ -472,7 +537,14 @@ PDB_MAX_CHAINS = len(PDB_CHAIN_IDS)  # := 62.
 @jaxtyped(typechecker=beartype)
 @dataclasses.dataclass(frozen=True)
 class Protein:
-    """Protein structure representation."""
+    """Protein structure representation.
+
+    Stores per-residue atom coordinates, sequence identity, masks, and chain
+    metadata in the atom37 layout (matching OpenFold / AlphaFold2
+    residue_constants.atom_order). The b_factors field encodes molecule type
+    (MOL_TYPE_PROTEIN / MOL_TYPE_DNA / MOL_TYPE_RNA) rather than
+    crystallographic B-factors.
+    """
 
     # Cartesian coordinates of atoms in angstroms. The atom types correspond to
     # residue_constants.atom_types, i.e. the first three are N, CA, CB.
@@ -482,34 +554,36 @@ class Protein:
     # 20, where 20 is 'X'.
 
     # expanded form for pallatom ligand
-    # restype: One-hot encoding of the sequence. 32 possible values: 20 amino acids + unknown,
-    # 4 RNA nucleotides + unknown, 4 DNA nucleotides + unknown, and gap.
-    # Ligands represented as “unknown amino acid”
+    # restype: One-hot encoding of the sequence. 32 possible values:
+    # 20 amino acids + unknown, 4 RNA nucleotides + unknown, 4 DNA nucleotides
+    # + unknown, and gap. Ligands represented as “unknown amino acid”
     aatype: Int[npt.NDArray[np.intp], "num_res"]
 
-    # Binary float mask to indicate presence of a particular atom. 1.0 if an atom
-    # is present and 0.0 if not. This should be used for loss masking.
+    # Binary float mask to indicate presence of a particular atom. 1.0 if an
+    # atom is present and 0.0 if not. This should be used for loss masking.
     atom_mask: Float[npt.NDArray[np.float64], "num_res num_atom_type"]
 
-    # Residue index as used in PDB. It is not necessarily continuous or 0-indexed.
+    # Residue index as used in PDB. Not necessarily continuous or 0-indexed.
     residue_index: Int[npt.NDArray[np.intp], "num_res"]
 
-    # 0-indexed number corresponding to the chain in the protein that this residue
-    # belongs to.
+    # 0-indexed number corresponding to the chain in the protein that this
+    # residue belongs to.
     chain_index: Int[npt.NDArray[np.intp], "num_res"]
 
     b_factors: Float[npt.NDArray[np.float64], "num_res num_atom_type"]
 
-    # molecular type: MOL_TYPE_PROTEIN (0), MOL_TYPE_DNA (1), MOL_TYPE_RNA (2), MOL_TYPE_LIGAND(3).
-    # mol_type: Float[npt.NDArray[np.float64], "num_res num_atom_type"]
+    # molecular type: MOL_TYPE_PROTEIN (0),
+    # MOL_TYPE_DNA (1), MOL_TYPE_RNA (2), MOL_TYPE_LIGAND(3).
+    # later mol_type: Float[npt.NDArray[np.float64], "num_res num_atom_type"]
 
-    # # Unique integer for each distinct sequence. if chains A, B and C share a sequence,
-    # # then they all have the same entity_id
-    # entity_id: Int[npt.NDArray[np.intp], "num_res"]
+    # Unique integer for each distinct sequence.
+    # if chains A, B and C share a sequence, then they all have the same
+    # entity_id.
+    # later entity_id: Int[npt.NDArray[np.intp], "num_res"]
 
-    # # Unique integer within chains of this sequence. E.g. if chains A, B and
-    # # C share a sequence but D does not, their sym_ids would be [0, 1, 2, 0].
-    # sym_id: Int[npt.NDArray[np.intp], "num_res"]
+    # Unique integer within chains of this sequence. E.g. if chains A, B and
+    # C share a sequence but D does not, their sym_ids would be [0, 1, 2, 0].
+    # later sym_id: Int[npt.NDArray[np.intp], "num_res"]
 
 
 # since we are actually going to implement this, I want to only i/o mmcifs
@@ -533,19 +607,22 @@ def classify_mol_type(resname: str, atom_names: frozenset[str]) -> int:
     """
     if resname in restype_3to1:
         return MOL_TYPE_PROTEIN
-    if resname in DNA_RESTYPE_3TO1 or resname == "T":
+    if resname in DNA_RESTYPE_3TO1 or resname == DNA_THYMINE:
         return MOL_TYPE_DNA
-    if resname == "U":
+    if resname == RNA_URACIL:
         return MOL_TYPE_RNA
     if resname in RNA_RESTYPE_3TO1:  # A / C / G — ambiguous
-        return MOL_TYPE_RNA if "O2'" in atom_names else MOL_TYPE_DNA
+        return MOL_TYPE_RNA if RNA_RIBOSE_OXYGEN in atom_names else MOL_TYPE_DNA
     return MOL_TYPE_PROTEIN  # unknown residue → treat as protein
 
 
 def _parse_pdb_atoms(
-    pdb_path: str,
+    pdb_path: Path,
 ) -> tuple[
-    MutableMapping[tuple[str, int, str], MutableMapping[str, tuple[float, float, float, float]]],
+    MutableMapping[
+        tuple[str, int, str],
+        MutableMapping[str, tuple[float, float, float, float]],
+    ],
     MutableMapping[tuple[str, int, str], str],
     MutableMapping[tuple[str, int, str], str],
 ]:
@@ -565,17 +642,18 @@ def _parse_pdb_atoms(
         ``residue_chain`` maps the same key to the single-character chain ID.
     """
     residue_atoms: MutableMapping[
-        tuple[str, int, str], MutableMapping[str, tuple[float, float, float, float]]
+        tuple[str, int, str],
+        MutableMapping[str, tuple[float, float, float, float]],
     ] = {}
     residue_name: MutableMapping[tuple[str, int, str], str] = {}
     residue_chain: MutableMapping[tuple[str, int, str], str] = {}
 
-    with open(pdb_path) as fh:
+    with pdb_path.open(encoding="utf-8") as fh:
         for line in fh:
             rec = line[:6].strip()
-            if rec == "HETATM":
-                continue  # skip: water, ions, ligands, crystallographic reagents
-            if rec != "ATOM":
+            if rec == PDB_REC_HETATM:
+                continue  # skip water, ions, ligands, crystal reagents.
+            if rec != PDB_REC_ATOM:
                 continue
             atom_name = line[12:16].strip()
             alt_loc = line[16]
@@ -588,7 +666,9 @@ def _parse_pdb_atoms(
             x = float(line[30:38])
             y = float(line[38:46])
             z = float(line[46:54])
-            bfac = float(line[60:66]) if len(line) > PDB_LINE_NO_B_FACTOR else 0.0
+            bfac = (
+                float(line[60:66]) if len(line) > PDB_LINE_NO_B_FACTOR else 0.0
+            )
             key = (chain_id, resseq, icode)
             if key not in residue_atoms:
                 residue_atoms[key] = {}
@@ -600,8 +680,8 @@ def _parse_pdb_atoms(
     return residue_atoms, residue_name, residue_chain
 
 
-def protein_from_pdb(pdb_path: str) -> "Protein":
-    """Parse a PDB file (ATOM records only) into a Protein using the atom37 layout.
+def protein_from_pdb(pdb_path: Path) -> "Protein":
+    """Parse PDB file (ATOM records only) into Protein using atom37 layout.
 
     HETATM records (water, ions, ligands, crystallographic reagents) are
     explicitly detected and skipped; only ATOM records produce residues in
@@ -616,7 +696,7 @@ def protein_from_pdb(pdb_path: str) -> "Protein":
         MOL_TYPE_PROTEIN / MOL_TYPE_DNA / MOL_TYPE_RNA per residue.
 
     Raises:
-        ValueError: If the file contains no ATOM records.
+        NoAtomRecordsError: If the file contains no ATOM records.
     """
     _atom_type_idx = {name: i for i, name in enumerate(atom_types)}
     _seen_chains: dict[str, int] = {}
@@ -624,7 +704,7 @@ def protein_from_pdb(pdb_path: str) -> "Protein":
     _residue_atoms, _residue_name, _residue_chain = _parse_pdb_atoms(pdb_path)
 
     if not _residue_atoms:
-        raise ValueError(f"No ATOM records found in {pdb_path}")
+        raise NoAtomRecordsError(str(pdb_path))
 
     _keys = sorted(_residue_atoms)
     N_res = len(_keys)
@@ -664,7 +744,12 @@ def protein_from_pdb(pdb_path: str) -> "Protein":
     )
 
 
-def chain_end(atom_index: int, end_resname: str, chain_name: str, residue_index: int) -> str:
+def chain_end(
+    atom_index: int,
+    end_resname: str,
+    chain_name: str,
+    residue_index: int,
+) -> str:
     """Formats a PDB TER record marking the end of a chain.
 
     Args:
@@ -676,8 +761,14 @@ def chain_end(atom_index: int, end_resname: str, chain_name: str, residue_index:
     Returns:
         Formatted PDB TER line string.
     """
-    chain_end = "TER"
-    return f"{chain_end:<6}{atom_index:>5}      {end_resname:>3} {chain_name:>1}{residue_index:>4}"
+    fmt = "{:<6}{:>5}      {:>3} {:>1}{:>4}"
+    return fmt.format(
+        PDB_REC_TER,
+        atom_index,
+        end_resname,
+        chain_name,
+        residue_index,
+    )
 
 
 def to_pdb(prot: Protein) -> str:
@@ -692,6 +783,10 @@ def to_pdb(prot: Protein) -> str:
 
     Returns:
       PDB string.
+
+    Raises:
+        InvalidAAtypesError: If any residue has an out-of-range aatype index.
+        TooManyChainsError: If the structure has more chains than PDB supports.
     """
 
     def res_1to3(r: int) -> str:
@@ -707,20 +802,20 @@ def to_pdb(prot: Protein) -> str:
     b_factors = prot.b_factors
 
     if np.any(aatype > RESTYPE_NUM):
-        raise ValueError("Invalid aatypes.")
+        raise InvalidAAtypesError
 
     # Construct a mapping from chain integer indices to chain ID strings.
     chain_ids: dict[int, str] = {}
     unique_chains = np.unique(chain_index)
     for ci_idx in range(len(unique_chains)):
-        ci = cast(int, unique_chains[ci_idx])
+        ci = cast("int", unique_chains[ci_idx])
         if ci >= PDB_MAX_CHAINS:
-            raise ValueError(f"The PDB format supports at most {PDB_MAX_CHAINS} chains.")
+            raise TooManyChainsError(str(PDB_MAX_CHAINS))
         chain_ids[ci] = PDB_CHAIN_IDS[ci]
 
-    pdb_lines.append("MODEL     1")
+    pdb_lines.append(f"{PDB_REC_MODEL}     1")
     atom_index = 1
-    last_chain_index = cast(np.intp, chain_index[0])
+    last_chain_index = cast("np.intp", chain_index[0])
     # Add all atom sites.
     for i in range(aatype.shape[0]):
         # Close the previous chain if in a multichain PDB.
@@ -728,32 +823,38 @@ def to_pdb(prot: Protein) -> str:
             pdb_lines.append(
                 chain_end(
                     atom_index,
-                    res_1to3(cast(int, aatype[i - 1])),
-                    chain_ids[cast(int, chain_index[i - 1])],
-                    cast(int, residue_index[i - 1]),
-                )
+                    res_1to3(cast("int", aatype[i - 1])),
+                    chain_ids[cast("int", chain_index[i - 1])],
+                    cast("int", residue_index[i - 1]),
+                ),
             )
-            last_chain_index = cast(np.intp, chain_index[i])
+            last_chain_index = cast("np.intp", chain_index[i])
             atom_index += 1  # Atom index increases at the TER symbol.
 
-        res_name_3 = res_1to3(cast(int, aatype[i]))
-        atom_pos_i = cast(npt.NDArray[np.float64], atom_positions[i])
-        atom_mask_i = cast(npt.NDArray[np.float64], atom_mask[i])
-        b_factors_i = cast(npt.NDArray[np.float64], b_factors[i])
+        res_name_3 = res_1to3(cast("int", aatype[i]))
+        atom_pos_i = cast("npt.NDArray[np.float64]", atom_positions[i])
+        atom_mask_i = cast("npt.NDArray[np.float64]", atom_mask[i])
+        b_factors_i = cast("npt.NDArray[np.float64]", b_factors[i])
         for j in range(len(atom_types)):
             atom_name = atom_types[j]
-            pos = cast(npt.NDArray[np.float64], atom_pos_i[j])
-            mask = cast(float, atom_mask_i[j])
-            b_factor = cast(float, b_factors_i[j])
+            pos = cast("npt.NDArray[np.float64]", atom_pos_i[j])
+            mask = cast("float", atom_mask_i[j])
+            b_factor = cast("float", b_factors_i[j])
             if mask < ATOM_DNE:
                 continue
 
-            record_type = "ATOM"
-            name = atom_name if len(atom_name) == PDB_ATOM_NAME_CUTOFF_LEN else f" {atom_name}"
+            record_type = PDB_REC_ATOM
+            name = (
+                atom_name
+                if len(atom_name) == PDB_ATOM_NAME_CUTOFF_LEN
+                else f" {atom_name}"
+            )
             alt_loc = ""
             insertion_code = ""
             occupancy = 1.00
-            element = atom_name[0]  # Protein supports only C, N, O, S, this works.
+            element = atom_name[
+                0
+            ]  # Protein supports only C, N, O, S, this works.
             charge = ""
             # PDB is a columnar format, every space matters here!
             atom_line = (
@@ -771,13 +872,13 @@ def to_pdb(prot: Protein) -> str:
     pdb_lines.append(
         chain_end(
             atom_index,
-            res_1to3(cast(int, aatype[-1])),
-            chain_ids[cast(int, chain_index[-1])],
-            cast(int, residue_index[-1]),
-        )
+            res_1to3(cast("int", aatype[-1])),
+            chain_ids[cast("int", chain_index[-1])],
+            cast("int", residue_index[-1]),
+        ),
     )
-    pdb_lines.append("ENDMDL")
-    pdb_lines.append("END")
+    pdb_lines.append(PDB_REC_ENDMDL)
+    pdb_lines.append(PDB_REC_END)
 
     # Pad all lines to 80 characters.
     pdb_lines = [line.ljust(PDB_LINE_CUTOFF_LEN) for line in pdb_lines]
@@ -788,13 +889,19 @@ def to_pdb(prot: Protein) -> str:
 def atom37_to_atom5(
     atom37_positions: Float[torch.Tensor, "B N_res 37 3"],
     atom37_mask: Float[torch.Tensor, "B N_res 37"],
-) -> tuple[Float[torch.Tensor, "B N_res 5 3"], Float[torch.Tensor, "B N_res 5"]]:
+) -> tuple[
+    Float[torch.Tensor, "B N_res 5 3"],
+    Float[torch.Tensor, "B N_res 5"],
+]:
     """Extract the 5 backbone+Cβ atoms from atom37 representation.
 
+    Args:
+        atom37_positions: Full atom37 coordinates (B, N_res, 37, 3).
+        atom37_mask: Atom37 presence mask (B, N_res, 37).
+
     Returns:
-    -------
-    atom5_positions : (B, N_res, 5, 3)
-    atom5_mask      : (B, N_res, 5)
+        Tuple of (atom5_positions, atom5_mask) with shapes (B, N_res, 5, 3)
+        and (B, N_res, 5).
     """
     select = [ATOM37_N, ATOM37_CA, ATOM37_C, ATOM37_O, ATOM37_CB]
 
@@ -828,7 +935,9 @@ def pseudo_cb(
         torch.sqrt(reduce(d**2, "... d -> ... 1", "sum")) + 1e-8
     )
     n_vec: Float[torch.Tensor, "... 3"] = torch.cross(bc, dc, dim=-1)
-    n_vec = n_vec / (torch.sqrt(reduce(n_vec**2, "... d -> ... 1", "sum")) + 1e-8)
+    n_vec = n_vec / (
+        torch.sqrt(reduce(n_vec**2, "... d -> ... 1", "sum")) + 1e-8
+    )
 
     # Ideal Cβ placement constants (Hs or N→C→C alpha geometry)
     # values from Havel (1998) / AlphaFold2 supplementary
@@ -844,18 +953,16 @@ def get_cb_coords(
     atom5_positions: Float[torch.Tensor, "B N_res 5 3"],
     atom5_mask: Float[torch.Tensor, "B N_res 5"],
 ) -> tuple[Float[torch.Tensor, "B N_res 3"], Bool[torch.Tensor, "B N_res"]]:
-    """Extract Cβ (slot 4) from atom5, replacing missing Cβ (Gly) with pseudo-Cβ.
+    """Extract beta carbon from atom5, replace missing beta carbon for Gly.
 
-    Parameters
-    ----------
-    atom5_positions : (B, N_res, 5, 3)
-    atom5_mask      : (B, N_res, 5)  — 1 where atom is present
-    fill_pseudo     : if True,
+    Args:
+        atom5_positions: Atom5 coordinates (B, N_res, 5, 3).
+        atom5_mask: Atom5 presence mask (B, N_res, 5); 1 where atom is present.
 
     Returns:
-    -------
-    cb               : (B, N_res, 3)  — real Cβ where available, pseudo-Cβ otherwise
-    pseudo_beta_mask : (B, N_res)     — True where real Cβ present, False where pseudo-Cβ was used
+        Tuple of (cb, pseudo_beta_mask): cb is (B, N_res, 3) with real Cβ
+        where available and pseudo-Cβ otherwise; pseudo_beta_mask is
+        (B, N_res) True where real Cβ was present.
     """
     n = atom5_positions[:, :, ATOM5_N, :]  # (B, N_res, 3)
     ca = atom5_positions[:, :, ATOM5_CA, :]
@@ -869,7 +976,7 @@ def get_cb_coords(
     return cb, cb_present
 
 
-# ── convenience wrapper ───────────────────────────────────────────────────────
+# ── convenience wrapper ─────────────────────────────────────────────────────
 
 
 @jaxtyped(typechecker=beartype)
@@ -879,10 +986,14 @@ def atom37_to_cb(
 ) -> tuple[Float[torch.Tensor, "B N_res 3"], Bool[torch.Tensor, "B N_res"]]:
     """Full pipeline: atom37 → atom5 → Cβ / pseudo-Cβ.
 
+    Args:
+        atom37_positions: Full atom37 coordinates (B, N_res, 37, 3).
+        atom37_mask: Atom37 presence mask (B, N_res, 37).
+
     Returns:
-    -------
-    cb               : (B, N_res, 3)  — real Cβ where available, pseudo-Cβ otherwise
-    pseudo_beta_mask : (B, N_res)     — True where real Cβ present, False where pseudo-Cβ was used
+        Tuple of (cb, pseudo_beta_mask): cb is (B, N_res, 3) with real Cβ
+        where available and pseudo-Cβ otherwise; pseudo_beta_mask is
+        (B, N_res) True where real Cβ was present.
     """
     atom5_pos, atom5_mask = atom37_to_atom5(atom37_positions, atom37_mask)
     return get_cb_coords(atom5_pos, atom5_mask)

@@ -1,4 +1,8 @@
-"""Node update modules for single-representation refinement."""
+"""Node update modules for single-representation refinement.
+
+Contains AdaLN (adaptive layer normalisation), AttentionPairBias (pair-biased
+self-attention), and NodeUpdate (Algorithm 6 single-embedding update step).
+"""
 
 import math
 
@@ -11,6 +15,15 @@ from beartype import beartype
 from einops import einsum, rearrange
 from jaxtyping import Float, Int, jaxtyped
 from typing_extensions import override
+
+
+class InvalidSingleHeadDimensionError(ValueError):
+    """Raised when c_res is not divisible by n_heads in attention modules."""
+
+    def __init__(self, c_res: int, n_heads: int) -> None:
+        super().__init__(
+            f"c_res ({c_res}) must be divisible by n_heads ({n_heads})",
+        )
 
 
 class AdaLN(nn.Module):
@@ -33,7 +46,10 @@ class AdaLN(nn.Module):
         a: Float[torch.Tensor, "B N_res c_a"],
         s: Float[torch.Tensor, "B N_res c_s"],
     ) -> Float[torch.Tensor, "B N_res c_a"]:
-        """Call forward; typed override so call-site return types are not Any."""
+        """Call forward; typed override so call-site return types are not Any.
+
+        See ``forward`` for full documentation of arguments and return values.
+        """
         return self.forward(a, s)
 
     @override
@@ -43,7 +59,17 @@ class AdaLN(nn.Module):
         a: Float[torch.Tensor, "B N_res c_a"],
         s: Float[torch.Tensor, "B N_res c_s"],
     ) -> Float[torch.Tensor, "B N_res c_a"]:
-        """Apply adaptive layer norm: scale and shift `a` using gated projections of `s`."""
+        """Apply adaptive layer norm.
+
+        Scale and shift ``a`` using gated projections of ``s``.
+
+        Args:
+            a: Features to normalise, shape ``(B, N_res, c_a)``.
+            s: Conditioning signal, shape ``(B, N_res, c_s)``.
+
+        Returns:
+            Scaled and shifted features of shape ``(B, N_res, c_a)``.
+        """
         a = self.norm_a(a)
         s = self.norm_s(s)
         return torch.sigmoid(self.to_scale(s)) * a + self.to_shift(s)
@@ -72,13 +98,14 @@ class AttentionPairBias(nn.Module):
 
     def __init__(self, c_res: int, c_pair: int, n_heads: int = 8) -> None:
         super().__init__()
-        assert c_res % n_heads == 0, "c_res must be divisible by n_heads"
+        if c_res % n_heads != 0:
+            raise InvalidSingleHeadDimensionError(c_res, n_heads)
         self.n_heads: int = n_heads
         self.head_dim: int = c_res // n_heads
 
         self.adaLN: AdaLN = AdaLN(c_a=c_res, c_s=c_res)
-        # all actual model callers (NodeUpdate, DiffusionTransformer) always pass a real s,
-        # so norm_a is never called
+        # all actual model callers (NodeUpdate, DiffusionTransformer)
+        # always pass a real s, so norm_a is never called
         self.norm_a: LayerNorm = LayerNorm(c_res, elementwise_affine=False)
         self.a_to_q: TypedLinear = TypedLinear(c_res, c_res)
         self.a_to_k: TypedLinear = TypedLinear(c_res, c_res)
@@ -86,7 +113,10 @@ class AttentionPairBias(nn.Module):
         self.z_to_b: LinearNoBias = LinearNoBias(c_pair, self.n_heads)
         self.a_to_g: LinearNoBias = LinearNoBias(c_res, c_res)
         self.s_to_a: TypedLinear = TypedLinear(c_res, c_res)  # biasinit=-2.0
-        _: Float[torch.Tensor, "..."] = nn.init.constant_(self.s_to_a.bias, -2.0)
+        _: Float[torch.Tensor, "..."] = nn.init.constant_(
+            self.s_to_a.bias,
+            -2.0,
+        )
         self.out_to_a: LinearNoBias = LinearNoBias(c_res, c_res)
 
         self.norm_z: LayerNorm = LayerNorm(c_pair)
@@ -100,7 +130,10 @@ class AttentionPairBias(nn.Module):
         beta: Float[torch.Tensor, "B N_res N_j"] | None = None,
         neighbor_idx: Int[torch.Tensor, "B N_res N_j"] | None = None,
     ) -> Float[torch.Tensor, "B N_res c_res"]:
-        """Call forward; typed override so call-site return types are not Any."""
+        """Call forward; typed override so call-site return types are not Any.
+
+        See ``forward`` for full documentation of arguments and return values.
+        """
         return self.forward(a, s, z, beta, neighbor_idx)
 
     @override
@@ -113,22 +146,27 @@ class AttentionPairBias(nn.Module):
         beta: Float[torch.Tensor, "B N_res N_j"] | None = None,
         neighbor_idx: Int[torch.Tensor, "B N_res N_j"] | None = None,
     ) -> Float[torch.Tensor, "B N_res c_res"]:
-        """Compute time-conditioned pair-biased attention over residue single embeddings.
+        """Compute time-conditioned pair-biased attention over a.
 
-        Supports both dense ``[B, N, N, c_pair]`` and sparse ``[B, N, K, c_pair]`` pair
-        tensors.  When ``neighbor_idx`` is provided the attention is sparse: for each query
-        position i, only its K neighbours listed in ``neighbor_idx[i]`` are used as
-        keys/values, keeping the logit shape ``(B, n_heads, N, K)`` consistent with the
-        sparse pair bias derived from ``z``.  When ``neighbor_idx`` is ``None``, standard
-        dense self-attention over all N positions is used.
+        Supports both dense ``[B, N, N, c_pair]`` and sparse ``[B, N, K,
+        c_pair]`` pair tensors. When ``neighbor_idx`` is provided the attention
+        is sparse: for each query position i, only its K neighbours listed in
+        ``neighbor_idx[i]`` are used as keys/values, keeping the logit shape
+        ``(B, n_heads, N, K)`` consistent with the sparse pair bias derived from
+        ``z``. When ``neighbor_idx`` is ``None``, standard dense self-attention
+        over all N positions is used.
 
         Args:
             a: Node embeddings of shape ``(B, N, c_res)``.
-            s: Optional conditioning embeddings of shape ``(B, N, c_res)``; if ``None``
+            s: Optional conditioning embeddings of shape ``(B, N, c_res)``; if
+                ``None``
                 a plain LayerNorm is applied instead of AdaLN.
-            z: Pair embeddings — dense ``(B, N, N, c_pair)`` or sparse ``(B, N, K, c_pair)``.
-            beta: Optional additive attention bias of shape ``(B, N, N_j)`` matching z.
-            neighbor_idx: Sparse neighbour indices ``(B, N, K)``; required when z is sparse.
+            z: Pair embeddings — dense ``(B, N, N, c_pair)`` or sparse ``(B, N,
+                K, c_pair)``.
+            beta: Optional additive attention bias of shape ``(B, N, N_j)``
+                matching z.
+            neighbor_idx: Sparse neighbour indices ``(B, N, K)``; required when
+                z is sparse.
 
         Returns:
             Updated node embeddings of shape ``(B, N, c_res)``.
@@ -162,39 +200,53 @@ class AttentionPairBias(nn.Module):
                 self.a_to_g(a),
                 "B N_res (n_heads head_dim) -> B N_res n_heads head_dim",
                 n_heads=self.n_heads,
-            )
+            ),
         )
 
         if neighbor_idx is not None:
             B = k.shape[0]
-            batch_idx = torch.arange(B, device=k.device)[:, None, None]  # (B, 1, 1) broadcasts
+            batch_idx = torch.arange(B, device=k.device)[
+                :,
+                None,
+                None,
+            ]  # (B, 1, 1) broadcasts
             k_gathered: Float[torch.Tensor, "B N_res N_j n_heads head_dim"] = k[
-                batch_idx, neighbor_idx
+                batch_idx,
+                neighbor_idx,
             ]
             attn: Float[torch.Tensor, "B n_heads N_res N_j"] = einsum(
-                q, k_gathered, "B N h d, B N K h d -> B h N K"
+                q,
+                k_gathered,
+                "B N h d, B N K h d -> B h N K",
             ) / math.sqrt(self.head_dim)
             attn = F.softmax(attn + pair_bias, dim=-1)
             v_gathered: Float[torch.Tensor, "B N_res N_j n_heads head_dim"] = v[
-                batch_idx, neighbor_idx
+                batch_idx,
+                neighbor_idx,
             ]
-            intermediate: Float[torch.Tensor, "B N_res n_heads head_dim"] = einsum(
-                attn, v_gathered, "B h N K, B N K h d -> B N h d"
+            intermediate: Float[torch.Tensor, "B N_res n_head h_dim"] = einsum(
+                attn,
+                v_gathered,
+                "B h N K, B N K h d -> B N h d",
             )
         else:
             # Dense path: full N-by-N self-attention.
             attn = einsum(
-                q, k, "B N_q n_heads head_dim, B N_k n_heads head_dim -> B n_heads N_q N_k"
+                q,
+                k,
+                "B N_q n_head h_dim, B N_k n_head h_dim -> B n_head N_q N_k",
             ) / math.sqrt(self.head_dim)
             attn = F.softmax(attn + pair_bias, dim=-1)
             intermediate = einsum(
-                attn, v, "B n_heads N_q N_k, B N_k n_heads head_dim -> B N_q n_heads head_dim"
+                attn,
+                v,
+                "B n_head N_q N_k, B N_k n_head h_dim -> B N_q n_head h_dim",
             )
 
         intermediate = g * intermediate
         out: Float[torch.Tensor, "B N_res c_res"] = rearrange(
             intermediate,
-            "B N_q n_heads head_dim -> B N_q (n_heads head_dim)",
+            "B N_q n_head h_dim -> B N_q (n_head h_dim)",
         )
         a = self.out_to_a(out)
 
@@ -228,7 +280,11 @@ class NodeUpdate(nn.Module):
         super().__init__()
 
         # Step 1
-        self.attn_pair_bias: AttentionPairBias = AttentionPairBias(c, c_pair, n_heads)
+        self.attn_pair_bias: AttentionPairBias = AttentionPairBias(
+            c,
+            c_pair,
+            n_heads,
+        )
         self.dropout_row: DropoutRowwise = DropoutRowwise(dropout)
 
         # Step 2
@@ -241,7 +297,10 @@ class NodeUpdate(nn.Module):
         t: Float[torch.Tensor, "B N_res c_res"],
         z: Float[torch.Tensor, "B N_res N_res c_pair"],
     ) -> Float[torch.Tensor, "B N_res c_res"]:
-        """Call forward; typed override so call-site return types are not Any."""
+        """Call forward; typed override so call-site return types are not Any.
+
+        See ``forward`` for full documentation of arguments and return values.
+        """
         return self.forward(s, t, z)
 
     @override
@@ -252,13 +311,29 @@ class NodeUpdate(nn.Module):
         t: Float[torch.Tensor, "B N_res c_res"],
         z: Float[torch.Tensor, "B N_res N_res c_pair"],
     ) -> Float[torch.Tensor, "B N_res c_res"]:
-        """Apply pair-biased attention and transition to update the residue single embedding."""
+        """Apply pair-biased attention and transition to update s.
+
+        Args:
+            s: Residue single embeddings of shape ``(B, N_res, c_res)``.
+            t: Time/noise conditioning embeddings of shape
+                ``(B, N_res, c_res)``.
+            z: Pair embeddings of shape ``(B, N_res, N_res, c_pair)``.
+
+        Returns:
+            Updated residue single embeddings of shape ``(B, N_res, c_res)``.
+        """
         # ------------------------------------------------------------------
-        # Step 1: s_i += DropoutRowwise_0.25(AttentionPairBias(s, t, z, β=0, N_head=8))
+        # Step 1:
+        # s_i += DropoutRowwise_0.25(AttentionPairBias(s, t, z, β=0, N_head=8))
         # ------------------------------------------------------------------
-        # DropoutRowwise expects leading (B, rows, ...) — expand s to (B, N_res, 1, c)
-        # so it drops rows independently per batch item, then squeeze back.
-        attn_out: Float[torch.Tensor, "B N_res c_res"] = self.attn_pair_bias(s, t, z)
+        # DropoutRowwise expects leading (B, rows, ...) — expand s to
+        # (B, N_res, 1, c) so it drops rows independently per batch item,
+        # then squeeze back.
+        attn_out: Float[torch.Tensor, "B N_res c_res"] = self.attn_pair_bias(
+            s,
+            t,
+            z,
+        )
         s = s + rearrange(
             self.dropout_row(rearrange(attn_out, "b n c -> b n 1 c")),
             "b n 1 c -> b n c",

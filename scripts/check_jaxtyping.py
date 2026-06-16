@@ -11,7 +11,7 @@ from pathlib import Path
 
 # All dtype wrapper names exported by jaxtyping.
 _JAXTYPING_WRAPPERS = frozenset(
-    ["Bool", "Complex", "Float", "Inexact", "Int", "Integer", "Num", "Shaped"]
+    ["Bool", "Complex", "Float", "Inexact", "Int", "Integer", "Num", "Shaped"],
 )
 
 
@@ -19,7 +19,9 @@ def _is_tensor_node(node: ast.expr) -> bool:
     """Return True if node is the literal torch.Tensor or bare Tensor."""
     if isinstance(node, ast.Attribute):
         return (
-            node.attr == "Tensor" and isinstance(node.value, ast.Name) and node.value.id == "torch"
+            node.attr == "Tensor"
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "torch"
         )
     return isinstance(node, ast.Name) and node.id == "Tensor"
 
@@ -32,7 +34,10 @@ def _collect_bare_tensors(node: ast.expr, out: list[tuple[int, int]]) -> None:
 
     if isinstance(node, ast.Subscript):
         # Float[torch.Tensor, "..."] — stop; the Tensor is properly wrapped.
-        if isinstance(node.value, ast.Name) and node.value.id in _JAXTYPING_WRAPPERS:
+        if (
+            isinstance(node.value, ast.Name)
+            and node.value.id in _JAXTYPING_WRAPPERS
+        ):
             return
         _collect_bare_tensors(node.value, out)
         _collect_bare_tensors(node.slice, out)
@@ -83,16 +88,27 @@ class _AnnotationVisitor(ast.NodeVisitor):
         for line, col in found:
             self.violations.append((line, col, description))
 
-    def _visit_function(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+    def _visit_function(
+        self,
+        node: ast.FunctionDef | ast.AsyncFunctionDef,
+    ) -> None:
         has_jaxtyped = _has_jaxtyped_decorator(node)
         if has_jaxtyped:
-            all_args = node.args.posonlyargs + node.args.args + node.args.kwonlyargs
+            all_args = (
+                node.args.posonlyargs + node.args.args + node.args.kwonlyargs
+            )
             for arg in all_args:
                 self._check(arg.annotation, f"argument '{arg.arg}'")
             if node.args.vararg:
-                self._check(node.args.vararg.annotation, f"argument '*{node.args.vararg.arg}'")
+                self._check(
+                    node.args.vararg.annotation,
+                    f"argument '*{node.args.vararg.arg}'",
+                )
             if node.args.kwarg:
-                self._check(node.args.kwarg.annotation, f"argument '**{node.args.kwarg.arg}'")
+                self._check(
+                    node.args.kwarg.annotation,
+                    f"argument '**{node.args.kwarg.arg}'",
+                )
             self._check(node.returns, "return type")
             self._jaxtyped_depth += 1
         self.generic_visit(node)
@@ -138,7 +154,7 @@ def check_file(path: Path) -> list[str]:
     for line, col, desc in visitor.violations:
         errors.append(
             f"{path}:{line}:{col + 1}: bare Tensor in {desc}"
-            ' — use Float[torch.Tensor, "..."] or similar jaxtyping wrapper'
+            ' — use Float[torch.Tensor, "..."] or similar jaxtyping wrapper',
         )
     return errors
 
@@ -150,7 +166,9 @@ def main() -> None:
     for f in py_files:
         all_errors.extend(check_file(f))
     if all_errors:
-        print("bare torch.Tensor annotations found — wrap with jaxtyping dtype:\n")
+        print(
+            "bare torch.Tensor annotations found — wrap with jaxtyping dtype:\n",
+        )
         for err in all_errors:
             print(f"  {err}")
         sys.exit(1)

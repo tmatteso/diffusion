@@ -12,6 +12,29 @@ repos:
         additional_dependencies:
           - "@commitlint/config-conventional"
 
+  - repo: https://github.com/psf/black
+    rev: 24.10.0
+    hooks:
+      - id: black
+        language_version: python3
+        stages: [pre-commit]
+
+  ### Makefile ###
+  - repo: https://github.com/mrtazz/checkmake.git
+    rev: 0.2.2
+    hooks:
+      - id: checkmake
+        name: "🐮 Makefile · Lint Makefile"
+        stages: [pre-commit]
+
+  ### YAML ###
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: check-yaml
+        name: "📄 yaml · Validate YAML files"
+        stages: [pre-commit]
+
   ### Data & Config Validation ###
   - repo: https://github.com/python-jsonschema/check-jsonschema
     rev: 0.31.0
@@ -24,59 +47,6 @@ repos:
         name: "✅ taskfile · Validate Task configuration"
         stages: [pre-commit]
 
-  ### YAML ###
-  - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v5.0.0
-    hooks:
-      - id: check-yaml
-        name: "📄 yaml · Validate YAML files"
-        stages: [pre-commit]
-
-  ### Makefile ###
-  - repo: https://github.com/mrtazz/checkmake.git
-    rev: 0.2.2
-    hooks:
-      - id: checkmake
-        name: "🐮 Makefile · Lint Makefile"
-        stages: [pre-commit]
-
-  ### Shell ###
-
-  # STRICT
-  # - repo: https://github.com/shellcheck-py/shellcheck-py
-  #   rev: v0.10.0.1
-  #   hooks:
-  #     - id: shellcheck
-  #       name: "🐚 shell · Lint shell scripts"
-
-  # STRICT
-  # - repo: https://github.com/openstack/bashate
-  #   rev: 2.1.1
-  #   hooks:
-  #     - id: bashate
-  #       name: "🐚 shell · Check shell script code style"
-
-  - repo: https://github.com/psf/black
-    rev: 24.10.0
-    hooks:
-      - id: black
-        language_version: python3
-        stages: [pre-commit]
-
-  - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.9.0
-    hooks:
-      - id: ruff
-        args: [--fix]
-        stages: [pre-commit]
-
-  # - repo: https://github.com/wemake-services/wemake-python-styleguide
-  #   rev: 0.19.0
-  #   hooks:
-  #     - id: wemake-python-styleguide
-  #       name: "🐍 wemake · Strict Python style guide"
-  #       stages: [pre-commit]
-
   - repo: local
     hooks:
       - id: basedpyright
@@ -86,6 +56,32 @@ repos:
         types: [python]
         pass_filenames: false
         always_run: true
+        stages: [pre-commit]
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.9.0
+    hooks:
+      - id: ruff
+        args: [--fix]
+        stages: [pre-commit]
+        files: ^(pallatom)/
+
+  - repo: local
+    hooks:
+      - id: xenon
+        name: "xenon · Enforce cyclomatic complexity limits"
+        entry: xenon --max-absolute B --max-modules A --max-average A pallatom
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-commit]
+
+      - id: pylint
+        name: "pylint · Google-style lint"
+        entry: pylint
+        language: system
+        types: [python]
+        files: ^pallatom/
         stages: [pre-commit]
 
   - repo: local
@@ -104,10 +100,26 @@ repos:
         types: [python]
         stages: [pre-commit]
 
-      - id: pytest
-        name: pytest
-        entry: pytest
+      - id: pydoclint
+        name: "pydoclint · Google-style docstring linting"
+        entry: pydoclint pallatom
         language: system
         pass_filenames: false
         always_run: true
         stages: [pre-commit]
+
+  ### Shell ###
+
+  # STRICT
+  # - repo: https://github.com/shellcheck-py/shellcheck-py
+  #   rev: v0.10.0.1
+  #   hooks:
+  #     - id: shellcheck
+  #       name: "🐚 shell · Lint shell scripts"
+
+  # STRICT
+  # - repo: https://github.com/openstack/bashate
+  #   rev: 2.1.1
+  #   hooks:
+  #     - id: bashate
+  #       name: "🐚 shell · Check shell script code style"
