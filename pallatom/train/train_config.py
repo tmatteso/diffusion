@@ -280,7 +280,7 @@ class LoaderConfig(BaseModel):
 class TrainLoaderConfig(LoaderConfig):
     """DataLoader configuration for the training split.
 
-    Extends :class:`LoaderConfig` with training-specific data-pipeline settings.
+    Extends `LoaderConfig` with training-specific data-pipeline settings.
 
     Attributes:
         model_config: Pydantic config — frozen to prevent mutation after init.
@@ -293,6 +293,8 @@ class TrainLoaderConfig(LoaderConfig):
         seed: Random seed for the training data sampler.
         n_threads: Number of worker threads used by the DataLoader.
         n_proteins_in_shard: Expected number of proteins per shard tar.
+        noise_magnitude: Half-width of uniform noise added to each protein's
+            length before sorting; controls cross-epoch FFD batch diversity.
     """
 
     model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True)
@@ -304,6 +306,7 @@ class TrainLoaderConfig(LoaderConfig):
     seed: int = Field(default=0)
     n_threads: int = Field(default=32, gt=0)
     n_proteins_in_shard: int = Field(default=100, gt=0)
+    noise_magnitude: int = Field(default=10, ge=0)
 
 
 class ConditioningDropoutConfig(BaseModel):

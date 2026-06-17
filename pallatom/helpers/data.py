@@ -286,10 +286,47 @@ class ShardBatchPlan:
     batches_per_shard: npt.NDArray[np.int32]
 
 
-# so the shards themselves are static subsets of the clusters
+@dataclasses.dataclass
+class FFDWorkerPlan:
+    """One DataLoader worker's per-epoch plan for FFD batch streaming.
+
+    Attributes:
+        shard_ids: Global shard IDs this worker streams this epoch, in
+            iteration order.
+        permutations: For each shard, an int32 array mapping streaming
+            position (i.e. WebDataset arrival order) to the protein's index
+            in the prepended-and-permuted local sequence.
+        batch_ends: For each shard, an int32 array of cumulative batch-end
+            positions in the prepended-and-permuted sequence
+            ``carry_in_sizes[k] + permuted shard k proteins``.
+        carry_in_sizes: For each shard, the number of proteins prepended
+            from the previous shard's carry-over. Always zero for length-
+            disjoint shards (the typical case with globally sorted shards),
+            but stored explicitly so workers can validate the carry buffer.
+    """
+
+    shard_ids: npt.NDArray[np.int32]
+    permutations: list[npt.NDArray[np.int32]]
+    batch_ends: list[npt.NDArray[np.int32]]
+    carry_in_sizes: npt.NDArray[np.int32]
+
+
+@dataclasses.dataclass
+class FFDBatchPlan:
+    """Full per-epoch FFD plan for one rank, partitioned by DataLoader worker.
+
+    Attributes:
+        worker_plans: One :class:`FFDWorkerPlan` per DataLoader worker; the
+            ``i``th entry is consumed by the worker with ``worker_info.id ==
+            i``.
+    """
+
+    worker_plans: list[FFDWorkerPlan]
+
+
 @dataclasses.dataclass(frozen=True)
 class ShardBudgetParameters:
-    """All scalar inputs needed to compute one epoch's ShardBatchPlan.
+    """All scalar inputs needed to compute one epoch's FFDBatchPlan.
 
     Attributes:
         shard_dir: Directory containing the shard tars and metadata.
@@ -301,6 +338,12 @@ class ShardBudgetParameters:
         world_size: Number of DDP processes.
         rank: This process's DDP rank.
         n_proteins_in_shard: Expected number of proteins per shard tar.
+        noise_magnitude: Half-width of the uniform noise added to each
+            protein's length before sorting; controls cross-epoch batch
+            diversity vs. within-batch length variance.
+        num_workers: Number of DataLoader worker processes per rank. The
+            plan is partitioned across workers so each worker's FFD batches
+            stay within its strided shard assignment.
     """
 
     shard_dir: Path
@@ -312,6 +355,8 @@ class ShardBudgetParameters:
     world_size: int
     rank: int
     n_proteins_in_shard: int
+    noise_magnitude: int
+    num_workers: int
 
 
 class ProteinShardDataset(torch.utils.data.IterableDataset[list[Protein]]):
@@ -1062,6 +1107,8 @@ def make_bucketed_data_loaders(
         n_proteins_in_shard=cfg.train_loader.n_proteins_in_shard,
         world_size=world_size,
         rank=rank,
+        noise_magnitude=cfg.train_loader.noise_magnitude,
+        num_workers=cfg.train_loader.num_workers,
     )
 
     train_names = (

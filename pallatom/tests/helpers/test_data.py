@@ -359,6 +359,8 @@ def shard_budget(tmp_path: pathlib.Path) -> ShardBudgetParameters:
         world_size=1,
         rank=0,
         n_proteins_in_shard=100,
+        noise_magnitude=0,
+        num_workers=1,
     )
 
 
