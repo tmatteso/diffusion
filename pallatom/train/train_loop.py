@@ -894,7 +894,7 @@ def _parse_args() -> TrainArgs:
     ns = parser.parse_args()
     return TrainArgs(
         dataset_jsonl=cast("Path", ns.dataset_jsonl),
-        shard_dir=cast("Path", ns.cluster_dir),
+        shard_dir=cast("Path", ns.shard_dir),
         keys_for_splits_json=cast("Path", ns.keys_for_splits_json),
         config=cast("Path", ns.config),
         structlog_jsonl=cast("Path", ns.structlog_jsonl),
