@@ -36,7 +36,7 @@ from helpers.context_managers import (
     ShardWorkerState,
 )
 from helpers.useful_objects import TrainArgs
-from pydantic import BaseModel, ConfigDict, RootModel
+from pydantic import BaseModel, ConfigDict, Field, RootModel
 from structlog.typing import FilteringBoundLogger
 from torch.utils.data.distributed import DistributedSampler
 from train.train_config import TrainConfig
@@ -64,10 +64,25 @@ class ProteinNamesManifest(RootModel[list[str]]):
     root: list[str]
 
 
-class DatasetSplitsManifest(RootModel[dict[str, list[str]]]):
-    """Pydantic root model mapping split name to list of protein names."""
+class DatasetSplitsManifest(BaseModel):
+    """Train/validation/test split lists, plus optional CATH topology mapping.
 
-    root: dict[str, list[str]]
+    Attributes:
+        model_config: Pydantic config; ``extra="ignore"`` silently drops
+            unknown fields encountered when loading the manifest.
+        train: Protein entry names in the training split.
+        validation: Protein entry names in the validation split.
+        test: Protein entry names in the test split.
+        cath_nodes: Optional mapping from protein chain name to its CATH
+            topology codes (e.g. ``"2fyz.A": ["1.20.5"]``). Empty when the
+            manifest does not include CATH metadata.
+    """
+
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="ignore")
+    train: list[str]
+    validation: list[str]
+    test: list[str]
+    cath_nodes: dict[str, list[str]] = Field(default_factory=dict)
 
 
 class ProteinDataset(
@@ -1024,16 +1039,16 @@ def make_bucketed_data_loaders(
 
     splits = DatasetSplitsManifest.model_validate_json(
         extra_train_args.keys_for_splits_json.read_bytes(),
-    ).root
+    )
 
     val_set = ProteinDataset(
         extra_train_args.dataset_jsonl,
-        splits["validation"],
+        splits.validation,
         max_seq_length=cfg.test_loader.max_seq_length,
     )
     test_set = ProteinDataset(
         extra_train_args.dataset_jsonl,
-        splits["test"],
+        splits.test,
         max_seq_length=cfg.test_loader.max_seq_length,
     )
 
@@ -1050,7 +1065,7 @@ def make_bucketed_data_loaders(
     )
 
     train_names = (
-        splits["train"][:252] if extra_train_args.debug_run else splits["train"]
+        splits.train[:252] if extra_train_args.debug_run else splits.train
     )
 
     train_set = ProteinShardDataset(  # this should take the structlog_jsonl too
