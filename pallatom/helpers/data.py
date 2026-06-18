@@ -364,7 +364,6 @@ class ProteinShardDataset(torch.utils.data.IterableDataset[list[Protein]]):
         if not self.shard_metadata_path.exists():
             self._log.info(
                 "shards_do_not_exist",
-                shard_manifest_file=self.shard_metadata_path,
             )
             n_shards, all_lengths, shard_sizes_list = self.build_sorted_shards()
             _ = self.write_shard_metadata_sidecar(
