@@ -188,7 +188,7 @@ class StructlogConfig:
             The unmodified ``event_dict`` so the processor chain continues.
         """
         if self.f is not None:
-            _ = self.f.write(json.dumps(event_dict) + "\n")
+            _ = self.f.write(json.dumps(event_dict, default=str) + "\n")
         return event_dict
 
     def __exit__(

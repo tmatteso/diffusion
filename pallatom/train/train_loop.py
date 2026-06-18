@@ -413,7 +413,7 @@ def process_accum_window(
 @torch.no_grad()
 @jaxtyped(typechecker=beartype)
 def evaluate(
-    loader: torch.utils.data.DataLoader[Protein],
+    loader: torch.utils.data.DataLoader[list[Protein]],
     model_params: ModelSetup,
 ) -> tuple[LossMetrics, ThroughputStatistics]:
     """Full-dataset evaluation pass.
@@ -689,7 +689,7 @@ def collect_distributed_vars() -> tuple[int, int, int]:
 def train(
     best_val_loss: Float[torch.Tensor, ""],
     train_loader: torch.utils.data.DataLoader[list[Protein]],
-    test_loader: torch.utils.data.DataLoader[Protein],
+    test_loader: torch.utils.data.DataLoader[list[Protein]],
     model_params: ModelSetup,
     log: FilteringBoundLogger,
 ) -> None:

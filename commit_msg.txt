@@ -1,95 +1,56 @@
-refactor: replace BucketedBatchSampler with WebDataset shard pipeline
+refactor: replace cluster sharding with global FFD planning, fix decoder bug
 
-The old token-budget sampler relied on ClusterIndex building an
-in-memory map of every protein in the JSONL file and
-BucketedBatchSampler managing a multiprocessing prefetch queue
-on top of it. This design held the entire cluster map in RAM,
-made checkpoint-resume impossible for mid-shard state, and
-required a bespoke batching layer outside PyTorch's DataLoader
-contract.
+The cluster-based sharding approach divided proteins into equal-width
+length bins before packing them into shard tars. This introduced
+arbitrary bin boundaries that degraded padding efficiency at cluster
+edges and produced a single monolithic ShardBatchPlan shared across
+all DataLoader workers, forcing each worker to re-derive the same
+global ordering rather than owning a disjoint shard slice.
 
-Replace it with a plan-driven shard-streaming design backed by
-WebDataset tar archives. ProteinShardDataset (an IterableDataset)
-receives a ShardBatchPlan at the start of each epoch, streams
-shards sequentially through WebDataset, and cuts the protein
-stream into batches exactly as the plan dictates. ShardDataLoader
-wraps it with a standard DataLoader whose workers are initialised
-via a ShardWorkerState context manager that loads shard-level
-metadata sidecars (ShardMetadata) from disk. Supporting types
-ClusterMetadataEntry, ShardBudgetParameters, and ShardBatchPlan
-carry the clustering and batching contract between the
-pre-processing step and the training loop. Delete
-bucketed_sampler.py and cluster_index.py and their tests entirely.
+Replace the entire batching stack with worker-aware FFD planning:
 
-Introduce dedicated error modules for helpers and architecture
-(pallatom/helpers/errors.py, pallatom/architecture/errors.py).
-All previously bare ValueError raises with f-string messages are
-replaced by named exception classes (NoAtomRecordsError,
-TooManyChainsError, InvalidAAtypesError, InvalidDistanceError,
-InvalidSigmaRangeError, InvalidPairHeadDimensionError,
-LossComputationError, NoDenoiserBlockError,
-BlockCountMismatchError). This makes exception handling in
-callers introspectable and prevents accidental swallowing of
-unrelated ValueErrors.
+Data pipeline (helpers/data.py)
+- Remove ClusterMetadataEntry, ShardBatchPlan, and the two-pass
+  compute_clusters / compute_shards methods. Replace with a single
+  build_sorted_shards pass that globally sorts proteins descending
+  by seq_len and slices them into sequential shard tars — no bins,
+  no arbitrary boundaries.
+- Introduce FFDWorkerPlan and FFDBatchPlan as Pydantic models instead
+  of plain dataclasses. Each DataLoader worker now owns a disjoint
+  shard slice so FFD batch construction is fully local.
+- Add num_workers and noise_magnitude to ShardBudgetParameters. The
+  uniform noise half-width randomises sort order across epochs to
+  improve batch diversity without sacrificing mean padding efficiency.
+- Drop n_clusters from ShardMetadata; it was only meaningful under
+  the old cluster scheme.
 
-Add a TensorAccumulatorMixin to useful_objects.py. The mixin
-provides zero_init, __iadd__, __itruediv__, __mul__,
-weighted_avg, and all_reduce_ so that per-step scalar metrics
-can be accumulated over gradient-accumulation steps and reduced
-across DDP ranks without repeating the loop-over-fields pattern
-at every callsite. LossMetrics, ThroughputStatistics, and
-ComponentNorms all subclass it; ModelSetup.device is narrowed
-from str to torch.device throughout.
+Config (train/train_config.py, train/run_config.json)
+- Replace n_clusters and n_proteins_in_shard with n_shards in
+  TrainLoaderConfig, matching what the FFD pipeline actually needs.
+- Add InsufficientShardsError and a Pydantic model_validator that
+  rejects configs where num_workers > n_shards at construction time
+  rather than producing a confusing WebDataset error during iteration.
 
-Add a Checkpoint dataclass to train_loop.py. The checkpoint dict
-was previously typed as a plain dict[str, ...] with cast at
-every access site. The dataclass provides named fields (model,
-optimizer, scheduler, best_val_loss) so load_checkpoint and
-save_checkpoint are self-documenting and type-safe without
-casting through an untyped intermediate.
+Featurizer (helpers/featurize.py)
+- Thread window_size through featurize_single_item so the sparse
+  atom-pair window is driven by model_params.window_size rather than
+  the module-level WINDOW_SIZE constant, removing a hidden coupling
+  between the featurizer and the architecture module.
 
-Promote ProteinDataset to return Protein objects instead of raw
-dict mappings. The ProteinBatch dataclass is removed; callers
-now see Protein everywhere from the DataLoader boundary through
-featurize_single_item. Rename FeaturizedItem fields for clarity:
-flat_pos -> r_gt, atom_mask_flat -> atom5_mask,
-f_pseudo_beta -> f_pseudo_beta_mask, t_template -> t_normalized.
-Make ProteinEntry public (was _ProteinEntry); add
-ProteinNamesManifest and DatasetSplitsManifest as typed Pydantic
-RootModel wrappers replacing raw TypeAdapter calls.
+Bug fixes
+- AtomAttentionDecoder.proj_z projected from c_res instead of c_pair,
+  causing a dimension mismatch when c_res != c_pair. Fix the input
+  dimension to c_pair as the layer comment already stated.
+- StructlogConfig.write_event_dict called json.dumps without
+  default=str, raising TypeError whenever an event dict contained a
+  Path or other non-serialisable value. Pass default=str to coerce
+  those values gracefully.
+- evaluate() and train() annotated their DataLoader as
+  DataLoader[Protein] instead of DataLoader[list[Protein]], hiding
+  the per-batch list wrapping from the type checker.
 
-Change all path fields in TrainConfig (pretrained_weights,
-resume_checkpoint, checkpoint_path) from str | None to
-pathlib.Path | None so that path manipulation uses the Path API
-rather than string concatenation. Propagate to torch.load /
-torch.save call sites accordingly.
-
-Add ShardWorkerState and DDPNoSync context managers to
-context_managers.py. ShardWorkerState is a process-local
-singleton (ClassVar _current) that DataLoader workers call
-init_worker on; it holds lengths and shard start indices for
-the per-epoch plan and configures structlog for the worker
-process. DDPNoSync wraps model.no_sync() so gradient-
-accumulation steps before the last micro-batch suppress the
-DDP all-reduce correctly.
-
-Rename build_AA_context -> build_aa_context in sampling.py to
-match the PEP 8 naming convention enforced by ruff's N-series
-rules.
-
-Add .github/workflows/tests.yml to run pytest on every push
-and pull request against main. The workflow installs a CPU-only
-PyTorch wheel via uv to keep CI fast without a GPU runner
-dependency.
-
-Add __init__.py files to pallatom/sample/, pallatom/train/,
-pallatom/tests/, and each test sub-package so that pytest
-discovers tests as proper Python packages and relative imports
-work correctly under the namespace layout.
-
-Update pyproject.toml to add webdataset>=0.2.0 as a runtime
-dependency and expand the pylint and ruff configuration sections
-to cover the new magic-value, code-style, and comparison-
-placement extensions. Reorder pre-commit hooks so black runs
-before json-schema validators and move basedpyright to a local
-hook entry with always_run = true.
+Tests
+- Update all fixtures to drop n_clusters, supply n_shards, and use
+  the new factory pattern for ProteinShardDataset construction.
+- Remove test_train_config.py (superseded by the inline validator
+  tests on TrainLoaderConfig).

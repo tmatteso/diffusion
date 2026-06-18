@@ -18,3 +18,16 @@
 - Use **`einops.reduce`** instead of `torch.sum`, `torch.mean`, `torch.max`, etc. when reducing over named axes.
 - Use **`einops.repeat`** instead of `expand`, `repeat`, or `tile`.
 - Prefer einops operations throughout helper functions so shape contracts interact naturally with jaxtyping annotations.
+
+## Pytest best practices
+
+- **Fixtures:** Use `@pytest.fixture` for all shared setup/teardown; prefer `yield` fixtures for cleanup. Place shared fixtures in `conftest.py`.
+- **Parametrization:** Use `@pytest.mark.parametrize` for data-driven tests; group cases with the same expected behavior under a single parametrized test.
+- **Markers:** Use markers (e.g., `@pytest.mark.slow`) to categorize tests.
+- **Style:** Prefer functional tests over class-based tests.
+- **Comments:** Code should be self-explanatory. If explanation is needed, write a multi-line Google-style docstring — no inline comments.
+- **Imports:** Import at module level only; import inside functions only when absolutely necessary.
+- **Fixtures:** Reuse existing fixtures; create new ones only when needed.
+- **Mocking:** Avoid mocks for internal code; mock only external services. Use the `monkeypatch` fixture for patching.
+- **Temp files:** Use the `tmp_path` fixture for filesystem tests.
+- **Assertions:** Use `pytest.raises(ExceptionType)` for exception testing.

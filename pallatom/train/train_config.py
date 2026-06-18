@@ -30,6 +30,21 @@ class InvalidSigmaRangeError(ValueError):
         )
 
 
+class InsufficientShardsError(ValueError):
+    """Raised when num_workers exceeds n_shards.
+
+    The FFD plan assigns shards round-robin (worker w streams
+    shards[w::num_workers]).  If num_workers > n_shards some workers receive
+    zero shards, causing WebDataset to raise ValueError during iteration.
+    """
+
+    def __init__(self, num_workers: int, n_shards: int) -> None:
+        super().__init__(
+            f"num_workers ({num_workers}) must be <= n_shards ({n_shards}); "
+            + "workers with no shards cause WebDataset to raise at runtime",
+        )
+
+
 class TrainingParams(BaseModel):
     """Optimizer and training loop hyperparameters.
 
@@ -286,13 +301,14 @@ class TrainLoaderConfig(LoaderConfig):
         model_config: Pydantic config — frozen to prevent mutation after init.
         token_budget: Upper bound on the total number of residues across all
             samples in a single batch step.
-        n_clusters: Number of length-based clusters for bucketed sampling.
         batch_prefetch_depth: Number of batches to prefetch from the shard
             worker.
         epoch_prefetch_depth: Number of epochs to prefetch shard plans for.
         seed: Random seed for the training data sampler.
         n_threads: Number of worker threads used by the DataLoader.
-        n_proteins_in_shard: Expected number of proteins per shard tar.
+        n_shards: Total number of shard tars in the prepared training split.
+            Must be >= ``num_workers`` so every DataLoader worker receives at
+            least one shard in the FFD round-robin assignment.
         noise_magnitude: Half-width of uniform noise added to each protein's
             length before sorting; controls cross-epoch FFD batch diversity.
     """
@@ -300,13 +316,27 @@ class TrainLoaderConfig(LoaderConfig):
     model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True)
 
     token_budget: int = Field(default=512, gt=0)
-    n_clusters: int = Field(default=16, gt=0)
     batch_prefetch_depth: int = Field(default=4, gt=0)
     epoch_prefetch_depth: int = Field(default=3, gt=0)
     seed: int = Field(default=0)
     n_threads: int = Field(default=32, gt=0)
-    n_proteins_in_shard: int = Field(default=100, gt=0)
+    n_shards: int = Field(default=16, gt=0)
     noise_magnitude: int = Field(default=10, ge=0)
+
+    @model_validator(mode="after")
+    def workers_le_shards(self) -> "TrainLoaderConfig":
+        """Validate that num_workers does not exceed n_shards.
+
+        Returns:
+            The validated model instance.
+
+        Raises:
+            InsufficientShardsError: If ``num_workers`` is greater than
+                ``n_shards``.
+        """
+        if self.num_workers > self.n_shards:
+            raise InsufficientShardsError(self.num_workers, self.n_shards)
+        return self
 
 
 class ConditioningDropoutConfig(BaseModel):

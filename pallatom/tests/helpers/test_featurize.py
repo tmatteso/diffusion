@@ -439,6 +439,7 @@ def featurized_item(
         atom_distogram_fn=atom_distogram_fn,
         noise_params=tcfg.noise,
         max_seq_len_in_batch=N_RES,
+        window_size=tcfg.model.window_size,
     )
 
 

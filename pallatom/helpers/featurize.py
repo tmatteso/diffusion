@@ -11,7 +11,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from architecture.atom_transformers import WINDOW_SIZE, build_sparse_pairs
+from architecture.atom_transformers import build_sparse_pairs
 from beartype import beartype
 from einops import rearrange, reduce, repeat
 from helpers.atom_utils import (
@@ -245,6 +245,7 @@ def featurize_single_item(
     atom_distogram_fn: Distogram,
     noise_params: NoiseScheduleParams,
     max_seq_len_in_batch: int,
+    window_size: int,
 ) -> FeaturizedItem:
     """Featurize one protein into model-ready tensors.
 
@@ -261,6 +262,8 @@ def featurize_single_item(
             (P_std, P_mean, sigma_data).
         max_seq_len_in_batch: Padded sequence length; all tensors
             are zero-padded to this length.
+        window_size: Residue-level neighbour window for GT atom-pair
+            construction; must match model_params.window_size.
 
     Returns:
         FeaturizedItem with flat atom positions, masks, distogram
@@ -384,7 +387,7 @@ def featurize_single_item(
     ]  # True where the slot is a real neighbour (not padding)
     neighbor_idx, valid_mask = build_sparse_pairs(
         token_idx,
-        WINDOW_SIZE,
+        window_size,
     )  # (N_atom, K)
 
     # atom_distogram_fn
@@ -463,6 +466,7 @@ def featurize_batch(
             atom_distogram_fn=distogram_atom,
             noise_params=tcfg.noise,
             max_seq_len_in_batch=max_seq_len_in_batch,
+            window_size=tcfg.model.window_size,
         )
         for ix in range(B)
     ]

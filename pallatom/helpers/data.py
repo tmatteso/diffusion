@@ -11,7 +11,7 @@ import hashlib
 import io
 import multiprocessing as mp
 import queue
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Sequence
 from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor
 from pathlib import Path
 from typing import ClassVar, cast
@@ -22,6 +22,7 @@ import structlog
 import torch
 import torch.distributed as dist
 import torch.utils.data
+import webdataset as wds
 from helpers.atom_utils import (
     Protein,
     center_positions,
@@ -36,12 +37,16 @@ from helpers.context_managers import (
     ShardWorkerState,
 )
 from helpers.useful_objects import TrainArgs
-from pydantic import BaseModel, ConfigDict, Field, RootModel
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    RootModel,
+)
 from structlog.typing import FilteringBoundLogger
 from torch.utils.data.distributed import DistributedSampler
 from train.train_config import TrainConfig
-from typing_extensions import Self, override
-from webdataset.compat import WebDataset
+from typing_extensions import override
 from webdataset.writer import TarWriter
 
 
@@ -218,32 +223,6 @@ class ProteinDataset(
         )
 
 
-@dataclasses.dataclass(frozen=True)
-class ClusterMetadataEntry:
-    """Metadata collected in pass 1 for one protein.
-
-    Attributes:
-        name: Protein entry name.
-        seq_len: Sequence length in residues.
-        byte_offset: Byte position of this entry's line in the source JSONL.
-    """
-
-    name: str
-    seq_len: int
-    byte_offset: int
-
-    def __lt__(self, other: Self) -> bool:
-        """Compare entries by sequence length for sort order within a cluster.
-
-        Args:
-            other: Another ClusterMetadataEntry to compare against.
-
-        Returns:
-            True if this entry's seq_len is less than other's.
-        """
-        return self.seq_len < other.seq_len
-
-
 class ShardMetadata(BaseModel):
     """Persisted record of the parameters used to build a shard directory.
 
@@ -255,7 +234,6 @@ class ShardMetadata(BaseModel):
         model_config: Pydantic config — frozen to prevent mutation after init.
         names_hash: SHA-256 hex digest of the sorted protein names list.
         token_budget: Maximum padded token cost per batch used during sharding.
-        n_clusters: Number of length-based clusters the dataset was split into.
         shard_size: Maximum number of proteins per shard.
         n_shards: Total number of shard tars written.
     """
@@ -263,40 +241,20 @@ class ShardMetadata(BaseModel):
     model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True)
     names_hash: str
     token_budget: int
-    n_clusters: int
     shard_size: int
     n_shards: int
 
 
-@dataclasses.dataclass
-class ShardBatchPlan:
-    """Compact per-epoch batch plan for shard-based streaming.
-
-    Attributes:
-        shard_order: Global shard IDs this rank will stream this epoch.
-        flat_batch_ends: Local cumulative batch-end positions (protein count
-            within each shard at each cut), concatenated across all shards in
-            shard_order order.
-        batches_per_shard: Number of batches produced by each shard in
-            shard_order.
-    """
-
-    shard_order: npt.NDArray[np.int32]
-    flat_batch_ends: npt.NDArray[np.int32]
-    batches_per_shard: npt.NDArray[np.int32]
-
-
-@dataclasses.dataclass
-class FFDWorkerPlan:
+class FFDWorkerPlan(BaseModel):
     """One DataLoader worker's per-epoch plan for FFD batch streaming.
 
     Attributes:
         shard_ids: Global shard IDs this worker streams this epoch, in
             iteration order.
-        permutations: For each shard, an int32 array mapping streaming
-            position (i.e. WebDataset arrival order) to the protein's index
+        permutations: For each shard, a list mapping streaming position
+            (i.e. WebDataset arrival order) to the protein's sorted rank
             in the prepended-and-permuted local sequence.
-        batch_ends: For each shard, an int32 array of cumulative batch-end
+        batch_ends: For each shard, a list of cumulative batch-end
             positions in the prepended-and-permuted sequence
             ``carry_in_sizes[k] + permuted shard k proteins``.
         carry_in_sizes: For each shard, the number of proteins prepended
@@ -305,14 +263,13 @@ class FFDWorkerPlan:
             but stored explicitly so workers can validate the carry buffer.
     """
 
-    shard_ids: npt.NDArray[np.int32]
-    permutations: list[npt.NDArray[np.int32]]
-    batch_ends: list[npt.NDArray[np.int32]]
-    carry_in_sizes: npt.NDArray[np.int32]
+    shard_ids: Sequence[int]
+    permutations: Sequence[Sequence[int]]
+    batch_ends: Sequence[Sequence[int]]
+    carry_in_sizes: Sequence[int]
 
 
-@dataclasses.dataclass
-class FFDBatchPlan:
+class FFDBatchPlan(BaseModel):
     """Full per-epoch FFD plan for one rank, partitioned by DataLoader worker.
 
     Attributes:
@@ -376,8 +333,6 @@ class ProteinShardDataset(torch.utils.data.IterableDataset[list[Protein]]):
         budget_parameters: Scalar batching and shard configuration.
         names: Protein entry names to include in the training split.
         dataset_jsonl: Path to the source JSONL protein database.
-        n_clusters: Number of length-based clusters to partition the dataset
-            into before sharding.
     """
 
     def __init__(
@@ -385,7 +340,6 @@ class ProteinShardDataset(torch.utils.data.IterableDataset[list[Protein]]):
         budget_parameters: ShardBudgetParameters,
         names: list[str],
         dataset_jsonl: Path,
-        n_clusters: int,
     ) -> None:
         self.names: list[str] = names
         self.dataset_jsonl: Path = dataset_jsonl
@@ -400,29 +354,19 @@ class ProteinShardDataset(torch.utils.data.IterableDataset[list[Protein]]):
 
         self.structlog_path: Path = budget_parameters.structlog_path
         self._log: FilteringBoundLogger = cast(
-            "FilteringBoundLogger",
+            FilteringBoundLogger,
             structlog.get_logger(),
         )
-        self.n_clusters: int = n_clusters
         self.token_budget: int = budget_parameters.token_budget
         self.max_seq_length: int = budget_parameters.max_seq_len
 
-        self.bin_width: int = self.token_budget // self.n_clusters
         # Construct the shards if they do not already exist.
         if not self.shard_metadata_path.exists():
             self._log.info(
                 "shards_do_not_exist",
                 shard_manifest_file=self.shard_metadata_path,
             )
-            cluster_metadata: list[list[ClusterMetadataEntry]] = (
-                self.compute_clusters()
-            )
-            n_shards: int
-            all_lengths: list[int]
-            shard_sizes_list: list[int]
-            n_shards, all_lengths, shard_sizes_list = self.compute_shards(
-                cluster_metadata,
-            )
+            n_shards, all_lengths, shard_sizes_list = self.build_sorted_shards()
             _ = self.write_shard_metadata_sidecar(
                 n_shards,
                 all_lengths,
@@ -430,116 +374,78 @@ class ProteinShardDataset(torch.utils.data.IterableDataset[list[Protein]]):
             )
 
         # prefill the batch
-        self._plan: ShardBatchPlan | None = None
+        self._plan: FFDBatchPlan | None = None
 
-    def compute_clusters(self) -> list[list[ClusterMetadataEntry]]:
-        """Scan the source JSONL and assign each protein to a length cluster.
+    def build_sorted_shards(self) -> tuple[int, list[int], list[int]]:
+        """Globally sort proteins descending by length and write to shard tars.
 
-        Reads the dataset JSONL in a single sequential pass, filters to
-        ``self.names``, and assigns each protein to one of ``self.n_clusters``
-        equal-width length bins (plus an overflow bin for sequences longer than
-        ``self.token_budget``). Each cluster is sorted ascending by seq_len.
+        Single JSONL pass collects ``(name, seq_len, byte_offset)`` for each
+        included protein. Entries are sorted globally descending by
+        ``seq_len`` and sliced into sequential chunks of
+        ``n_proteins_in_shard``. Each chunk is written to
+        ``shard_{id:05d}.tar`` by seeking to the recorded byte offsets in the
+        source JSONL.
 
         Returns:
-            List of n_clusters + 1 clusters, each a sorted list of
-            ClusterMetadataEntry objects.
+            Tuple of ``(n_shards, all_lengths, shard_sizes_list)`` where
+            ``all_lengths`` contains the ``seq_len`` of every protein in
+            global shard order (descending) and ``shard_sizes_list`` contains
+            the protein count per shard.
         """
         self.shard_dir.mkdir(parents=True, exist_ok=True)
         name_set = set(self.names)
 
-        # ── Pass 1: collect metadata ──────────────────────────────────────────
-        cluster_metadata: list[list[ClusterMetadataEntry]] = [
-            [] for _ in range(self.n_clusters + 1)
-        ]
+        entries: list[tuple[str, int, int]] = []
         with self.dataset_jsonl.open("rb") as f:
             byte_pos = 0
             for raw_line in f:
                 entry = ProteinEntry.model_validate_json(raw_line)
                 if entry.name in name_set:
-                    seq_len = len(entry.seq)
-                    if seq_len > self.token_budget:
-                        k = self.n_clusters
-                    else:  # overflow bin
-                        k = min(
-                            (seq_len - 1) // self.bin_width,
-                            self.n_clusters - 1,
-                        )
-                    cluster_metadata[k].append(
-                        ClusterMetadataEntry(
-                            name=entry.name,
-                            seq_len=seq_len,
-                            byte_offset=byte_pos,
+                    entries.append(
+                        (
+                            entry.name,
+                            len(entry.seq),
+                            byte_pos,
                         ),
                     )
                 byte_pos += len(raw_line)
 
-        for cluster in cluster_metadata:
-            cluster.sort()
+        # Global descending sort by seq_len.
+        entries.sort(key=lambda e: -e[1])
 
-        self._log.info(
-            "clusters_computed",
-            n_shards=self.n_clusters,
-        )
-        return cluster_metadata
-
-    def compute_shards(
-        self,
-        cluster_metadata: list[list[ClusterMetadataEntry]],
-    ) -> tuple[int, list[int], list[int]]:
-        """Write WebDataset tar shards from sorted cluster metadata.
-
-        Iterates over clusters in cluster_metadata, slicing each into
-        fixed-size shards of ``self.n_proteins_in_shard`` proteins. Each shard
-        is written as ``shard_{id:05d}.tar`` in ``self.shard_dir``. Proteins
-        are retrieved from the source JSONL by stored byte offsets.
-
-        Args:
-            cluster_metadata: Per-cluster sorted lists of ClusterMetadataEntry
-                objects, as returned by compute_clusters.
-
-        Returns:
-            Tuple of (n_shards, all_lengths, shard_sizes_list) where
-            all_lengths contains the seq_len of every protein in global shard
-            order and shard_sizes_list contains the protein count per shard.
-        """
         all_lengths: list[int] = []
         shard_sizes_list: list[int] = []
         shard_id: int = 0
 
         with self.dataset_jsonl.open("rb") as src:
-            for cluster in cluster_metadata:
-                for shard_start in range(
-                    0,
-                    max(len(cluster), 1),
-                    self.n_proteins_in_shard,
-                ):
-                    shard_entries: list[ClusterMetadataEntry] = cluster[
-                        shard_start : shard_start + self.n_proteins_in_shard
-                    ]
-                    if not shard_entries:
-                        continue
-                    shard_path: Path = (
-                        self.shard_dir / f"shard_{shard_id:05d}.tar"
-                    )
-                    with TarWriter(str(shard_path)) as sink:
-                        for local_idx, cluster_metadata_entry in enumerate(
-                            shard_entries,
-                        ):
-                            _ = src.seek(cluster_metadata_entry.byte_offset)
-                            raw_line = src.readline()
-                            _ = sink.write(
-                                {
-                                    "__key__": f"{local_idx:06d}",
-                                    "json": raw_line,
-                                },
-                            )
-                            all_lengths.append(cluster_metadata_entry.seq_len)
-                    shard_sizes_list.append(len(shard_entries))
-                    shard_id += 1
+            for shard_start in range(
+                0,
+                max(len(entries), 1),
+                self.n_proteins_in_shard,
+            ):
+                shard_entries = entries[
+                    shard_start : shard_start + self.n_proteins_in_shard
+                ]
+                if not shard_entries:
+                    continue
+                shard_path: Path = self.shard_dir / f"shard_{shard_id:05d}.tar"
+                with TarWriter(str(shard_path)) as sink:
+                    for local_idx, ent in enumerate(shard_entries):
+                        _ = src.seek(ent[2])  # byte_pos
+                        raw_line = src.readline()
+                        _ = sink.write(
+                            {
+                                "__key__": f"{local_idx:06d}",
+                                "json": raw_line,
+                            },
+                        )
+                        all_lengths.append(ent[1])  # seq_len
+                shard_sizes_list.append(len(shard_entries))
+                shard_id += 1
 
         n_shards = shard_id
         self._log.info(
-            "shards_computed",
+            "sorted_shards_built",
             n_shards=n_shards,
         )
         return n_shards, all_lengths, shard_sizes_list
@@ -598,7 +504,6 @@ class ProteinShardDataset(torch.utils.data.IterableDataset[list[Protein]]):
         shard_metadata_manifest = ShardMetadata(
             names_hash=names_hash,
             token_budget=self.token_budget,
-            n_clusters=self.n_clusters,
             shard_size=self.n_proteins_in_shard,
             n_shards=n_shards,
         )
@@ -615,15 +520,15 @@ class ProteinShardDataset(torch.utils.data.IterableDataset[list[Protein]]):
         )
         return shard_metadata_manifest
 
-    def set_plan(self, plan: ShardBatchPlan) -> None:
-        """Inject the ShardBatchPlan for the next epoch.
+    def set_plan(self, plan: FFDBatchPlan) -> None:
+        """Inject the FFDBatchPlan for the next epoch.
 
-        Called by ShardBatchSampler.set_epoch before the DataLoader iterates.
-        Because the DataLoader uses persistent_workers=False, workers restart
-        each epoch and receive the updated plan via pickling.
+        Called by ShardDataLoader.__iter__ before the underlying DataLoader
+        starts. Because persistent_workers=False, workers restart each epoch
+        and pick up the updated plan via pickling of ProteinShardDataset._plan.
 
         Args:
-            plan: Pre-computed plan from ShardBatchSampler.
+            plan: Pre-computed plan from ShardDataLoader.compute_ffd_plan.
         """
         self._plan = plan
 
@@ -663,44 +568,20 @@ class ProteinShardDataset(torch.utils.data.IterableDataset[list[Protein]]):
             b_factors=np.zeros((n_res, 37), dtype=np.float64),
         )
 
-    @staticmethod
-    def cut_stream_into_batches(
-        protein_iter: Iterator[Protein],
-        local_ends: npt.NDArray[np.int32],
-    ) -> Iterator[list[Protein]]:
-        """Cut a sequential protein stream into batches using pre-computed ends.
-
-        Args:
-            protein_iter: Sequential stream of Protein objects from one shard.
-            local_ends: Local cumulative batch-end positions (1-indexed protein
-                count within the shard at each cut). Produced by _pack_shard.
-
-        Yields:
-            list[Protein]: Non-empty lists of Protein objects, one per batch
-                cut.
-        """
-        batch: list[Protein] = []
-        cut_idx = 0
-        n_cuts = len(local_ends)
-        for i, protein in enumerate(protein_iter):
-            batch.append(protein)
-            if cut_idx < n_cuts and i + 1 == int(
-                cast("np.int32", local_ends[cut_idx]),
-            ):
-                yield batch
-                batch = []
-                cut_idx += 1
-        if batch:
-            yield batch
-
     @override
     def __iter__(self) -> Iterator[list[Protein]]:
-        """Yield complete protein batches for this worker's assigned shards.
+        """Yield FFD batches for this worker's assigned shards.
 
-        If set_plan has not been called, yields nothing. Worker w of
-        num_workers takes shard_order[w::num_workers]. For each assigned shard,
-        streams the tar via WebDataset and cuts proteins into batches using the
-        pre-computed local_ends slice from flat_batch_ends.
+        For each shard in the worker's plan:
+        1. Stream all proteins via WebDataset into a local list.
+        2. Reorder them in memory using the per-shard permutation
+           (``permutations[k][local_pos]`` is the sorted rank of the protein
+           at streaming position ``local_pos`` within shard ``k``).
+        3. Prepend the carry-over buffer from the previous shard.
+        4. Cut at ``batch_ends[k]``; yield each completed batch.
+        5. Stash any trailing proteins as the new carry-over buffer.
+
+        If set_plan has not been called, yields nothing.
         """
         plan = self._plan
         if plan is None:
@@ -708,38 +589,90 @@ class ProteinShardDataset(torch.utils.data.IterableDataset[list[Protein]]):
 
         worker_info = torch.utils.data.get_worker_info()
         worker_id: int = worker_info.id if worker_info is not None else 0
-        num_workers: int = (
-            worker_info.num_workers if worker_info is not None else 1
-        )
+        worker_plan = plan.worker_plans[worker_id]
 
-        shard_batch_offsets: npt.NDArray[np.int32] = np.concatenate(
-            [np.array([0], dtype=np.int32), np.cumsum(plan.batches_per_shard)],
-        )
-
-        for pos in range(worker_id, len(plan.shard_order), num_workers):
-            sid = int(cast("np.int32", plan.shard_order[pos]))
-            batch_start = int(cast("np.int32", shard_batch_offsets[pos]))
-            batch_end = int(cast("np.int32", shard_batch_offsets[pos + 1]))
-            local_ends = plan.flat_batch_ends[batch_start:batch_end]
-
+        carry_over: list[Protein] = []
+        for k in range(len(worker_plan.shard_ids)):
+            sid = worker_plan.shard_ids[k]
             url = str(self.shard_dir / f"shard_{sid:05d}.tar")
-            decoded: object = cast(
-                "object",
-                WebDataset(url),
-            )
             ds: Iterable[dict[str, object]] = cast(
-                "Iterable[dict[str, object]]",
-                decoded,
+                Iterable[dict[str, object]],
+                wds.DataPipeline(  # pyright: ignore[reportUnknownMemberType,reportAttributeAccessIssue]
+                    wds.SimpleShardList(  # pyright: ignore[reportUnknownMemberType,reportAttributeAccessIssue]
+                        [url],
+                    ),
+                    wds.tarfile_to_samples(),  # pyright: ignore[reportUnknownMemberType,reportAttributeAccessIssue]
+                ),
             )
-            protein_iter: Iterator[Protein] = (
-                self.parse_protein(s) for s in ds
-            )
-            yield from self.cut_stream_into_batches(protein_iter, local_ends)
+            shard_proteins: list[Protein] = [self.parse_protein(s) for s in ds]
+
+            permutation = worker_plan.permutations[k]
+            sorted_proteins: list[Protein | None] = [None] * len(shard_proteins)
+            for local_pos, sorted_rank in enumerate(permutation):
+                sorted_proteins[sorted_rank] = shard_proteins[local_pos]
+            sorted_proteins_checked: list[Protein] = [
+                p for p in sorted_proteins if p is not None
+            ]
+
+            full: list[Protein] = carry_over + sorted_proteins_checked
+            prev_cut = 0
+            for cut in worker_plan.batch_ends[k]:
+                yield full[prev_cut:cut]
+                prev_cut = cut
+            carry_over = full[prev_cut:]
+
+        if carry_over:
+            yield carry_over
 
 
+# this will be replaced with featurize
 def identity_collate(batch: list[Protein]) -> list[Protein]:
     """Pass pre-assembled protein batches through without default stacking."""
     return batch
+
+
+def batch_count_in_ffd_plan(plan: FFDBatchPlan) -> int:
+    """Total batch count across all workers for single epoch's FFDBatchPlan."""
+    return sum(len(be) for wp in plan.worker_plans for be in wp.batch_ends)
+
+
+def plan_cache(
+    budget: ShardBudgetParameters,
+    sidecar_path: Path,
+    cache_dir: Path,
+) -> Path:
+    """Return the JSON cache file path for a given budget.
+
+    Computes a hex digest uniquely identifying a plan's inputs. Hashes all
+    budget fields (excluding structlog_path, which does not affect plan
+    content) plus the sidecar file's size and mtime so the key changes if the
+    shard data is regenerated.
+
+    Args:
+        budget: Epoch-level packing parameters.
+        sidecar_path: Path to the shard sidecar metadata file.
+        cache_dir: Directory in which plan cache files are stored.
+
+    Returns:
+        Path to the ``<key>.json`` cache file.
+    """
+    h = hashlib.sha256()
+    for part in (
+        str(budget.shard_dir),
+        str(budget.token_budget),
+        str(budget.max_seq_len),
+        str(budget.noise_magnitude),
+        str(budget.seed),
+        str(budget.world_size),
+        str(budget.rank),
+        str(budget.num_workers),
+        str(budget.n_proteins_in_shard),
+    ):
+        h.update(part.encode())
+    stat = sidecar_path.stat()
+    h.update(str(stat.st_size).encode())
+    h.update(str(stat.st_mtime_ns).encode())
+    return cache_dir / f"{h.hexdigest()[:24]}.json"
 
 
 class ShardDataLoader(torch.utils.data.DataLoader[list[Protein]]):
@@ -786,7 +719,7 @@ class ShardDataLoader(torch.utils.data.DataLoader[list[Protein]]):
         self.base_seed: int = budget.seed
         self.epoch: int = 0
         self._log: FilteringBoundLogger = cast(
-            "FilteringBoundLogger",
+            FilteringBoundLogger,
             structlog.get_logger(),
         )
         self.structlog_path: Path = budget.structlog_path
@@ -806,127 +739,133 @@ class ShardDataLoader(torch.utils.data.DataLoader[list[Protein]]):
         self.queue_watcher: ThreadPoolExecutor = ThreadPoolExecutor(
             max_workers=1,
         )
-        self.process_queue: queue.Queue[ShardBatchPlan] = queue.Queue(
+        self.process_queue: queue.Queue[FFDBatchPlan] = queue.Queue(
             maxsize=self.prefetch_epochs,
         )
+        self.plan_cache_dir: Path = budget.shard_dir / "plan_cache"
+        self.plan_cache_dir.mkdir(parents=True, exist_ok=True)
         self._log.info(
             "process_queue_initialized",
             queue_depth=self.prefetch_epochs,
         )
-        first_plan: ShardBatchPlan | None = None
+
+        first_plan: FFDBatchPlan | None = None
         for offset in range(self.prefetch_epochs):
             epoch_budget = dataclasses.replace(
                 budget,
                 seed=self.base_seed + offset,
+                num_workers=num_workers if num_workers > 0 else 1,
             )
-            plan: ShardBatchPlan = self.process_executor.submit(
-                self.compute_shard_plan,
+            cache_path = plan_cache(
                 epoch_budget,
-            ).result()
+                self.shard_sidecar_path,
+                self.plan_cache_dir,
+            )
+            if cache_path.exists():
+                plan = FFDBatchPlan.model_validate_json(cache_path.read_bytes())
+                self._log.info(
+                    "ffd_plan_cache_hit",
+                )
+            else:
+                plan = self.process_executor.submit(
+                    self.compute_ffd_plan,
+                    epoch_budget,
+                ).result()
+                _ = cache_path.write_bytes(plan.model_dump_json().encode())
+                self._log.info(
+                    "ffd_plan_computed_and_cached",
+                )
             self.process_queue.put(plan)
             if first_plan is None:
                 first_plan = plan
 
         self._cached_len: int = (
-            int(
-                first_plan.batches_per_shard.sum(),  # pyright: ignore[reportAny]
-            )
-            if first_plan is not None
-            else 0
+            batch_count_in_ffd_plan(first_plan) if first_plan is not None else 0
         )
         self._log.info(
             "shard_prefetch_complete",
             prefetch_epochs=self.prefetch_epochs,
         )
 
-    # these two must be static methods
     @staticmethod
-    def pack_shard(
-        shard_id: int,
-        lengths: npt.NDArray[np.int16],
-        shard_starts: npt.NDArray[np.int32],
-        shard_sizes: npt.NDArray[np.int32],
-        max_seq_len: int,
+    def ffd_pack(
+        sorted_effective_lengths: list[int],
         token_budget: int,
-    ) -> npt.NDArray[np.int32]:
-        """Greedy-pack a pre-sorted shard; return local cumulative batch ends.
+    ) -> list[int]:
+        """First-Fit-Decreasing pack with padded `(count + 1) * L_max²` budget.
 
-        Each shard is sorted ascending by seq_len, so the current protein's
-        effective length is always the max in any in-progress batch. The batch
-        cost check is (current_count + 1) * eff_len <= token_budget.
+        Walks a descending-sorted, max-seq-length-clamped length list once. For
+        each protein, decides whether to extend the current open batch or
+        close it and start a new one. L_max for the budget check is the first
+        protein in the batch (never grows mid-batch because the list is sorted
+        descending). Proteins whose own L² already exceeds the budget are
+        emitted as solo batches, matching today's pack_shard policy.
 
         Args:
-            shard_id: Global shard index to index shard_starts/shard_sizes.
-            lengths: Global int16 array of seq_len per protein in shard order.
-            shard_starts: Start index into lengths for each shard.
-            shard_sizes: Protein count for each shard.
-            max_seq_len: Hard truncation ceiling applied to effective lengths.
+            sorted_effective_lengths: Protein lengths after applying
+                ``min(L, max_seq_len)`` and sorting descending by the noisy
+                sort key.
             token_budget: Maximum padded token cost per batch.
 
         Returns:
-            Int32 array of local cumulative batch-end positions (1-indexed
-            protein count within the shard at each cut).
+            List of cumulative batch-end positions (1-indexed element
+            count at each cut). An empty input returns an empty list.
         """
-        start_of_current_shard = int(cast("np.intp", shard_starts[shard_id]))
-        size_of_current_shard = int(cast("np.intp", shard_sizes[shard_id]))
-
-        effective_lengths = np.minimum(
-            lengths[
-                start_of_current_shard : start_of_current_shard
-                + size_of_current_shard
-            ].astype(np.int32),
-            max_seq_len,
-        )
-        batches: list[int] = []
-        current_item_count = 0
-        for local_index, residue_count in enumerate(
-            cast("list[int]", effective_lengths.tolist()),
-        ):
-            # eventually this would include the atom attention calculation
-            cost_from_item = residue_count * residue_count
-
+        batch_ends: list[int] = []
+        token_budget = token_budget * token_budget
+        current_count = 0
+        batch_max_sq = 0
+        for i, length in enumerate(sorted_effective_lengths):
+            cost_from_item = length * length
             if cost_from_item > token_budget:
-                if current_item_count > 0:
-                    # end the batch before adding the new item
-                    batches.append(local_index)
-                    current_item_count = 0
-                # end the batch, the batch is only the oversize item
-                batches.append(local_index + 1)
-            elif (current_item_count + 1) * cost_from_item > token_budget:
-                # end the batch before adding the new item
-                batches.append(local_index)
-                # new batch starts with the new item
-                current_item_count = 1
+                if current_count > 0:
+                    batch_ends.append(i)
+                    current_count = 0
+                batch_ends.append(i + 1)
+                batch_max_sq = 0
+                continue
+            if current_count == 0:
+                batch_max_sq = cost_from_item
+                current_count = 1
+            elif (current_count + 1) * batch_max_sq > token_budget:
+                batch_ends.append(i)
+                batch_max_sq = cost_from_item
+                current_count = 1
             else:
-                # continue filling the batch
-                current_item_count += 1
-        # fill another batch from trailing elements at end of loop.
-        if current_item_count > 0:
-            batches.append(size_of_current_shard)
-        return np.array(batches, dtype=np.int32)
+                current_count += 1
+        if current_count > 0:
+            batch_ends.append(len(sorted_effective_lengths))
+        return batch_ends
 
     @staticmethod
-    def compute_shard_plan(budget: ShardBudgetParameters) -> ShardBatchPlan:
-        """Compute one epoch's ShardBatchPlan inside the WorkerState subprocess.
+    def compute_ffd_plan(
+        budget: ShardBudgetParameters,
+    ) -> FFDBatchPlan:
+        """Compute one epoch's FFDBatchPlan inside the WorkerState subprocess.
 
-        Shuffles all shard IDs with RNG(budget.seed), assigns this rank's slice
-        (rank::world_size), then greedy-packs each assigned shard in parallel
-        via a ThreadPoolExecutor. Wrapped in FatalOnError so subprocess
-        failures are logged before propagating.
+        Shuffles all shard IDs with ``rng(budget.seed)``, takes this rank's
+        strided slice, then partitions that slice across DataLoader workers.
+        For each (worker, shard) pair: looks up the shard's lengths, adds
+        uniform noise ``rng.uniform(-noise_magnitude, noise_magnitude)`` to
+        each length, sorts descending by the noisy key, runs
+        :meth:`ffd_pack` on the clamped sorted lengths. Per-shard FFD is
+        equivalent to per-worker global FFD here because globally sorted
+        shards have disjoint length ranges, so FFD batches never span
+        shards (carry_in_sizes is always zero).
 
         Args:
             budget: Scalar parameters for this epoch's plan computation.
 
         Returns:
-            ShardBatchPlan with shard_order, flat_batch_ends, batches_per_shard.
+            FFDBatchPlan with one FFDWorkerPlan per DataLoader worker.
 
         Raises:
             ShardWorkerNotInitializedError: If the worker state has not been
-                initialized (lengths, shard_starts, or shard_sizes is None).
+                initialised (lengths, shard_starts, or shard_sizes is None).
         """
         with FatalOnError():
             log: FilteringBoundLogger = cast(
-                "FilteringBoundLogger",
+                FilteringBoundLogger,
                 structlog.get_logger(),
             )
             ws = ShardWorkerState.get()
@@ -944,90 +883,170 @@ class ShardDataLoader(torch.utils.data.DataLoader[list[Protein]]):
             rng = np.random.default_rng(budget.seed)
             all_ids: npt.NDArray[np.int32] = np.arange(n_shards, dtype=np.int32)
             rng.shuffle(all_ids)
-            # Compute separate shards for each GPU. rank strided.
-            # Syntax is sequence[start:stop:step].
             rank_ids: npt.NDArray[np.int32] = all_ids[
                 budget.rank : len(all_ids) : budget.world_size
             ]
 
             log.info(
-                "shard_plan_start",
+                "ffd_plan_start",
                 seed=budget.seed,
                 n_rank_shards=len(rank_ids),
+                num_workers=budget.num_workers,
             )
 
-            with ThreadPoolExecutor(max_workers=budget.n_threads) as pool:
-                futures: list[Future[npt.NDArray[np.int32]]] = [
-                    pool.submit(
-                        ShardDataLoader.pack_shard,
-                        int(sid),
-                        lengths,
-                        shard_starts,
-                        shard_sizes,
-                        budget.max_seq_len,
-                        budget.token_budget,
-                    )
-                    for sid in cast("Iterable[np.int32]", rank_ids)
-                ]
-                batches_across_all_shards: list[npt.NDArray[np.int32]] = [
-                    f.result() for f in futures
-                ]
-
-            batches_per_shard: npt.NDArray[np.int32] = np.array(
-                [
-                    len(shard_batches)
-                    for shard_batches in batches_across_all_shards
-                ],
-                dtype=np.int32,
-            )
-            flattened_batches_across_all_shards: npt.NDArray[np.int32] = (
-                np.concatenate(batches_across_all_shards)
-                if batches_across_all_shards
-                else np.empty(0, dtype=np.int32)  # why is this else here?
-            )
-            log.info(
-                "shard_plan_done",
-                n_batches=int(
-                    np.intp(
-                        batches_per_shard.sum(),  # pyright: ignore[reportAny]
+            worker_plans: list[FFDWorkerPlan] = []
+            for w in range(budget.num_workers):
+                worker_shard_ids: list[int] = cast(
+                    list[int],
+                    rank_ids[w :: budget.num_workers].tolist(),
+                )
+                with ThreadPoolExecutor(
+                    max_workers=budget.n_threads,
+                ) as pool:
+                    futures: list[Future[tuple[list[int], list[int]]]] = [
+                        pool.submit(
+                            ShardDataLoader.pack_one_shard,
+                            sid,
+                            lengths,
+                            shard_starts,
+                            shard_sizes,
+                            budget,
+                            int(rng.integers(0, np.iinfo(np.int64).max)),
+                        )
+                        for sid in worker_shard_ids
+                    ]
+                permutations, batch_ends = zip(
+                    *(f.result() for f in futures),
+                    strict=False,
+                )
+                worker_plans.append(
+                    FFDWorkerPlan(
+                        shard_ids=worker_shard_ids,
+                        permutations=permutations,
+                        batch_ends=batch_ends,
+                        carry_in_sizes=[0] * len(worker_shard_ids),
                     ),
+                )
+
+            log.info(
+                "ffd_plan_done",
+                n_workers=len(worker_plans),
+                n_batches=sum(
+                    len(be) for wp in worker_plans for be in wp.batch_ends
                 ),
-                n_shards=len(rank_ids),
             )
-            return ShardBatchPlan(
-                shard_order=rank_ids,
-                flat_batch_ends=flattened_batches_across_all_shards,
-                batches_per_shard=batches_per_shard,
-            )
+            return FFDBatchPlan(worker_plans=worker_plans)
+
+    @staticmethod
+    def pack_one_shard(
+        shard_id: int,
+        lengths: npt.NDArray[np.int16],
+        shard_starts: npt.NDArray[np.int32],
+        shard_sizes: npt.NDArray[np.int32],
+        budget: ShardBudgetParameters,
+        seed: int,
+    ) -> tuple[list[int], list[int]]:
+        """Noisy-sort then FFD-pack one shard into variable-size batches.
+
+        Adds uniform random noise to each protein's length before sorting
+        descending, which breaks the strict length ordering and prevents
+        every epoch from producing identical batch groupings. The noisy
+        sorted lengths are then passed to ``ffd_pack``, which uses a
+        First-Fit Decreasing bin-packing algorithm to group proteins into
+        batches whose total padded token cost stays within
+        ``budget.token_budget``.
+
+        The return value contains two arrays: an inverse permutation that
+        maps each protein's original streaming position within the shard
+        to its rank in the sorted order, and a ``batch_ends`` cut array
+        that encodes where each packed batch ends in sorted order.
+
+        Args:
+            shard_id: Global shard index into shard_starts/shard_sizes.
+            lengths: Global int16 array of seq_len per protein in shard
+                order.
+            shard_starts: Start index into lengths for each shard.
+            shard_sizes: Protein count for each shard.
+            budget: Epoch-level packing parameters; ``max_seq_len``,
+                ``token_budget``, and ``noise_magnitude`` are read from
+                this object.
+            seed: Per-shard RNG seed so threads do not contend on a
+                shared RNG.
+
+        Returns:
+            Tuple ``(inverse_permutation, batch_ends)`` where
+            ``inverse_permutation[local_pos]`` is the protein's sorted
+            rank within this shard, and ``batch_ends`` is the FFD
+            cumulative cut array.
+        """
+        start = int(cast(np.intp, shard_starts[shard_id]))
+        size = int(cast(np.intp, shard_sizes[shard_id]))
+        shard_lengths = lengths[start : start + size].astype(np.int32)
+        rng = np.random.default_rng(seed)
+        noise = rng.uniform(
+            -budget.noise_magnitude,
+            budget.noise_magnitude,
+            size=size,
+        )
+        sort_key = shard_lengths.astype(np.float64) + noise
+        # argsort of -key gives descending order indices.
+        sorted_order: npt.NDArray[np.int32] = np.argsort(
+            -sort_key,
+            kind="stable",
+        ).astype(np.int32)
+        # inverse_permutation[streaming_pos] = sorted rank.
+        inverse_permutation: npt.NDArray[np.int32] = np.empty_like(sorted_order)
+        inverse_permutation[sorted_order] = np.arange(size, dtype=np.int32)
+        sorted_effective = np.minimum(
+            shard_lengths[sorted_order],
+            budget.max_seq_len,
+        )
+        batch_ends = ShardDataLoader.ffd_pack(
+            cast(list[int], sorted_effective.tolist()),
+            budget.token_budget,
+        )
+        return cast(list[int], inverse_permutation.tolist()), batch_ends
 
     @override
     def __iter__(  # pyright: ignore[reportIncompatibleMethodOverride]
         self,
     ) -> Iterator[list[Protein]]:
-        """Dequeue next plan, inject into dataset, delegate to DataLoader.
-
-        Returns:
-            Iterator of list[Protein] batches from the underlying DataLoader.
-        """
+        """Dequeue next plan, inject into dataset, delegate to DataLoader."""
         plan = self.process_queue.get()
-        self._cached_len = int(
-            plan.batches_per_shard.sum(),  # pyright: ignore[reportAny]
-        )
+        self._cached_len = batch_count_in_ffd_plan(plan)
 
         self.shard_dataset.set_plan(plan)
 
         seed = self.base_seed + self.epoch + self.prefetch_epochs
-        epoch_budget = dataclasses.replace(self.budget, seed=seed)
-        future: Future[ShardBatchPlan] = self.process_executor.submit(
-            self.compute_shard_plan,
+        epoch_budget = dataclasses.replace(
+            self.budget,
+            seed=seed,
+            num_workers=self.num_workers if self.num_workers > 0 else 1,
+        )
+        cache_path = plan_cache(
             epoch_budget,
+            self.shard_sidecar_path,
+            self.plan_cache_dir,
         )
 
         def wait_and_enqueue() -> None:
-            """Block on subprocess future and enqueue resolved plan."""
+            """Load from cache or compute, save, then enqueue the next plan."""
             with FatalOnError():
-                self.process_queue.put(future.result())
-                self._log.info("shard_plan_enqueued", seed=seed)
+                if cache_path.exists():
+                    cached = FFDBatchPlan.model_validate_json(
+                        cache_path.read_bytes(),
+                    )
+                    self._log.info("ffd_plan_cache_hit", seed=seed)
+                    self.process_queue.put(cached)
+                    return
+                future: Future[FFDBatchPlan] = self.process_executor.submit(
+                    self.compute_ffd_plan,
+                    epoch_budget,
+                )
+                computed = future.result()
+                _ = cache_path.write_bytes(plan.model_dump_json().encode())
+                self._log.info("ffd_plan_computed_and_cached", seed=seed)
+                self.process_queue.put(computed)
 
         _ = self.queue_watcher.submit(wait_and_enqueue)
         self.epoch += 1
@@ -1045,7 +1064,15 @@ class ShardDataLoader(torch.utils.data.DataLoader[list[Protein]]):
         return self._cached_len
 
     def __del__(self) -> None:
-        """Shut down executor and watcher without blocking process exit."""
+        """Shut down executor and watcher without blocking process exit.
+
+        Uses ``hasattr`` guards because ``__del__`` is called even when
+        ``__init__`` raised partway through. If ``super().__init__()`` or
+        any line before the executor assignments throws, Python still
+        garbage-collects the partially-constructed object and fires
+        ``__del__``, but ``process_executor`` and ``queue_watcher`` were
+        never set.
+        """
         if hasattr(self, "process_executor"):
             self.process_executor.shutdown(wait=False)
         if hasattr(self, "queue_watcher"):
@@ -1058,8 +1085,8 @@ def make_bucketed_data_loaders(
     extra_train_args: TrainArgs,
 ) -> tuple[
     torch.utils.data.DataLoader[list[Protein]],
-    torch.utils.data.DataLoader[Protein],
-    torch.utils.data.DataLoader[Protein],
+    torch.utils.data.DataLoader[list[Protein]],
+    torch.utils.data.DataLoader[list[Protein]],
 ]:
     """Build the train shard loader and val/test loaders; auto-detects DDP.
 
@@ -1096,6 +1123,9 @@ def make_bucketed_data_loaders(
         splits.test,
         max_seq_length=cfg.test_loader.max_seq_length,
     )
+    train_names = (
+        splits.train[:252] if extra_train_args.debug_run else splits.train
+    )
 
     budget = ShardBudgetParameters(
         shard_dir=extra_train_args.shard_dir,
@@ -1104,22 +1134,16 @@ def make_bucketed_data_loaders(
         max_seq_len=cfg.train_loader.max_seq_length,
         seed=cfg.train_loader.seed,
         n_threads=cfg.train_loader.n_threads,
-        n_proteins_in_shard=cfg.train_loader.n_proteins_in_shard,
+        n_proteins_in_shard=len(train_names) // cfg.train_loader.n_shards,
         world_size=world_size,
         rank=rank,
         noise_magnitude=cfg.train_loader.noise_magnitude,
         num_workers=cfg.train_loader.num_workers,
     )
-
-    train_names = (
-        splits.train[:252] if extra_train_args.debug_run else splits.train
-    )
-
     train_set = ProteinShardDataset(  # this should take the structlog_jsonl too
         budget_parameters=budget,
         names=train_names,
         dataset_jsonl=extra_train_args.dataset_jsonl,
-        n_clusters=cfg.train_loader.n_clusters,
     )
 
     train_loader = ShardDataLoader(
@@ -1149,6 +1173,7 @@ def make_bucketed_data_loaders(
             sampler=val_sampler,
             num_workers=cfg.test_loader.num_workers,
             pin_memory=True,
+            collate_fn=identity_collate,
         )
         test_loader = torch.utils.data.DataLoader(
             test_set,
@@ -1156,6 +1181,7 @@ def make_bucketed_data_loaders(
             sampler=test_sampler,
             num_workers=cfg.test_loader.num_workers,
             pin_memory=True,
+            collate_fn=identity_collate,
         )
     else:
         val_loader = torch.utils.data.DataLoader(
@@ -1164,6 +1190,7 @@ def make_bucketed_data_loaders(
             shuffle=False,
             num_workers=cfg.test_loader.num_workers,
             pin_memory=True,
+            collate_fn=identity_collate,
         )
         test_loader = torch.utils.data.DataLoader(
             test_set,
@@ -1171,6 +1198,11 @@ def make_bucketed_data_loaders(
             shuffle=False,
             num_workers=cfg.test_loader.num_workers,
             pin_memory=True,
+            collate_fn=identity_collate,
         )
 
-    return (train_loader, val_loader, test_loader)
+    return (
+        train_loader,
+        cast(torch.utils.data.DataLoader[list[Protein]], val_loader),
+        cast(torch.utils.data.DataLoader[list[Protein]], test_loader),
+    )

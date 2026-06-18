@@ -430,7 +430,7 @@ def loaders(
     splits_path: str,
 ) -> tuple[
     torch.utils.data.DataLoader[list[Protein]],
-    torch.utils.data.DataLoader[Protein],
+    torch.utils.data.DataLoader[list[Protein]],
 ]:
     """Provide a ShardDataLoader built by make_bucketed_data_loaders.
 
@@ -464,8 +464,7 @@ def loaders(
         logging=LoggingParams(use_wandb=False),
         train_loader=TrainLoaderConfig(
             token_budget=64,
-            n_clusters=1,
-            n_proteins_in_shard=5,
+            n_shards=1,
             num_workers=1,
             epoch_prefetch_depth=1,
             batch_prefetch_depth=1,
@@ -798,7 +797,7 @@ def test_optimizer_step_outputs(
 def test_evaluate_outputs(
     loaders: tuple[
         torch.utils.data.DataLoader[list[Protein]],
-        torch.utils.data.DataLoader[Protein],
+        torch.utils.data.DataLoader[list[Protein]],
     ],
     model_params: ModelSetup,
 ) -> None:
@@ -1072,7 +1071,7 @@ def test_train_updates_model_parameters(
     model_params: ModelSetup,
     loaders: tuple[
         torch.utils.data.DataLoader[list[Protein]],
-        torch.utils.data.DataLoader[Protein],
+        torch.utils.data.DataLoader[list[Protein]],
     ],
     log: FilteringBoundLogger,
 ) -> None:
@@ -1102,7 +1101,7 @@ def test_train_no_grad_clip_completes(
     model_params: ModelSetup,
     loaders: tuple[
         torch.utils.data.DataLoader[list[Protein]],
-        torch.utils.data.DataLoader[Protein],
+        torch.utils.data.DataLoader[list[Protein]],
     ],
     log: FilteringBoundLogger,
     tmp_path: pathlib.Path,
@@ -1145,7 +1144,7 @@ def test_train_partial_window_at_epoch_end_updates_params(
     model_params: ModelSetup,
     loaders: tuple[
         torch.utils.data.DataLoader[list[Protein]],
-        torch.utils.data.DataLoader[Protein],
+        torch.utils.data.DataLoader[list[Protein]],
     ],
     log: FilteringBoundLogger,
     tmp_path: pathlib.Path,
@@ -1193,10 +1192,8 @@ def test_train_partial_window_at_epoch_end_updates_params(
 
 def test_train_token_budget_preflush_fires_before_oversized_batch(
     model_params: ModelSetup,
-    loaders: tuple[
-        torch.utils.data.DataLoader[list[Protein]],
-        torch.utils.data.DataLoader[Protein],
-    ],
+    jsonl_path: str,
+    splits_path: str,
     log: FilteringBoundLogger,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: pathlib.Path,
@@ -1210,17 +1207,20 @@ def test_train_token_budget_preflush_fires_before_oversized_batch(
     - epoch end: batch3 flushed
     Result: three optimizer windows each of size 1.
     """
-    train_loader, test_loader = loaders
     window_sizes: list[int] = []
     _real_process = process_accum_window
 
     def _tracking_process(
         micro_buffer: list[list[Protein]],
         n_proteins_per_batch: list[int],
-        setup: ModelSetup,
+        model_setup_params: ModelSetup,
     ) -> tuple[LossMetrics, ThroughputStatistics]:
         window_sizes.append(len(micro_buffer))
-        return _real_process(micro_buffer, n_proteins_per_batch, setup)
+        return _real_process(
+            micro_buffer,
+            n_proteins_per_batch,
+            model_setup_params,
+        )
 
     monkeypatch.setattr(
         "train.train_loop.process_accum_window",
@@ -1241,12 +1241,34 @@ def test_train_token_budget_preflush_fires_before_oversized_batch(
             save_every=100,
         ),
         logging=LoggingParams(use_wandb=False),
+        train_loader=TrainLoaderConfig(
+            token_budget=_N_RES_BUCKET,
+            noise_magnitude=0,
+            n_shards=1,
+            num_workers=1,
+            epoch_prefetch_depth=1,
+            batch_prefetch_depth=1,
+            n_threads=1,
+        ),
     )
     mp_b = _make_model_params(
         model_params.model,
         tcfg_b,
         model_params.distogram_res,
         model_params.distogram_atom,
+    )
+    args = TrainArgs(
+        dataset_jsonl=pathlib.Path(jsonl_path),
+        shard_dir=tmp_path / "shards",
+        keys_for_splits_json=pathlib.Path(splits_path),
+        config=tmp_path / "config.json",
+        structlog_jsonl=tmp_path / "structlog.jsonl",
+        ddp=False,
+        debug_run=False,
+    )
+    train_loader, test_loader, _ = make_bucketed_data_loaders(
+        cfg=tcfg_b,
+        extra_train_args=args,
     )
     train(
         best_val_loss=torch.tensor(float("inf")),
@@ -1262,7 +1284,7 @@ def test_train_wandb_called_once_per_epoch_when_enabled(
     model_params: ModelSetup,
     loaders: tuple[
         torch.utils.data.DataLoader[list[Protein]],
-        torch.utils.data.DataLoader[Protein],
+        torch.utils.data.DataLoader[list[Protein]],
     ],
     log: FilteringBoundLogger,
     wandb_payloads: list[dict[str, object]],
@@ -1304,7 +1326,7 @@ def test_train_wandb_not_called_when_disabled(
     model_params: ModelSetup,
     loaders: tuple[
         torch.utils.data.DataLoader[list[Protein]],
-        torch.utils.data.DataLoader[Protein],
+        torch.utils.data.DataLoader[list[Protein]],
     ],
     log: FilteringBoundLogger,
     wandb_call_counter: list[object],
@@ -1325,7 +1347,7 @@ def test_train_metrics_nonzero_when_budget_exceeds_total_tokens(
     model_params: ModelSetup,
     loaders: tuple[
         torch.utils.data.DataLoader[list[Protein]],
-        torch.utils.data.DataLoader[Protein],
+        torch.utils.data.DataLoader[list[Protein]],
     ],
     log: FilteringBoundLogger,
     wandb_payloads: list[dict[str, object]],
@@ -1434,7 +1456,7 @@ def test_train_one_epoch_with_bucketed_loader(
     model_params: ModelSetup,
     loaders: tuple[
         torch.utils.data.DataLoader[list[Protein]],
-        torch.utils.data.DataLoader[Protein],
+        torch.utils.data.DataLoader[list[Protein]],
     ],
     log: FilteringBoundLogger,
 ) -> None:
@@ -1454,7 +1476,7 @@ def test_train_accum_full_window_updates_params(
     model_params: ModelSetup,
     loaders: tuple[
         torch.utils.data.DataLoader[list[Protein]],
-        torch.utils.data.DataLoader[Protein],
+        torch.utils.data.DataLoader[list[Protein]],
     ],
     log: FilteringBoundLogger,
     tmp_path: pathlib.Path,
@@ -1505,7 +1527,7 @@ def test_train_optimizer_state_non_zero_after_one_step(
     model_params: ModelSetup,
     loaders: tuple[
         torch.utils.data.DataLoader[list[Protein]],
-        torch.utils.data.DataLoader[Protein],
+        torch.utils.data.DataLoader[list[Protein]],
     ],
     log: FilteringBoundLogger,
 ) -> None:
@@ -1540,7 +1562,7 @@ def test_train_scheduler_state_reflects_completed_epoch(
     model_params: ModelSetup,
     loaders: tuple[
         torch.utils.data.DataLoader[list[Protein]],
-        torch.utils.data.DataLoader[Protein],
+        torch.utils.data.DataLoader[list[Protein]],
     ],
     log: FilteringBoundLogger,
 ) -> None:
@@ -1569,7 +1591,7 @@ def test_train_wandb_epoch_increments_across_epochs(
     model_params: ModelSetup,
     loaders: tuple[
         torch.utils.data.DataLoader[list[Protein]],
-        torch.utils.data.DataLoader[Protein],
+        torch.utils.data.DataLoader[list[Protein]],
     ],
     tcfg3: TrainConfig,
     log: FilteringBoundLogger,

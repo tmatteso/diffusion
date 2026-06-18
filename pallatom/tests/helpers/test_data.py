@@ -5,20 +5,24 @@ and make_bucketed_data_loaders, including length/indexing, sample structure,
 pickle compatibility, and bucketed loader behaviour.
 """
 
+import dataclasses
 import json
 import pathlib
 import pickle
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import cast
 
 import numpy as np
+import numpy.typing as npt
 import pytest
-from helpers.atom_utils import Protein
+from helpers.atom_utils import Protein, restype_order
 from helpers.data import (
+    DatasetSplitsManifest,
     ProteinDataset,
     ProteinShardDataset,
     ShardBudgetParameters,
     ShardDataLoader,
+    ShardMetadata,
     make_bucketed_data_loaders,
 )
 from helpers.useful_objects import TrainArgs
@@ -364,115 +368,61 @@ def shard_budget(tmp_path: pathlib.Path) -> ShardBudgetParameters:
     )
 
 
+@pytest.fixture
+def multi_shard_budget(tmp_path: pathlib.Path) -> ShardBudgetParameters:
+    """ShardBudgetParameters with two workers and zero noise for plan tests.
+
+    token_budget=250 is chosen so ffd_pack on four equal-length proteins
+    produces two batches of two (3*L²>250 flushes at count 2).
+    """
+    return ShardBudgetParameters(
+        shard_dir=tmp_path / "shards",
+        structlog_path=tmp_path / "train.jsonl",
+        token_budget=250,
+        max_seq_len=MAX_SEQ_LENGTH,
+        seed=0,
+        n_threads=1,
+        world_size=1,
+        rank=0,
+        n_proteins_in_shard=100,
+        noise_magnitude=0,
+        num_workers=2,
+    )
+
+
 # ---------------------------------------------------------------------------
 # ProteinShardDataset
 # ---------------------------------------------------------------------------
 
 
-def test_shard_dataset_names_len(
+@pytest.fixture
+def protein_shard_dataset_factory(
     tmp_path: pathlib.Path,
     shard_budget: ShardBudgetParameters,
-) -> None:
-    """ProteinShardDataset.names contains one entry per included protein.
+) -> Callable[[list[str], list[int]], ProteinShardDataset]:
+    """Returns callable to build ProteinShardDataset from names and lengths."""
 
-    Verifies that a dataset constructed with B entries has B names.
-    """
-    entries = [_make_entry(f"p{i}", PROT_1_LEN) for i in range(B)]
-    _write_jsonl(tmp_path / "p.jsonl", entries)
-    ds = ProteinShardDataset(
-        budget_parameters=shard_budget,
-        names=[f"p{i}" for i in range(B)],
-        dataset_jsonl=tmp_path / "p.jsonl",
-        n_clusters=1,
-    )
-    assert len(ds.names) == B
+    def _build(
+        protein_name_array: list[str],
+        protein_len_array: list[int],
+    ) -> ProteinShardDataset:
+        entries: list[dict[str, object]] = [
+            _make_entry(name, length)
+            for name, length in zip(
+                protein_name_array,
+                protein_len_array,
+                strict=True,
+            )
+        ]
+        dataset_jsonl_path = tmp_path / "p.jsonl"
+        _write_jsonl(dataset_jsonl_path, entries)
+        return ProteinShardDataset(
+            budget_parameters=shard_budget,
+            names=protein_name_array,
+            dataset_jsonl=dataset_jsonl_path,
+        )
 
-
-def test_shard_dataset_builds_shards_on_init(
-    tmp_path: pathlib.Path,
-    shard_budget: ShardBudgetParameters,
-) -> None:
-    """ProteinShardDataset writes shard tars and metadata files at first init.
-
-    Verifies that shard_metadata.json, shard_sidecar.npz, and
-    all_protein_lengths.npy  all exist in shard_dir after the dataset is
-    constructed.
-    """
-    entries = [_make_entry("p1", PROT_1_LEN)]
-    _write_jsonl(tmp_path / "p.jsonl", entries)
-    ds = ProteinShardDataset(
-        budget_parameters=shard_budget,
-        names=["p1"],
-        dataset_jsonl=tmp_path / "p.jsonl",
-        n_clusters=1,
-    )
-    assert ds.shard_metadata_path.exists()
-    assert ds.shard_sidecar_path.exists()
-    assert ds.lengths_path.exists()
-
-
-def test_shard_dataset_parse_protein_returns_protein(
-    tmp_path: pathlib.Path,
-    shard_budget: ShardBudgetParameters,
-) -> None:
-    """parse_protein converts raw JSONL sample to a Protein of correct length.
-
-    Verifies that atom_positions has the expected number of residues.
-    """
-    entry = _make_entry("p1", PROT_1_LEN)
-    _write_jsonl(tmp_path / "p.jsonl", [entry])
-    ds = ProteinShardDataset(
-        budget_parameters=shard_budget,
-        names=["p1"],
-        dataset_jsonl=tmp_path / "p.jsonl",
-        n_clusters=1,
-    )
-    protein = ds.parse_protein({"json": entry})
-    assert isinstance(protein, Protein)
-    assert protein.atom_positions.shape[0] == PROT_1_LEN
-
-
-def test_shard_dataset_truncates_to_max_seq_length(
-    tmp_path: pathlib.Path,
-    shard_budget: ShardBudgetParameters,
-) -> None:
-    """parse_protein truncates proteins to max_seq_len residues.
-
-    Verifies that a 600-residue entry truncated to MAX_SEQ_LENGTH (128) atoms.
-    """
-    entry = _make_entry("p1", 600)
-    _write_jsonl(tmp_path / "p.jsonl", [entry])
-    ds = ProteinShardDataset(
-        budget_parameters=shard_budget,
-        names=["p1"],
-        dataset_jsonl=tmp_path / "p.jsonl",
-        n_clusters=1,
-    )
-    protein = ds.parse_protein({"json": entry})
-    assert protein.atom_positions.shape[0] == MAX_SEQ_LENGTH
-
-
-def test_shard_dataset_pickles(
-    tmp_path: pathlib.Path,
-    shard_budget: ShardBudgetParameters,
-) -> None:
-    """ProteinShardDataset survives a pickle round-trip for DataLoader workers.
-
-    Verifies names are preserved after serialising and deserialising dataset.
-    """
-    entries = [_make_entry("p1", PROT_1_LEN)]
-    _write_jsonl(tmp_path / "p.jsonl", entries)
-    ds = ProteinShardDataset(
-        budget_parameters=shard_budget,
-        names=["p1"],
-        dataset_jsonl=tmp_path / "p.jsonl",
-        n_clusters=1,
-    )
-    restored = cast(
-        ProteinShardDataset,
-        pickle.loads(pickle.dumps(ds)),  # noqa: S301
-    )
-    assert restored.names == ["p1"]
+    return _build
 
 
 # ---------------------------------------------------------------------------
@@ -524,6 +474,7 @@ def bucketed_cfg() -> TrainConfig:
             token_budget=512,
             num_workers=1,
             epoch_prefetch_depth=1,
+            n_shards=1,
         ),
         test_loader=EvalLoaderConfig(
             batch_size=2,
@@ -697,3 +648,264 @@ def test_bucketed_debug_run_not_poisoned_by_prior_full_cache(
     assert (
         len(cast(ShardDataLoader, train_loader).shard_dataset.names) == _N_DEBUG
     )
+
+
+# ---------------------------------------------------------------------------
+# write_shard_metadata_sidecar tests
+# ---------------------------------------------------------------------------
+
+
+def test_write_shard_metadata_fields_match_inputs(
+    protein_shard_dataset_factory: Callable[
+        [list[str], list[int]],
+        ProteinShardDataset,
+    ],
+) -> None:
+    """ShardMetadata JSON fields match the values used at construction."""
+    ds = protein_shard_dataset_factory(["p1", "p2"], [10, 20])
+    meta = ShardMetadata.model_validate_json(ds.shard_metadata_path.read_text())
+    assert meta.token_budget == ds.token_budget
+    assert meta.shard_size == ds.n_proteins_in_shard
+    assert meta.n_shards >= 1
+
+
+def test_write_shard_metadata_names_hash_stable(
+    tmp_path: pathlib.Path,
+    shard_budget: ShardBudgetParameters,
+) -> None:
+    """The same name set produces an identical names_hash on both runs."""
+    names = ["p1", "p2"]
+    _write_jsonl(
+        tmp_path / "p.jsonl",
+        [_make_entry(n, 10) for n in names],
+    )
+    ds_a = ProteinShardDataset(
+        budget_parameters=dataclasses.replace(
+            shard_budget,
+            shard_dir=tmp_path / "shards_a",
+        ),
+        names=names,
+        dataset_jsonl=tmp_path / "p.jsonl",
+    )
+    ds_b = ProteinShardDataset(
+        budget_parameters=dataclasses.replace(
+            shard_budget,
+            shard_dir=tmp_path / "shards_b",
+        ),
+        names=names,
+        dataset_jsonl=tmp_path / "p.jsonl",
+    )
+    hash_a = ShardMetadata.model_validate_json(
+        ds_a.shard_metadata_path.read_text(),
+    ).names_hash
+    hash_b = ShardMetadata.model_validate_json(
+        ds_b.shard_metadata_path.read_text(),
+    ).names_hash
+    assert hash_a == hash_b
+
+
+def test_write_shard_metadata_names_hash_changes_on_different_names(
+    tmp_path: pathlib.Path,
+    shard_budget: ShardBudgetParameters,
+) -> None:
+    """Different name sets produce different names_hash values."""
+    _write_jsonl(
+        tmp_path / "p.jsonl",
+        [_make_entry("p1", 10), _make_entry("p2", 20)],
+    )
+    ds_a = ProteinShardDataset(
+        budget_parameters=dataclasses.replace(
+            shard_budget,
+            shard_dir=tmp_path / "shards_a",
+        ),
+        names=["p1"],
+        dataset_jsonl=tmp_path / "p.jsonl",
+    )
+    ds_b = ProteinShardDataset(
+        budget_parameters=dataclasses.replace(
+            shard_budget,
+            shard_dir=tmp_path / "shards_b",
+        ),
+        names=["p1", "p2"],
+        dataset_jsonl=tmp_path / "p.jsonl",
+    )
+    hash_a = ShardMetadata.model_validate_json(
+        ds_a.shard_metadata_path.read_text(),
+    ).names_hash
+    hash_b = ShardMetadata.model_validate_json(
+        ds_b.shard_metadata_path.read_text(),
+    ).names_hash
+    assert hash_a != hash_b
+
+
+def test_build_sorted_shards_existing_metadata_prevents_rebuild(
+    tmp_path: pathlib.Path,
+    shard_budget: ShardBudgetParameters,
+) -> None:
+    """A second init with the same shard_dir reuses cached metadata as-is."""
+    _write_jsonl(tmp_path / "p.jsonl", [_make_entry("p1", 10)])
+    first = ProteinShardDataset(
+        budget_parameters=shard_budget,
+        names=["p1"],
+        dataset_jsonl=tmp_path / "p.jsonl",
+    )
+    mtime_before = first.shard_metadata_path.stat().st_mtime
+    _ = ProteinShardDataset(
+        budget_parameters=shard_budget,
+        names=["p1"],
+        dataset_jsonl=tmp_path / "p.jsonl",
+    )
+    mtime_after = first.shard_metadata_path.stat().st_mtime
+    assert mtime_before == mtime_after
+
+
+# ---------------------------------------------------------------------------
+# ShardDataLoader lifecycle tests
+# ---------------------------------------------------------------------------
+
+
+def test_shard_data_loader_epoch_increments_after_iter(
+    bucketed_cfg: TrainConfig,
+    bucketed_train_args: TrainArgs,
+) -> None:
+    """ShardDataLoader.epoch starts at 0 and increments with each __iter__."""
+    train_loader, _, _ = make_bucketed_data_loaders(
+        cfg=bucketed_cfg,
+        extra_train_args=bucketed_train_args,
+    )
+    loader = cast(ShardDataLoader, train_loader)
+    assert loader.epoch == 0
+    _ = list(loader)
+    assert loader.epoch == 1
+
+
+def test_shard_data_loader_cached_len_is_positive(
+    bucketed_cfg: TrainConfig,
+    bucketed_train_args: TrainArgs,
+) -> None:
+    """__len__ returns a positive batch count immediately after construction."""
+    train_loader, _, _ = make_bucketed_data_loaders(
+        cfg=bucketed_cfg,
+        extra_train_args=bucketed_train_args,
+    )
+    loader = cast(ShardDataLoader, train_loader)
+    assert len(loader) > 0
+
+
+def test_shard_data_loader_del_no_error(
+    bucketed_cfg: TrainConfig,
+    bucketed_train_args: TrainArgs,
+) -> None:
+    """Deleting a ShardDataLoader shuts down executors without raising."""
+    train_loader, _, _ = make_bucketed_data_loaders(
+        cfg=bucketed_cfg,
+        extra_train_args=bucketed_train_args,
+    )
+    del train_loader
+
+
+# ---------------------------------------------------------------------------
+# parse_protein tests
+# ---------------------------------------------------------------------------
+
+
+def test_parse_protein_bytes_and_dict_give_identical_result(
+    protein_shard_dataset_factory: Callable[
+        [list[str], list[int]],
+        ProteinShardDataset,
+    ],
+) -> None:
+    """parse_protein accepts raw bytes and a decoded dict with equal results."""
+    ds = protein_shard_dataset_factory(["p1"], [10])
+    raw_bytes: bytes = json.dumps(_make_entry("p1", 10)).encode()
+    raw_dict: dict[str, object] = cast(
+        "dict[str, object]",
+        json.loads(raw_bytes),
+    )
+    p_from_bytes = ds.parse_protein({"json": raw_bytes})
+    p_from_dict = ds.parse_protein({"json": raw_dict})
+    np.testing.assert_array_equal(
+        p_from_bytes.atom_positions,
+        p_from_dict.atom_positions,
+    )
+
+
+def test_parse_protein_coordinates_are_centered(
+    protein_shard_dataset_factory: Callable[
+        [list[str], list[int]],
+        ProteinShardDataset,
+    ],
+) -> None:
+    """After parsing, the masked CA-position centroid is near zero."""
+    ds = protein_shard_dataset_factory(["p1"], [10])
+    entry: dict[str, object] = _make_entry("p1", 10)
+    protein = ds.parse_protein({"json": entry})
+    ca_pos = protein.atom_positions[:, 1, :]  # (n_res, 3)
+    ca_mask = protein.atom_mask[:, 1]  # (n_res,)
+    masked_mean = cast(
+        npt.NDArray[np.float64],
+        np.sum(ca_mask[:, None] * ca_pos, axis=0) / np.sum(ca_mask),
+    )
+    np.testing.assert_allclose(masked_mean, np.zeros(3), atol=1e-6)
+
+
+def test_parse_protein_unknown_aa_maps_to_restype_x(
+    protein_shard_dataset_factory: Callable[
+        [list[str], list[int]],
+        ProteinShardDataset,
+    ],
+) -> None:
+    """Amino acids not in restype_order are mapped to restype_order['X']."""
+    ds = protein_shard_dataset_factory(["p1"], [3])
+    entry: dict[str, object] = {
+        "name": "p1",
+        "seq": "ZZZ",
+        "coords": _make_coords(3),
+    }
+    protein = ds.parse_protein({"json": entry})
+    expected_idx = restype_order["X"]
+    aatype_list = cast(list[int], protein.aatype.tolist())
+    assert all(a == expected_idx for a in aatype_list)
+
+
+# ---------------------------------------------------------------------------
+# DatasetSplitsManifest tests
+# ---------------------------------------------------------------------------
+
+
+def test_dataset_splits_manifest_ignores_extra_fields() -> None:
+    """DatasetSplitsManifest silently drops unknown JSON fields."""
+    data: dict[str, object] = {
+        "train": ["p1"],
+        "validation": ["p2"],
+        "test": ["p3"],
+        "unknown_field": "ignored",
+        "also_ignored": 42,
+    }
+    manifest = DatasetSplitsManifest.model_validate(data)
+    assert manifest.train == ["p1"]
+    assert manifest.validation == ["p2"]
+    assert manifest.test == ["p3"]
+
+
+def test_dataset_splits_manifest_cath_nodes_defaults_empty() -> None:
+    """cath_nodes defaults to an empty dict when absent from the JSON."""
+    data: dict[str, object] = {
+        "train": ["p1"],
+        "validation": ["p2"],
+        "test": ["p3"],
+    }
+    manifest = DatasetSplitsManifest.model_validate(data)
+    assert manifest.cath_nodes == {}
+
+
+def test_dataset_splits_manifest_cath_nodes_populated() -> None:
+    """cath_nodes is fully populated when present in the JSON."""
+    data: dict[str, object] = {
+        "train": ["p1"],
+        "validation": ["p2"],
+        "test": ["p3"],
+        "cath_nodes": {"p1": ["1.20.5"], "p2": ["2.60.40"]},
+    }
+    manifest = DatasetSplitsManifest.model_validate(data)
+    assert manifest.cath_nodes == {"p1": ["1.20.5"], "p2": ["2.60.40"]}

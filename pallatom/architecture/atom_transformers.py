@@ -906,7 +906,7 @@ class AtomAttentionDecoder(nn.Module):
 
         self.norm_z: LayerNorm = LayerNorm(self.c_pair)
         self.proj_z: LinearNoBias = LinearNoBias(
-            self.c_res,
+            self.c_pair,
             self.c_atompair,
         )  # [c_pair, c_atompair]
 

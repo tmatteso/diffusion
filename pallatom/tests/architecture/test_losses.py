@@ -1253,6 +1253,7 @@ def test_pipeline_preserves_pdb_x_as_index_20(
         atom_distogram_fn,
         NoiseScheduleParams(),
         max_seq_len_in_batch=n_res,
+        window_size=32,
     )
 
     assert item.aa_indices[x_pos].item() == _N_AMINO
