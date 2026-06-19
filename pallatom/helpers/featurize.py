@@ -289,6 +289,7 @@ def featurize_single_item(
         atom37_positions = F.pad(atom37_positions, (0, 0, 0, 0, 0, pad))
         atom37_mask = F.pad(atom37_mask, (0, 0, 0, pad))
         f_residue_idx = F.pad(f_residue_idx, (0, pad))
+    N_res = max_seq_len_in_batch
 
     aa_indices: Int[torch.Tensor, "N_res"] = torch.full(
         (max_seq_len_in_batch,),
@@ -397,14 +398,16 @@ def featurize_single_item(
         flat_pos,
         atom_mask_flat,
     )
-    n_atom_bins: int = gt_atom_disto_dense.shape[-1]
-
     # Vectorised sparse gather: result[l, k] = dense[l, neighbor_idx[l, k]]
     # index must be the same shape as the output
     gt_atom_distogram_sparse: Float[torch.Tensor, "N_atom K n_atom_bins"] = (
         gt_atom_disto_dense.gather(
             1,
-            repeat(neighbor_idx, "n k -> n k d", d=n_atom_bins),
+            repeat(
+                neighbor_idx,
+                "n k -> n k d",
+                d=gt_atom_disto_dense.shape[-1],
+            ),
         )
     )
     gt_atom_distogram_mask_sparse: Bool[torch.Tensor, "N_atom K"] = (
