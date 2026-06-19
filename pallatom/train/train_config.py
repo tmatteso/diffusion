@@ -315,7 +315,7 @@ class TrainLoaderConfig(LoaderConfig):
 
     model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True)
 
-    token_budget: int = Field(default=512, gt=0)
+    token_budget: int = Field(default=384, gt=0)
     batch_prefetch_depth: int = Field(default=4, gt=0)
     epoch_prefetch_depth: int = Field(default=3, gt=0)
     seed: int = Field(default=0)

@@ -13,7 +13,7 @@ import traceback
 from collections.abc import Callable
 from pathlib import Path
 from types import TracebackType
-from typing import ClassVar, cast
+from typing import ClassVar, NoReturn, cast
 
 import numpy as np
 import numpy.typing as npt
@@ -151,15 +151,17 @@ class StructlogConfig:
         Returns:
             This ``StructlogConfig`` instance, ready for use as a log-file tee.
         """
-        processors: list[Processor] = [
-            structlog.processors.TimeStamper(fmt="iso", utc=True),
-            structlog.processors.add_log_level,
-            structlog.processors.StackInfoRenderer(),
-        ]
         if self._is_rank_zero:
             self.f = self._log_file.open("w", encoding="utf-8", buffering=1)
-            processors.append(self.write_log_line)
-            processors.append(structlog.dev.ConsoleRenderer())
+            processors: list[Processor] = [
+                structlog.processors.TimeStamper(fmt="iso", utc=True),
+                structlog.processors.add_log_level,
+                structlog.processors.StackInfoRenderer(),
+                self.write_log_line,
+                structlog.dev.ConsoleRenderer(),
+            ]
+        else:
+            processors = [self._suppress_event]
         structlog.configure(
             processors=processors,
             wrapper_class=structlog.make_filtering_bound_logger(20),
@@ -167,6 +169,18 @@ class StructlogConfig:
             logger_factory=structlog.PrintLoggerFactory(),
         )
         return self
+
+    @staticmethod
+    def _suppress_event(
+        _logger: object,
+        _method: str | None,
+        _event_dict: EventDict,
+    ) -> NoReturn:
+        """Structlog processor that silently drops every log event.
+
+        Used on non-rank-zero processes so nothing reaches ``PrintLogger``.
+        """
+        raise structlog.DropEvent
 
     def write_log_line(  # pylint: disable=useless-param-doc
         self,
