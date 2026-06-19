@@ -1213,13 +1213,13 @@ def test_train_token_budget_preflush_fires_before_oversized_batch(
     def _tracking_process(
         micro_buffer: list[list[Protein]],
         n_proteins_per_batch: list[int],
-        model_setup_params: ModelSetup,
+        model_params: ModelSetup,  # pylint: disable=redefined-outer-name
     ) -> tuple[LossMetrics, ThroughputStatistics]:
         window_sizes.append(len(micro_buffer))
         return _real_process(
             micro_buffer,
             n_proteins_per_batch,
-            model_setup_params,
+            model_params,
         )
 
     monkeypatch.setattr(
