@@ -411,7 +411,7 @@ def test_atom_loss_perfect_near_zero(
     whose maximum is below numerical tolerance when prediction equals ground
     truth.
     """
-    loss = atom_loss(coords, coords)
+    loss = atom_loss(coords, coords, lambda_sigma_weight=torch.ones(B))
     assert loss.shape == (B,)
     assert loss.max().item() < TOLERANCE
 
@@ -427,7 +427,7 @@ def test_atom_loss_known_translation_near_zero(
     """
     translation = rearrange(torch.tensor([10.0, 5.0, -3.0]), "d -> 1 1 d")
     r_translated = coords + translation
-    loss = atom_loss(r_translated, coords)
+    loss = atom_loss(r_translated, coords, lambda_sigma_weight=torch.ones(B))
     assert (loss < TIGHT_TOLERANCE).all()
 
 
@@ -441,9 +441,10 @@ def test_atom_loss_full_mask_matches_no_mask(
     to the unmasked default, confirming mask has no unintended side effects.
     """
     mask_all = torch.ones(B, N, dtype=torch.bool)
+    w = torch.ones(B)
     assert torch.allclose(
-        atom_loss(coords, noisy_coords, mask=mask_all),
-        atom_loss(coords, noisy_coords),
+        atom_loss(coords, noisy_coords, mask=mask_all, lambda_sigma_weight=w),
+        atom_loss(coords, noisy_coords, lambda_sigma_weight=w),
         atol=TOLERANCE,
     )
 
@@ -459,9 +460,22 @@ def test_atom_loss_increases_with_noise_level(
     """
     _ = manual_seed(0)
     noise_dir = torch.randn(B, N, 3)
-    loss_low = atom_loss(coords + 0.1 * noise_dir, coords)
-    loss_mid = atom_loss(coords + 1.0 * noise_dir, coords)
-    loss_high = atom_loss(coords + 5.0 * noise_dir, coords)
+    w = torch.ones(B)
+    loss_low = atom_loss(
+        coords + 0.1 * noise_dir,
+        coords,
+        lambda_sigma_weight=w,
+    )
+    loss_mid = atom_loss(
+        coords + 1.0 * noise_dir,
+        coords,
+        lambda_sigma_weight=w,
+    )
+    loss_high = atom_loss(
+        coords + 5.0 * noise_dir,
+        coords,
+        lambda_sigma_weight=w,
+    )
     assert (loss_low < loss_mid).all()
     assert (loss_mid < loss_high).all()
 
@@ -473,12 +487,16 @@ def test_atom_loss_gradient_flow() -> None:
     and that backward leaves r_gt.grad as None, confirming ground-truth
     coordinates are treated as constants.
     """
-    r_pred = torch.randn(N, 3, requires_grad=True)
-    (grad,) = torch.autograd.grad(atom_loss(r_pred, torch.randn(N, 3)), r_pred)
+    r_pred = torch.randn(1, N, 3, requires_grad=True)
+    w1 = torch.ones(1)
+    (grad,) = torch.autograd.grad(
+        atom_loss(r_pred, torch.randn(1, N, 3), lambda_sigma_weight=w1),
+        r_pred,
+    )
     assert torch.isfinite(grad).all()
-    r_pred2 = torch.randn(N, 3, requires_grad=True)
-    r_gt2 = torch.randn(N, 3, requires_grad=True)
-    torch.autograd.backward([atom_loss(r_pred2, r_gt2)])
+    r_pred2 = torch.randn(1, N, 3, requires_grad=True)
+    r_gt2 = torch.randn(1, N, 3, requires_grad=True)
+    torch.autograd.backward([atom_loss(r_pred2, r_gt2, lambda_sigma_weight=w1)])
     assert r_gt2.grad is None
 
 
@@ -494,9 +512,10 @@ def test_atom_loss_rotation_invariant(
     tolerance.
     """
     r_gt_rot = einsum(r_gt, rotation, "b n d, d e -> b n e")
+    w = torch.ones(B)
     assert torch.allclose(
-        atom_loss(coords, r_gt),
-        atom_loss(coords, r_gt_rot),
+        atom_loss(coords, r_gt, lambda_sigma_weight=w),
+        atom_loss(coords, r_gt_rot, lambda_sigma_weight=w),
         atol=1e-4,
     )
 
@@ -534,6 +553,7 @@ def test_med_loss_scalar_finite_positive(
         list(aa_blocks),
         batch,
         LossParams(lam=LAM, alpha_0=ALPHA, gamma=GAMMA),
+        lambda_sigma_weight=torch.ones(B),
     )
     assert loss.ndim == 0
     assert torch.isfinite(loss)
@@ -555,6 +575,7 @@ def test_med_loss_perfect_struct_near_zero(
         list(aa_blocks),
         batch,
         LossParams(lam=LAM, alpha_0=0.0, gamma=GAMMA),
+        lambda_sigma_weight=torch.ones(B),
     )
     assert loss.item() < TOLERANCE
 
@@ -591,6 +612,7 @@ def test_med_loss_mismatched_blocks_raises(
             list(aa_blocks)[:-1],
             batch,
             LossParams(lam=LAM, alpha_0=ALPHA),
+            lambda_sigma_weight=torch.ones(B),
         )
 
 
@@ -637,6 +659,7 @@ def test_med_loss_gradient_flows_to_first_block() -> None:
             aa_blocks_g,
             batch_1,
             LossParams(lam=LAM, alpha_0=ALPHA, gamma=GAMMA),
+            lambda_sigma_weight=torch.ones(1),
         ),
         r0,
     )
@@ -655,17 +678,20 @@ def test_med_loss_hyperparams_scale_contributions(
     smaller total loss than the nominal configuration.
     """
     r_list, aa_list = list(r_blocks), list(aa_blocks)
+    w = torch.ones(B)
     loss_nominal = med_loss(
         r_list,
         aa_list,
         batch,
         LossParams(lam=LAM, alpha_0=ALPHA, gamma=GAMMA),
+        lambda_sigma_weight=w,
     )
     loss_lam_small = med_loss(
         r_list,
         aa_list,
         batch,
         LossParams(lam=1e-6, alpha_0=ALPHA, gamma=GAMMA),
+        lambda_sigma_weight=w,
     )
     assert loss_lam_small.item() < loss_nominal.item()
     loss_alpha_zero = med_loss(
@@ -673,6 +699,7 @@ def test_med_loss_hyperparams_scale_contributions(
         aa_list,
         batch,
         LossParams(lam=LAM, alpha_0=0.0, gamma=GAMMA),
+        lambda_sigma_weight=w,
     )
     assert loss_alpha_zero.item() < loss_nominal.item()
 
@@ -982,7 +1009,7 @@ def test_atom_loss_wrong_shape() -> None:
     r_bad = torch.zeros(B, N, 4)  # last dim must be 3
     r_target = torch.zeros(B, N, 3)
     with pytest.raises(TypeCheckError):
-        _ = atom_loss(r_bad, r_target)
+        _ = atom_loss(r_bad, r_target, lambda_sigma_weight=torch.ones(B))
 
 
 def testpairwise_dist_wrong_shape() -> None:

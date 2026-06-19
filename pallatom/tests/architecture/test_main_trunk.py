@@ -801,6 +801,7 @@ def test_integration_gradient_flow_composite_loss(
         pred.r_denoised,
         featurized_batch.r_gt,
         featurized_batch.atom5_mask,
+        lambda_sigma_weight=torch.ones(B),
     ).mean()
     ce_loss = seq_ce_loss(pred.seq_logits, featurized_batch.aa_indices)
     lddt = smooth_lddt_loss(
@@ -838,6 +839,7 @@ def test_integration_gradient_flow_composite_loss(
             inter_coords,
             featurized_batch.r_gt,
             featurized_batch.atom5_mask,
+            lambda_sigma_weight=torch.ones(B),
         ) + seq_ce_loss(inter_logits, featurized_batch.aa_indices)
         intermediate_loss = intermediate_loss + gamma * k_loss
     intermediate_loss = (intermediate_loss / max(K_unit, 1)).mean()

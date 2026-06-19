@@ -27,29 +27,34 @@ PAD_TOKEN = -100
 
 @jaxtyped(typechecker=beartype)
 def atom_loss(
-    r_denoised: Float[torch.Tensor, "... N_res 3"],
-    r_gt: Float[torch.Tensor, "... N_res 3"],
-    mask: Bool[torch.Tensor, "... N_res"] | None = None,
-) -> Float[torch.Tensor, "..."]:
-    """Kabsch-aligned atom-coordinate MSE loss.
+    r_denoised: Float[torch.Tensor, "B N_res 3"],
+    r_gt: Float[torch.Tensor, "B N_res 3"],
+    mask: Bool[torch.Tensor, "B N_res"] | None = None,
+    *,
+    lambda_sigma_weight: Float[torch.Tensor, "B"],
+) -> Float[torch.Tensor, "B"]:
+    """Kabsch-aligned atom-coordinate MSE loss with EDM noise weighting.
 
     Rigidly aligns the ground-truth structure onto the denoised structure
     (i.e. the *prediction* is held fixed; the GT is rotated/translated to
     match it), then computes the mean squared deviation per coordinate:
 
-        L_atom = ||r_denoised - r_aligned||² / (3L)
+        L_atom = lambda_sigma · ||r_denoised - r_aligned||² / (3L)
 
-    where L is the number of (unmasked) residues and the factor 3 accounts
-    for the x, y, z dimensions, matching the formulation in the screenshot.
+    where L is the number of (unmasked) residues, the factor 3 accounts
+    for the x, y, z dimensions, and ``lambda_sigma = (t̂² + sigma_data²) /
+    (t̂ · sigma_data)²`` is the per-sample EDM noise weighting.
 
     Args:
-        r_denoised: (..., N_res, 3) — model output / denoised coordinates.
-        r_gt:       (..., N_res, 3) — ground-truth coordinates  r̄⁰.
-        mask:       (..., N_res)    — boolean or float mask; 1 = valid residue.
-                                      When None, all N_res residues are used.
+        r_denoised: (B, N_res, 3) — model output / denoised coordinates.
+        r_gt:       (B, N_res, 3) — ground-truth coordinates  r̄⁰.
+        mask:       (B, N_res)    — boolean or float mask; 1 = valid residue.
+                                    When None, all N_res residues are used.
+        lambda_sigma_weight: Per-batch EDM loss weight
+            ``(t̂² + sigma_data²) / (t̂ · sigma_data)²``, shape ``(B,)``.
 
     Returns:
-        (...,) scalar loss per batch element.
+        (B,) EDM-weighted loss per batch element.
 
     Raises:
         LossComputationError: If the computed loss contains NaN values.
@@ -60,7 +65,7 @@ def atom_loss(
         • Gradients flow through r_denoised (r_aligned is treated as a
           constant frame — the GT is being moved, not the prediction).
     """
-    weights: Float[torch.Tensor, "... N_res"] | None = (
+    weights: Float[torch.Tensor, "B N_res"] | None = (
         mask.float() if mask is not None else None
     )
 
@@ -74,25 +79,27 @@ def atom_loss(
     )
     r_aligned = r_aligned.detach()
 
-    # Squared residuals summed over xyz → (..., N_res)
-    diff: Float[torch.Tensor, "... N_res 3"] = r_denoised - r_aligned
-    sq: Float[torch.Tensor, "... N_res"] = einsum(
+    # Squared residuals summed over xyz → (B, N_res)
+    diff: Float[torch.Tensor, "B N_res 3"] = r_denoised - r_aligned
+    sq: Float[torch.Tensor, "B N_res"] = einsum(
         diff,
         diff,
-        "... l d, ... l d -> ... l",
+        "b l d, b l d -> b l",
     )
 
     if mask is not None:
-        m: Float[torch.Tensor, "... N_res"] = mask.float()
-        L_eff: Float[torch.Tensor, ...] = m.sum(dim=-1).clamp(min=1)
-        loss: Float[torch.Tensor, ...] = einsum(
+        m: Float[torch.Tensor, "B N_res"] = mask.float()
+        L_eff: Float[torch.Tensor, "B"] = m.sum(dim=-1).clamp(min=1)
+        loss: Float[torch.Tensor, "B"] = einsum(
             sq,
             m,
-            "... l, ... l -> ...",
+            "b l, b l -> b",
         ) / (3.0 * L_eff)
     else:
         L = r_denoised.shape[-2]
         loss = sq.sum(dim=-1) / (3.0 * L)
+
+    loss = loss * lambda_sigma_weight
 
     if torch.isnan(loss).any():
         raise LossComputationError
@@ -110,6 +117,7 @@ def med_loss(
     logits_aa_blocks: list[Float[torch.Tensor, "K N_res n_amino"]],
     batch: FeaturizedBatch,
     loss_params: LossParams,
+    lambda_sigma_weight: Float[torch.Tensor, "B"],
 ) -> Float[torch.Tensor, ""]:
     """Intermediate loss over K decoder blocks.
 
@@ -119,6 +127,10 @@ def med_loss(
     gamma^0 = 1), so the final block always receives weight 1 and earlier
     blocks are progressively discounted.
 
+    The EDM noise weighting ``lambda_sigma_weight`` is applied to the
+    structural term of each block, matching the outer Kabsch MSE loss so all
+    loss components remain on the same scale across noise levels.
+
     Args:
         r_denoised_blocks: K tensors of denoised atom positions, each
             ``(B, N_atom, 3)``.
@@ -127,6 +139,8 @@ def med_loss(
         batch: Ground-truth coordinates, atom masks, and amino-acid indices.
         loss_params: Scalar hyperparameters lam (lambda), alpha_0, and gamma
             controlling loss weighting.
+        lambda_sigma_weight: Per-batch EDM loss weight
+            ``(t̂² + sigma_data²) / (t̂ · sigma_data)²``, shape ``(B,)``.
 
     Returns:
         Scalar mean intermediate loss L_med.
@@ -146,8 +160,8 @@ def med_loss(
     if len(logits_aa_blocks) != K:
         raise BlockCountMismatchError(K, len(logits_aa_blocks))
 
-    intermediate_loss: Float[torch.Tensor, ""] = torch.tensor(
-        0.0,
+    intermediate_loss: Float[torch.Tensor, "B"] = torch.zeros(
+        lambda_sigma_weight.shape[0],
         device=r_denoised_blocks[0].device,
     )
     for k_idx, intermediate_denoised_coord in enumerate(
@@ -159,13 +173,14 @@ def med_loss(
             logits_aa_blocks[k_idx],
             batch.aa_indices,
         )
-        structure_loss: Float[torch.Tensor, ""] = atom_loss(
+        structure_loss: Float[torch.Tensor, "B"] = atom_loss(
             intermediate_denoised_coord,
             batch.r_gt,
             batch.atom5_mask,
+            lambda_sigma_weight=lambda_sigma_weight,
         )
 
-        k_loss: Float[torch.Tensor, ""] = (
+        k_loss: Float[torch.Tensor, "B"] = (
             lam * structure_loss + alpha_0 * seq_loss
         )
         intermediate_loss = intermediate_loss + gamma_K_minus_k * k_loss

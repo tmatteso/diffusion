@@ -241,7 +241,7 @@ def take_step(
 
     with StepContext(model=model_params.model, train_mode=train_mode):
         # Elucidating diffusion model loss weighting:
-        lambda_sigma_loss_weight: Float[torch.Tensor, ""] = (
+        lambda_sigma_loss_weight: Float[torch.Tensor, "B"] = (
             featurized_batch.t_hat**2 + sigma_data**2
         ) / (featurized_batch.t_hat * sigma_data) ** 2
 
@@ -254,9 +254,7 @@ def take_step(
             pred_outputs.r_denoised,
             featurized_batch.r_gt,
             featurized_batch.atom5_mask,
-        )
-        Kabsch_aligned_MSE_loss = (
-            Kabsch_aligned_MSE_loss * lambda_sigma_loss_weight
+            lambda_sigma_weight=lambda_sigma_loss_weight,
         ).mean()
 
         intermediate_loss = med_loss(
@@ -264,6 +262,7 @@ def take_step(
             logits_aa_blocks=pred_outputs.intermediate_pred_aa_logit_stack,
             batch=featurized_batch,
             loss_params=model_params.tcfg.loss,
+            lambda_sigma_weight=lambda_sigma_loss_weight,
         )
         gt_res_bin_idx: Int[
             torch.Tensor,
@@ -756,6 +755,7 @@ def train(
             total=estimated_steps,
             leave=False,
             unit="step",
+            disable=(rank != 0),
         )
         step = StepProgress(
             global_step=global_step,

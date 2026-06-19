@@ -176,7 +176,10 @@ def test_atom_loss_perfect_prediction_near_zero() -> None:
     coordinates are identical to the target coordinates.
     """
     r = torch.randn(B, N, 3)
-    assert atom_loss(r, r).mean().item() < TOLERANCE
+    assert (
+        atom_loss(r, r, lambda_sigma_weight=torch.ones(B)).mean().item()
+        < TOLERANCE
+    )
 
 
 def test_atom_loss_noisy_prediction_positive_and_finite() -> None:
@@ -187,7 +190,7 @@ def test_atom_loss_noisy_prediction_positive_and_finite() -> None:
     """
     r = torch.randn(B, N, 3)
     r_noisy = r + 0.5 * torch.randn(B, N, 3)
-    loss = atom_loss(r, r_noisy)
+    loss = atom_loss(r, r_noisy, lambda_sigma_weight=torch.ones(B))
     assert (loss > 0).all()
     assert torch.isfinite(loss).all()
 
