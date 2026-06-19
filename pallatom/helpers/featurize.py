@@ -296,7 +296,7 @@ def featurize_single_item(
         -100,
         dtype=torch.long,
     )
-    aa_indices[:N_res] = torch.tensor(prot.aatype, dtype=torch.long)
+    aa_indices[:unpadded_N_res] = torch.tensor(prot.aatype, dtype=torch.long)
 
     ala_ref_pos: Float[torch.Tensor, "5 3"] = ref_pos_for_residue("ALA")
     ala_ref_elem: Float[torch.Tensor, "5 4"] = ATOM5_ELEMENTS.float()
