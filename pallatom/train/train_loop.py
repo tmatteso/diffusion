@@ -10,7 +10,7 @@ import dataclasses
 import math
 import os
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from pathlib import Path
 from typing import NoReturn, cast
 
@@ -745,6 +745,11 @@ def train(
         accum_tokens: int = 0
         model_params.optimizer.zero_grad()
 
+        # Calling iter() triggers ShardDataLoader.__iter__, which dequeues
+        # the current-epoch plan and updates _cached_len before we read it.
+        train_iter: Iterator[list[Protein]] = iter(
+            cast(Iterable[list[Protein]], train_loader),
+        )
         estimated_steps: int = math.ceil(
             len(train_loader)
             * model_params.tcfg.train_loader.token_budget
@@ -767,7 +772,7 @@ def train(
             step_n_proteins=[],
         )
 
-        for batch in cast(Iterable[list[Protein]], train_loader):
+        for batch in train_iter:
 
             n_proteins: int = len(batch)
             n_all_tokens: int = sum(p.atom_positions.shape[0] for p in batch)
