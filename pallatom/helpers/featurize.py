@@ -282,14 +282,14 @@ def featurize_single_item(
     # The pdb residue number for calculating relative positional embedding
     f_residue_idx: Int[torch.Tensor, "N_res"] = torch.tensor(prot.residue_index)
     Natom: int = 5
-    N_res: int = atom37_positions.shape[0]
+    unpadded_N_res: int = atom37_positions.shape[0]
 
-    pad = max_seq_len_in_batch - N_res
+    pad = max_seq_len_in_batch - unpadded_N_res
     if pad > 0:
         atom37_positions = F.pad(atom37_positions, (0, 0, 0, 0, 0, pad))
         atom37_mask = F.pad(atom37_mask, (0, 0, 0, pad))
         f_residue_idx = F.pad(f_residue_idx, (0, pad))
-    N_res = max_seq_len_in_batch
+    N_res: int = max_seq_len_in_batch
 
     aa_indices: Int[torch.Tensor, "N_res"] = torch.full(
         (max_seq_len_in_batch,),
