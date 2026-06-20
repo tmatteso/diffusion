@@ -758,7 +758,7 @@ def train(
         pbar: tqdm[NoReturn] = tqdm(  # pylint: disable=unsubscriptable-object
             desc=f"Epoch {epoch:03d}/{tp.num_epochs}",
             total=estimated_steps,
-            leave=False,
+            leave=True,
             unit="step",
             disable=(rank != 0),
         )
@@ -807,6 +807,7 @@ def train(
             n_batches += 1
             micro_buffer = []
 
+        pbar.close()
         model_params.scheduler.step()
 
         epoch_val_metrics, _ = evaluate(
@@ -846,7 +847,6 @@ def train(
                 rank=rank,
                 log=log,
             )
-        pbar.close()
 
 
 def _parse_args() -> TrainArgs:
