@@ -26,6 +26,7 @@ from helpers.atom_utils import RESTYPE_NUM_NO_X, Protein, restype_order
 from helpers.data import (
     DatasetSplitsManifest,
     Distogram,
+    FeaturizeCollate,
     FeaturizedBatch,
     FeaturizedItem,
     ProteinDataset,
@@ -1087,6 +1088,47 @@ def test_featurize_batch_rejects_wrong_atom_count() -> None:
             chain_index=np.zeros(N_RES, dtype=np.intp),
             b_factors=np.zeros((N_RES, 37), dtype=np.float64),
         )
+
+
+# ---------------------------------------------------------------------------
+# FeaturizeCollate
+# ---------------------------------------------------------------------------
+
+
+def test_featurize_collate_returns_featurized_batch(
+    featurize_protein_batch: list[Protein],
+    tcfg: TrainConfig,
+    c_beta_distogram_fn: Distogram,
+    atom_distogram_fn: Distogram,
+) -> None:
+    """FeaturizeCollate.__call__ returns a FeaturizedBatch."""
+    collate = FeaturizeCollate(
+        tcfg=tcfg,
+        distogram_res=c_beta_distogram_fn,
+        distogram_atom=atom_distogram_fn,
+    )
+    result = collate(featurize_protein_batch)
+    assert isinstance(result, FeaturizedBatch)
+
+
+def test_featurize_collate_is_picklable(
+    featurize_protein_batch: list[Protein],
+    tcfg: TrainConfig,
+    c_beta_distogram_fn: Distogram,
+    atom_distogram_fn: Distogram,
+) -> None:
+    """FeaturizeCollate survives a pickle round-trip for num_workers > 0."""
+    collate = FeaturizeCollate(
+        tcfg=tcfg,
+        distogram_res=c_beta_distogram_fn,
+        distogram_atom=atom_distogram_fn,
+    )
+    restored = cast(
+        FeaturizeCollate,
+        pickle.loads(pickle.dumps(collate)),  # noqa: S301
+    )
+    result = restored(featurize_protein_batch)
+    assert isinstance(result, FeaturizedBatch)
 
 
 # ---------------------------------------------------------------------------

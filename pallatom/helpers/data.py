@@ -725,6 +725,44 @@ def featurize_batch(
     )
 
 
+@dataclasses.dataclass
+class FeaturizeCollate:
+    """Picklable collation callable wrapping featurize_batch for workers.
+
+    Captures the three featurization dependencies so the collate_fn
+    contract ``(batch: list[T]) -> CollatedT`` is satisfied. Implemented
+    as a dataclass so it survives pickle round-trips required by
+    multi-worker DataLoaders.
+
+    Attributes:
+        tcfg: Training configuration supplying noise schedule parameters.
+        distogram_res: Residue-level Cβ distogram module.
+        distogram_atom: Atom-level sparse distogram module.
+    """
+
+    tcfg: TrainConfig
+    distogram_res: Distogram
+    distogram_atom: Distogram
+
+    @jaxtyped(typechecker=beartype)
+    def __call__(self, batch: list[Protein]) -> FeaturizedBatch:
+        """Featurize a pre-assembled protein batch.
+
+        Args:
+            batch: List of proteins assembled by the dataset iterator.
+
+        Returns:
+            FeaturizedBatch with noisy inputs, ground-truth positions,
+            and labels.
+        """
+        return featurize_batch(
+            batch,
+            self.tcfg,
+            self.distogram_res,
+            self.distogram_atom,
+        )
+
+
 @jaxtyped(typechecker=beartype)
 def apply_conditioning_dropout(
     batch: FeaturizedBatch,
