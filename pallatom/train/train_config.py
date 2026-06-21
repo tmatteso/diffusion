@@ -8,7 +8,6 @@ conditioning dropout.
 
 import dataclasses
 import pathlib
-from pathlib import Path
 from typing import ClassVar
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -425,10 +424,10 @@ class TrainArgs:
         debug_run: If True, restrict to 252 proteins for fast iteration.
     """
 
-    dataset_jsonl: Path
-    shard_dir: Path
-    keys_for_splits_json: Path
-    config: Path
-    structlog_jsonl: Path
+    dataset_jsonl: pathlib.Path
+    shard_dir: pathlib.Path
+    keys_for_splits_json: pathlib.Path
+    config: pathlib.Path
+    structlog_jsonl: pathlib.Path
     ddp: bool
     debug_run: bool
