@@ -15,9 +15,11 @@ from typing import cast
 import numpy as np
 import numpy.typing as npt
 import pytest
+import torch.nn as nn
 from helpers.atom_utils import Protein, restype_order
 from helpers.data import (
     DatasetSplitsManifest,
+    Distogram,
     FeaturizedBatch,
     FeaturizedItem,
     ProteinDataset,
@@ -25,7 +27,12 @@ from helpers.data import (
     ShardBudgetParameters,
     ShardDataLoader,
     ShardMetadata,
+    apply_conditioning_dropout,
+    featurize_batch,
+    featurize_single_item,
     make_bucketed_data_loaders,
+    ref_pos_for_residue,
+    sinusoidal_encoding,
 )
 from train.train_config import LoaderConfig as EvalLoaderConfig
 from train.train_config import TrainArgs, TrainConfig, TrainLoaderConfig
@@ -925,3 +932,38 @@ def test_featurized_item_is_importable_from_data() -> None:
 def test_featurized_batch_is_importable_from_data() -> None:
     """FeaturizedBatch is a dataclass importable directly from helpers.data."""
     assert dataclasses.is_dataclass(FeaturizedBatch)
+
+
+# ---------------------------------------------------------------------------
+# Featurization utilities — importability from helpers.data
+# ---------------------------------------------------------------------------
+
+
+def test_distogram_is_importable_from_data() -> None:
+    """Distogram is an nn.Module importable directly from helpers.data."""
+    assert issubclass(Distogram, nn.Module)
+
+
+def test_sinusoidal_encoding_is_importable_from_data() -> None:
+    """sinusoidal_encoding is callable and importable from helpers.data."""
+    assert callable(sinusoidal_encoding)
+
+
+def test_ref_pos_for_residue_is_importable_from_data() -> None:
+    """ref_pos_for_residue is callable and importable from helpers.data."""
+    assert callable(ref_pos_for_residue)
+
+
+def test_featurize_single_item_is_importable_from_data() -> None:
+    """featurize_single_item is callable and importable from helpers.data."""
+    assert callable(featurize_single_item)
+
+
+def test_featurize_batch_is_importable_from_data() -> None:
+    """featurize_batch is callable and importable from helpers.data."""
+    assert callable(featurize_batch)
+
+
+def test_apply_conditioning_dropout_is_importable_from_data() -> None:
+    """apply_conditioning_dropout is importable from helpers.data."""
+    assert callable(apply_conditioning_dropout)

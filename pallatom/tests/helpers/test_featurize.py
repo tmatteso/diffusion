@@ -17,9 +17,10 @@ import torch
 from architecture.main_trunk import MainTrunk
 from einops import rearrange, reduce, repeat
 from helpers.atom_utils import RESTYPE_NUM_NO_X, Protein, restype_order
-from helpers.data import FeaturizedBatch, FeaturizedItem
-from helpers.featurize import (
+from helpers.data import (
     Distogram,
+    FeaturizedBatch,
+    FeaturizedItem,
     apply_conditioning_dropout,
     featurize_batch,
     featurize_single_item,

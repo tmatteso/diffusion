@@ -13,7 +13,7 @@ import torch.distributed as dist
 from architecture.main_trunk import MainTrunk
 from beartype import beartype
 from einops import reduce
-from helpers.featurize import Distogram
+from helpers.data import Distogram
 from jaxtyping import Float, jaxtyped
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import Adam

@@ -39,11 +39,12 @@ from helpers.context_managers import (
     StepContext,
     StructlogConfig,
 )
-from helpers.data import FeaturizedBatch, make_bucketed_data_loaders
-from helpers.featurize import (
+from helpers.data import (
     Distogram,
+    FeaturizedBatch,
     apply_conditioning_dropout,
     featurize_batch,
+    make_bucketed_data_loaders,
 )
 from helpers.useful_objects import (
     ComponentNorms,

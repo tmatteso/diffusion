@@ -34,8 +34,7 @@ from helpers.atom_utils import (
     to_pdb,
 )
 from helpers.context_managers import FatalOnError, StructlogConfig
-from helpers.data import FeaturizedBatch
-from helpers.featurize import Distogram, ref_pos_for_residue
+from helpers.data import Distogram, FeaturizedBatch, ref_pos_for_residue
 from jaxtyping import Bool, Float, Int, jaxtyped
 from sample.sample_config import SampleConfig, SamplerParams
 from structlog.typing import FilteringBoundLogger

@@ -29,8 +29,7 @@ from architecture.main_trunk import (
 from beartype import beartype
 from einops import einsum, rearrange, reduce, repeat
 from helpers.atom_utils import RESTYPE_NUM_NO_X
-from helpers.data import FeaturizedBatch
-from helpers.featurize import sinusoidal_encoding
+from helpers.data import FeaturizedBatch, sinusoidal_encoding
 from helpers.useful_objects import manual_seed
 from jaxtyping import Bool, Float, Int, jaxtyped
 from train.train_config import (

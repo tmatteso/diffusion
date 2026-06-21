@@ -19,8 +19,7 @@ import torch.nn as nn
 from architecture.main_trunk import MainTrunk
 from einops import reduce
 from helpers.atom_utils import RESTYPE_NUM, RESTYPE_NUM_NO_X, Protein
-from helpers.data import make_bucketed_data_loaders
-from helpers.featurize import Distogram
+from helpers.data import Distogram, make_bucketed_data_loaders
 from helpers.useful_objects import (
     ComponentNorms,
     EpochMetrics,
