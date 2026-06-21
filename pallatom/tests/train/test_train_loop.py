@@ -27,7 +27,6 @@ from helpers.useful_objects import (
     LossMetrics,
     ModelSetup,
     ThroughputStatistics,
-    TrainArgs,
     manual_seed,
 )
 from pydantic import ValidationError
@@ -42,6 +41,7 @@ from train.train_config import (
     ModelParams,
     NoiseScheduleParams,
     ResidueDistogramParams,
+    TrainArgs,
     TrainConfig,
     TrainingParams,
     TrainLoaderConfig,

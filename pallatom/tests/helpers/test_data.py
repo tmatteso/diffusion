@@ -25,9 +25,8 @@ from helpers.data import (
     ShardMetadata,
     make_bucketed_data_loaders,
 )
-from helpers.useful_objects import TrainArgs
 from train.train_config import LoaderConfig as EvalLoaderConfig
-from train.train_config import TrainConfig, TrainLoaderConfig
+from train.train_config import TrainArgs, TrainConfig, TrainLoaderConfig
 
 _N_RES_DATA = 6  # residues per synthetic entry
 _MAX_SEQ = 8  # padded / truncated to this length

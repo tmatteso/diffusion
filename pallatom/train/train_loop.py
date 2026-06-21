@@ -53,7 +53,6 @@ from helpers.useful_objects import (
     ModelSetup,
     StepProgress,
     ThroughputStatistics,
-    TrainArgs,
 )
 from jaxtyping import Float, Int, jaxtyped
 from structlog.typing import FilteringBoundLogger
@@ -61,7 +60,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import Adam
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from tqdm import tqdm
-from train.train_config import TrainConfig
+from train.train_config import TrainArgs, TrainConfig
 
 
 @dataclasses.dataclass
@@ -662,7 +661,9 @@ def flush_micro_buffer(
     )
     loss_dict: dict[str, float] = loss_metrics.to_float_dict()
 
-    step.pbar.update(1)  # pyright: ignore[reportUnusedCallResult]
+    step.pbar.update(
+        len(n_proteins_buffer),
+    )  # pyright: ignore[reportUnusedCallResult]
     if step.rank == 0:
         step.pbar.set_postfix(  # pyright: ignore[reportUnknownMemberType]
             {k: f"{v:.2f}" for k, v in loss_dict.items()},
@@ -807,7 +808,6 @@ def train(
             n_batches += 1
             micro_buffer = []
 
-        pbar.close()
         model_params.scheduler.step()
 
         epoch_val_metrics, _ = evaluate(
@@ -847,6 +847,7 @@ def train(
                 rank=rank,
                 log=log,
             )
+    pbar.close()  # pyright: ignore[reportPossiblyUnboundVariable]
 
 
 def _parse_args() -> TrainArgs:

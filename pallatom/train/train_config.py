@@ -6,7 +6,9 @@ distogram binning, loss weights, checkpointing, logging, data-loading, and
 conditioning dropout.
 """
 
+import dataclasses
 import pathlib
+from pathlib import Path
 from typing import ClassVar
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -407,3 +409,26 @@ class TrainConfig(BaseModel):
     conditioning_dropout: ConditioningDropoutConfig = Field(
         default_factory=ConditioningDropoutConfig,
     )
+
+
+@dataclasses.dataclass
+class TrainArgs:
+    """Parsed command-line arguments for the training entry point.
+
+    Attributes:
+        dataset_jsonl: Path to the proteins JSONL dataset file.
+        shard_dir: Directory containing the pre-built shard tars.
+        keys_for_splits_json: Path to the train/val/test splits JSON.
+        config: Path to TrainConfig JSON.
+        structlog_jsonl: Path to write structured JSON log lines.
+        ddp: If True, use DistributedDataParallel training.
+        debug_run: If True, restrict to 252 proteins for fast iteration.
+    """
+
+    dataset_jsonl: Path
+    shard_dir: Path
+    keys_for_splits_json: Path
+    config: Path
+    structlog_jsonl: Path
+    ddp: bool
+    debug_run: bool

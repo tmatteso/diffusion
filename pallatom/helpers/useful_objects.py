@@ -6,7 +6,6 @@ that are threaded through training and evaluation passes.
 """
 
 import dataclasses
-from pathlib import Path
 from typing import NoReturn, cast
 
 import torch
@@ -328,26 +327,3 @@ class StepProgress:
     step_throughput_stats: list[ThroughputStatistics]
     step_component_norms: list[ComponentNorms]
     step_n_proteins: list[int]
-
-
-@dataclasses.dataclass
-class TrainArgs:
-    """Parsed command-line arguments for the training entry point.
-
-    Attributes:
-        dataset_jsonl: Path to the proteins JSONL dataset file.
-        shard_dir: Directory containing the pre-built shard tars.
-        keys_for_splits_json: Path to the train/val/test splits JSON.
-        config: Path to TrainConfig JSON.
-        structlog_jsonl: Path to write structured JSON log lines.
-        ddp: If True, use DistributedDataParallel training.
-        debug_run: If True, restrict to 252 proteins for fast iteration.
-    """
-
-    dataset_jsonl: Path
-    shard_dir: Path
-    keys_for_splits_json: Path
-    config: Path
-    structlog_jsonl: Path
-    ddp: bool
-    debug_run: bool

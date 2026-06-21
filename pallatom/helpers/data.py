@@ -36,7 +36,6 @@ from helpers.context_managers import (
     ShardWorkerNotInitializedError,
     ShardWorkerState,
 )
-from helpers.useful_objects import TrainArgs
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -45,7 +44,7 @@ from pydantic import (
 )
 from structlog.typing import FilteringBoundLogger
 from torch.utils.data.distributed import DistributedSampler
-from train.train_config import TrainConfig
+from train.train_config import TrainArgs, TrainConfig
 from typing_extensions import override
 from webdataset.writer import TarWriter
 
