@@ -24,7 +24,7 @@ from architecture.losses import (
 from beartype import beartype
 from einops import einsum, rearrange, repeat
 from helpers.atom_utils import RESTYPE_NUM_NO_X, Protein, restype_order
-from helpers.batch_types import FeaturizedBatch, FeaturizedItem
+from helpers.data import FeaturizedBatch, FeaturizedItem
 from helpers.featurize import (
     Distogram,
     apply_conditioning_dropout,

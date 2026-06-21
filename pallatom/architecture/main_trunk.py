@@ -40,7 +40,7 @@ from architecture.pair_update import PairUpdate
 from architecture.template_embedder import TemplateEmbedder
 from beartype import beartype
 from einops import rearrange, repeat
-from helpers.batch_types import FeaturizedBatch
+from helpers.data import FeaturizedBatch
 from jaxtyping import Bool, Float, Int, jaxtyped
 from train.train_config import (
     AtomDistogramParams,

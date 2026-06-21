@@ -9,7 +9,7 @@ import pytest
 import torch
 from einops import repeat
 from helpers.atom_utils import Protein
-from helpers.batch_types import FeaturizedBatch, FeaturizedItem
+from helpers.data import FeaturizedBatch, FeaturizedItem
 from jaxtyping import TypeCheckError
 
 B = 2

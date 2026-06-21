@@ -23,7 +23,7 @@ from helpers.atom_utils import (
     atom37_to_cb,
     rigid_group_atom_positions,
 )
-from helpers.batch_types import FeaturizedBatch, FeaturizedItem
+from helpers.data import FeaturizedBatch, FeaturizedItem
 from jaxtyping import Bool, Float, Int, jaxtyped
 from train.train_config import NoiseScheduleParams, TrainConfig
 from typing_extensions import override

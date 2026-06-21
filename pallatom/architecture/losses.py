@@ -15,7 +15,7 @@ from architecture.errors import (
 from beartype import beartype
 from einops import einsum, rearrange
 from helpers.alignment import kabsch_align
-from helpers.batch_types import FeaturizedBatch
+from helpers.data import FeaturizedBatch
 from jaxtyping import Bool, Float, Int, jaxtyped
 from train.train_config import LossParams
 

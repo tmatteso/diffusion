@@ -32,7 +32,6 @@ from beartype import beartype
 from einops import reduce
 from helpers.alignment import kabsch_align
 from helpers.atom_utils import Protein
-from helpers.batch_types import FeaturizedBatch
 from helpers.context_managers import (
     DDPNoSync,
     DistProcessGroup,
@@ -40,7 +39,7 @@ from helpers.context_managers import (
     StepContext,
     StructlogConfig,
 )
-from helpers.data import make_bucketed_data_loaders
+from helpers.data import FeaturizedBatch, make_bucketed_data_loaders
 from helpers.featurize import (
     Distogram,
     apply_conditioning_dropout,

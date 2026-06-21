@@ -18,6 +18,8 @@ import pytest
 from helpers.atom_utils import Protein, restype_order
 from helpers.data import (
     DatasetSplitsManifest,
+    FeaturizedBatch,
+    FeaturizedItem,
     ProteinDataset,
     ProteinShardDataset,
     ShardBudgetParameters,
@@ -908,3 +910,18 @@ def test_dataset_splits_manifest_cath_nodes_populated() -> None:
     }
     manifest = DatasetSplitsManifest.model_validate(data)
     assert manifest.cath_nodes == {"p1": ["1.20.5"], "p2": ["2.60.40"]}
+
+
+# ---------------------------------------------------------------------------
+# FeaturizedItem and FeaturizedBatch — importability from helpers.data
+# ---------------------------------------------------------------------------
+
+
+def test_featurized_item_is_importable_from_data() -> None:
+    """FeaturizedItem is a dataclass importable directly from helpers.data."""
+    assert dataclasses.is_dataclass(FeaturizedItem)
+
+
+def test_featurized_batch_is_importable_from_data() -> None:
+    """FeaturizedBatch is a dataclass importable directly from helpers.data."""
+    assert dataclasses.is_dataclass(FeaturizedBatch)

@@ -33,8 +33,8 @@ from helpers.atom_utils import (
     protein_from_pdb,
     to_pdb,
 )
-from helpers.batch_types import FeaturizedBatch
 from helpers.context_managers import FatalOnError, StructlogConfig
+from helpers.data import FeaturizedBatch
 from helpers.featurize import Distogram, ref_pos_for_residue
 from jaxtyping import Bool, Float, Int, jaxtyped
 from sample.sample_config import SampleConfig, SamplerParams

@@ -12,7 +12,7 @@ import torch
 from architecture.main_trunk import PredictedOutputs
 from einops import rearrange, reduce
 from helpers.atom_utils import RESTYPE_NUM_NO_X, Protein, restype_order
-from helpers.batch_types import FeaturizedBatch
+from helpers.data import FeaturizedBatch
 from helpers.featurize import Distogram
 from helpers.useful_objects import manual_seed
 from jaxtyping import Float, TypeCheckError
