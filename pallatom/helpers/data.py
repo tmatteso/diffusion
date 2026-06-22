@@ -1411,6 +1411,47 @@ class ProteinShardDataset(torch.utils.data.IterableDataset[list[Protein]]):
             b_factors=np.zeros((n_res, 37), dtype=np.float64),
         )
 
+    def load_shard(self, sid: int) -> list[Protein]:
+        """Stream all proteins from one shard tar into a list.
+
+        Args:
+            sid: Shard index used to construct the tar filename.
+
+        Returns:
+            List of Protein objects parsed from the shard.
+        """
+        url = str(self.shard_dir / f"shard_{sid:05d}.tar")
+        ds: Iterable[dict[str, object]] = cast(
+            Iterable[dict[str, object]],
+            wds.DataPipeline(  # pyright: ignore[reportUnknownMemberType,reportAttributeAccessIssue]
+                wds.SimpleShardList(  # pyright: ignore[reportUnknownMemberType,reportAttributeAccessIssue]
+                    [url],
+                ),
+                wds.tarfile_to_samples(),  # pyright: ignore[reportUnknownMemberType,reportAttributeAccessIssue]
+            ),
+        )
+        return [self.parse_protein(s) for s in ds]
+
+    def sort_by_permutation(
+        self,
+        proteins: list[Protein],
+        permutation: Sequence[int],
+    ) -> list[Protein]:
+        """Reorder proteins according to a permutation.
+
+        Args:
+            proteins: Proteins in streaming order.
+            permutation: Maps streaming position to sorted rank.
+
+        Returns:
+            Proteins reordered so that proteins[local_pos] is placed at
+            sorted_rank.
+        """
+        out: list[Protein | None] = [None] * len(proteins)
+        for local_pos, sorted_rank in enumerate(permutation):
+            out[sorted_rank] = proteins[local_pos]
+        return [p for p in out if p is not None]
+
     @override
     def __iter__(self) -> Iterator[list[Protein]]:
         """Yield FFD batches for this worker's assigned shards.
@@ -1424,6 +1465,9 @@ class ProteinShardDataset(torch.utils.data.IterableDataset[list[Protein]]):
         4. Cut at ``batch_ends[k]``; yield each completed batch.
         5. Stash any trailing proteins as the new carry-over buffer.
 
+        Shard k+1 is read from disk in a background thread while batches
+        from shard k are being yielded, hiding inter-shard I/O latency.
+
         If set_plan has not been called, yields nothing.
         """
         plan = self._plan
@@ -1433,36 +1477,36 @@ class ProteinShardDataset(torch.utils.data.IterableDataset[list[Protein]]):
         worker_info = torch.utils.data.get_worker_info()
         worker_id: int = worker_info.id if worker_info is not None else 0
         worker_plan = plan.worker_plans[worker_id]
+        n_shards: int = len(worker_plan.shard_ids)
+
+        if n_shards == 0:
+            return
 
         carry_over: list[Protein] = []
-        for k in range(len(worker_plan.shard_ids)):
-            sid = worker_plan.shard_ids[k]
-            url = str(self.shard_dir / f"shard_{sid:05d}.tar")
-            ds: Iterable[dict[str, object]] = cast(
-                Iterable[dict[str, object]],
-                wds.DataPipeline(  # pyright: ignore[reportUnknownMemberType,reportAttributeAccessIssue]
-                    wds.SimpleShardList(  # pyright: ignore[reportUnknownMemberType,reportAttributeAccessIssue]
-                        [url],
-                    ),
-                    wds.tarfile_to_samples(),  # pyright: ignore[reportUnknownMemberType,reportAttributeAccessIssue]
-                ),
+        with ThreadPoolExecutor(max_workers=1) as loader:
+            next_future: Future[list[Protein]] = loader.submit(
+                self.load_shard,
+                worker_plan.shard_ids[0],
             )
-            shard_proteins: list[Protein] = [self.parse_protein(s) for s in ds]
+            for k in range(n_shards):
+                shard_proteins: list[Protein] = next_future.result()
+                # Start reading shard k+1 from disk while we yield from shard k.
+                if k + 1 < n_shards:
+                    next_future = loader.submit(
+                        self.load_shard,
+                        worker_plan.shard_ids[k + 1],
+                    )
 
-            permutation = worker_plan.permutations[k]
-            sorted_proteins: list[Protein | None] = [None] * len(shard_proteins)
-            for local_pos, sorted_rank in enumerate(permutation):
-                sorted_proteins[sorted_rank] = shard_proteins[local_pos]
-            sorted_proteins_checked: list[Protein] = [
-                p for p in sorted_proteins if p is not None
-            ]
-
-            full: list[Protein] = carry_over + sorted_proteins_checked
-            prev_cut = 0
-            for cut in worker_plan.batch_ends[k]:
-                yield full[prev_cut:cut]
-                prev_cut = cut
-            carry_over = full[prev_cut:]
+                sorted_proteins = self.sort_by_permutation(
+                    shard_proteins,
+                    worker_plan.permutations[k],
+                )
+                full: list[Protein] = carry_over + sorted_proteins
+                prev_cut = 0
+                for cut in worker_plan.batch_ends[k]:
+                    yield full[prev_cut:cut]
+                    prev_cut = cut
+                carry_over = full[prev_cut:]
 
         if carry_over:
             yield carry_over

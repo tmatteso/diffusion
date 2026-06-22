@@ -226,6 +226,10 @@ def take_step(
             device="cpu",
         )
 
+    b_size, n_res = cpu_batch.f_residue_idx.shape
+    actual_residues: int = int(cpu_batch.f_pseudo_beta_mask.sum().item())
+    actual_atoms: int = int(cpu_batch.atom5_mask.sum().item())
+
     featurized_batch: FeaturizedBatch = cpu_batch.to(
         model_params.device,
         non_blocking=True,
@@ -318,10 +322,6 @@ def take_step(
 
     t1 = time.perf_counter()
     step_time = t1 - t0
-
-    b_size, n_res = featurized_batch.f_residue_idx.shape
-    actual_residues = int(featurized_batch.f_pseudo_beta_mask.sum().item())
-    actual_atoms = int(featurized_batch.atom5_mask.sum().item())
 
     return LossMetrics(
         total_loss=total_loss,
