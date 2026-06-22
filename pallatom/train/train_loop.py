@@ -31,7 +31,6 @@ from architecture.main_trunk import MainTrunk, PredictedOutputs
 from beartype import beartype
 from einops import reduce
 from helpers.alignment import kabsch_align
-from helpers.atom_utils import Protein
 from helpers.context_managers import (
     DDPNoSync,
     DistProcessGroup,
@@ -43,7 +42,6 @@ from helpers.data import (
     Distogram,
     FeaturizedBatch,
     apply_conditioning_dropout,
-    featurize_batch,
     make_bucketed_data_loaders,
 )
 from helpers.useful_objects import (
@@ -190,7 +188,7 @@ def save_checkpoint(
 @jaxtyped(typechecker=beartype)
 def take_step(
     *,
-    batch: list[Protein],
+    batch: FeaturizedBatch,
     model_params: ModelSetup,
     train_mode: bool,
     grad_scale: float = 1.0,
@@ -202,7 +200,7 @@ def take_step(
     accumulated gradients match a single large-batch backward.
 
     Args:
-        batch: Raw protein micro-batch.
+        batch: Pre-featurized micro-batch produced by FeaturizeCollate.
         model_params: Bundled model, optimizer, config, and device.
         train_mode: If True, enables dropout, conditioning dropout, and backward
             pass.
@@ -214,16 +212,11 @@ def take_step(
     """
     t0 = time.perf_counter()
 
-    cpu_batch: FeaturizedBatch = featurize_batch(
-        batch,
-        model_params.tcfg,
-        model_params.distogram_res,
-        model_params.distogram_atom,
-    )
     sigma_data = model_params.tcfg.noise.sigma_data
 
     lp = model_params.tcfg.loss
 
+    cpu_batch: FeaturizedBatch = batch
     if train_mode:
         cpu_batch = apply_conditioning_dropout(
             cpu_batch,
@@ -348,7 +341,7 @@ def take_step(
 
 
 def process_accum_window(
-    micro_buffer: list[list[Protein]],
+    micro_buffer: list[FeaturizedBatch],
     n_proteins_per_batch: list[int],
     model_params: ModelSetup,
 ) -> tuple[LossMetrics, ThroughputStatistics]:
@@ -435,13 +428,15 @@ def evaluate(
 
     log.info("evaluate_start", n_batches=len(loader))
 
-    pbar: tqdm[list[Protein]] = tqdm(  # pylint: disable=unsubscriptable-object
-        cast(Iterable[list[Protein]], loader),
-        desc="evaluate",
-        total=len(loader),
-        leave=False,
-        unit="batch",
-        disable=(rank != 0),
+    pbar: tqdm[FeaturizedBatch] = (  # pylint: disable=unsubscriptable-object
+        tqdm(
+            cast(Iterable[FeaturizedBatch], loader),
+            desc="evaluate",
+            total=len(loader),
+            leave=False,
+            unit="batch",
+            disable=(rank != 0),
+        )
     )
     with DistProcessGroup.guard():
         for batch in pbar:
@@ -518,7 +513,7 @@ def component_grad_norms(model: MainTrunk | DDP) -> ComponentNorms:
 
 
 def optimizer_step(
-    micro_buffer: list[list[Protein]],
+    micro_buffer: list[FeaturizedBatch],
     n_proteins_buffer: list[int],
     model_params: ModelSetup,
     global_step: int,
@@ -649,7 +644,7 @@ def log_epoch(
 
 
 def flush_micro_buffer(
-    micro_buffer: list[list[Protein]],
+    micro_buffer: list[FeaturizedBatch],
     n_proteins_buffer: list[int],
     model_params: ModelSetup,
     step: StepProgress,
@@ -761,15 +756,15 @@ def train(
             model_params.model.train()
         )  # returns "DistributedDataParallel | MainTrunk"
         n_batches = 0
-        micro_buffer: list[list[Protein]] = []
+        micro_buffer: list[FeaturizedBatch] = []
         n_proteins_buffer: list[int] = []
         accum_tokens: int = 0
         model_params.optimizer.zero_grad()
 
         # Calling iter() triggers ShardDataLoader.__iter__, which dequeues
         # the current-epoch plan and updates _cached_len before we read it.
-        train_iter: Iterator[list[Protein]] = iter(
-            cast(Iterable[list[Protein]], train_loader),
+        train_iter: Iterator[FeaturizedBatch] = iter(
+            cast(Iterable[FeaturizedBatch], train_loader),
         )
         estimated_steps: int = math.ceil(
             len(train_loader)
@@ -795,8 +790,10 @@ def train(
 
         for batch in train_iter:
 
-            n_proteins: int = len(batch)
-            n_all_tokens: int = sum(p.atom_positions.shape[0] for p in batch)
+            n_proteins: int = int(batch.r_gt.shape[0])
+            n_all_tokens: int = int(
+                batch.r_gt.shape[0] * batch.r_gt.shape[1],
+            )
 
             # if adding this batch would push tokens over the budget, flush.
             if (

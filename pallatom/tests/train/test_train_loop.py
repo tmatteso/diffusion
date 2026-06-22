@@ -19,7 +19,12 @@ import torch.nn as nn
 from architecture.main_trunk import MainTrunk
 from einops import reduce
 from helpers.atom_utils import RESTYPE_NUM, RESTYPE_NUM_NO_X, Protein
-from helpers.data import Distogram, FeaturizedBatch, make_bucketed_data_loaders
+from helpers.data import (
+    Distogram,
+    FeaturizedBatch,
+    featurize_batch,
+    make_bucketed_data_loaders,
+)
 from helpers.useful_objects import (
     ComponentNorms,
     EpochMetrics,
@@ -423,6 +428,20 @@ def protein_batch(single_sample: Protein) -> list[Protein]:
 
 
 @pytest.fixture
+def featurized_batch(
+    protein_batch: list[Protein],
+    model_params: ModelSetup,
+) -> FeaturizedBatch:
+    """FeaturizedBatch produced from protein_batch for take_step tests."""
+    return featurize_batch(
+        protein_batch,
+        model_params.tcfg,
+        model_params.distogram_res,
+        model_params.distogram_atom,
+    )
+
+
+@pytest.fixture
 def loaders(
     tmp_path: pathlib.Path,
     jsonl_path: str,
@@ -535,7 +554,7 @@ def wandb_call_counter(monkeypatch: pytest.MonkeyPatch) -> list[object]:
 
 
 def test_take_step_eval_outputs(
-    protein_batch: list[Protein],
+    featurized_batch: FeaturizedBatch,
     model_params: ModelSetup,
 ) -> None:
     """Verify take_step eval-mode outputs are well-formed and gradient-free.
@@ -550,7 +569,7 @@ def test_take_step_eval_outputs(
     """
     model_params.model.zero_grad()
     loss_metrics, tput = take_step(
-        batch=protein_batch,
+        batch=featurized_batch,
         model_params=model_params,
         train_mode=False,
     )
@@ -580,14 +599,14 @@ def test_take_step_eval_outputs(
 
 
 def test_take_step_train_produces_gradients(
-    protein_batch: list[Protein],
+    featurized_batch: FeaturizedBatch,
     model_params: ModelSetup,
 ) -> None:
     """take_step(train_mode=True) back-props grads into model parameters."""
     _ = model_params.model.train()
     model_params.model.zero_grad()
     _ = take_step(
-        batch=protein_batch,
+        batch=featurized_batch,
         model_params=model_params,
         train_mode=True,
     )
@@ -595,7 +614,7 @@ def test_take_step_train_produces_gradients(
 
 
 def test_take_step_grad_scale_halves_gradient_norm(
-    protein_batch: list[Protein],
+    featurized_batch: FeaturizedBatch,
     model_params: ModelSetup,
 ) -> None:
     """grad_scale=2 yields approx half the gradient L2 norm of grad_scale=1.
@@ -608,7 +627,7 @@ def test_take_step_grad_scale_halves_gradient_norm(
     _ = manual_seed(0)
     model_params.model.zero_grad()
     _ = take_step(
-        batch=protein_batch,
+        batch=featurized_batch,
         model_params=model_params,
         train_mode=True,
         grad_scale=1.0,
@@ -626,7 +645,7 @@ def test_take_step_grad_scale_halves_gradient_norm(
     _ = manual_seed(0)
     model_params.model.zero_grad()
     _ = take_step(
-        batch=protein_batch,
+        batch=featurized_batch,
         model_params=model_params,
         train_mode=True,
         grad_scale=2.0,
@@ -650,14 +669,14 @@ def test_take_step_grad_scale_halves_gradient_norm(
 
 
 def test_process_accum_window_outputs(
-    protein_batch: list[Protein],
+    featurized_batch: FeaturizedBatch,
     model_params: ModelSetup,
 ) -> None:
     """process_accum_window -> finite LossMetrics, ThroughputStatistics."""
     _ = model_params.model.train()
     model_params.model.zero_grad()
     loss_metrics, tput = process_accum_window(
-        [protein_batch],
+        [featurized_batch],
         [1],
         model_params,
     )
@@ -677,7 +696,7 @@ def test_process_accum_window_outputs(
 
 
 def test_process_accum_window_protein_weighted_grad_scale(
-    protein_batch: list[Protein],
+    featurized_batch: FeaturizedBatch,
     model_params: ModelSetup,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -693,7 +712,7 @@ def test_process_accum_window_protein_weighted_grad_scale(
 
     def _recording_take_step(
         *,
-        batch: list[Protein],
+        batch: FeaturizedBatch,
         model_params: ModelSetup,  # pylint: disable=redefined-outer-name
         train_mode: bool,
         grad_scale: float = 1.0,
@@ -709,7 +728,7 @@ def test_process_accum_window_protein_weighted_grad_scale(
     monkeypatch.setattr("train.train_loop.take_step", _recording_take_step)
     _ = model_params.model.train()
     model_params.model.zero_grad()
-    acummulated_batch = [protein_batch, protein_batch]
+    acummulated_batch = [featurized_batch, featurized_batch]
     _ = process_accum_window(acummulated_batch, [1, 3], model_params)
 
     assert len(captured_scales) == len(acummulated_batch)
@@ -723,7 +742,7 @@ def test_process_accum_window_protein_weighted_grad_scale(
 
 
 def test_component_grad_norms_outputs(
-    protein_batch: list[Protein],
+    featurized_batch: FeaturizedBatch,
     model_params: ModelSetup,
 ) -> None:
     """Component_grad_norms returns a ComponentNorms with all positive values.
@@ -735,7 +754,7 @@ def test_component_grad_norms_outputs(
     _ = model_params.model.train()
     model_params.model.zero_grad()
     _ = take_step(
-        batch=protein_batch,
+        batch=featurized_batch,
         model_params=model_params,
         train_mode=True,
     )
@@ -752,7 +771,7 @@ def test_component_grad_norms_outputs(
 
 
 def test_optimizer_step_outputs(
-    protein_batch: list[Protein],
+    featurized_batch: FeaturizedBatch,
     model_params: ModelSetup,
 ) -> None:
     """Verify optimizer_step returns valid outputs and updates model parameters.
@@ -770,7 +789,7 @@ def test_optimizer_step_outputs(
     model_params.model.zero_grad()
     global_step = 5
     loss_metrics, _, norms, new_step = optimizer_step(
-        [protein_batch],
+        [featurized_batch],
         [1],
         model_params,
         global_step=global_step,
@@ -1211,7 +1230,7 @@ def test_train_token_budget_preflush_fires_before_oversized_batch(
     _real_process = process_accum_window
 
     def _tracking_process(
-        micro_buffer: list[list[Protein]],
+        micro_buffer: list[FeaturizedBatch],
         n_proteins_per_batch: list[int],
         model_params: ModelSetup,  # pylint: disable=redefined-outer-name
     ) -> tuple[LossMetrics, ThroughputStatistics]:
@@ -1616,14 +1635,14 @@ def test_train_wandb_epoch_increments_across_epochs(
 
 
 def test_integration_gradient_flow_through_all_submodules(
-    protein_batch: list[Protein],
+    featurized_batch: FeaturizedBatch,
     model_params: ModelSetup,
 ) -> None:
     """take_step(train_mode) back-props nonzero grads to every submodule."""
     _ = model_params.model.train()
     model_params.model.zero_grad()
     _ = take_step(
-        batch=protein_batch,
+        batch=featurized_batch,
         model_params=model_params,
         train_mode=True,
     )
