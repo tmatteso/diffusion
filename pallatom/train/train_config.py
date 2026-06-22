@@ -290,7 +290,7 @@ class LoaderConfig(BaseModel):
 
     max_seq_length: int = Field(default=128, gt=0)  # was 256
     batch_size: int = Field(default=2, gt=0)  # was 2
-    num_workers: int = Field(default=4, gt=0)
+    num_workers: int = Field(default=1, gt=0)
 
 
 class TrainLoaderConfig(LoaderConfig):
@@ -380,8 +380,6 @@ class TrainConfig(BaseModel):
         loss: Weights and thresholds for the composite training loss.
         checkpoint: Checkpoint path and save frequency.
         logging: Logging and W&B project settings.
-        loader: Default DataLoader settings (sequence length, batch size,
-            token budget).
         train_loader: DataLoader settings used for the training split.
         test_loader: DataLoader settings used for the evaluation split.
         conditioning_dropout: Dropout probabilities for each conditioning
@@ -402,7 +400,6 @@ class TrainConfig(BaseModel):
     loss: LossParams = Field(default_factory=LossParams)
     checkpoint: CheckpointParams = Field(default_factory=CheckpointParams)
     logging: LoggingParams = Field(default_factory=LoggingParams)
-    loader: LoaderConfig = Field(default_factory=LoaderConfig)
     train_loader: TrainLoaderConfig = Field(default_factory=TrainLoaderConfig)
     test_loader: LoaderConfig = Field(default_factory=LoaderConfig)
     conditioning_dropout: ConditioningDropoutConfig = Field(
