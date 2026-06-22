@@ -1436,12 +1436,6 @@ class ProteinShardDataset(torch.utils.data.IterableDataset[list[Protein]]):
             yield carry_over
 
 
-# this will be replaced with featurize
-def identity_collate(batch: list[Protein]) -> list[Protein]:
-    """Pass pre-assembled protein batches through without default stacking."""
-    return batch
-
-
 def batch_count_in_ffd_plan(plan: FFDBatchPlan) -> int:
     """Total batch count across all workers for single epoch's FFDBatchPlan."""
     return sum(len(be) for wp in plan.worker_plans for be in wp.batch_ends)
