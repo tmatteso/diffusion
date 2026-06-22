@@ -61,6 +61,17 @@ RUN if [ "${PLATFORM}" = "cuda" ]; then \
         uv venv /opt/venv; \
     fi
 
+# Install hadolint
+ARG PLATFORM
+RUN if [ "${PLATFORM}" = "arm64" ]; then \
+        wget -qO /usr/local/bin/hadolint \
+            https://github.com/hadolint/hadolint/releases/download/v2.12.0/hadolint-Linux-arm64; \
+    else \
+        wget -qO /usr/local/bin/hadolint \
+            https://github.com/hadolint/hadolint/releases/download/v2.12.0/hadolint-Linux-x86_64; \
+    fi \
+    && chmod +x /usr/local/bin/hadolint
+
 WORKDIR /workspaces/diffusion
 
 # Install project dependencies into the image — cached as a layer, only re-runs when lockfile changes

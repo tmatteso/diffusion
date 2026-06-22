@@ -675,13 +675,12 @@ def flush_micro_buffer(
         )
     )
     loss_dict: dict[str, float] = loss_metrics.to_float_dict()
+    throughput_stats_dict: dict[str, float] = throughput_stats.to_float_dict()
 
-    step.pbar.update(
-        len(n_proteins_buffer),
-    )  # pyright: ignore[reportUnusedCallResult]
     if step.rank == 0:
         step.pbar.set_postfix(  # pyright: ignore[reportUnknownMemberType]
-            {k: f"{v:.2f}" for k, v in loss_dict.items()},
+            {k: f"{v:.2f}" for k, v in loss_dict.items()}
+            | {k: f"{v:.2f}" for k, v in throughput_stats_dict.items()},
         )
     step.step_loss_metrics.append(loss_metrics)
     step.step_throughput_stats.append(throughput_stats)
@@ -742,7 +741,11 @@ def train(
         tp.accumulated_token_budget // world_size,
     )
     if rank == 0:
-        log.info("training", ddp=dist.is_initialized())
+        log.info(
+            "training",
+            device=model_params.device,
+            ddp=dist.is_initialized(),
+        )
         log.info(
             "gradient_accumulation",
             token_budget_per_rank=per_rank_token_budget,
@@ -766,11 +769,7 @@ def train(
         train_iter: Iterator[FeaturizedBatch] = iter(
             cast(Iterable[FeaturizedBatch], train_loader),
         )
-        estimated_steps: int = math.ceil(
-            len(train_loader)
-            * model_params.tcfg.train_loader.token_budget
-            / per_rank_token_budget,
-        )
+        estimated_steps: int = math.ceil(len(train_loader))
         pbar: tqdm[NoReturn] = tqdm(  # pylint: disable=unsubscriptable-object
             desc=f"Epoch {epoch:03d}/{tp.num_epochs}",
             total=estimated_steps,
@@ -810,6 +809,12 @@ def train(
             micro_buffer.append(batch)
             n_proteins_buffer.append(n_proteins)
             accum_tokens += n_all_tokens
+            step.pbar.update(1)  # pyright: ignore[reportUnusedCallResult]
+            log.info(
+                "micro batch step taken",
+                proteins_in_micro_batch=n_proteins,
+                tokens_in_micro_batch=n_all_tokens,
+            )
 
         # Flush any remaining micro-batches at epoch end,
         # regardless of token count.

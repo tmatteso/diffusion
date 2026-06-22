@@ -108,6 +108,14 @@ repos:
         always_run: true
         stages: [pre-commit]
 
+  ### Dockerfile ###
+  # - repo: https://github.com/hadolint/hadolint
+  #   rev: v2.12.0
+  #   hooks:
+  #     - id: hadolint
+  #       name: "🐳 dockerfile · Lint Dockerfile"
+  #       stages: [pre-commit]
+
   ### Shell ###
 
   # STRICT

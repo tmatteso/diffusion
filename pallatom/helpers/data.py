@@ -242,6 +242,38 @@ class FeaturizedBatch:
             ),
         )
 
+    def pin_memory(self) -> "FeaturizedBatch":
+        """Return a new FeaturizedBatch with all tensors in pinned memory.
+
+        Called automatically by the DataLoader when ``pin_memory=True``.
+        Pinned (page-locked) memory enables truly asynchronous CPU→GPU
+        transfers when ``non_blocking=True`` is passed to ``.to()``.
+
+        Returns:
+            A new FeaturizedBatch whose tensors are in page-locked memory.
+        """
+        return dataclasses.replace(
+            self,
+            ref_pos=self.ref_pos.pin_memory(),
+            ref_element=self.ref_element.pin_memory(),
+            ref_space_uid=self.ref_space_uid.pin_memory(),
+            gt_res_distogram=self.gt_res_distogram.pin_memory(),
+            f_pseudo_beta_mask=self.f_pseudo_beta_mask.pin_memory(),
+            f_residue_idx=self.f_residue_idx.pin_memory(),
+            r_gt=self.r_gt.pin_memory(),
+            r_gt_noised=self.r_gt_noised.pin_memory(),
+            atom5_mask=self.atom5_mask.pin_memory(),
+            aa_indices=self.aa_indices.pin_memory(),
+            t_hat=self.t_hat.pin_memory(),
+            t_normalized=self.t_normalized.pin_memory(),
+            tok_idx=self.tok_idx.pin_memory(),
+            center_uid=self.center_uid.pin_memory(),
+            gt_atom_distogram_sparse=self.gt_atom_distogram_sparse.pin_memory(),
+            gt_atom_distogram_mask_sparse=(
+                self.gt_atom_distogram_mask_sparse.pin_memory()
+            ),
+        )
+
 
 # the distogram is a N x N x bin_num matrix where each entry is a 1 if a
 # residue distance is in the right num_bin bucket. the point of the distogram
