@@ -1593,6 +1593,7 @@ class ShardDataLoader(torch.utils.data.DataLoader[FeaturizedBatch]):
         self.queue_watcher: ThreadPoolExecutor = ThreadPoolExecutor(
             max_workers=1,
         )
+        self._watcher_future: Future[None] | None = None
         self.process_queue: queue.Queue[FFDBatchPlan] = queue.Queue(
             maxsize=self.prefetch_epochs,
         )
@@ -1866,6 +1867,8 @@ class ShardDataLoader(torch.utils.data.DataLoader[FeaturizedBatch]):
         self,
     ) -> Iterator[list[Protein]]:
         """Dequeue next plan, inject into dataset, delegate to DataLoader."""
+        if self._watcher_future is not None and self._watcher_future.done():
+            self._watcher_future.result()  # re-raise exception from thread
         plan = self.process_queue.get()
         self._cached_len = batch_count_in_ffd_plan(plan)
 
@@ -1885,24 +1888,23 @@ class ShardDataLoader(torch.utils.data.DataLoader[FeaturizedBatch]):
 
         def wait_and_enqueue() -> None:
             """Load from cache or compute, save, then enqueue the next plan."""
-            with FatalOnError():
-                if cache_path.exists():
-                    cached = FFDBatchPlan.model_validate_json(
-                        cache_path.read_bytes(),
-                    )
-                    self._log.info("ffd_plan_cache_hit", seed=seed)
-                    self.process_queue.put(cached)
-                    return
-                future: Future[FFDBatchPlan] = self.process_executor.submit(
-                    self.compute_ffd_plan,
-                    epoch_budget,
+            if cache_path.exists():
+                cached = FFDBatchPlan.model_validate_json(
+                    cache_path.read_bytes(),
                 )
-                computed = future.result()
-                _ = cache_path.write_bytes(plan.model_dump_json().encode())
-                self._log.info("ffd_plan_computed_and_cached", seed=seed)
-                self.process_queue.put(computed)
+                self._log.info("ffd_plan_cache_hit", seed=seed)
+                self.process_queue.put(cached)
+                return
+            future: Future[FFDBatchPlan] = self.process_executor.submit(
+                self.compute_ffd_plan,
+                epoch_budget,
+            )
+            computed = future.result()
+            _ = cache_path.write_bytes(computed.model_dump_json().encode())
+            self._log.info("ffd_plan_computed_and_cached", seed=seed)
+            self.process_queue.put(computed)
 
-        _ = self.queue_watcher.submit(wait_and_enqueue)
+        self._watcher_future = self.queue_watcher.submit(wait_and_enqueue)
         self.epoch += 1
         return super().__iter__()
 
