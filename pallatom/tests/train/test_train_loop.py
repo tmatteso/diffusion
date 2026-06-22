@@ -475,6 +475,16 @@ def loaders(
             c_atompair=_C_ATOMPAIR,
             K_unit=_K_UNIT,
         ),
+        distogram_res=ResidueDistogramParams(
+            n_bins=_N_BINS,
+            min_dist=3.25,
+            max_dist=50.75,
+        ),
+        distogram_atom=AtomDistogramParams(
+            n_bins=_N_ATOM_BINS,
+            min_dist=0.0,
+            max_dist=10.0,
+        ),
         checkpoint=CheckpointParams(
             checkpoint_path=tmp_path / "loader_best.pt",
             save_every=100,
@@ -1255,6 +1265,16 @@ def test_train_token_budget_preflush_fires_before_oversized_batch(
             accumulated_token_budget=budget,
         ),
         model=model_params.tcfg.model,
+        distogram_res=ResidueDistogramParams(
+            n_bins=_N_BINS,
+            min_dist=3.25,
+            max_dist=50.75,
+        ),
+        distogram_atom=AtomDistogramParams(
+            n_bins=_N_ATOM_BINS,
+            min_dist=0.0,
+            max_dist=10.0,
+        ),
         checkpoint=CheckpointParams(
             checkpoint_path=tmp_path / "flush.pt",
             save_every=100,

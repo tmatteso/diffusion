@@ -361,7 +361,7 @@ def process_accum_window(
     Args:
         micro_buffer: Micro-batches to process.
         n_proteins_per_batch: Protein count per micro-batch
-            (``batch.atom_positions.shape[0]``).
+            (``batch.r_gt.shape[0]``).
         model_params: Model and associated configuration (plain ``MainTrunk``
             or DDP-wrapped).
 
@@ -791,9 +791,7 @@ def train(
         for batch in train_iter:
 
             n_proteins: int = int(batch.r_gt.shape[0])
-            n_all_tokens: int = int(
-                batch.r_gt.shape[0] * batch.r_gt.shape[1],
-            )
+            n_all_tokens: int = int(batch.f_pseudo_beta_mask.sum().item())
 
             # if adding this batch would push tokens over the budget, flush.
             if (
