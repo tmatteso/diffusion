@@ -19,7 +19,7 @@ import torch.nn as nn
 from architecture.main_trunk import MainTrunk
 from einops import reduce
 from helpers.atom_utils import RESTYPE_NUM, RESTYPE_NUM_NO_X, Protein
-from helpers.data import Distogram, make_bucketed_data_loaders
+from helpers.data import Distogram, FeaturizedBatch, make_bucketed_data_loaders
 from helpers.useful_objects import (
     ComponentNorms,
     EpochMetrics,
@@ -428,8 +428,8 @@ def loaders(
     jsonl_path: str,
     splits_path: str,
 ) -> tuple[
-    torch.utils.data.DataLoader[list[Protein]],
-    torch.utils.data.DataLoader[list[Protein]],
+    torch.utils.data.DataLoader[FeaturizedBatch],
+    torch.utils.data.DataLoader[FeaturizedBatch],
 ]:
     """Provide a ShardDataLoader built by make_bucketed_data_loaders.
 
@@ -795,10 +795,11 @@ def test_optimizer_step_outputs(
 
 def test_evaluate_outputs(
     loaders: tuple[
-        torch.utils.data.DataLoader[list[Protein]],
-        torch.utils.data.DataLoader[list[Protein]],
+        torch.utils.data.DataLoader[FeaturizedBatch],
+        torch.utils.data.DataLoader[FeaturizedBatch],
     ],
     model_params: ModelSetup,
+    log: FilteringBoundLogger,
 ) -> None:
     """Evaluate returns well-formed, finite outputs and leaves no gradients.
 
@@ -811,7 +812,7 @@ def test_evaluate_outputs(
         - No model parameter accumulates a gradient.
     """
     _, test_loader = loaders
-    loss_metrics, tput = evaluate(test_loader, model_params)
+    loss_metrics, tput = evaluate(test_loader, model_params, log)
     assert isinstance(loss_metrics, LossMetrics)
     assert isinstance(tput, ThroughputStatistics)
     for name, v in [
@@ -1069,8 +1070,8 @@ def test_log_epoch_wandb_payload_keys(
 def test_train_updates_model_parameters(
     model_params: ModelSetup,
     loaders: tuple[
-        torch.utils.data.DataLoader[list[Protein]],
-        torch.utils.data.DataLoader[list[Protein]],
+        torch.utils.data.DataLoader[FeaturizedBatch],
+        torch.utils.data.DataLoader[FeaturizedBatch],
     ],
     log: FilteringBoundLogger,
 ) -> None:
@@ -1099,8 +1100,8 @@ def test_train_updates_model_parameters(
 def test_train_no_grad_clip_completes(
     model_params: ModelSetup,
     loaders: tuple[
-        torch.utils.data.DataLoader[list[Protein]],
-        torch.utils.data.DataLoader[list[Protein]],
+        torch.utils.data.DataLoader[FeaturizedBatch],
+        torch.utils.data.DataLoader[FeaturizedBatch],
     ],
     log: FilteringBoundLogger,
     tmp_path: pathlib.Path,
@@ -1142,8 +1143,8 @@ def test_train_no_grad_clip_completes(
 def test_train_partial_window_at_epoch_end_updates_params(
     model_params: ModelSetup,
     loaders: tuple[
-        torch.utils.data.DataLoader[list[Protein]],
-        torch.utils.data.DataLoader[list[Protein]],
+        torch.utils.data.DataLoader[FeaturizedBatch],
+        torch.utils.data.DataLoader[FeaturizedBatch],
     ],
     log: FilteringBoundLogger,
     tmp_path: pathlib.Path,
@@ -1282,8 +1283,8 @@ def test_train_token_budget_preflush_fires_before_oversized_batch(
 def test_train_wandb_called_once_per_epoch_when_enabled(
     model_params: ModelSetup,
     loaders: tuple[
-        torch.utils.data.DataLoader[list[Protein]],
-        torch.utils.data.DataLoader[list[Protein]],
+        torch.utils.data.DataLoader[FeaturizedBatch],
+        torch.utils.data.DataLoader[FeaturizedBatch],
     ],
     log: FilteringBoundLogger,
     wandb_payloads: list[dict[str, object]],
@@ -1324,8 +1325,8 @@ def test_train_wandb_called_once_per_epoch_when_enabled(
 def test_train_wandb_not_called_when_disabled(
     model_params: ModelSetup,
     loaders: tuple[
-        torch.utils.data.DataLoader[list[Protein]],
-        torch.utils.data.DataLoader[list[Protein]],
+        torch.utils.data.DataLoader[FeaturizedBatch],
+        torch.utils.data.DataLoader[FeaturizedBatch],
     ],
     log: FilteringBoundLogger,
     wandb_call_counter: list[object],
@@ -1345,8 +1346,8 @@ def test_train_wandb_not_called_when_disabled(
 def test_train_metrics_nonzero_when_budget_exceeds_total_tokens(
     model_params: ModelSetup,
     loaders: tuple[
-        torch.utils.data.DataLoader[list[Protein]],
-        torch.utils.data.DataLoader[list[Protein]],
+        torch.utils.data.DataLoader[FeaturizedBatch],
+        torch.utils.data.DataLoader[FeaturizedBatch],
     ],
     log: FilteringBoundLogger,
     wandb_payloads: list[dict[str, object]],
@@ -1454,8 +1455,8 @@ def splits_path(tmp_path: pathlib.Path) -> str:
 def test_train_one_epoch_with_bucketed_loader(
     model_params: ModelSetup,
     loaders: tuple[
-        torch.utils.data.DataLoader[list[Protein]],
-        torch.utils.data.DataLoader[list[Protein]],
+        torch.utils.data.DataLoader[FeaturizedBatch],
+        torch.utils.data.DataLoader[FeaturizedBatch],
     ],
     log: FilteringBoundLogger,
 ) -> None:
@@ -1474,8 +1475,8 @@ def test_train_one_epoch_with_bucketed_loader(
 def test_train_accum_full_window_updates_params(
     model_params: ModelSetup,
     loaders: tuple[
-        torch.utils.data.DataLoader[list[Protein]],
-        torch.utils.data.DataLoader[list[Protein]],
+        torch.utils.data.DataLoader[FeaturizedBatch],
+        torch.utils.data.DataLoader[FeaturizedBatch],
     ],
     log: FilteringBoundLogger,
     tmp_path: pathlib.Path,
@@ -1525,8 +1526,8 @@ def test_train_accum_full_window_updates_params(
 def test_train_optimizer_state_non_zero_after_one_step(
     model_params: ModelSetup,
     loaders: tuple[
-        torch.utils.data.DataLoader[list[Protein]],
-        torch.utils.data.DataLoader[list[Protein]],
+        torch.utils.data.DataLoader[FeaturizedBatch],
+        torch.utils.data.DataLoader[FeaturizedBatch],
     ],
     log: FilteringBoundLogger,
 ) -> None:
@@ -1560,8 +1561,8 @@ def test_train_optimizer_state_non_zero_after_one_step(
 def test_train_scheduler_state_reflects_completed_epoch(
     model_params: ModelSetup,
     loaders: tuple[
-        torch.utils.data.DataLoader[list[Protein]],
-        torch.utils.data.DataLoader[list[Protein]],
+        torch.utils.data.DataLoader[FeaturizedBatch],
+        torch.utils.data.DataLoader[FeaturizedBatch],
     ],
     log: FilteringBoundLogger,
 ) -> None:
@@ -1589,8 +1590,8 @@ def test_train_scheduler_state_reflects_completed_epoch(
 def test_train_wandb_epoch_increments_across_epochs(
     model_params: ModelSetup,
     loaders: tuple[
-        torch.utils.data.DataLoader[list[Protein]],
-        torch.utils.data.DataLoader[list[Protein]],
+        torch.utils.data.DataLoader[FeaturizedBatch],
+        torch.utils.data.DataLoader[FeaturizedBatch],
     ],
     tcfg3: TrainConfig,
     log: FilteringBoundLogger,

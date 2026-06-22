@@ -1486,7 +1486,7 @@ def plan_cache(
     return cache_dir / f"{h.hexdigest()[:24]}.json"
 
 
-class ShardDataLoader(torch.utils.data.DataLoader[list[Protein]]):
+class ShardDataLoader(torch.utils.data.DataLoader[FeaturizedBatch]):
     """Plan-driven DataLoader wrapper for WebDataset shard streaming.
 
     Encapsulates ProteinShardDataset, DataLoader, and a plan prefetch queue.
@@ -1500,9 +1500,13 @@ class ShardDataLoader(torch.utils.data.DataLoader[list[Protein]]):
         dataset: Pre-constructed ProteinShardDataset to stream from.
         budget: Scalar batching and shard configuration shared with the
             dataset.
-        num_workers: Number of DataLoader worker processes.
-        batch_prefetch_depth: DataLoader prefetch_factor per worker.
-        prefetch_epochs: Number of epoch plans to precompute at startup.
+        tcfg: Training configuration; supplies num_workers,
+            batch_prefetch_depth, epoch_prefetch_depth, and featurization
+            parameters.
+        distogram_res: Residue-level Cβ distogram module used by
+            FeaturizeCollate.
+        distogram_atom: Atom-level sparse distogram module used by
+            FeaturizeCollate.
     """
 
     def __init__(
@@ -1510,23 +1514,36 @@ class ShardDataLoader(torch.utils.data.DataLoader[list[Protein]]):
         *,
         dataset: ProteinShardDataset,
         budget: ShardBudgetParameters,
-        num_workers: int,
-        batch_prefetch_depth: int,
-        prefetch_epochs: int,
+        tcfg: TrainConfig,
+        distogram_res: Distogram,
+        distogram_atom: Distogram,
     ) -> None:
         self.shard_dataset: ProteinShardDataset = dataset
+        num_workers: int = tcfg.train_loader.num_workers
+        self.prefetch_epochs: int = tcfg.train_loader.epoch_prefetch_depth
+        collate = FeaturizeCollate(
+            tcfg=tcfg,
+            distogram_res=distogram_res,
+            distogram_atom=distogram_atom,
+        )
         super().__init__(  # pyright: ignore[reportUnknownMemberType]
-            self.shard_dataset,
+            cast(
+                torch.utils.data.Dataset[FeaturizedBatch],
+                self.shard_dataset,
+            ),
             batch_size=None,
-            collate_fn=identity_collate,
+            collate_fn=collate,
             num_workers=num_workers,
             pin_memory=True,
             persistent_workers=False,
-            prefetch_factor=batch_prefetch_depth if num_workers > 0 else None,
+            prefetch_factor=(
+                tcfg.train_loader.batch_prefetch_depth
+                if num_workers > 0
+                else None
+            ),
         )
         self.budget: ShardBudgetParameters = budget
         self.world_size: int = budget.world_size
-        self.prefetch_epochs: int = prefetch_epochs
         self.base_seed: int = budget.seed
         self.epoch: int = 0
         self._log: FilteringBoundLogger = cast(
@@ -1565,7 +1582,7 @@ class ShardDataLoader(torch.utils.data.DataLoader[list[Protein]]):
             epoch_budget = dataclasses.replace(
                 budget,
                 seed=self.base_seed + offset,
-                num_workers=num_workers if num_workers > 0 else 1,
+                num_workers=self.num_workers if self.num_workers > 0 else 1,
             )
             cache_path = plan_cache(
                 epoch_budget,
@@ -1895,9 +1912,9 @@ def make_bucketed_data_loaders(
     cfg: TrainConfig,
     extra_train_args: TrainArgs,
 ) -> tuple[
-    torch.utils.data.DataLoader[list[Protein]],
-    torch.utils.data.DataLoader[list[Protein]],
-    torch.utils.data.DataLoader[list[Protein]],
+    torch.utils.data.DataLoader[FeaturizedBatch],
+    torch.utils.data.DataLoader[FeaturizedBatch],
+    torch.utils.data.DataLoader[FeaturizedBatch],
 ]:
     """Build the train shard loader and val/test loaders; auto-detects DDP.
 
@@ -1922,6 +1939,26 @@ def make_bucketed_data_loaders(
 
     splits = DatasetSplitsManifest.model_validate_json(
         extra_train_args.keys_for_splits_json.read_bytes(),
+    )
+
+    dr = cfg.distogram_res
+    da = cfg.distogram_atom
+    distogram_res: Distogram = Distogram(
+        n_bins=dr.n_bins - 1,
+        min_dist=dr.min_dist,
+        max_dist=dr.max_dist,
+        overflow_bin=True,
+    ).eval()
+    distogram_atom: Distogram = Distogram(
+        n_bins=da.n_bins,
+        overflow_bin=False,
+        min_dist=da.min_dist,
+        max_dist=da.max_dist,
+    ).eval()
+    collate: FeaturizeCollate = FeaturizeCollate(
+        tcfg=cfg,
+        distogram_res=distogram_res,
+        distogram_atom=distogram_atom,
     )
 
     val_set = ProteinDataset(
@@ -1960,9 +1997,9 @@ def make_bucketed_data_loaders(
     train_loader = ShardDataLoader(
         dataset=train_set,
         budget=budget,
-        num_workers=cfg.train_loader.num_workers,
-        batch_prefetch_depth=cfg.train_loader.batch_prefetch_depth,
-        prefetch_epochs=cfg.train_loader.epoch_prefetch_depth,
+        tcfg=cfg,
+        distogram_res=distogram_res,
+        distogram_atom=distogram_atom,
     )
 
     if is_ddp:
@@ -1984,7 +2021,7 @@ def make_bucketed_data_loaders(
             sampler=val_sampler,
             num_workers=cfg.test_loader.num_workers,
             pin_memory=True,
-            collate_fn=identity_collate,
+            collate_fn=collate,
         )
         test_loader = torch.utils.data.DataLoader(
             test_set,
@@ -1992,7 +2029,7 @@ def make_bucketed_data_loaders(
             sampler=test_sampler,
             num_workers=cfg.test_loader.num_workers,
             pin_memory=True,
-            collate_fn=identity_collate,
+            collate_fn=collate,
         )
     else:
         val_loader = torch.utils.data.DataLoader(
@@ -2001,7 +2038,7 @@ def make_bucketed_data_loaders(
             shuffle=False,
             num_workers=cfg.test_loader.num_workers,
             pin_memory=True,
-            collate_fn=identity_collate,
+            collate_fn=collate,
         )
         test_loader = torch.utils.data.DataLoader(
             test_set,
@@ -2009,11 +2046,11 @@ def make_bucketed_data_loaders(
             shuffle=False,
             num_workers=cfg.test_loader.num_workers,
             pin_memory=True,
-            collate_fn=identity_collate,
+            collate_fn=collate,
         )
 
     return (
         train_loader,
-        cast(torch.utils.data.DataLoader[list[Protein]], val_loader),
-        cast(torch.utils.data.DataLoader[list[Protein]], test_loader),
+        cast(torch.utils.data.DataLoader[FeaturizedBatch], val_loader),
+        cast(torch.utils.data.DataLoader[FeaturizedBatch], test_loader),
     )

@@ -409,16 +409,17 @@ def process_accum_window(
 
 
 @torch.no_grad()
-@jaxtyped(typechecker=beartype)
 def evaluate(
-    loader: torch.utils.data.DataLoader[list[Protein]],
+    loader: torch.utils.data.DataLoader[FeaturizedBatch],
     model_params: ModelSetup,
+    log: FilteringBoundLogger,
 ) -> tuple[LossMetrics, ThroughputStatistics]:
     """Full-dataset evaluation pass.
 
     Args:
         loader: DataLoader yielding ProteinBatch batches for evaluation.
         model_params: Bundled model, optimizer, config, and device.
+        log: Bound structlog logger.
 
     Returns:
         Tuple of mean LossMetrics and mean ThroughputStatistics over the full
@@ -430,17 +431,30 @@ def evaluate(
     n_batches = 0
     is_ddp: bool = dist.is_initialized()
     world_size: int = dist.get_world_size() if is_ddp else 1
+    rank: int = dist.get_rank() if is_ddp else 0
 
-    for batch in cast(Iterable[list[Protein]], loader):
-        loss_metrics, throughput_statistics = take_step(
-            batch=batch,
-            model_params=model_params,
-            grad_scale=0.0,
-            train_mode=False,
-        )
-        loss_sums += loss_metrics
-        tput_sums += throughput_statistics
-        n_batches += 1
+    log.info("evaluate_start", n_batches=len(loader))
+
+    pbar: tqdm[list[Protein]] = tqdm(  # pylint: disable=unsubscriptable-object
+        cast(Iterable[list[Protein]], loader),
+        desc="evaluate",
+        total=len(loader),
+        leave=False,
+        unit="batch",
+        disable=(rank != 0),
+    )
+    with DistProcessGroup.guard():
+        for batch in pbar:
+            loss_metrics, throughput_statistics = take_step(
+                batch=batch,
+                model_params=model_params,
+                grad_scale=0.0,
+                train_mode=False,
+            )
+            loss_sums += loss_metrics
+            tput_sums += throughput_statistics
+            n_batches += 1
+    pbar.close()
 
     n = max(n_batches, 1)
     divisor = n * world_size
@@ -448,6 +462,12 @@ def evaluate(
     if is_ddp:
         loss_sums.all_reduce_()
         tput_sums.all_reduce_()
+
+    log.info(
+        "evaluate_complete",
+        n_batches=n_batches,
+        world_size=world_size,
+    )
 
     loss_sums /= divisor
     tput_sums /= divisor
@@ -688,8 +708,8 @@ def collect_distributed_vars() -> tuple[int, int, int]:
 
 def train(
     best_val_loss: Float[torch.Tensor, ""],
-    train_loader: torch.utils.data.DataLoader[list[Protein]],
-    test_loader: torch.utils.data.DataLoader[list[Protein]],
+    train_loader: torch.utils.data.DataLoader[FeaturizedBatch],
+    test_loader: torch.utils.data.DataLoader[FeaturizedBatch],
     model_params: ModelSetup,
     log: FilteringBoundLogger,
 ) -> None:
@@ -813,6 +833,7 @@ def train(
         epoch_val_metrics, _ = evaluate(
             loader=test_loader,
             model_params=model_params,
+            log=log,
         )
 
         global_step = step.global_step

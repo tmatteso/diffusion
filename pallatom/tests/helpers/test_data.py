@@ -1840,18 +1840,17 @@ def full_debug_train_args(
 # ---------------------------------------------------------------------------
 
 
-def test_bucketed_train_loader_yields_protein_batch(
+def test_bucketed_train_loader_yields_featurized_batch(
     bucketed_cfg: TrainConfig,
     bucketed_train_args: TrainArgs,
 ) -> None:
-    """Training loader yields a list of Protein objects."""
+    """Training loader yields FeaturizedBatch objects, not raw Protein lists."""
     train_loader, _, _ = make_bucketed_data_loaders(
         cfg=bucketed_cfg,
         extra_train_args=bucketed_train_args,
     )
-    batch = cast(list[Protein], next(iter(train_loader)))
-    assert isinstance(batch, list)
-    assert all(isinstance(p, Protein) for p in batch)
+    batch = cast(FeaturizedBatch, next(iter(train_loader)))
+    assert isinstance(batch, FeaturizedBatch)
 
 
 def test_bucketed_debug_run_train_dataset_has_252_items(

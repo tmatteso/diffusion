@@ -1,8 +1,9 @@
 """Context manager helpers for distributed training and logging.
 
 Provides ``DistProcessGroup``, ``FatalOnError``, ``StructlogConfig``,
-``DDPNoSync``, and ``StepContext`` — reusable context managers that handle
-setup and teardown boilerplate so training scripts remain concise.
+``DDPNoSync``, ``StepContext``, and ``DistributedPeerFailure`` — reusable
+context managers that handle setup and teardown boilerplate so training
+scripts remain concise.
 """
 
 import contextlib
@@ -10,7 +11,8 @@ import io
 import json
 import os
 import traceback
-from collections.abc import Callable
+from collections.abc import Callable, Generator
+from datetime import timedelta
 from pathlib import Path
 from types import TracebackType
 from typing import ClassVar, NoReturn, cast
@@ -26,17 +28,41 @@ from typing_extensions import Self
 log: FilteringBoundLogger = cast("FilteringBoundLogger", structlog.get_logger())
 
 
+class DistributedPeerError(RuntimeError):
+    """Raised on a healthy DDP rank when a peer rank fails mid-collective.
+
+    ``DistProcessGroup.guard()`` raises this on surviving ranks so they abort
+    cleanly instead of hanging at the next ``all_reduce``.  ``FatalOnError``
+    logs it as ``peer_failure`` (warning level) rather than ``fatal`` (error
+    level) to distinguish bystander exits from root-cause failures.
+    """
+
+
 class DistProcessGroup:
     """Context manager that inits and tears down distributed process group.
 
     Exposes rank, local_rank, world_size, device, and is_rank_zero after entry.
+    Use ``DistProcessGroup.guard()`` inside any section where a per-rank
+    failure should be propagated to all peers immediately rather than causing
+    a collective hang.
 
     Args:
         backend: Distributed backend for ``dist.init_process_group``.
+        timeout: Watchdog timeout passed to ``init_process_group``; a hung
+            collective raises after this duration.  Defaults to 30 minutes
+            (PyTorch's built-in default) but can be set shorter.
     """
 
-    def __init__(self, backend: str = "nccl") -> None:
+    def __init__(
+        self,
+        backend: str = "nccl",
+        *,
+        timeout: timedelta | None = None,
+    ) -> None:
         self.backend: str = backend
+        self.timeout: timedelta = (
+            timeout if timeout is not None else timedelta(minutes=5)
+        )
         self.rank: int = -1
         self.local_rank: int = -1
         self.world_size: int = -1
@@ -49,7 +75,7 @@ class DistProcessGroup:
             This ``DistProcessGroup`` instance with rank, local_rank,
             world_size, and device attributes set.
         """
-        dist.init_process_group(backend=self.backend)
+        dist.init_process_group(backend=self.backend, timeout=self.timeout)
         self.rank = dist.get_rank()
         self.local_rank = int(os.environ["LOCAL_RANK"])
         self.world_size = dist.get_world_size()
@@ -65,6 +91,50 @@ class DistProcessGroup:
             ``True`` when ``self.rank == 0``, ``False`` on all other ranks.
         """
         return self.rank == 0
+
+    @staticmethod
+    @contextlib.contextmanager
+    def guard() -> Generator[None, None, None]:
+        """Context manager that propagates rank failures across process group.
+
+        Wrap any loop that feeds into a subsequent ``all_reduce`` with this
+        guard.  On exit, every rank participates in a single health
+        ``all_reduce`` (SUM reduction across ``world_size`` ranks).  If any
+        rank raised an exception, its contribution to the sum is 0; surviving
+        ranks detect the shortfall and raise ``DistributedPeerError`` so
+        they abort cleanly instead of hanging at the next data collective.
+        Falls back to a no-op when no process group is initialised.
+
+        Raises:
+            DistributedPeerError: On a rank that completed successfully when
+                a peer rank failed.
+            Exception: Re-raises any exception from the guarded body on the
+                rank where it occurred.
+        """
+        if not dist.is_initialized():
+            yield
+            return
+        device = f"cuda:{int(os.environ.get('LOCAL_RANK', '0'))}"
+        world_size: int = dist.get_world_size()
+        rank: int = dist.get_rank()
+        healthy: torch.Tensor = torch.ones(1, device=device)
+        this_rank_failed = False
+        try:
+            yield
+        except Exception:
+            healthy[0] = 0.0
+            this_rank_failed = True
+            raise
+        finally:
+            _ = dist.all_reduce(  # pyright: ignore[reportUnknownMemberType]
+                healthy,
+                op=dist.ReduceOp.SUM,
+            )
+            if healthy[0] < world_size and not this_rank_failed:
+                raise DistributedPeerError(
+                    f"rank {rank}: a peer DDP rank failed; "
+                    + "aborting to prevent collective hang",
+                )
 
     def __exit__(
         self,
@@ -84,11 +154,20 @@ class DistProcessGroup:
 
 
 class FatalOnError:
-    """Context manager that logs any exception via structlog.
+    """Context manager that logs any exception via structlog then exits.
 
     Intended to be used as the outermost context in a training script so that
     uncaught exceptions are always surfaced to the structured log before the
     process terminates.
+
+    Distinguishes two exit kinds so operators can read logs clearly:
+
+    * ``fatal`` (error level) — this rank raised an unexpected exception; the
+      full traceback is included.
+    * ``peer_failure`` (warning level) — a peer DDP rank failed and
+      ``DistProcessGroup.guard()`` raised ``DistributedPeerError`` on this
+      rank to abort the hang.  No traceback is logged because this rank did
+      nothing wrong.
     """
 
     def __enter__(self) -> None:
@@ -115,11 +194,14 @@ class FatalOnError:
             SystemExit: If an exception was raised inside the block.
         """
         if exc_val is not None:
-            log.exception(
-                "fatal",
-                error=str(exc_val),
-                traceback=traceback.format_exc(),
-            )
+            if isinstance(exc_val, DistributedPeerError):
+                log.warning("peer_failure", error=str(exc_val))
+            else:
+                log.exception(
+                    "fatal",
+                    error=str(exc_val),
+                    traceback=traceback.format_exc(),
+                )
             raise SystemExit(1) from exc_val
 
 
