@@ -12,7 +12,6 @@ import io
 import math
 import multiprocessing as mp
 import queue
-import tarfile
 from collections.abc import Iterable, Iterator, Sequence
 from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor
 from pathlib import Path
@@ -60,6 +59,7 @@ from structlog.typing import FilteringBoundLogger
 from torch.utils.data.distributed import DistributedSampler
 from train.train_config import NoiseScheduleParams, TrainArgs, TrainConfig
 from typing_extensions import override
+from webdataset.writer import TarWriter
 
 
 @jaxtyped(typechecker=beartype)
@@ -1272,20 +1272,16 @@ class ProteinShardDataset(torch.utils.data.IterableDataset[list[Protein]]):
                 if not shard_entries:
                     continue
                 shard_path: Path = self.shard_dir / f"shard_{shard_id:05d}.tar"
-                with tarfile.open(
-                    str(shard_path),
-                    "w:",
-                    format=tarfile.GNU_FORMAT,
-                ) as tf:
+                with TarWriter(str(shard_path)) as sink:
                     for local_idx, ent in enumerate(shard_entries):
                         _ = src.seek(ent[2])  # byte_pos
                         raw_line = src.readline()
-                        info = tarfile.TarInfo(
-                            name=f"{local_idx:06d}.json",
+                        _ = sink.write(
+                            {
+                                "__key__": f"{local_idx:06d}",
+                                "json": raw_line,
+                            },
                         )
-                        info.size = len(raw_line)
-                        info.mtime = 0
-                        tf.addfile(info, io.BytesIO(raw_line))
                         all_lengths.append(ent[1])  # seq_len
                 shard_sizes_list.append(len(shard_entries))
                 shard_id += 1
@@ -1424,6 +1420,7 @@ class ProteinShardDataset(torch.utils.data.IterableDataset[list[Protein]]):
         Returns:
             List of Protein objects parsed from the shard.
         """
+        self._log.info(f"shard id: {sid}")
         url = str(self.shard_dir / f"shard_{sid:05d}.tar")
         ds: Iterable[dict[str, object]] = cast(
             Iterable[dict[str, object]],
@@ -1916,8 +1913,10 @@ class ShardDataLoader(torch.utils.data.DataLoader[FeaturizedBatch]):
         self,
     ) -> Iterator[list[Protein]]:
         """Dequeue next plan, inject into dataset, delegate to DataLoader."""
+        self._log.info("checking watcher")
         if self._watcher_future is not None and self._watcher_future.done():
             self._watcher_future.result()  # re-raise exception from thread
+        self._log.info("watcher checked")
         plan = self.process_queue.get()
         self._cached_len = batch_count_in_ffd_plan(plan)
 
