@@ -2,7 +2,7 @@
 
 Covers FeaturizedItem and FeaturizedBatch shape contracts; Distogram shape,
 one-hot, masking, symmetry, and bin-assignment properties; featurize_batch
-output shapes and value contracts; apply_conditioning_dropout behaviour;
+output shapes and value contracts;
 sinusoidal_encoding and ref_pos_for_residue correctness; ProteinDataset
 length/indexing; and make_bucketed_data_loaders behaviour.
 """
@@ -34,7 +34,6 @@ from helpers.data import (
     ShardBudgetParameters,
     ShardDataLoader,
     ShardMetadata,
-    apply_conditioning_dropout,
     featurize_batch,
     featurize_single_item,
     make_bucketed_data_loaders,
@@ -44,7 +43,7 @@ from helpers.data import (
 from helpers.useful_objects import ModelSetup, manual_seed
 from jaxtyping import Bool, Float, TypeCheckError
 from torch.optim import Adam
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import StepLR
 from train.train_config import (
     LoaderConfig as EvalLoaderConfig,
 )
@@ -64,7 +63,6 @@ BT_N_ATOM = BT_N_RES * 5
 BT_N_TEMPL_BINS = 38
 BT_C_RES = 32
 BT_K = 16
-BT_N_ATOM_BINS = 16
 
 
 # ---------------------------------------------------------------------------
@@ -181,13 +179,18 @@ def featurized_item_raw() -> FeaturizedItem:
     """
     return FeaturizedItem(
         r_gt=torch.randn(BT_N_ATOM, 3),
+        r_gt_noised=torch.randn(BT_N_ATOM, 3),
         atom5_mask=torch.ones(BT_N_ATOM, dtype=torch.bool),
         f_pseudo_beta_mask=torch.zeros(BT_N_RES, dtype=torch.long),
-        gt_res_distogram=torch.zeros(
+        gt_res_distogram_indices=torch.zeros(
+            BT_N_RES,
+            BT_N_RES,
+            dtype=torch.long,
+        ),
+        noised_res_distogram=torch.zeros(
             BT_N_RES,
             BT_N_RES,
             BT_N_TEMPL_BINS,
-            dtype=torch.long,
         ),
         aa_indices=torch.zeros(BT_N_RES, dtype=torch.long),
         ref_pos=torch.randn(BT_N_ATOM, 3),
@@ -203,7 +206,7 @@ def featurized_item_raw() -> FeaturizedItem:
         center_uid=(
             torch.arange(BT_N_RES, dtype=torch.long) * 5 + 1
         ).repeat_interleave(5),
-        gt_atom_distogram_sparse=torch.zeros(BT_N_ATOM, BT_K, BT_N_ATOM_BINS),
+        gt_atom_distogram_sparse=torch.zeros(BT_N_ATOM, BT_K, dtype=torch.long),
         gt_atom_distogram_mask_sparse=torch.ones(
             BT_N_ATOM,
             BT_K,
@@ -224,17 +227,16 @@ def test_featurized_item_constructs(
 
     Verifies that the fixture produces a FeaturizedItem instance and that key
     tensors retain expected shapes: r_gt (BT_N_ATOM, 3), atom5_mask
-    (BT_N_ATOM,), gt_res_distogram (BT_N_RES, BT_N_RES, BT_N_TEMPL_BINS),
+    (BT_N_ATOM,), gt_res_distogram_indices (BT_N_RES, BT_N_RES),
     ref_pos (BT_N_ATOM, 3), ref_element (BT_N_ATOM, 4), and f_residue_idx
     (BT_N_RES,).
     """
     assert isinstance(featurized_item_raw, FeaturizedItem)
     assert featurized_item_raw.r_gt.shape == (BT_N_ATOM, 3)
     assert featurized_item_raw.atom5_mask.shape == (BT_N_ATOM,)
-    assert featurized_item_raw.gt_res_distogram.shape == (
+    assert featurized_item_raw.gt_res_distogram_indices.shape == (
         BT_N_RES,
         BT_N_RES,
-        BT_N_TEMPL_BINS,
     )
     assert featurized_item_raw.ref_pos.shape == (BT_N_ATOM, 3)
     assert featurized_item_raw.ref_element.shape == (BT_N_ATOM, 4)
@@ -255,13 +257,18 @@ def test_featurized_item_rejects_1d_r_gt() -> None:
     with pytest.raises((TypeCheckError, Exception)):
         _ = FeaturizedItem(
             r_gt=torch.randn(BT_N_ATOM),
+            r_gt_noised=torch.randn(BT_N_ATOM, 3),
             atom5_mask=torch.ones(BT_N_ATOM, dtype=torch.bool),
             f_pseudo_beta_mask=torch.zeros(BT_N_RES, dtype=torch.long),
-            gt_res_distogram=torch.zeros(
+            gt_res_distogram_indices=torch.zeros(
+                BT_N_RES,
+                BT_N_RES,
+                dtype=torch.long,
+            ),
+            noised_res_distogram=torch.zeros(
                 BT_N_RES,
                 BT_N_RES,
                 BT_N_TEMPL_BINS,
-                dtype=torch.long,
             ),
             aa_indices=torch.zeros(BT_N_RES, dtype=torch.long),
             ref_pos=torch.randn(BT_N_ATOM, 3),
@@ -275,7 +282,7 @@ def test_featurized_item_rejects_1d_r_gt() -> None:
             gt_atom_distogram_sparse=torch.zeros(
                 BT_N_ATOM,
                 BT_K,
-                BT_N_ATOM_BINS,
+                dtype=torch.long,
             ),
             gt_atom_distogram_mask_sparse=torch.zeros(
                 BT_N_ATOM,
@@ -295,13 +302,18 @@ def test_featurized_item_rejects_wrong_ref_element_dim() -> None:
     with pytest.raises((TypeCheckError, Exception)):
         _ = FeaturizedItem(
             r_gt=torch.randn(BT_N_ATOM, 3),
+            r_gt_noised=torch.randn(BT_N_ATOM, 3),
             atom5_mask=torch.ones(BT_N_ATOM, dtype=torch.bool),
             f_pseudo_beta_mask=torch.zeros(BT_N_RES, dtype=torch.long),
-            gt_res_distogram=torch.zeros(
+            gt_res_distogram_indices=torch.zeros(
+                BT_N_RES,
+                BT_N_RES,
+                dtype=torch.long,
+            ),
+            noised_res_distogram=torch.zeros(
                 BT_N_RES,
                 BT_N_RES,
                 BT_N_TEMPL_BINS,
-                dtype=torch.long,
             ),
             aa_indices=torch.zeros(BT_N_RES, dtype=torch.long),
             ref_pos=torch.randn(BT_N_ATOM, 3),
@@ -315,7 +327,7 @@ def test_featurized_item_rejects_wrong_ref_element_dim() -> None:
             gt_atom_distogram_sparse=torch.zeros(
                 BT_N_ATOM,
                 BT_K,
-                BT_N_ATOM_BINS,
+                dtype=torch.long,
             ),
             gt_atom_distogram_mask_sparse=torch.zeros(
                 BT_N_ATOM,
@@ -341,12 +353,17 @@ def featurized_batch_raw() -> FeaturizedBatch:
         ref_pos=torch.randn(BT_B, BT_N_ATOM, 3),
         ref_element=torch.zeros(BT_B, BT_N_ATOM, 4),
         ref_space_uid=torch.zeros(BT_B, BT_N_ATOM, dtype=torch.long),
-        gt_res_distogram=torch.zeros(
+        gt_res_distogram_indices=torch.zeros(
+            BT_B,
+            BT_N_RES,
+            BT_N_RES,
+            dtype=torch.long,
+        ),
+        noised_res_distogram=torch.zeros(
             BT_B,
             BT_N_RES,
             BT_N_RES,
             BT_N_TEMPL_BINS,
-            dtype=torch.long,
         ),
         f_pseudo_beta_mask=torch.zeros(BT_B, BT_N_RES, dtype=torch.long),
         f_residue_idx=repeat(
@@ -362,11 +379,11 @@ def featurized_batch_raw() -> FeaturizedBatch:
         t_normalized=torch.rand(BT_B, BT_N_RES, BT_N_RES),
         tok_idx=torch.zeros(BT_B, BT_N_ATOM, dtype=torch.long),
         center_uid=torch.zeros(BT_B, BT_N_ATOM, dtype=torch.long),
-        gt_atom_distogram_sparse=torch.randn(
+        gt_atom_distogram_sparse=torch.zeros(
             BT_B,
             BT_N_ATOM,
             BT_K,
-            BT_N_ATOM_BINS,
+            dtype=torch.long,
         ),
         gt_atom_distogram_mask_sparse=torch.ones(
             BT_B,
@@ -395,11 +412,10 @@ def test_featurized_batch_valid_construction(
     """
     assert featurized_batch_raw.ref_pos.shape == (BT_B, BT_N_ATOM, 3)
     assert featurized_batch_raw.ref_element.shape == (BT_B, BT_N_ATOM, 4)
-    assert featurized_batch_raw.gt_res_distogram.shape == (
+    assert featurized_batch_raw.gt_res_distogram_indices.shape == (
         BT_B,
         BT_N_RES,
         BT_N_RES,
-        BT_N_TEMPL_BINS,
     )
     assert featurized_batch_raw.f_residue_idx.shape == (BT_B, BT_N_RES)
     assert featurized_batch_raw.atom5_mask.shape == (BT_B, BT_N_ATOM)
@@ -407,7 +423,6 @@ def test_featurized_batch_valid_construction(
         BT_B,
         BT_N_ATOM,
         BT_K,
-        BT_N_ATOM_BINS,
     )
     assert featurized_batch_raw.t_hat.is_floating_point()
     assert featurized_batch_raw.t_normalized.min() >= 0.0
@@ -430,12 +445,17 @@ def test_featurized_batch_rejects_unbatched_ref_pos() -> None:
             ref_pos=torch.randn(BT_N_ATOM, 3),
             ref_element=torch.zeros(BT_B, BT_N_ATOM, 4),
             ref_space_uid=torch.zeros(BT_B, BT_N_ATOM, dtype=torch.long),
-            gt_res_distogram=torch.zeros(
+            gt_res_distogram_indices=torch.zeros(
+                BT_B,
+                BT_N_RES,
+                BT_N_RES,
+                dtype=torch.long,
+            ),
+            noised_res_distogram=torch.zeros(
                 BT_B,
                 BT_N_RES,
                 BT_N_RES,
                 BT_N_TEMPL_BINS,
-                dtype=torch.long,
             ),
             f_pseudo_beta_mask=torch.zeros(BT_B, BT_N_RES, dtype=torch.long),
             f_residue_idx=torch.randn(BT_B, BT_N_RES, BT_C_RES),
@@ -447,11 +467,11 @@ def test_featurized_batch_rejects_unbatched_ref_pos() -> None:
             t_normalized=torch.randn(BT_B, BT_N_RES, BT_N_RES),
             tok_idx=torch.zeros(BT_B, BT_N_ATOM, dtype=torch.long),
             center_uid=torch.zeros(BT_B, BT_N_ATOM, dtype=torch.long),
-            gt_atom_distogram_sparse=torch.randn(
+            gt_atom_distogram_sparse=torch.zeros(
                 BT_B,
                 BT_N_ATOM,
                 BT_K,
-                BT_N_ATOM_BINS,
+                dtype=torch.long,
             ),
             gt_atom_distogram_mask_sparse=torch.ones(
                 BT_B,
@@ -473,12 +493,17 @@ def test_featurized_batch_rejects_wrong_coords_dim() -> None:
             ref_pos=torch.randn(BT_B, BT_N_ATOM, 3),
             ref_element=torch.zeros(BT_B, BT_N_ATOM, 4),
             ref_space_uid=torch.zeros(BT_B, BT_N_ATOM, dtype=torch.long),
-            gt_res_distogram=torch.zeros(
+            gt_res_distogram_indices=torch.zeros(
+                BT_B,
+                BT_N_RES,
+                BT_N_RES,
+                dtype=torch.long,
+            ),
+            noised_res_distogram=torch.zeros(
                 BT_B,
                 BT_N_RES,
                 BT_N_RES,
                 BT_N_TEMPL_BINS,
-                dtype=torch.long,
             ),
             f_pseudo_beta_mask=torch.zeros(BT_B, BT_N_RES, dtype=torch.long),
             f_residue_idx=torch.randn(BT_B, BT_N_RES, BT_C_RES),
@@ -490,11 +515,11 @@ def test_featurized_batch_rejects_wrong_coords_dim() -> None:
             t_normalized=torch.randn(BT_B, BT_N_RES, BT_N_RES),
             tok_idx=torch.zeros(BT_B, BT_N_ATOM, dtype=torch.long),
             center_uid=torch.zeros(BT_B, BT_N_ATOM, dtype=torch.long),
-            gt_atom_distogram_sparse=torch.randn(
+            gt_atom_distogram_sparse=torch.zeros(
                 BT_B,
                 BT_N_ATOM,
                 BT_K,
-                BT_N_ATOM_BINS,
+                dtype=torch.long,
             ),
             gt_atom_distogram_mask_sparse=torch.ones(
                 BT_B,
@@ -883,7 +908,11 @@ def model_params(
         noise_params=tcfg.noise,
     ).eval()
     optimizer = Adam(trunk.parameters(), lr=tcfg.training.lr)
-    scheduler = CosineAnnealingLR(optimizer, T_max=tcfg.training.num_epochs)
+    scheduler = StepLR(
+        optimizer,
+        step_size=tcfg.training.lr_decay_steps,
+        gamma=tcfg.training.lr_decay_factor,
+    )
     return ModelSetup(
         model=trunk,
         tcfg=tcfg,
@@ -913,9 +942,8 @@ def featurized_item(
         prot=single_protein,
         c_beta_distogram_fn=c_beta_distogram_fn,
         atom_distogram_fn=atom_distogram_fn,
-        noise_params=tcfg.noise,
+        tcfg=tcfg,
         max_seq_len_in_batch=N_RES,
-        window_size=tcfg.model.window_size,
     )
 
 
@@ -961,7 +989,8 @@ def test_featurize_batch_output_shapes(
         "ref_pos": (FZ_B, N_ATOM, 3),
         "ref_element": (FZ_B, N_ATOM, 4),
         "ref_space_uid": (FZ_B, N_ATOM),
-        "gt_res_distogram": (FZ_B, N_RES, N_RES, 39),
+        "gt_res_distogram_indices": (FZ_B, N_RES, N_RES),
+        "noised_res_distogram": (FZ_B, N_RES, N_RES, 39),
         "f_pseudo_beta_mask": (FZ_B, N_RES),
         "tok_idx": (FZ_B, N_ATOM),
         "center_uid": (FZ_B, N_ATOM),
@@ -1021,7 +1050,8 @@ def test_featurize_single_item_output_shapes(
         "ref_pos": (N_ATOM, 3),
         "ref_element": (N_ATOM, 4),
         "ref_space_uid": (N_ATOM,),
-        "gt_res_distogram": (N_RES, N_RES, 39),
+        "gt_res_distogram_indices": (N_RES, N_RES),
+        "noised_res_distogram": (N_RES, N_RES, 39),
         "f_pseudo_beta_mask": (N_RES,),
         "tok_idx": (N_ATOM,),
         "center_uid": (N_ATOM,),
@@ -1134,108 +1164,6 @@ def test_featurize_collate_is_picklable(
     )
     result = restored(featurize_protein_batch)
     assert isinstance(result, FeaturizedBatch)
-
-
-# ---------------------------------------------------------------------------
-# apply_conditioning_dropout
-# ---------------------------------------------------------------------------
-
-
-def test_conditioning_dropout_p1_distogram_zeroes_all(
-    featurized_batch: FeaturizedBatch,
-) -> None:
-    """p_distogram=1.0 zeros entire distogram and mask for valid residues."""
-    out = apply_conditioning_dropout(
-        featurized_batch,
-        p_distogram=1.0,
-        p_atom=0.0,
-        p_seq=0.0,
-        device="cpu",
-    )
-    assert out.gt_res_distogram.sum() == 0
-    assert out.f_pseudo_beta_mask.sum() == 0
-
-
-def test_conditioning_dropout_p1_atom_zeroes_all(
-    featurized_batch: FeaturizedBatch,
-) -> None:
-    """p_atom=1.0 clears atom5_mask for all valid residues."""
-    out = apply_conditioning_dropout(
-        featurized_batch,
-        p_distogram=0.0,
-        p_atom=1.0,
-        p_seq=0.0,
-        device="cpu",
-    )
-    assert not out.atom5_mask.any()
-
-
-def test_conditioning_dropout_p1_seq_sets_all_to_mask_token(
-    featurized_batch: FeaturizedBatch,
-) -> None:
-    """p_seq=1.0 replaces all valid amino-acid indices with mask token (20)."""
-    out = apply_conditioning_dropout(
-        featurized_batch,
-        p_distogram=0.0,
-        p_atom=0.0,
-        p_seq=1.0,
-        device="cpu",
-    )
-    valid = featurized_batch.f_pseudo_beta_mask.bool()
-    assert (out.aa_indices[valid] == X_TOKEN).all()
-
-
-def test_conditioning_dropout_p0_is_noop(
-    featurized_batch: FeaturizedBatch,
-) -> None:
-    """Dropout at 0 leaves distogram, atom mask, sequence unchanged."""
-    out = apply_conditioning_dropout(
-        featurized_batch,
-        p_distogram=0.0,
-        p_atom=0.0,
-        p_seq=0.0,
-        device="cpu",
-    )
-    assert torch.equal(out.gt_res_distogram, featurized_batch.gt_res_distogram)
-    assert torch.equal(out.atom5_mask, featurized_batch.atom5_mask)
-    assert torch.equal(out.aa_indices, featurized_batch.aa_indices)
-
-
-def test_conditioning_dropout_distogram_symmetric(
-    featurized_batch: FeaturizedBatch,
-) -> None:
-    """Distogram dropout zeros both row and column for each dropped residue."""
-    _ = manual_seed(0)
-    out = apply_conditioning_dropout(
-        featurized_batch,
-        p_distogram=0.5,
-        p_atom=0.0,
-        p_seq=0.0,
-        device="cpu",
-    )
-    row_sums = out.gt_res_distogram.sum(dim=(2, 3))
-    col_sums = out.gt_res_distogram.sum(dim=(1, 3))
-    assert torch.equal(row_sums == 0, col_sums == 0)
-
-
-def test_conditioning_dropout_respects_residue_mask(
-    featurized_batch: FeaturizedBatch,
-) -> None:
-    """Conditioning dropout never modifies padding residues."""
-    batch_with_padding = dataclasses.replace(
-        featurized_batch,
-        f_pseudo_beta_mask=torch.zeros_like(
-            featurized_batch.f_pseudo_beta_mask,
-        ),
-    )
-    out = apply_conditioning_dropout(
-        batch_with_padding,
-        p_distogram=1.0,
-        p_atom=1.0,
-        p_seq=1.0,
-        device="cpu",
-    )
-    assert torch.equal(out.aa_indices, batch_with_padding.aa_indices)
 
 
 # ---------------------------------------------------------------------------
@@ -1677,6 +1605,40 @@ def protein_shard_dataset_factory(
     return _build
 
 
+@pytest.fixture
+def shard_data_loader(
+    protein_shard_dataset_factory: Callable[
+        [list[str], list[int]],
+        ProteinShardDataset,
+    ],
+    shard_budget: ShardBudgetParameters,
+    bucketed_cfg: TrainConfig,
+) -> ShardDataLoader:
+    """A minimal ShardDataLoader over two synthetic proteins."""
+    ds = protein_shard_dataset_factory(["p1", "p2"], [10, 20])
+    dr = bucketed_cfg.distogram_res
+    da = bucketed_cfg.distogram_atom
+    distogram_res = Distogram(
+        n_bins=dr.n_bins - 1,
+        min_dist=dr.min_dist,
+        max_dist=dr.max_dist,
+        overflow_bin=True,
+    ).eval()
+    distogram_atom = Distogram(
+        n_bins=da.n_bins,
+        overflow_bin=False,
+        min_dist=da.min_dist,
+        max_dist=da.max_dist,
+    ).eval()
+    return ShardDataLoader(
+        dataset=ds,
+        budget=shard_budget,
+        tcfg=bucketed_cfg,
+        distogram_res=distogram_res,
+        distogram_atom=distogram_atom,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Fixtures for bucketed loader tests
 # ---------------------------------------------------------------------------
@@ -1867,9 +1829,7 @@ def test_bucketed_debug_run_train_dataset_has_252_items(
         cfg=bucketed_cfg,
         extra_train_args=debug_train_args,
     )
-    assert (
-        len(cast(ShardDataLoader, train_loader).shard_dataset.names) == _N_DEBUG
-    )
+    assert len(train_loader.dataset) == _N_DEBUG
 
 
 _N_FULL = 300  # dataset larger than _N_DEBUG to expose cache-poisoning bug
@@ -1880,25 +1840,23 @@ def test_bucketed_debug_run_not_poisoned_by_prior_full_cache(
     full_train_args: TrainArgs,
     full_debug_train_args: TrainArgs,
 ) -> None:
-    """Must yield _N_DEBUG items even when shard cache built by full run.
+    """debug_run=True caps at _N_DEBUG even after a full-dataset loader was built.
 
-    A cache built from all _N_FULL proteins must not silently return _N_FULL
-    items for subsequent debug_run=True call that caps train names at _N_DEBUG.
+    Building a loader over all _N_FULL proteins must not affect a subsequent
+    debug_run=True call that slices train names to _N_DEBUG.
     """
-    # Seed the shard cache with the full _N_FULL-protein dataset.
+    # Build a full-dataset loader first.
     _, _, _ = make_bucketed_data_loaders(
         cfg=bucketed_cfg,
         extra_train_args=full_train_args,
     )
 
-    # A subsequent debug_run=True call must cap at _N_DEBUG despite warm cache.
+    # A subsequent debug_run=True call must cap at _N_DEBUG.
     train_loader, _, _ = make_bucketed_data_loaders(
         cfg=bucketed_cfg,
         extra_train_args=full_debug_train_args,
     )
-    assert (
-        len(cast(ShardDataLoader, train_loader).shard_dataset.names) == _N_DEBUG
-    )
+    assert len(train_loader.dataset) == _N_DEBUG
 
 
 # ---------------------------------------------------------------------------
@@ -2016,43 +1974,26 @@ def test_build_sorted_shards_existing_metadata_prevents_rebuild(
 
 
 def test_shard_data_loader_epoch_increments_after_iter(
-    bucketed_cfg: TrainConfig,
-    bucketed_train_args: TrainArgs,
+    shard_data_loader: ShardDataLoader,
 ) -> None:
     """ShardDataLoader.epoch starts at 0 and increments with each __iter__."""
-    train_loader, _, _ = make_bucketed_data_loaders(
-        cfg=bucketed_cfg,
-        extra_train_args=bucketed_train_args,
-    )
-    loader = cast(ShardDataLoader, train_loader)
-    assert loader.epoch == 0
-    _ = list(loader)
-    assert loader.epoch == 1
+    assert shard_data_loader.epoch == 0
+    _ = list(shard_data_loader)
+    assert shard_data_loader.epoch == 1
 
 
 def test_shard_data_loader_cached_len_is_positive(
-    bucketed_cfg: TrainConfig,
-    bucketed_train_args: TrainArgs,
+    shard_data_loader: ShardDataLoader,
 ) -> None:
     """__len__ returns a positive batch count immediately after construction."""
-    train_loader, _, _ = make_bucketed_data_loaders(
-        cfg=bucketed_cfg,
-        extra_train_args=bucketed_train_args,
-    )
-    loader = cast(ShardDataLoader, train_loader)
-    assert len(loader) > 0
+    assert len(shard_data_loader) > 0
 
 
 def test_shard_data_loader_del_no_error(
-    bucketed_cfg: TrainConfig,
-    bucketed_train_args: TrainArgs,
+    shard_data_loader: ShardDataLoader,
 ) -> None:
     """Deleting a ShardDataLoader shuts down executors without raising."""
-    train_loader, _, _ = make_bucketed_data_loaders(
-        cfg=bucketed_cfg,
-        extra_train_args=bucketed_train_args,
-    )
-    del train_loader
+    del shard_data_loader
 
 
 # ---------------------------------------------------------------------------
@@ -2205,8 +2146,3 @@ def test_featurize_single_item_is_importable_from_data() -> None:
 def test_featurize_batch_is_importable_from_data() -> None:
     """featurize_batch is callable and importable from helpers.data."""
     assert callable(featurize_batch)
-
-
-def test_apply_conditioning_dropout_is_importable_from_data() -> None:
-    """apply_conditioning_dropout is importable from helpers.data."""
-    assert callable(apply_conditioning_dropout)

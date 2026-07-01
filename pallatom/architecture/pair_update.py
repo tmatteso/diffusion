@@ -13,7 +13,8 @@ b_ij))
 5. z_ij += Transition(z_ij)
 """
 
-import math
+import contextlib
+import dataclasses
 
 import torch
 import torch.nn as nn
@@ -21,13 +22,31 @@ import torch.nn.functional as F
 from architecture.errors import InvalidPairHeadDimensionError
 from architecture.layers import LayerNorm, LinearNoBias, TypedLinear
 from beartype import beartype
-from einops import einsum, rearrange, reduce
+from einops import rearrange, reduce
 from jaxtyping import Float, jaxtyped
+from torch.nn.attention import SDPBackend, sdpa_kernel
 from typing_extensions import override
 
 # ---------------------------------------------------------------------------
 # RBF transform  (Transform_RBF in step 2)
 # ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class ParamsForRBF:
+    """Hyperparameters for the radial basis function distance encoding.
+
+    Attributes:
+        n_rbf: Number of RBF centres evenly spaced in [d_min, d_max].
+        d_min: Minimum distance (Å) for the first RBF centre.
+        d_max: Maximum distance (Å) for the last RBF centre.
+        sigma: Width parameter controlling the spread of each Gaussian basis.
+    """
+
+    n_rbf: int = 39
+    d_min: float = 3.25
+    d_max: float = 50.75
+    sigma: float = 5.0
 
 
 class TransformRBF(nn.Module):
@@ -38,27 +57,23 @@ class TransformRBF(nn.Module):
 
     def __init__(
         self,
-        c: int,
-        n_rbf: int = 16,
-        d_min: float = 0.0,
-        d_max: float = 22.0,
+        rbf_params: ParamsForRBF,
     ) -> None:
         super().__init__()
         centers: Float[torch.Tensor, "n_rbf"] = torch.linspace(
-            d_min,
-            d_max,
-            n_rbf,
+            rbf_params.d_min,
+            rbf_params.d_max,
+            rbf_params.n_rbf,
         )
         self.centers: Float[torch.Tensor, "n_rbf"]
         self.register_buffer("centers", centers)
-        self.sigma: float = (d_max - d_min) / n_rbf
-        self.proj: LinearNoBias = LinearNoBias(n_rbf, c)
+        self.sigma: float = rbf_params.sigma
 
     @override
     def __call__(
         self,
         d: Float[torch.Tensor, "B N_res N_res"],
-    ) -> Float[torch.Tensor, "B N_res N_res c_pair"]:
+    ) -> Float[torch.Tensor, "B N_res N_res n_rbf"]:
         """Call forward; typed override so call-site return types are not Any.
 
         See ``forward`` for full documentation of arguments and return values.
@@ -70,21 +85,21 @@ class TransformRBF(nn.Module):
     def forward(
         self,
         d: Float[torch.Tensor, "B N_res N_res"],
-    ) -> Float[torch.Tensor, "B N_res N_res c_pair"]:
+    ) -> Float[torch.Tensor, "B N_res N_res n_rbf"]:
         """Project pairwise distances with RBF basis into pair embedding space.
 
         Args:
             d: Pairwise distance matrix of shape ``(B, N_res, N_res)``.
 
         Returns:
-            Pair embeddings of shape ``(B, N_res, N_res, c_pair)``.
+            Pair embeddings of shape ``(B, N_res, N_res, n_rbf)``.
         """
         rbf: Float[torch.Tensor, "B N_res N_res n_rbf"] = torch.exp(
             -((rearrange(d, "b n_i n_j -> b n_i n_j 1") - self.centers) ** 2)
-            / self.sigma**2,
+            / 2
+            * self.sigma**2,
         )
-        result: Float[torch.Tensor, "B N_res N_res c_pair"] = self.proj(rbf)
-        return result
+        return rbf
 
 
 # ---------------------------------------------------------------------------
@@ -108,8 +123,9 @@ class TriangleAttentionStartingNodeWithBias(nn.Module):
             raise InvalidPairHeadDimensionError(c_pair, n_heads)
         self.n_heads: int = n_heads
         self.head_dim: int = c_pair // n_heads
+        self.c_pair_to_n_heads: LinearNoBias = LinearNoBias(c_pair, n_heads)
 
-        self.layer_norm: LayerNorm = LayerNorm(c_pair)
+        self.layer_norm: LayerNorm = LayerNorm(normalized_shape=c_pair)
         self.to_q: LinearNoBias = LinearNoBias(c_pair, c_pair)
         self.to_k: LinearNoBias = LinearNoBias(c_pair, c_pair)
         self.to_v: LinearNoBias = LinearNoBias(c_pair, c_pair)
@@ -123,7 +139,7 @@ class TriangleAttentionStartingNodeWithBias(nn.Module):
     def __call__(
         self,
         z: Float[torch.Tensor, "B N_res N_res c_pair"],
-        b: Float[torch.Tensor, "B N_res N_res n_heads"],
+        b: Float[torch.Tensor, "B N_res N_res c_pair"],
     ) -> Float[torch.Tensor, "B N_res N_res c_pair"]:
         """Call forward; typed override so call-site return types are not Any.
 
@@ -136,18 +152,21 @@ class TriangleAttentionStartingNodeWithBias(nn.Module):
     def forward(
         self,
         z: Float[torch.Tensor, "B N_res N_res c_pair"],
-        b: Float[torch.Tensor, "B N_res N_res n_heads"],
+        b: Float[torch.Tensor, "B N_res N_res c_pair"],
     ) -> Float[torch.Tensor, "B N_res N_res c_pair"]:
         """Apply row gated biased self-attention to update pair embeddings.
 
         Args:
             z: Pair embeddings of shape ``(B, N_res, N_res, c_pair)``.
             b: Per-head additive attention bias of shape
-                ``(B, N_res, N_res, n_heads)``.
+                ``(B, N_res, N_res, c_pair)``.
 
         Returns:
             Updated pair embeddings of shape ``(B, N_res, N_res, c_pair)``.
         """
+        # B N_res N_res c_pair -> B N_res N_res n_heads
+        b = self.c_pair_to_n_heads(b)
+
         zn: Float[torch.Tensor, "B N_res N_res c_pair"] = self.layer_norm(z)
         q: Float[torch.Tensor, "B N_res N_res n_heads head_dim"] = rearrange(
             self.to_q(zn),
@@ -170,20 +189,31 @@ class TriangleAttentionStartingNodeWithBias(nn.Module):
             n_heads=self.n_heads,
         )
 
-        # Starting node: fix i, attend j (queries) over k (keys)
-        attn: Float[torch.Tensor, "B N_res n_heads N_res N_res"] = einsum(
-            q,
-            k,
-            "b i j h d, b i k h d -> b i h j k",
-        ) / math.sqrt(self.head_dim)
+        # Fix i, attend j over k. Fold (B, N_i) into SDPA batch dim to
+        # produce 4D tensors; bias is the same for every row so repeat it.
+        B = q.shape[0]
+        sdpa_ctx = (
+            sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION)
+            if q.is_cuda
+            else contextlib.nullcontext()
+        )
 
-        attn = F.softmax(
-            attn + rearrange(b, "b n_j n_k h -> b 1 h n_j n_k"),
-            dim=-1,
-        )
-        intermediate: Float[torch.Tensor, "B N_res N_res n_heads head_dim"] = (
-            einsum(attn, v, "b i h j k, b i k h d -> b i j h d")
-        )
+        # Merge B into the heads dim: "head" b*H+h carries both batch and head
+        # identity. Mask (1, B*H, N_j, N_k) has a singleton N_i batch dim that
+        # EFFICIENT_ATTENTION broadcasts over all N_i rows — O(N^2), no loop.
+        with sdpa_ctx:
+            intermediate: Float[
+                torch.Tensor, "B N_res N_res n_heads head_dim",
+            ] = rearrange(
+                F.scaled_dot_product_attention(
+                    rearrange(q, "b i j h d -> i (b h) j d"),
+                    rearrange(k, "b i k h d -> i (b h) k d"),
+                    rearrange(v, "b i k h d -> i (b h) k d"),
+                    attn_mask=rearrange(b, "b j k h -> 1 (b h) j k"),
+                ),
+                "i (b h) j d -> b i j h d",
+                b=B,
+            )
         intermediate = g * intermediate
         out: Float[torch.Tensor, "B N_res N_res c_pair"] = rearrange(
             intermediate,
@@ -212,6 +242,7 @@ class TriangleAttentionEndingNodeWithBias(nn.Module):
             raise InvalidPairHeadDimensionError(c_pair, n_heads)
         self.n_heads: int = n_heads
         self.head_dim: int = c_pair // n_heads
+        self.c_pair_to_n_heads: LinearNoBias = LinearNoBias(c_pair, n_heads)
 
         self.layer_norm: LayerNorm = LayerNorm(c_pair)
         self.to_q: LinearNoBias = LinearNoBias(c_pair, c_pair)
@@ -224,7 +255,7 @@ class TriangleAttentionEndingNodeWithBias(nn.Module):
     def __call__(
         self,
         z: Float[torch.Tensor, "B N_res N_res c_pair"],
-        b: Float[torch.Tensor, "B N_res N_res n_heads"],
+        b: Float[torch.Tensor, "B N_res N_res c_pair"],
     ) -> Float[torch.Tensor, "B N_res N_res c_pair"]:
         """Call forward; typed override so call-site return types are not Any.
 
@@ -237,7 +268,7 @@ class TriangleAttentionEndingNodeWithBias(nn.Module):
     def forward(
         self,
         z: Float[torch.Tensor, "B N_res N_res c_pair"],
-        b: Float[torch.Tensor, "B N_res N_res n_heads"],
+        b: Float[torch.Tensor, "B N_res N_res c_pair"],
     ) -> Float[torch.Tensor, "B N_res N_res c_pair"]:
         """Apply column gated biased self-attention to update pair embeddings.
 
@@ -249,6 +280,9 @@ class TriangleAttentionEndingNodeWithBias(nn.Module):
         Returns:
             Updated pair embeddings of shape ``(B, N_res, N_res, c_pair)``.
         """
+        # B N_res N_res c_pair -> B N_res N_res n_heads
+        b = self.c_pair_to_n_heads(b)
+
         zn: Float[torch.Tensor, "B N_res N_res c_pair"] = self.layer_norm(z)
         # Transpose to column-first so ending node j leads
         q: Float[torch.Tensor, "B N_res N_res n_heads head_dim"] = rearrange(
@@ -272,20 +306,31 @@ class TriangleAttentionEndingNodeWithBias(nn.Module):
             n_heads=self.n_heads,
         )
 
-        # Ending node: fix j, attend i (queries) over k (keys)
-        attn: Float[torch.Tensor, "B N_res n_heads N_res N_res"] = einsum(
-            q,
-            k,
-            "b n_j n_i h d, b n_j n_k h d -> b n_j h n_i n_k",
-        ) / math.sqrt(self.head_dim)
+        # Fix j, attend i over k. Fold (B, N_j) into SDPA batch dim to
+        # produce 4D tensors;
+        B = q.shape[0]
 
-        attn = F.softmax(
-            attn + rearrange(b, "b n_i n_k h -> b 1 h n_i n_k"),
-            dim=-1,
+        # Merge B into the heads dim: "head" b*H+h carries both batch and head
+        # identity. Mask (1, B*H, N_j, N_k) has a singleton N_i batch dim that
+        # EFFICIENT_ATTENTION broadcasts over all N_i rows — O(N^2), no loop.
+        sdpa_ctx = (
+            sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION)
+            if q.is_cuda
+            else contextlib.nullcontext()
         )
-        intermediate: Float[torch.Tensor, "B N_res N_res n_heads head_dim"] = (
-            einsum(attn, v, "b n_j h n_i n_k, b n_j n_k h d -> b n_j n_i h d")
-        )
+        with sdpa_ctx:
+            intermediate: Float[
+                torch.Tensor, "B N_res N_res n_heads head_dim",
+            ] = rearrange(
+                F.scaled_dot_product_attention(
+                    rearrange(q, "b n_j n_i h d -> n_j (b h) n_i d"),
+                    rearrange(k, "b n_j n_k h d -> n_j (b h) n_k d"),
+                    rearrange(v, "b n_j n_k h d -> n_j (b h) n_k d"),
+                    attn_mask=rearrange(b, "b n_i n_k h -> 1 (b h) n_i n_k"),
+                ),
+                "n_j (b h) n_i d -> b n_j n_i h d",
+                b=B,
+            )
         intermediate = g * intermediate
         # Weighted sum, then transpose back to (B, N_i, N_j, C)
         out: Float[torch.Tensor, "B N_res N_res c_pair"] = rearrange(
@@ -396,7 +441,7 @@ class DropoutRowwise(nn.Module):
             return x
         mask_shape = (x.size(0), x.size(1)) + (1,) * (x.dim() - 2)
         mask = torch.ones(mask_shape, device=x.device)
-        mask = F.dropout(mask, p=self.p, training=True) * (1 - self.p)
+        mask = F.dropout(mask, p=self.p, training=True)  # * (1 - self.p)
         return x * mask
 
 
@@ -441,7 +486,7 @@ class DropoutColumnwise(nn.Module):
             return x
         mask_shape = (x.size(0), 1, x.size(2)) + (1,) * (x.dim() - 3)
         mask = torch.ones(mask_shape, device=x.device)
-        mask = F.dropout(mask, p=self.p, training=True) * (1 - self.p)
+        mask = F.dropout(mask, p=self.p, training=True)  # * (1 - self.p)
         return x * mask
 
 
@@ -462,16 +507,16 @@ class PairUpdate(nn.Module):
 
     def __init__(
         self,
-        c: int = 128,
-        n_rbf: int = 16,
+        c: int,
         n_heads: int = 4,
         dropout: float = 0.25,
     ) -> None:
         super().__init__()
 
+        rbf_params: ParamsForRBF = ParamsForRBF()
         # Step 2
-        self.rbf: TransformRBF = TransformRBF(c, n_rbf=n_rbf)
-        self.b_proj: LinearNoBias = LinearNoBias(c, n_heads)
+        self.rbf: TransformRBF = TransformRBF(rbf_params)
+        self.b_proj: LinearNoBias = LinearNoBias(rbf_params.n_rbf, c)
 
         # Step 3
         self.tri_start: TriangleAttentionStartingNodeWithBias = (
@@ -529,6 +574,7 @@ class PairUpdate(nn.Module):
             r_center,
             "b n d -> b n 1 d",
         ) - rearrange(r_center, "b n d -> b 1 n d")
+
         d_ij: Float[torch.Tensor, "B N_res N_res"] = torch.sqrt(
             reduce(diff**2, "b n m d -> b n m", "sum").clamp(min=1e-8),
         )
@@ -536,7 +582,7 @@ class PairUpdate(nn.Module):
         # ------------------------------------------------------------------
         # Step 2: b_ij = LinearNoBias(Transform_RBF(d_ij))
         # ------------------------------------------------------------------
-        b_ij: Float[torch.Tensor, "B N_res N_res n_heads"] = self.b_proj(
+        b_ij: Float[torch.Tensor, "B N_res N_res c_pair"] = self.b_proj(
             self.rbf(d_ij),
         )
 

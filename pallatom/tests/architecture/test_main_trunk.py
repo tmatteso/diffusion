@@ -19,11 +19,9 @@ from architecture.losses import (
     smooth_lddt_loss,
 )
 from architecture.main_trunk import (
-    AtomDistogramHead,
     MainTrunk,
     PredictedOutputs,
     RelativePositionEncoding,
-    ResidueDistogramHead,
     TimeFourierEmbedding,
 )
 from beartype import beartype
@@ -273,11 +271,9 @@ def center_uid() -> Int[torch.Tensor, "B N_atom"]:
 
 
 @pytest.fixture
-def gt_atom_distogram_sparse() -> (
-    Float[torch.Tensor, "B N_atom K_sparse N_atom_bins"]
-):
-    """Random ground-truth sparse atom distogram targets."""
-    return torch.randn(B, N_ATOM, K_SPARSE, N_ATOM_BINS)
+def gt_atom_distogram_sparse() -> Int[torch.Tensor, "B N_atom K_sparse"]:
+    """Random ground-truth sparse atom distogram bin indices."""
+    return torch.randint(0, N_ATOM_BINS, (B, N_ATOM, K_SPARSE))
 
 
 @pytest.fixture
@@ -313,7 +309,8 @@ def featurized_batch(  # noqa: PLR0913
         ref_pos=ref_pos,
         ref_element=ref_element,
         ref_space_uid=ref_space_uid,
-        gt_res_distogram=f_distogram.long(),
+        gt_res_distogram_indices=torch.zeros(B, N_RES, N_RES, dtype=torch.long),
+        noised_res_distogram=f_distogram,
         f_pseudo_beta_mask=f_pseudo_beta_mask.long(),
         f_residue_idx=f_residue_idx,
         r_gt=torch.zeros_like(r_input),
@@ -591,69 +588,6 @@ def test_rel_pos_enc_algo3_chain_distance_varies_with_sym_id() -> None:
 
 
 # ---------------------------------------------------------------------------
-# ResidueDistogramHead
-# ---------------------------------------------------------------------------
-
-
-def test_residue_distogram_head_output() -> None:
-    """ResidueDistogramHead output is finite, correctly shaped, and symmetric.
-
-    Maps [B, N_res, N_res, C_pair] to [B, N_res, N_res, N_bins] and
-    symmetrises the pair embedding before projection so logits[i,j] ==
-    logits[j,i].
-    """
-    head = ResidueDistogramHead(C_PAIR, n_bins=N_BINS)
-    logits = head(torch.randn(B, N_RES, N_RES, C_PAIR))
-    assert logits.shape == (B, N_RES, N_RES, N_BINS)
-    assert torch.isfinite(logits).all()
-    assert mean_abs_asymmetry(logits).item() < TOLERANCE
-
-
-# ---------------------------------------------------------------------------
-# AtomDistogramHead
-# ---------------------------------------------------------------------------
-
-
-def test_atom_distogram_head_output_shapes() -> None:
-    """AtomDistogramHead returns finite logits and local-window mask."""
-    head = AtomDistogramHead(
-        C_ATOMPAIR,
-        n_bins=N_BINS,
-        atoms_per_res=ATOMS_PER_RES,
-    )
-    logits, mask = head(torch.randn(N_ATOM, N_ATOM, C_ATOMPAIR))
-    assert logits.shape == (N_ATOM, N_ATOM, N_BINS)
-    assert mask.shape == (N_ATOM, N_ATOM)
-    assert mask.dtype == torch.bool
-    assert torch.isfinite(logits).all()
-    assert (
-        logits[mask].std(dim=-1).min().item() > 0
-    )  # logits vary across bin dimension for local-window pairs
-
-
-def test_atom_distogram_head_mask_includes_diagonal() -> None:
-    """Window mask is True on diagonal, every atom is within own window."""
-    head = AtomDistogramHead(
-        C_ATOMPAIR,
-        n_bins=N_BINS,
-        atoms_per_res=ATOMS_PER_RES,
-    )
-    _, mask = head(torch.randn(N_ATOM, N_ATOM, C_ATOMPAIR))
-    assert mask.diagonal().all()
-
-
-def test_atom_distogram_head_mask_symmetric() -> None:
-    """If atom i within window of atom j, atom j within window of atom i."""
-    head = AtomDistogramHead(
-        C_ATOMPAIR,
-        n_bins=N_BINS,
-        atoms_per_res=ATOMS_PER_RES,
-    )
-    _, mask = head(torch.randn(N_ATOM, N_ATOM, C_ATOMPAIR))
-    assert torch.equal(mask, rearrange(mask, "i j -> j i"))
-
-
-# ---------------------------------------------------------------------------
 # MainTrunk.forward — output shapes and values
 # ---------------------------------------------------------------------------
 
@@ -695,12 +629,15 @@ def test_main_trunk_atom_distogram_bins_match_ground_truth(
     model: MainTrunk,
     featurized_batch: FeaturizedBatch,
 ) -> None:
-    """Number of pred atom distance bins matches bin count in ground-truth."""
+    """K-neighbour dim matches and gt indices are valid bin indices."""
     out = _forward(model, featurized_batch)
+    n_bins = out.atom_distogram_logits.shape[-1]
     assert (
-        out.atom_distogram_logits.shape[-1]
-        == featurized_batch.gt_atom_distogram_sparse.shape[-1]
+        out.atom_distogram_logits.shape[2]
+        == featurized_batch.gt_atom_distogram_sparse.shape[2]
     )
+    assert featurized_batch.gt_atom_distogram_sparse.max() < n_bins
+    assert featurized_batch.gt_atom_distogram_sparse.min() >= 0
 
 
 def test_main_trunk_distogram_loss_atom_computable(
@@ -799,7 +736,7 @@ def test_integration_gradient_flow_composite_loss(
     kabsch_loss = atom_loss(
         pred.r_denoised,
         featurized_batch.r_gt,
-        featurized_batch.atom5_mask,
+        featurized_batch.atom5_mask.float(),
         lambda_sigma_weight=torch.ones(B),
     ).mean()
     ce_loss = seq_ce_loss(pred.seq_logits, featurized_batch.aa_indices)
@@ -809,14 +746,14 @@ def test_integration_gradient_flow_composite_loss(
         featurized_batch.atom5_mask,
         cutoff=15.0,
     )
-    gt_res_bin_idx = featurized_batch.gt_res_distogram.argmax(dim=-1).clamp(
+    gt_res_bin_idx = featurized_batch.gt_res_distogram_indices.clamp(
         0,
         pred.residue_distogram_logits.size(-1) - 1,
     )
     res_distogram_loss = distogram_loss_residue(
         pred.residue_distogram_logits,
         gt_res_bin_idx,
-        featurized_batch.f_pseudo_beta_mask.bool(),
+        featurized_batch.f_pseudo_beta_mask.float(),
     ).mean()
     atom_distogram_loss = distogram_loss_atom(
         pred.atom_distogram_logits,
@@ -837,7 +774,7 @@ def test_integration_gradient_flow_composite_loss(
         k_loss = atom_loss(
             inter_coords,
             featurized_batch.r_gt,
-            featurized_batch.atom5_mask,
+            featurized_batch.atom5_mask.float(),
             lambda_sigma_weight=torch.ones(B),
         ) + seq_ce_loss(inter_logits, featurized_batch.aa_indices)
         intermediate_loss = intermediate_loss + gamma * k_loss

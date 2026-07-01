@@ -28,12 +28,11 @@ from helpers.data import (
     Distogram,
     FeaturizedBatch,
     FeaturizedItem,
-    apply_conditioning_dropout,
     featurize_single_item,
 )
 from helpers.useful_objects import manual_seed
 from jaxtyping import Bool, Float, Int, TypeCheckError, jaxtyped
-from train.train_config import LossParams, NoiseScheduleParams
+from train.train_config import LossParams, TrainConfig
 
 _ = manual_seed(42)
 
@@ -284,7 +283,8 @@ def batch(
         ref_pos=torch.randn(B, N, 3),
         ref_element=torch.zeros(B, N, 4),
         ref_space_uid=torch.zeros(B, N, dtype=torch.long),
-        gt_res_distogram=torch.zeros(B, N, N, N_TEMPL_BINS, dtype=torch.long),
+        gt_res_distogram_indices=torch.zeros(B, N, N, dtype=torch.long),
+        noised_res_distogram=torch.zeros(B, N, N, N_TEMPL_BINS),
         f_pseudo_beta_mask=torch.zeros(B, N, dtype=torch.long),
         f_residue_idx=torch.zeros(B, N, dtype=torch.long),
         r_gt=r_gt,
@@ -295,7 +295,7 @@ def batch(
         t_normalized=torch.zeros(B, N, N),
         tok_idx=torch.zeros(B, N, dtype=torch.long),
         center_uid=torch.zeros(B, N, dtype=torch.long),
-        gt_atom_distogram_sparse=torch.zeros(B, N, K_NEIGH, N_ATOM_BINS),
+        gt_atom_distogram_sparse=torch.zeros(B, N, K_NEIGH, dtype=torch.long),
         gt_atom_distogram_mask_sparse=torch.zeros(
             B,
             N,
@@ -347,7 +347,7 @@ def res_mask() -> Bool[torch.Tensor, "B L_res"]:
     Returns:
         Boolean tensor of shape (B, L_RES); True for first L_RES//2 residues.
     """
-    mask = torch.ones(B, L_RES, dtype=torch.bool)
+    mask = torch.ones(B, L_RES, dtype=torch.float)
     mask[:, L_RES // 2 :] = False
     return mask
 
@@ -441,7 +441,7 @@ def test_atom_loss_full_mask_matches_no_mask(
     Verifies mask=all-True code path produces numerically identical results
     to the unmasked default, confirming mask has no unintended side effects.
     """
-    mask_all = torch.ones(B, N, dtype=torch.bool)
+    mask_all = torch.ones(B, N, dtype=torch.float)
     w = torch.ones(B)
     assert torch.allclose(
         atom_loss(coords, noisy_coords, mask=mask_all, lambda_sigma_weight=w),
@@ -635,7 +635,8 @@ def test_med_loss_gradient_flows_to_first_block() -> None:
         ref_pos=torch.randn(1, N, 3),
         ref_element=torch.zeros(1, N, 4),
         ref_space_uid=torch.zeros(1, N, dtype=torch.long),
-        gt_res_distogram=torch.zeros(1, N, N, N_TEMPL_BINS, dtype=torch.long),
+        gt_res_distogram_indices=torch.zeros(1, N, N, dtype=torch.long),
+        noised_res_distogram=torch.zeros(1, N, N, N_TEMPL_BINS),
         f_pseudo_beta_mask=torch.zeros(1, N, dtype=torch.long),
         f_residue_idx=torch.zeros(1, N, dtype=torch.long),
         r_gt=torch.randn(1, N, 3),
@@ -646,7 +647,7 @@ def test_med_loss_gradient_flows_to_first_block() -> None:
         t_normalized=torch.zeros(1, N, N),
         tok_idx=torch.zeros(1, N, dtype=torch.long),
         center_uid=torch.zeros(1, N, dtype=torch.long),
-        gt_atom_distogram_sparse=torch.zeros(1, N, K_NEIGH, N_ATOM_BINS),
+        gt_atom_distogram_sparse=torch.zeros(1, N, K_NEIGH, dtype=torch.long),
         gt_atom_distogram_mask_sparse=torch.zeros(
             1,
             N,
@@ -1123,12 +1124,17 @@ def minimal_batch() -> FeaturizedBatch:
         ref_pos=torch.randn(_B, _N_ATOM, 3),
         ref_element=torch.zeros(_B, _N_ATOM, 4),
         ref_space_uid=torch.zeros(_B, _N_ATOM, dtype=torch.long),
-        gt_res_distogram=torch.zeros(
+        gt_res_distogram_indices=torch.zeros(
+            _B,
+            _N_RES,
+            _N_RES,
+            dtype=torch.long,
+        ),
+        noised_res_distogram=torch.zeros(
             _B,
             _N_RES,
             _N_RES,
             _N_BINS,
-            dtype=torch.long,
         ),
         f_pseudo_beta_mask=torch.ones(_B, _N_RES, dtype=torch.long),
         f_residue_idx=torch.zeros(_B, _N_RES, dtype=torch.long),
@@ -1202,28 +1208,6 @@ def test_intermediate_and_final_ce_are_identical() -> None:
     assert torch.allclose(loss_final, loss_inter)
 
 
-def test_conditioning_dropout_uses_index_20_not_minus_100(
-    minimal_batch: FeaturizedBatch,
-) -> None:
-    """p_seq=1.0 sets all valid positions to 20; no valid position becomes -100.
-
-    Verifies that apply_conditioning_dropout uses the unknown-amino-acid
-    sentinel index 20 (RESTYPE_NUM_NO_X) rather than the PyTorch ignore_index
-    -100 when dropping out sequence information, so that seq_ce_loss can
-    distinguish between masked training targets and conditioned unknowns.
-    """
-    out: FeaturizedBatch = apply_conditioning_dropout(
-        minimal_batch,
-        p_distogram=0.0,
-        p_atom=0.0,
-        p_seq=1.0,
-        device="cpu",
-    )
-    valid: Bool[torch.Tensor, "1 5"] = minimal_batch.f_pseudo_beta_mask.bool()
-    assert (out.aa_indices[valid] == _N_AMINO).all()
-    assert not (out.aa_indices[valid] == PADDING_DROPOUT_TOKEN).any()
-
-
 def test_seq_ce_loss_ignores_minus_100() -> None:
     """seq_ce_loss on a tensor with padding is same as on the non-padded subset.
 
@@ -1279,9 +1263,8 @@ def test_pipeline_preserves_pdb_x_as_index_20(
         prot,
         c_beta_distogram_fn,
         atom_distogram_fn,
-        NoiseScheduleParams(),
+        TrainConfig(),
         max_seq_len_in_batch=n_res,
-        window_size=32,
     )
 
     assert item.aa_indices[x_pos].item() == _N_AMINO

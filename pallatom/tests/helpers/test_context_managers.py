@@ -232,21 +232,20 @@ def test_structlog_config_processors_include_console_renderer_rank_zero(
 
 def test_structlog_config_processors_no_console_renderer_not_rank_zero(
     tmp_path: pathlib.Path,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """ConsoleRenderer absent from processor chain when is_rank_zero False.
+    """Non-rank-zero suppresses INFO but emits WARNING and above.
 
-    Verifies ``structlog.dev.ConsoleRenderer`` is not included in processor
-    list on non-rank-zero processes, keeping logging output minimal.
+    Verifies the minimum log level is 30 (WARNING): an INFO event must produce
+    no output while a WARNING event must appear in the captured output.
     """
     with StructlogConfig(is_rank_zero=False, log_file=tmp_path / "run.jsonl"):
-        processor_types = [
-            type(p)
-            for p in cast(
-                list[object],
-                structlog.get_config()["processors"],
-            )
-        ]
-    assert structlog.dev.ConsoleRenderer not in processor_types
+        log = structlog.get_logger()
+        log.info("below_threshold")
+        log.warning("above_threshold")
+    captured = capsys.readouterr()
+    assert "below_threshold" not in captured.out + captured.err
+    assert "above_threshold" in captured.out + captured.err
 
 
 def test_structlog_config_write_log_line_in_processors_with_file(

@@ -6,7 +6,7 @@ the full ``PairformerBlock`` implementing the AF3 update sequence, and the
 ``PairformerStack`` that chains those blocks sequentially.
 """
 
-from typing import overload
+from typing import cast, overload
 
 import torch
 import torch.nn as nn
@@ -28,6 +28,7 @@ from architecture.pair_update import (
 from beartype import beartype
 from einops import einsum
 from jaxtyping import Float, jaxtyped
+from torch.utils.checkpoint import checkpoint
 from typing_extensions import override
 
 
@@ -208,8 +209,6 @@ class PairformerBlock(nn.Module):
 
         self.row_dropout: DropoutRowwise = DropoutRowwise(p=0.25)
         self.column_dropout: DropoutColumnwise = DropoutColumnwise(p=0.25)
-        self.b_proj_start: LinearNoBias = LinearNoBias(c_pair, n_heads // 4)
-        self.b_proj_end: LinearNoBias = LinearNoBias(c_pair, n_heads // 4)
 
         self.triangle_mult_outgoing: TriangleMultiplicationOutgoing = (
             TriangleMultiplicationOutgoing(c=c_pair, c_hidden=self.c_hidden)
@@ -281,10 +280,8 @@ class PairformerBlock(nn.Module):
         """
         z = z + self.row_dropout(self.triangle_mult_outgoing(z))
         z = z + self.row_dropout(self.traingle_mult_incoming(z))
-        b: Float[torch.Tensor, "B N_res N_res n_heads"] = self.b_proj_start(z)
-        z = z + self.row_dropout(self.triangle_attn_starting_node(z, b))
-        b = self.b_proj_end(z)
-        z = z + self.column_dropout(self.triangle_attn_ending_node(z, b))
+        z = z + self.row_dropout(self.triangle_attn_starting_node(z, z))
+        z = z + self.column_dropout(self.triangle_attn_ending_node(z, z))
         z = z + self.transition1(z)
         if s is not None:
             s = s + self.attn_pair_bias(a=s, s=None, z=z)
@@ -375,7 +372,14 @@ class PairformerStack(nn.Module):
             just the refined pair embedding ``z_out``.
         """
         for block in self.blocks:
-            s, z = block(s=s, z=z)
+            result = cast(
+                tuple[
+                    Float[torch.Tensor, "B N_res c_res"],
+                    Float[torch.Tensor, "B N_res N_res c_pair"],
+                ],
+                checkpoint(block, s, z, use_reentrant=False),
+            )
+            s, z = result
         if s is not None:
             return s, z
         return (

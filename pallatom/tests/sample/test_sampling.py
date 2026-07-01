@@ -17,12 +17,10 @@ from helpers.useful_objects import manual_seed
 from jaxtyping import Float, TypeCheckError
 from sample.sample_config import SamplerParams
 from sample.sampling import (
-    ATOM5_TO_ATOM37,
     NATOM,
     AllAtomContext,
     EDMSampler,
     TemplateContext,
-    atom5_to_atom37,
     build_aa_context,
     build_sampling_context,
     build_template_context,
@@ -70,14 +68,6 @@ def _make_trunk_mock() -> MagicMock:
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
-
-
-@pytest.fixture
-def coords5() -> Float[torch.Tensor, "N_RES 5 3"]:
-    """Provide random atom5 coordinates (N_RES, 5, 3) with fixed seed."""
-    return torch.tensor(
-        np.random.RandomState(1).randn(N_RES, 5, 3).astype(np.float64),
-    )
 
 
 @pytest.fixture
@@ -275,103 +265,6 @@ def identity_stoch_sampler_tmin_high(
     )
 
 
-_UNOCCUPIED_ATOM37: list[int] = [
-    i for i in range(37) if i not in set(ATOM5_TO_ATOM37)
-]
-
-
-@pytest.fixture
-def coords_sentinel() -> Float[torch.Tensor, "N_RES 5 3"]:
-    """Atom5 tensor where slot s has all coordinates equal to float(s + 1)."""
-    coords = torch.zeros((N_RES, 5, 3), dtype=torch.float64)
-    for slot in range(5):
-        coords[:, slot, :] = float(slot + 1)
-    return coords
-
-
-# ---------------------------------------------------------------------------
-# atom5_to_atom37 — shapes, coordinate placement, and mask handling
-# ---------------------------------------------------------------------------
-@pytest.mark.parametrize(
-    ("slot", "atom37_idx"),
-    list(enumerate(ATOM5_TO_ATOM37)),
-)
-def test_atom5_to_atom37(
-    coords_sentinel: Float[torch.Tensor, "N_RES 5 3"],
-    slot: int,
-    atom37_idx: int,
-) -> None:
-    """Verify dtype, shape, coordinate placement, mask handling per atom5 slot.
-
-    Unoccupied-slot zeroing is covered by the parametrized
-    ``test_atom5_to_atom37_unoccupied_*`` tests.
-    """
-    x_37, mask_37 = atom5_to_atom37(coords_sentinel)
-    assert x_37.dtype == torch.float64
-    assert mask_37.dtype == torch.float64
-    assert x_37.shape == (N_RES, 37, 3)
-    assert mask_37.shape == (N_RES, 37)
-    assert torch.allclose(
-        x_37[:, atom37_idx, :],
-        torch.tensor(float(slot + 1), dtype=torch.float64),
-    ), f"atom5 slot {slot} → atom37 slot {atom37_idx}: wrong coords"
-    assert torch.allclose(
-        mask_37[:, atom37_idx],
-        torch.ones(N_RES, dtype=torch.float64),
-    )
-    rng = np.random.RandomState(2)
-    mask_5 = torch.tensor(rng.rand(N_RES, 5).astype(np.float64))
-    _, mask_37_explicit = atom5_to_atom37(coords_sentinel, mask_5)
-    assert torch.allclose(mask_37_explicit[:, atom37_idx], mask_5[:, slot])
-
-
-@pytest.mark.parametrize("idx", _UNOCCUPIED_ATOM37)
-def test_atom5_to_atom37_unoccupied_coords_zero(
-    coords5: Float[torch.Tensor, "N_RES 5 3"],
-    idx: int,
-) -> None:
-    """Unoccupied atom37 coordinate slots are zeroed after conversion."""
-    x_37, _ = atom5_to_atom37(coords5)
-    assert torch.allclose(
-        x_37[:, idx, :],
-        torch.zeros(1, dtype=torch.float64),
-    ), f"atom37 slot {idx} should be zero (unoccupied)"
-
-
-@pytest.mark.parametrize("idx", _UNOCCUPIED_ATOM37)
-def test_atom5_to_atom37_unoccupied_mask_zero(idx: int) -> None:
-    """Unoccupied atom37 mask slots remain zero when all atom5 masks are 1."""
-    _, mask_37 = atom5_to_atom37(
-        torch.ones((N_RES, 5, 3), dtype=torch.float64),
-        torch.ones((N_RES, 5), dtype=torch.float64),
-    )
-    assert torch.allclose(
-        mask_37[:, idx],
-        torch.zeros(N_RES, dtype=torch.float64),
-    )
-
-
-# ---------------------------------------------------------------------------
-# atom5_to_atom37 — type enforcement and edge cases
-# ---------------------------------------------------------------------------
-
-
-def test_atom5_to_atom37_rejects_wrong_second_dimension() -> None:
-    """A jaxtyping TypeCheckError raised when second dimension is not 5."""
-    with pytest.raises(TypeCheckError):
-        _ = atom5_to_atom37(
-            torch.zeros((N_RES, 4, 3), dtype=torch.float64),
-        )  # 4 ≠ 5
-
-
-def test_atom5_to_atom37_single_residue() -> None:
-    """Atom5_toatom37 handles single-residue input without error."""
-    coords_5 = torch.randn(1, 5, 3)
-    x_37, mask_37 = atom5_to_atom37(coords_5)
-    assert x_37.shape == (1, 37, 3)
-    assert mask_37.shape == (1, 37)
-
-
 # ---------------------------------------------------------------------------
 # build_sampling_context — shapes and field values
 # ---------------------------------------------------------------------------
@@ -391,7 +284,7 @@ def test_build_sampling_context(context: FeaturizedBatch) -> None:
         "ref_pos": (1, N_ATOM, 3),
         "ref_element": (1, N_ATOM, 4),
         "ref_space_uid": (1, N_ATOM),
-        "gt_res_distogram": (1, N_RES, N_RES, N_TEMPL_BINS),
+        "noised_res_distogram": (1, N_RES, N_RES, N_TEMPL_BINS),
         "f_pseudo_beta_mask": (1, N_RES),
         "f_residue_idx": (1, N_RES),
         "tok_idx": (1, N_ATOM),
@@ -430,7 +323,7 @@ def test_build_sampling_context(context: FeaturizedBatch) -> None:
             "center_uid mapping",
         ),
         (
-            bool((context.gt_res_distogram.argmax(dim=-1) == 0).all()),
+            bool((context.noised_res_distogram.argmax(dim=-1) == 0).all()),
             "distogram peaks at bin 0",
         ),
         (
@@ -444,8 +337,8 @@ def test_build_sampling_context(context: FeaturizedBatch) -> None:
             "t_normalized equals T_NORM_INIT",
         ),
         (
-            context.gt_atom_distogram_sparse.shape[3] == N_ATOM_BINS,
-            "sparse distogram bin count",
+            int(context.gt_atom_distogram_sparse.max().item()) < N_ATOM_BINS,
+            "sparse distogram bin indices in range",
         ),
     ]
     for ok, msg in value_checks:
@@ -479,13 +372,13 @@ def test_build_sampling_context_scales_with_residue_number(
 def test_build_sampling_context_bin_count_propagation(
     context_19_bins: FeaturizedBatch,
 ) -> None:
-    """Template distogram bin count propagates into gt_res_distogram.
+    """Template distogram bin count propagates into noised_res_distogram.
 
     A 19-bin ``templ_distogram_fn`` plus its overflow bin must yield a
-    ``gt_res_distogram`` with last dimension 20, confirming that n_bins +
+    ``noised_res_distogram`` with last dimension 20, confirming that n_bins +
     overflow_bin flows through to the stored distogram tensor.
     """
-    assert context_19_bins.gt_res_distogram.shape == (1, N_RES, N_RES, 20)
+    assert context_19_bins.noised_res_distogram.shape == (1, N_RES, N_RES, 20)
 
 
 # ---------------------------------------------------------------------------
@@ -758,10 +651,10 @@ def test_build_sampling_context_additional_fields(
     """
     assert (context.aa_indices == 0).all()
     assert (context.r_gt == 0).all()
-    assert torch.isfinite(context.gt_atom_distogram_sparse).all()
+    assert torch.isfinite(context.gt_atom_distogram_sparse.float()).all()
     assert context.gt_atom_distogram_mask_sparse.all()
     assert context.gt_atom_distogram_sparse.shape[1] == N_ATOM
-    assert context.gt_atom_distogram_sparse.shape[3] == N_ATOM_BINS
+    assert int(context.gt_atom_distogram_sparse.max().item()) < N_ATOM_BINS
     assert context.ref_pos.device.type == CPU_DEVICE_TYPE
     assert context.tok_idx.device.type == CPU_DEVICE_TYPE
     assert context.r_gt.device.type == CPU_DEVICE_TYPE
@@ -896,7 +789,7 @@ class ExtraChecks(Flag):
         # K (sparse neighbour count) is variable; None skips that axis.
         (
             "gt_atom_distogram_sparse",
-            (2, N_ATOM_AA, None, N_ATOM_BINS),
+            (2, N_ATOM_AA, None),
             ExtraChecks.NONE,
         ),
         (
@@ -1078,7 +971,7 @@ def test_build_template_context(template_ctx: TemplateContext) -> None:
     )
     assert template_ctx.f_pseudo_beta_mask.shape == (1, N_RES)
 
-    assert template_ctx.f_template_distogram.dtype == torch.long
+    assert template_ctx.f_template_distogram.dtype == torch.float32
     assert template_ctx.f_pseudo_beta_mask.dtype == torch.long
 
     bin_sums = reduce(
@@ -1165,7 +1058,7 @@ def test_unconditional(unconditional_ctx: FeaturizedBatch) -> None:
     ``aa_indices`` are all alanine (0), every atom5 entry is unmasked, and the
     ground-truth coordinates are zero.
     """
-    assert (unconditional_ctx.gt_res_distogram.argmax(dim=-1) == 0).all()
+    assert (unconditional_ctx.noised_res_distogram.argmax(dim=-1) == 0).all()
     assert (unconditional_ctx.f_pseudo_beta_mask == 1).all()
     assert (unconditional_ctx.aa_indices == 0).all()
     assert unconditional_ctx.atom5_mask.all()

@@ -41,7 +41,6 @@ from helpers.context_managers import (
 from helpers.data import (
     Distogram,
     FeaturizedBatch,
-    apply_conditioning_dropout,
     make_bucketed_data_loaders,
 )
 from helpers.useful_objects import (
@@ -56,7 +55,7 @@ from jaxtyping import Float, Int, jaxtyped
 from structlog.typing import FilteringBoundLogger
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import Adam
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import StepLR
 from tqdm import tqdm
 from train.train_config import TrainArgs, TrainConfig
 
@@ -217,14 +216,6 @@ def take_step(
     lp = model_params.tcfg.loss
 
     cpu_batch: FeaturizedBatch = batch
-    if train_mode:
-        cpu_batch = apply_conditioning_dropout(
-            cpu_batch,
-            p_distogram=model_params.tcfg.conditioning_dropout.p_distogram,
-            p_atom=model_params.tcfg.conditioning_dropout.p_atom,
-            p_seq=model_params.tcfg.conditioning_dropout.p_seq,
-            device="cpu",
-        )
 
     b_size, n_res = cpu_batch.f_residue_idx.shape
     actual_residues: int = int(cpu_batch.f_pseudo_beta_mask.sum().item())
@@ -246,10 +237,17 @@ def take_step(
             model_params.model(featurized_batch),
         )
 
+        atom5_mask_f: Float[torch.Tensor, "B N_atom"] = (
+            featurized_batch.atom5_mask.float()
+        )
+        pseudo_beta_mask_f: Float[torch.Tensor, "B N_res"] = (
+            featurized_batch.f_pseudo_beta_mask.float()
+        )
+
         Kabsch_aligned_MSE_loss: Float[torch.Tensor, ""] = atom_loss(
             pred_outputs.r_denoised,
             featurized_batch.r_gt,
-            featurized_batch.atom5_mask,
+            atom5_mask_f,
             lambda_sigma_weight=lambda_sigma_loss_weight,
         ).mean()
 
@@ -263,7 +261,7 @@ def take_step(
         gt_res_bin_idx: Int[
             torch.Tensor,
             "B N_res N_res",
-        ] = featurized_batch.gt_res_distogram.argmax(dim=-1).clamp(
+        ] = featurized_batch.gt_res_distogram_indices.clamp(
             0,
             pred_outputs.residue_distogram_logits.size(-1) - 1,
         )
@@ -272,9 +270,10 @@ def take_step(
             distogram_loss_residue(
                 pred_outputs.residue_distogram_logits,
                 gt_res_bin_idx,
-                featurized_batch.f_pseudo_beta_mask.bool(),
+                pseudo_beta_mask_f,
             ).mean()
         )
+        del gt_res_bin_idx
 
         atom_distogram_loss: Float[torch.Tensor, ""] = distogram_loss_atom(
             pred_outputs.atom_distogram_logits,
@@ -304,39 +303,51 @@ def take_step(
     if train_mode:
         torch.autograd.backward([total_loss / grad_scale])
 
-    (r_aligned,) = kabsch_align(  # pylint: disable=unpacking-non-sequence
-        featurized_batch.r_gt,
-        pred_outputs.r_denoised,
-        weights=featurized_batch.atom5_mask.float(),
-        return_transform=False,
+    r_denoised_for_rmsd: Float[torch.Tensor, "B N_atom 3"] = (
+        pred_outputs.r_denoised.detach()
     )
+    del pred_outputs  # frees seq_logits, distogram logits, intermediate stacks
 
-    diff: Float[torch.Tensor, "B N_atom 3"] = (
-        pred_outputs.r_denoised - r_aligned
-    )
-    sq: Float[torch.Tensor, "B N_atom"] = (diff * diff).sum(dim=-1)
-    m: Float[torch.Tensor, "B N_atom"] = featurized_batch.atom5_mask.float()
-    rmsd: Float[torch.Tensor, ""] = (
-        (sq * m).sum() / m.sum().clamp(min=1)
-    ).sqrt()
+    with torch.no_grad():
+        (r_aligned,) = kabsch_align(  # pylint: disable=unpacking-non-sequence
+            featurized_batch.r_gt,
+            r_denoised_for_rmsd,
+            weights=atom5_mask_f,
+            return_transform=False,
+        )
+
+        diff: Float[torch.Tensor, "B N_atom 3"] = (
+            r_denoised_for_rmsd - r_aligned
+        )
+        sq: Float[torch.Tensor, "B N_atom"] = (diff * diff).sum(dim=-1)
+        rmsd: Float[torch.Tensor, ""] = (
+            (sq * atom5_mask_f).sum() / atom5_mask_f.sum().clamp(min=1)
+        ).sqrt()
 
     t1 = time.perf_counter()
     step_time = t1 - t0
 
+    device = model_params.device
     return LossMetrics(
-        total_loss=total_loss,
-        Kabsch_aligned_MSE_loss=Kabsch_aligned_MSE_loss,
-        CE_loss=CE_loss,
-        smooth_lddt_loss=lddt_loss,
-        res_distogram_loss=residue_distogram_loss,
-        atom_distogram_loss=atom_distogram_loss,
-        intermediate_loss=intermediate_loss,
+        total_loss=total_loss.detach(),
+        Kabsch_aligned_MSE_loss=Kabsch_aligned_MSE_loss.detach(),
+        CE_loss=CE_loss.detach(),
+        smooth_lddt_loss=lddt_loss.detach(),
+        res_distogram_loss=residue_distogram_loss.detach(),
+        atom_distogram_loss=atom_distogram_loss.detach(),
+        intermediate_loss=intermediate_loss.detach(),
         RMSD=rmsd,
     ), ThroughputStatistics(
-        avg_batch_size=torch.tensor(float(b_size)),
-        token_pack_rate=torch.tensor(actual_residues / (b_size * n_res)),
-        residues_per_sec=torch.tensor(actual_residues / step_time),
-        atoms_per_sec=torch.tensor(actual_atoms / step_time),
+        avg_batch_size=torch.tensor(float(b_size), device=device),
+        token_pack_rate=torch.tensor(
+            actual_residues / (b_size * n_res),
+            device=device,
+        ),
+        residues_per_sec=torch.tensor(
+            actual_residues / step_time,
+            device=device,
+        ),
+        atoms_per_sec=torch.tensor(actual_atoms / step_time, device=device),
     )
 
 
@@ -438,25 +449,21 @@ def evaluate(
             disable=(rank != 0),
         )
     )
-    with DistProcessGroup.guard():
-        for batch in pbar:
-            loss_metrics, throughput_statistics = take_step(
-                batch=batch,
-                model_params=model_params,
-                grad_scale=0.0,
-                train_mode=False,
-            )
-            loss_sums += loss_metrics
-            tput_sums += throughput_statistics
-            n_batches += 1
+
+    for batch in pbar:
+        # with DistProcessGroup.guard():
+        loss_metrics, throughput_statistics = take_step(
+            batch=batch,
+            model_params=model_params,
+            grad_scale=0.0,
+            train_mode=False,
+        )
+        loss_sums += loss_metrics
+        tput_sums += throughput_statistics
+        n_batches += 1
     pbar.close()
 
     n = max(n_batches, 1)
-    divisor = n * world_size
-
-    if is_ddp:
-        loss_sums.all_reduce_()
-        tput_sums.all_reduce_()
 
     log.info(
         "evaluate_complete",
@@ -464,8 +471,8 @@ def evaluate(
         world_size=world_size,
     )
 
-    loss_sums /= divisor
-    tput_sums /= divisor
+    loss_sums /= n
+    tput_sums /= n
 
     return (loss_sums, tput_sums)
 
@@ -561,6 +568,7 @@ def optimizer_step(
     _ = (
         model_params.optimizer.step()  # pyright: ignore[reportUnknownMemberType]
     )
+    model_params.scheduler.step()
     model_params.optimizer.zero_grad()
     return loss_metrics, throughput_statistics, component_norms, global_step + 1
 
@@ -651,20 +659,20 @@ def flush_micro_buffer(
 ) -> StepProgress:
     """Run one optimizer step over buffered micro-batches.
 
-    Appends loss metrics, throughput stats, gradient norms, and protein
-    counts to the corresponding lists in ``step``, increments
+    Accumulates loss metrics, throughput stats, and gradient norms into
+    the running protein-count-weighted sums in ``step``, increments
     ``step.global_step``, and returns ``step``.
 
     Args:
         micro_buffer: Accumulated micro-batches to flush.
         n_proteins_buffer: Per-micro-batch protein counts.
         model_params: Bundled model, optimizer, scheduler, and config.
-        step: Per-epoch accumulator holding running totals and the
+        step: Per-epoch accumulator holding running weighted sums and the
             progress bar.
 
     Returns:
         The same ``step`` object with updated ``global_step`` and
-        appended metrics.
+        accumulated metrics.
     """
     loss_metrics, throughput_stats, component_norms, new_global_step = (
         optimizer_step(
@@ -682,10 +690,11 @@ def flush_micro_buffer(
             {k: f"{v:.2f}" for k, v in loss_dict.items()}
             | {k: f"{v:.2f}" for k, v in throughput_stats_dict.items()},
         )
-    step.step_loss_metrics.append(loss_metrics)
-    step.step_throughput_stats.append(throughput_stats)
-    step.step_component_norms.append(component_norms)
-    step.step_n_proteins.append(sum(n_proteins_buffer))
+    n_proteins: int = sum(n_proteins_buffer)
+    step.loss_sum += loss_metrics * n_proteins
+    step.throughput_sum += throughput_stats * n_proteins
+    step.norms_sum += component_norms * n_proteins
+    step.n_proteins_total += n_proteins
     return dataclasses.replace(step, global_step=new_global_step)
 
 
@@ -732,7 +741,12 @@ def train(
     rank, world_size, local_rank = collect_distributed_vars()
 
     if dist.is_initialized():
-        ddp_wrapped: DDP = DDP(model_params.model, device_ids=[local_rank])
+        ddp_wrapped: DDP = DDP(
+            model_params.model,
+            device_ids=[local_rank],
+            find_unused_parameters=False,
+            gradient_as_bucket_view=True,
+        )
         model_params = dataclasses.replace(model_params, model=ddp_wrapped)
 
     tp = model_params.tcfg.training
@@ -781,10 +795,10 @@ def train(
             global_step=global_step,
             rank=rank,
             pbar=pbar,
-            step_loss_metrics=[],
-            step_throughput_stats=[],
-            step_component_norms=[],
-            step_n_proteins=[],
+            loss_sum=LossMetrics.zero_init(model_params.device),
+            throughput_sum=ThroughputStatistics.zero_init(model_params.device),
+            norms_sum=ComponentNorms.zero_init(model_params.device),
+            n_proteins_total=0,
         )
 
         for batch in train_iter:
@@ -810,25 +824,6 @@ def train(
             n_proteins_buffer.append(n_proteins)
             accum_tokens += n_all_tokens
             step.pbar.update(1)  # pyright: ignore[reportUnusedCallResult]
-            log.info(
-                "micro batch step taken",
-                proteins_in_micro_batch=n_proteins,
-                tokens_in_micro_batch=n_all_tokens,
-            )
-
-        # Flush any remaining micro-batches at epoch end,
-        # regardless of token count.
-        if micro_buffer:
-            step = flush_micro_buffer(
-                micro_buffer,
-                n_proteins_buffer,
-                model_params,
-                step,
-            )
-            n_batches += 1
-            micro_buffer = []
-
-        model_params.scheduler.step()
 
         epoch_val_metrics, _ = evaluate(
             loader=test_loader,
@@ -837,21 +832,14 @@ def train(
         )
 
         global_step = step.global_step
+        n_proteins_epoch: int = max(step.n_proteins_total, 1)
         epoch_metrics = EpochMetrics(
             epoch=epoch,
             global_step=global_step,
-            train_loss_metrics=LossMetrics.weighted_avg(
-                step.step_loss_metrics,
-                step.step_n_proteins,
-            ),
-            train_throughput_stats=ThroughputStatistics.weighted_avg(
-                step.step_throughput_stats,
-                step.step_n_proteins,
-            ),
-            train_gradient_norms=ComponentNorms.weighted_avg(
-                step.step_component_norms,
-                step.step_n_proteins,
-            ),
+            train_loss_metrics=step.loss_sum * (1.0 / n_proteins_epoch),
+            train_throughput_stats=step.throughput_sum
+            * (1.0 / n_proteins_epoch),
+            train_gradient_norms=step.norms_sum * (1.0 / n_proteins_epoch),
             val_loss_metrics=epoch_val_metrics,
         )
         log_epoch(
@@ -979,10 +967,10 @@ def main(args: TrainArgs, tcfg: TrainConfig) -> None:
             lr=tp.lr,
             weight_decay=tp.weight_decay,
         )
-        scheduler = CosineAnnealingLR(
+        scheduler = StepLR(
             optimizer,
-            T_max=tp.num_epochs,
-            eta_min=tp.lr * 0.01,
+            step_size=tp.lr_decay_steps,
+            gamma=tp.lr_decay_factor,
         )
 
         dr = tcfg.distogram_res

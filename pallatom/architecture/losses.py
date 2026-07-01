@@ -29,7 +29,7 @@ PAD_TOKEN = -100
 def atom_loss(
     r_denoised: Float[torch.Tensor, "B N_res 3"],
     r_gt: Float[torch.Tensor, "B N_res 3"],
-    mask: Bool[torch.Tensor, "B N_res"] | None = None,
+    mask: Float[torch.Tensor, "B N_res"] | None = None,
     *,
     lambda_sigma_weight: Float[torch.Tensor, "B"],
 ) -> Float[torch.Tensor, "B"]:
@@ -48,8 +48,10 @@ def atom_loss(
     Args:
         r_denoised: (B, N_res, 3) — model output / denoised coordinates.
         r_gt:       (B, N_res, 3) — ground-truth coordinates  r̄⁰.
-        mask:       (B, N_res)    — boolean or float mask; 1 = valid residue.
+        mask:       (B, N_res)    — float mask; 1 = valid residue.
                                     When None, all N_res residues are used.
+                                    Must be pre-converted to float by the
+                                    caller to avoid repeated allocation.
         lambda_sigma_weight: Per-batch EDM loss weight
             ``(t̂² + sigma_data²) / (t̂ · sigma_data)²``, shape ``(B,)``.
 
@@ -65,19 +67,14 @@ def atom_loss(
         • Gradients flow through r_denoised (r_aligned is treated as a
           constant frame — the GT is being moved, not the prediction).
     """
-    weights: Float[torch.Tensor, "B N_res"] | None = (
-        mask.float() if mask is not None else None
-    )
+    weights: Float[torch.Tensor, "B N_res"] | None = mask
 
     # Align GT → denoised  (mobile=r_gt, target=r_denoised).
     # Detach so gradients flow only through r_denoised, not through the SVD.
-    (r_aligned,) = kabsch_align(  # pylint: disable=unpacking-non-sequence
-        r_gt,
-        r_denoised,
-        weights=weights,
-        return_transform=False,
-    )
-    r_aligned = r_aligned.detach()
+    with torch.no_grad():
+        (r_aligned,) = kabsch_align(  # pylint: disable=unpacking-non-sequence
+            r_gt, r_denoised, weights=weights, return_transform=False,
+        )
 
     # Squared residuals summed over xyz → (B, N_res)
     diff: Float[torch.Tensor, "B N_res 3"] = r_denoised - r_aligned
@@ -87,12 +84,11 @@ def atom_loss(
         "b l d, b l d -> b l",
     )
 
-    if mask is not None:
-        m: Float[torch.Tensor, "B N_res"] = mask.float()
-        L_eff: Float[torch.Tensor, "B"] = m.sum(dim=-1).clamp(min=1)
+    if weights is not None:
+        L_eff: Float[torch.Tensor, "B"] = weights.sum(dim=-1).clamp(min=1)
         loss: Float[torch.Tensor, "B"] = einsum(
             sq,
-            m,
+            weights,
             "b l, b l -> b",
         ) / (3.0 * L_eff)
     else:
@@ -160,6 +156,7 @@ def med_loss(
     if len(logits_aa_blocks) != K:
         raise BlockCountMismatchError(K, len(logits_aa_blocks))
 
+    atom5_mask_f: Float[torch.Tensor, "B N_atom"] = batch.atom5_mask.float()
     intermediate_loss: Float[torch.Tensor, "B"] = torch.zeros(
         lambda_sigma_weight.shape[0],
         device=r_denoised_blocks[0].device,
@@ -176,7 +173,7 @@ def med_loss(
         structure_loss: Float[torch.Tensor, "B"] = atom_loss(
             intermediate_denoised_coord,
             batch.r_gt,
-            batch.atom5_mask,
+            atom5_mask_f,
             lambda_sigma_weight=lambda_sigma_weight,
         )
 
@@ -258,8 +255,8 @@ def smooth_lddt_loss(
     Returns:
         Scalar loss = 1 - lddt_smooth  (averaged over batch).
     """
-    dr_pred: Float[torch.Tensor, "... N_atom N_atom"] = pairwise_dist(r_pred)
     dr_true: Float[torch.Tensor, "... N_atom N_atom"] = pairwise_dist(r_true)
+    dr_pred: Float[torch.Tensor, "... N_atom N_atom"] = pairwise_dist(r_pred)
 
     # Absolute distance difference δ_lm
     delta: Float[torch.Tensor, "... N_atom N_atom"] = (dr_true - dr_pred).abs()
@@ -271,6 +268,9 @@ def smooth_lddt_loss(
         + torch.sigmoid(2.0 - delta)
         + torch.sigmoid(4.0 - delta)
     )
+    # delta is not saved by autograd (sigmoid backward uses its output, not
+    # delta; abs backward saves the pre-abs intermediate, not delta itself).
+    del delta
 
     # Local-neighbourhood mask c_lm  (l ≠ m, d_GT < cutoff)
     N_atom = r_pred.shape[-2]
@@ -280,17 +280,20 @@ def smooth_lddt_loss(
         dtype=torch.bool,
     )
     c: Bool[torch.Tensor, "... N_atom N_atom"] = (dr_true < cutoff) & not_diag
+    del dr_true
+    del not_diag
 
     if mask is not None:
-        m: Float[torch.Tensor, "... N_atom"] = mask.float()
-        pair_valid: Bool[torch.Tensor, "... N_atom N_atom"] = einsum(
-            m,
-            m,
-            "... n, ... m -> ... n m",
-        ).bool()
+        # Bool outer product avoids materialising a float [N_atom, N_atom]
+        # intermediate that would otherwise be created by einsum + .bool().
+        pair_valid: Bool[torch.Tensor, "... N_atom N_atom"] = rearrange(
+            mask, "... n -> ... n 1",
+        ) & rearrange(mask, "... n -> ... 1 n")
         c = c & pair_valid
+        del pair_valid
 
     c_f: Float[torch.Tensor, "... N_atom N_atom"] = c.float()
+    del c
 
     # lddt = sum of (c·ε) / sum of (c)
     numer: Float[torch.Tensor, ...] = einsum(
@@ -316,7 +319,7 @@ def distogram_loss_residue(
         Float[torch.Tensor, "... N_res N_res n_bins"]
         | Int[torch.Tensor, "... N_res N_res"]
     ),
-    mask: Bool[torch.Tensor, "... N_res"] | None = None,
+    mask: Float[torch.Tensor, "... N_res"] | None = None,
 ) -> Float[torch.Tensor, "..."]:
     """Residue-level distogram cross-entropy loss  (L_dist_res).
 
@@ -331,7 +334,8 @@ def distogram_loss_residue(
         y:    (..., N_res, N_res, n_bins) — one-hot target bin assignments,
                                             OR (..., N_res, N_res) integer bin
                                             indices.
-        mask: (..., N_res) — boolean/float residue mask (optional).
+        mask: (..., N_res) — float residue mask (optional). Must be
+              pre-converted to float by the caller.
 
     Returns:
         (...,) scalar loss per batch element.
@@ -359,7 +363,7 @@ def distogram_loss_residue(
         )
 
     if mask is not None:
-        m: Float[torch.Tensor, "... N_res"] = mask.float()
+        m: Float[torch.Tensor, "... N_res"] = mask
         pair_mask: Float[torch.Tensor, "... N_res N_res"] = einsum(
             m,
             m,

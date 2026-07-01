@@ -22,12 +22,9 @@ from einops import rearrange, reduce, repeat
 from helpers.alignment import centre_random_augment
 from helpers.atom_utils import (
     ATOM5_ELEMENTS,
-    ATOM37_C,
     ATOM37_CA,
-    ATOM37_CB,
-    ATOM37_N,
-    ATOM37_O,
     Protein,
+    atom5_to_atom37,
     atom37_to_atom5,
     atom37_to_cb,
     protein_from_pdb,
@@ -42,7 +39,6 @@ from train.train_config import NoiseScheduleParams
 
 # atom5 slot → atom37 index (used when writing PDB via atom37 representation)
 # atom5: N=0, CA=1, C=2, O=3, CB=4  →  atom37: N=0, CA=1, C=2, O=3, CB=4
-ATOM5_TO_ATOM37 = [ATOM37_N, ATOM37_CA, ATOM37_C, ATOM37_O, ATOM37_CB]
 NATOM = 5  # atoms per residue
 
 
@@ -61,7 +57,7 @@ class AllAtomContext:  # N_atom = N_res * 5 for atom5 representation
     r_gt: Float[torch.Tensor, "B N_atom 3"]  # gt atom_positions
     atom5_mask: Bool[torch.Tensor, "B N_atom"]
     residue_mask: Bool[torch.Tensor, "B N_res"]
-    gt_atom_distogram_sparse: Float[torch.Tensor, "B N_atom K n_atom_bins"]
+    gt_atom_distogram_sparse: Int[torch.Tensor, "B N_atom K"]
     gt_atom_distogram_mask_sparse: Bool[torch.Tensor, "B N_atom K"]
 
     # amino acid input -- aa indices is the seq itself,
@@ -82,7 +78,7 @@ class TemplateContext:
             pseudo-β carbon in the template, shape (B, N_RES).
     """
 
-    f_template_distogram: Int[torch.Tensor, "B N_RES N_RES N_TEMPL_BINS"]
+    f_template_distogram: Float[torch.Tensor, "B N_RES N_RES N_TEMPL_BINS"]
     f_pseudo_beta_mask: Int[torch.Tensor, "B N_RES"]
 
 
@@ -211,11 +207,11 @@ def build_aa_context(
         "n k -> b n k",
         b=batch_size,
     )
-    gt_atom_distogram_sparse: Float[torch.Tensor, "B N_atom K n_atom_bins"] = (
+    gt_atom_distogram_sparse: Int[torch.Tensor, "B N_atom K"] = (
         gt_atom_disto_dense.gather(
             2,
             repeat(nbr_b, "b n k -> b n k d", d=n_atom_bins),
-        )
+        ).argmax(dim=-1)
     )
     gt_atom_distogram_mask_sparse: Bool[torch.Tensor, "B N_atom K"] = (
         gt_atom_mask_dense.long().gather(2, nbr_b).bool()
@@ -309,13 +305,13 @@ def build_template_context(
     f_disto: Float[torch.Tensor, "B N_res N_res n_templ_bins"]
     f_disto, _ = distogram_fn(pseudo_beta_carbon_positions, residue_mask)
 
-    gt_res_distogram: Int[torch.Tensor, "B N_res N_res n_templ_bins"] = (
-        f_disto.long()
+    noised_res_distogram: Float[torch.Tensor, "B N_res N_res n_templ_bins"] = (
+        f_disto
     )
     f_pseudo_beta_mask: Int[torch.Tensor, "B N_res"] = residue_mask.long()
 
     return TemplateContext(
-        f_template_distogram=gt_res_distogram,
+        f_template_distogram=noised_res_distogram,
         f_pseudo_beta_mask=f_pseudo_beta_mask,
     )
 
@@ -411,9 +407,9 @@ def build_sampling_context(
     def tile(t: Float[torch.Tensor, "..."]) -> Float[torch.Tensor, "B ..."]:
         return repeat(t, "... -> b ...", b=B)
 
-    packed_t_hat = 1.0 * torch.ones(B)
+    packed_t_hat = 1.0 * torch.ones(B, device=device)
     # Apply zero-centered noise to turn r_gt into r_input.
-    noise = torch.randn_like(aa_ctx.r_gt)
+    noise = torch.randn_like(aa_ctx.r_gt, device=device)
     noise = noise - reduce(
         noise,
         "b n d -> b 1 d",
@@ -436,7 +432,14 @@ def build_sampling_context(
         ),  # spoofed inputs, modified during sampling
         tok_idx=tile(tok_idx_single),
         center_uid=tile(center_uid_single),
-        gt_res_distogram=template_context.f_template_distogram,
+        gt_res_distogram_indices=torch.zeros(
+            B,
+            residue_number,
+            residue_number,
+            dtype=torch.long,
+            device=device,
+        ),
+        noised_res_distogram=template_context.f_template_distogram,
         f_pseudo_beta_mask=template_context.f_pseudo_beta_mask,
         r_gt=aa_ctx.r_gt,
         r_gt_noised=r_input,  # spoofed inputs, modified during sampling
@@ -583,7 +586,7 @@ class EDMSampler:
         if f_template_distogram is not None:
             batch = dataclasses.replace(
                 batch,
-                gt_res_distogram=f_template_distogram.long(),
+                noised_res_distogram=f_template_distogram,
             )
         predicted_outputs: PredictedOutputs = self.model(batch)
         return predicted_outputs.r_denoised, predicted_outputs.seq_logits
@@ -668,22 +671,24 @@ class EDMSampler:
                 t_hat=t_hat,
                 normalized_timestep=t_p,
             )
-            ca_idx: Int[torch.Tensor, "B N_res"] = rearrange(
-                self.context.center_uid,
-                "b (n a) -> b n a",
-                a=NATOM,
-            )[
-                :,
-                :,
-                0,
-            ]  # I don't like this
-            ca_positions: Float[torch.Tensor, "B N_res 3"] = torch.gather(
-                r_denoised,
-                1,
-                repeat(ca_idx, "b n -> b n d", d=3),
+
+            atom37_positions: Float[torch.Tensor, "B N_res 37 3"]
+            atom37_mask: Float[torch.Tensor, "B N_res 37"]
+            atom37_positions, atom37_mask = atom5_to_atom37(
+                rearrange(r_denoised, "b (n a) d -> b n a d", a=NATOM),
+                rearrange(
+                    self.context.atom5_mask, "b (n a) -> b n a", a=NATOM,
+                ).float(),
+            )
+            cb_positions: Float[torch.Tensor, "B N_res 3"]
+            cb_positions, _ = atom37_to_cb(atom37_positions, atom37_mask)
+            self_condition_residue_mask: Bool[torch.Tensor, "B N_res"] = (
+                self.context.f_pseudo_beta_mask.bool()
             )
             f_template_distogram: Float[torch.Tensor, "B N_res N_res n_bins"]
-            f_template_distogram, _ = self.template_distogram_fn(ca_positions)
+            f_template_distogram, _ = self.template_distogram_fn(
+                cb_positions, self_condition_residue_mask,
+            )
             # calculate the score function.
             r_denoised, seq_logits = self.denoise(
                 r_noisy=noisy_r_l,
@@ -712,45 +717,6 @@ class EDMSampler:
         ).float()
         r_denoised = r_denoised - reduce(r_denoised, "b n d -> b 1 d", "mean")
         return r_denoised, decode_seqs
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 4.  PDB helper  —  atom5 (N_res, 5, 3) → atom37 (N_res, 37, 3)
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-@jaxtyped(typechecker=beartype)
-def atom5_to_atom37(
-    coords_5: Float[torch.Tensor, "N_res 5 3"],
-    mask_5: Float[torch.Tensor, "N_res 5"] | None = None,
-) -> tuple[Float[torch.Tensor, "N_res 37 3"], Float[torch.Tensor, "N_res 37"]]:
-    """Map atom5 coordinates back into the full atom37 layout.
-
-    Args:
-        coords_5: Atom5 coordinates (N_res, 5, 3).
-        mask_5: Atom5 presence mask (N_res, 5); when None all slots are marked
-            present.
-
-    Returns:
-        Tuple of (x_37, mask_37) with shapes (N_res, 37, 3) and (N_res, 37).
-    """
-    N_res: int = coords_5.shape[0]
-    x_37: Float[torch.Tensor, "N_res 37 3"] = torch.zeros(
-        (N_res, 37, 3),
-        dtype=torch.float64,
-    )
-    mask_37: Float[torch.Tensor, "N_res 37"] = torch.zeros(
-        (N_res, 37),
-        dtype=torch.float64,
-    )
-
-    for atom5_slot, atom37_idx in enumerate(ATOM5_TO_ATOM37):
-        x_37[:, atom37_idx, :] = coords_5[:, atom5_slot, :]
-        mask_37[:, atom37_idx] = (
-            mask_5[:, atom5_slot] if mask_5 is not None else 1.0
-        )
-
-    return x_37, mask_37
 
 
 @dataclasses.dataclass
@@ -894,19 +860,19 @@ def main(args: SamplingArgs, scfg: SampleConfig, device: str) -> None:
 
         pdb_strings: list[str] = []
         for b in range(B_SAMPLE):
-            coords_t: Float[torch.Tensor, "N_res 5 3"] = rearrange(
+            coords_t: Float[torch.Tensor, "1 N_res 5 3"] = rearrange(
                 coords_batch[b].cpu(),
-                "(n a) d -> n a d",
+                "(n a) d -> 1 n a d",
                 n=N_RES,
                 a=NATOM,
             )
-            x_37, mask_37 = atom5_to_atom37(coords_t)
+            x_37_b, mask_37_b = atom5_to_atom37(coords_t)
             atom_positions: npt.NDArray[np.float64] = np.asarray(
-                x_37,
+                rearrange(x_37_b, "1 n a d -> n a d"),
                 dtype=np.float64,
             )
             atom_mask: npt.NDArray[np.float64] = np.asarray(
-                mask_37,
+                rearrange(mask_37_b, "1 n a -> n a"),
                 dtype=np.float64,
             )
             aatype: npt.NDArray[np.intp] = np.asarray(

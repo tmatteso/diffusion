@@ -15,7 +15,7 @@ from collections.abc import Callable, Generator
 from datetime import timedelta
 from pathlib import Path
 from types import TracebackType
-from typing import ClassVar, NoReturn, cast
+from typing import ClassVar, cast
 
 import numpy as np
 import numpy.typing as npt
@@ -208,13 +208,14 @@ class FatalOnError:
 class StructlogConfig:
     """Context manager that configures structlog sends log lines to JSON file.
 
-    On non-rank-zero processes all output is suppressed; on rank zero, log
-    events are printed to the console and, if ``log_file`` is given, written as
-    JSON lines to that file.
+    On rank zero, all events are printed to the console and written as JSON
+    lines to ``log_file``.  On non-rank-zero processes, INFO and DEBUG events
+    are suppressed; WARNING and above (including fatal errors) are printed to
+    the console so failures on non-rank-zero ranks are visible.
 
     Args:
         is_rank_zero: Whether this process should emit console and file output.
-        log_file: Path to write structured JSON log lines.
+        log_file: Path to write structured JSON log lines (rank zero only).
     """
 
     def __init__(
@@ -242,27 +243,22 @@ class StructlogConfig:
                 self.write_log_line,
                 structlog.dev.ConsoleRenderer(),
             ]
+            min_level = 20  # INFO and above
         else:
-            processors = [self._suppress_event]
+            processors = [
+                structlog.processors.TimeStamper(fmt="iso", utc=True),
+                structlog.processors.add_log_level,
+                structlog.processors.StackInfoRenderer(),
+                structlog.dev.ConsoleRenderer(),
+            ]
+            min_level = 30  # WARNING and above only
         structlog.configure(
             processors=processors,
-            wrapper_class=structlog.make_filtering_bound_logger(20),
+            wrapper_class=structlog.make_filtering_bound_logger(min_level),
             context_class=dict,
             logger_factory=structlog.PrintLoggerFactory(),
         )
         return self
-
-    @staticmethod
-    def _suppress_event(
-        _logger: object,
-        _method: str | None,
-        _event_dict: EventDict,
-    ) -> NoReturn:
-        """Structlog processor that silently drops every log event.
-
-        Used on non-rank-zero processes so nothing reaches ``PrintLogger``.
-        """
-        raise structlog.DropEvent
 
     def write_log_line(  # pylint: disable=useless-param-doc
         self,
@@ -502,8 +498,9 @@ class StepContext:
 
     def __init__(self, *, model: torch.nn.Module, train_mode: bool) -> None:
         self.model: torch.nn.Module = model
-        self._train_mode: bool = train_mode  # desired state during the context.
-        self._was_training: bool = False  # state to restore to on exit
+        self._train_mode: bool = train_mode
+        self._was_training: bool = False
+        self._prev_grad_enabled: bool = True
 
     def __enter__(self) -> Self:
         """Switch model to eval mode and disable autograd if not training.
@@ -512,6 +509,7 @@ class StepContext:
             This ``StepContext`` instance.
         """
         self._was_training = self.model.training
+        self._prev_grad_enabled = torch.is_grad_enabled()
         if not self._train_mode:
             _ = self.model.eval()
         _ = torch.set_grad_enabled(self._train_mode)
@@ -532,4 +530,4 @@ class StepContext:
             exc_tb: Traceback if an exception was raised, else ``None``.
         """
         _ = self.model.train(self._was_training)
-        _ = torch.set_grad_enabled(True)
+        _ = torch.set_grad_enabled(self._prev_grad_enabled)

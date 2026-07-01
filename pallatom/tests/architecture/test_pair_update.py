@@ -12,6 +12,7 @@ from architecture.pair_update import (
     DropoutColumnwise,
     DropoutRowwise,
     PairUpdate,
+    ParamsForRBF,
     TransformRBF,
     Transition,
     TriangleAttentionEndingNodeWithBias,
@@ -101,10 +102,10 @@ def apply_rotation(
 def rbf() -> TransformRBF:
     """Provide a TransformRBF module in eval mode.
 
-    Returns a freshly constructed TransformRBF with channel width C, switched
-    to evaluation mode so dropout and batch-norm are deterministic.
+    Returns a freshly constructed TransformRBF built from default ParamsForRBF,
+    switched to evaluation mode so dropout and batch-norm are deterministic.
     """
-    return TransformRBF(C).eval()
+    return TransformRBF(ParamsForRBF()).eval()
 
 
 @pytest.fixture
@@ -141,10 +142,11 @@ def transition() -> Transition:
 def pair_update() -> PairUpdate:
     """Provide a PairUpdate module (no dropout) in eval mode.
 
-    Returns a PairUpdate built with 16 RBF features and N_HEADS attention
-    heads, with dropout disabled (p=0.0) and switched to evaluation mode.
+    Returns a PairUpdate built with N_HEADS attention heads and default
+    ParamsForRBF, with dropout disabled (p=0.0) and switched to evaluation
+    mode.
     """
-    return PairUpdate(C, n_rbf=16, n_heads=N_HEADS, dropout=0.0).eval()
+    return PairUpdate(C, n_heads=N_HEADS, dropout=0.0).eval()
 
 
 # ---------------------------------------------------------------------------
@@ -163,13 +165,14 @@ def z() -> Float[torch.Tensor, "B N_res N_res C"]:
 
 
 @pytest.fixture
-def b() -> Float[torch.Tensor, "B N_res N_res n_heads"]:
-    """Provide a random pair bias tensor [B, N_RES, N_RES, n_heads].
+def b() -> Float[torch.Tensor, "B N_res N_res C"]:
+    """Provide a random pair bias tensor [B, N_RES, N_RES, C].
 
     The tensor is sampled from a standard normal distribution and serves as
-    the attention bias input to triangle attention modules.
+    the attention bias input to triangle attention modules, which internally
+    project it down to per-head width.
     """
-    return torch.randn(B, N_RES, N_RES, N_HEADS)
+    return torch.randn(B, N_RES, N_RES, C)
 
 
 @pytest.fixture
@@ -209,14 +212,14 @@ def test_transform_rbf_output(
     rbf: TransformRBF,
     d: Float[torch.Tensor, "B N_res N_res"],
 ) -> None:
-    """TransformRBF expands [B, N, N] dist matrix to [B, N, N, C] RBF features.
+    """TransformRBF expands [B, N, N] dist matrix to [B, N, N, n_rbf] features.
 
-    Verifies that the output shape is (B, N_RES, N_RES, C) and that all values
-    are finite for a valid distance matrix.
+    Verifies that the output shape is (B, N_RES, N_RES, n_rbf) and that all
+    values are finite for a valid distance matrix.
     """
     with torch.no_grad():
         out = rbf(d)
-    assert out.shape == (B, N_RES, N_RES, C)
+    assert out.shape == (B, N_RES, N_RES, ParamsForRBF().n_rbf)
     assert torch.isfinite(out).all()
 
 
@@ -243,7 +246,7 @@ def test_transform_rbf_symmetric_distance_gives_symmetric_output(
 def test_tri_start_output(
     tri_start: TriangleAttentionStartingNodeWithBias,
     z: Float[torch.Tensor, "B N_res N_res C"],
-    b: Float[torch.Tensor, "B N_res N_res n_heads"],
+    b: Float[torch.Tensor, "B N_res N_res C"],
 ) -> None:
     """TriangleAttentionStartingNode output shape and finite for random inputs.
 
@@ -303,7 +306,7 @@ def test_tri_start_row_independence(
 def test_tri_end_output(
     tri_end: TriangleAttentionEndingNodeWithBias,
     z: Float[torch.Tensor, "B N_res N_res C"],
-    b: Float[torch.Tensor, "B N_res N_res n_heads"],
+    b: Float[torch.Tensor, "B N_res N_res C"],
 ) -> None:
     """TriangleAttentionEndingNode output shape and finite for random inputs.
 
@@ -441,23 +444,24 @@ def test_dropout_rowwise_train_preserves_shape(
 
 
 def test_dropout_rowwise_train_zeroes_entire_rows() -> None:
-    """DropoutRowwise drops entire row at once.
+    """DropoutRowwise drops entire rows at once with inverted-dropout scaling.
 
-    Uses a ones input so a dropped row becomes all-zero and a kept row remains
-    all-ones, verifying that the mask is applied uniformly across the entire
+    Uses a ones input so a dropped row becomes all-zero and a kept row becomes
+    all 1/(1-p), verifying that the mask is applied uniformly across the entire
     row rather than element-wise.
     """
-    # Use a ones input so a dropped row is all-zero and a kept row is all-ones.
     _ = manual_seed(0)
+    p = 0.5
     x = torch.ones(B, N_RES, N_RES, C)
-    drop = DropoutRowwise(p=0.5)
+    drop = DropoutRowwise(p=p)
     _ = drop.train()
     out = drop(x)
+    scale = 1.0 / (1.0 - p)
     for i in range(N_RES):
         row = out[0, i]  # shape (N_RES, C) — check first batch item
         assert torch.allclose(row, torch.zeros_like(row)) or torch.allclose(
             row,
-            torch.ones_like(row),
+            torch.full_like(row, scale),
         )
 
 
@@ -495,22 +499,24 @@ def test_dropout_columnwise_train_preserves_shape(
 
 
 def test_dropout_columnwise_train_zeroes_entire_cols() -> None:
-    """DropoutColumnwise drops entire columns at once.
+    """DropoutColumnwise drops entire columns with inverted-dropout scaling.
 
     Uses a ones input so a dropped column becomes all-zero and a kept column
-    remains all-ones, verifying that the mask is applied uniformly across the
-    entire column rather than element-wise.
+    becomes all 1/(1-p), verifying that the mask is applied uniformly across
+    the entire column rather than element-wise.
     """
     _ = manual_seed(0)
+    p = 0.5
     x = torch.ones(B, N_RES, N_RES, C)
-    drop = DropoutColumnwise(p=0.5)
+    drop = DropoutColumnwise(p=p)
     _ = drop.train()
     out = drop(x)
+    scale = 1.0 / (1.0 - p)
     for j in range(N_RES):
         col = out[0, :, j, :]  # shape (N_RES, C) — check first batch item
         assert torch.allclose(col, torch.zeros_like(col)) or torch.allclose(
             col,
-            torch.ones_like(col),
+            torch.full_like(col, scale),
         )
 
 
@@ -596,8 +602,8 @@ def test_tri_start_changes_with_pair_bias(
     Verifies that the pair bias b is actually used in the attention computation
     and that varying it causes the output to change.
     """
-    b1 = torch.randn(B, N_RES, N_RES, N_HEADS)
-    b2 = torch.randn(B, N_RES, N_RES, N_HEADS)
+    b1 = torch.randn(B, N_RES, N_RES, C)
+    b2 = torch.randn(B, N_RES, N_RES, C)
     with torch.no_grad():
         out1 = tri_start(z, b1)
         out2 = tri_start(z, b2)
@@ -729,7 +735,7 @@ def test_transform_rbf_forward_wrong_shape(rbf: TransformRBF) -> None:
 
 def test_triangle_attn_starting_node_forward_wrong_shape(
     tri_start: TriangleAttentionStartingNodeWithBias,
-    b: Float[torch.Tensor, "B N_res N_res n_heads"],
+    b: Float[torch.Tensor, "B N_res N_res C"],
 ) -> None:
     """Wrong z ndim (3-D instead of 4-D) triggers TypeCheckError.
 
@@ -744,7 +750,7 @@ def test_triangle_attn_starting_node_forward_wrong_shape(
 
 def test_triangle_attn_ending_node_forward_wrong_shape(
     tri_end: TriangleAttentionEndingNodeWithBias,
-    b: Float[torch.Tensor, "B N_res N_res n_heads"],
+    b: Float[torch.Tensor, "B N_res N_res C"],
 ) -> None:
     """Wrong z ndim (3-D instead of 4-D) triggers TypeCheckError.
 

@@ -19,6 +19,7 @@ f_seq_logits    : (B, N_token, 20)      — amino-acid sequence logits
 
 import dataclasses
 import math
+from typing import cast
 
 import torch
 import torch.nn as nn
@@ -31,7 +32,6 @@ from architecture.atom_transformers import (
 from architecture.layers import (
     LayerNorm,
     LinearNoBias,
-    TypedEmbedding,
     TypedModuleList,
     TypedSequential,
 )
@@ -42,6 +42,7 @@ from beartype import beartype
 from einops import rearrange, repeat
 from helpers.data import FeaturizedBatch
 from jaxtyping import Bool, Float, Int, jaxtyped
+from torch.utils.checkpoint import checkpoint
 from train.train_config import (
     AtomDistogramParams,
     ModelParams,
@@ -300,220 +301,6 @@ class RelativePositionEncoding(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# 1. ResidueDistogramHead
-# ---------------------------------------------------------------------------
-# Input is z_ij  (B, N_token, N_token, c_pair)  — trunk pair representation
-# Output the logits (B, N_token, N_token, 64)
-#
-# Symmetrisation: average z_ij and z_ji before projection, so the predicted
-# distance matrix is symmetric by construction.
-# ---------------------------------------------------------------------------
-
-
-class ResidueDistogramHead(nn.Module):
-    """Projects symmetrised pair embeddings z_ij → 64 distance-bin logits.
-
-    Parameters
-    ----------
-    c_pair  : input pair embedding dim
-    n_bins  : number of distance bins (default 64)
-    d_min   : minimum distance in Å   (default 2.0)
-    d_max   : maximum distance in Å   (default 22.0)
-    """
-
-    def __init__(
-        self,
-        c_pair: int,
-        n_bins: int = 64,
-        d_min: float = 2.0,
-        d_max: float = 22.0,
-    ) -> None:
-        super().__init__()
-        self.n_bins: int = n_bins
-        self.d_min: float = d_min
-        self.d_max: float = d_max
-
-        self.layer_norm: LayerNorm = LayerNorm(c_pair)
-        self.proj1: LinearNoBias = LinearNoBias(c_pair, c_pair)
-        self.proj2: LinearNoBias = LinearNoBias(c_pair, n_bins)
-
-    @override
-    def __call__(
-        self,
-        z: Float[torch.Tensor, "... N_res N_res c_pair"],
-    ) -> Float[torch.Tensor, "... N_res N_res n_bins"]:
-        """Call forward; typed override so call-site return types are not Any.
-
-        See ``forward`` for full documentation of arguments and return values.
-        """
-        return self.forward(z)
-
-    @override
-    @jaxtyped(typechecker=beartype)
-    def forward(
-        self,
-        z: Float[torch.Tensor, "... N_res N_res c_pair"],
-    ) -> Float[torch.Tensor, "... N_res N_res n_bins"]:
-        """Project symmetrised pair embeddings to distance-bin logits.
-
-        Args:
-            z: Pair embeddings of shape ``(... N_res N_res c_pair)``.
-
-        Returns:
-            Logits of shape ``(... N_res N_res n_bins)``.
-        """
-        # Symmetrise z_ij_sym = (z_ij + z_ji) / 2
-        # transpose(-3, -2) swaps the two N_token dims regardless of leading B
-        z_sym = (z + z.transpose(-3, -2)) * 0.5
-        x = self.layer_norm(z_sym)
-        x = F.relu(self.proj1(x))
-        return self.proj2(x)
-
-    def loss(
-        self,
-        z: Float[torch.Tensor, "... N_res N_res c_pair"],
-        targets: Float[torch.Tensor, "... N_res N_res n_bins"],
-    ) -> Float[torch.Tensor, ""]:
-        """Compute cross-entropy loss against one-hot ground-truth assignments.
-
-        Args:
-            z: Pair embeddings of shape ``(... N_res N_res c_pair)``.
-            targets: One-hot bin targets of shape ``(... N_res N_res n_bins)``.
-
-        Returns:
-            Scalar cross-entropy loss.
-        """
-        logits = self.forward(z)
-        return F.cross_entropy(
-            rearrange(logits, "b n1 n2 k -> (b n1 n2) k"),
-            rearrange(targets, "b n1 n2 k -> (b n1 n2) k"),
-        )
-
-
-# ---------------------------------------------------------------------------
-# 2. AtomDistogramHead
-# ---------------------------------------------------------------------------
-# Input : p_lm  (N_atom, N_atom, c_atompair) — atom-pair representation
-# Output: logits over 22 bins, 0-10 Å
-#
-# LOCAL WINDOW: only the 5L by 5L sub-block around each atom is used,
-# where L is the number of atoms per residue (typically 3-5).
-# Atoms outside this window are masked out in both prediction and loss.
-# ---------------------------------------------------------------------------
-
-
-class AtomDistogramHead(nn.Module):
-    """Projects atom-pair embeddings to local window distance-bin logits.
-
-    Parameters
-    ----------
-    c_atompair   : input atom-pair embedding dim
-    n_bins       : number of distance bins (default 22)
-    d_min        : minimum distance in Å   (default 0.0)
-    d_max        : maximum distance in Å   (default 10.0)
-    atoms_per_res: L — average atoms per residue, used to define window size
-    """
-
-    def __init__(
-        self,
-        c_atompair: int,
-        n_bins: int = 22,
-        d_min: float = 0.0,
-        d_max: float = 10.0,
-        atoms_per_res: int = 3,
-    ) -> None:
-        super().__init__()
-        self.n_bins: int = n_bins
-        self.d_min: float = d_min
-        self.d_max: float = d_max
-        self.window: int = 5 * atoms_per_res  # 5L
-
-        self.layer_norm: LayerNorm = LayerNorm(c_atompair)
-        self.proj1: LinearNoBias = LinearNoBias(c_atompair, c_atompair)
-        self.proj2: LinearNoBias = LinearNoBias(c_atompair, n_bins)
-
-    def _local_mask(
-        self,
-        N_atom: int,
-        device: torch.device,
-    ) -> Bool[torch.Tensor, "N_atom N_atom"]:
-        """Build a local-window boolean mask over atom pairs.
-
-        Args:
-            N_atom: Number of atoms.
-            device: Device for the output tensor.
-
-        Returns:
-            Boolean tensor of shape ``(N_atom, N_atom)``; True where
-            ``|i - j| <= window // 2``.
-        """
-        idx = torch.arange(N_atom, device=device)
-        dist = (
-            rearrange(idx, "n -> 1 n") - rearrange(idx, "n -> n 1")
-        ).abs()  # (N, N)
-        return dist <= (self.window // 2)  # (N, N) bool
-
-    @override
-    def __call__(
-        self,
-        p: Float[torch.Tensor, "N_atom N_atom c_atompair"],
-    ) -> tuple[
-        Float[torch.Tensor, "N_atom N_atom n_bins"],
-        Bool[torch.Tensor, "N_atom N_atom"],
-    ]:
-        """Call forward; typed override so call-site return types are not Any.
-
-        See ``forward`` for full documentation of arguments and return values.
-        """
-        return self.forward(p)
-
-    @override
-    @jaxtyped(typechecker=beartype)
-    def forward(
-        self,
-        p: Float[torch.Tensor, "N_atom N_atom c_atompair"],
-    ) -> tuple[
-        Float[torch.Tensor, "N_atom N_atom n_bins"],
-        Bool[torch.Tensor, "N_atom N_atom"],
-    ]:
-        """Returns:.
-
-        -------
-        logits: (N_atom, N_atom, n_bins) — full grid (unmasked pairs = 0 logit)
-        mask: (N_atom, N_atom) — True for pairs inside the local window
-        """
-        N = p.size(0)
-        x = self.layer_norm(p)
-        x = F.relu(self.proj1(x))
-        logits = self.proj2(x)  # (N, N, n_bins)
-
-        mask = self._local_mask(N, p.device)  # (N, N)
-        return logits, mask
-
-    def loss(
-        self,
-        p: Float[torch.Tensor, "N_atom N_atom c_atompair"],
-        targets: Float[torch.Tensor, "N_atom N_atom n_bins"],
-    ) -> Float[torch.Tensor, ""]:
-        """Compute cross-entropy loss restricted to local 5L by 5L atom window.
-
-        Args:
-            p: Atom-pair embeddings of shape ``(N_atom N_atom c_atompair)``.
-            targets: One-hot bin targets of shape ``(N_atom N_atom n_bins)``.
-
-        Returns:
-            Scalar cross-entropy loss averaged over local pairs.
-        """
-        logits, mask = self.forward(p)  # (N, N, n_bins), (N, N)
-
-        # Apply window mask — flatten and select only local pairs
-        logits_local = logits[mask]  # (M, n_bins)
-        targets_local = targets[mask]  # (M, n_bins)
-
-        return F.cross_entropy(logits_local, targets_local)
-
-
-# ---------------------------------------------------------------------------
 # MainTrunk — Algorithm 2
 # ---------------------------------------------------------------------------
 
@@ -585,10 +372,6 @@ class MainTrunk(nn.Module):
         self.time_fourier: TimeFourierEmbedding = TimeFourierEmbedding(
             self.c_res,
         )
-        # Amino-acid sequence conditioning: 21 entries
-        # (0-19 = amino acids, 20 = mask token "X"). magic number
-        self.aa_embedding: TypedEmbedding = TypedEmbedding(21, self.c_res)
-
         # Step 5: relative position encoding → z_init
         self.rel_pos_enc: RelativePositionEncoding = RelativePositionEncoding(
             self.c_pair,
@@ -598,7 +381,7 @@ class MainTrunk(nn.Module):
         self.template_embedder: TemplateEmbedder = TemplateEmbedder(
             n_bins=self.n_residue_bins,
             c_z=self.c_pair,
-            c=64,  # what is this magic number?
+            c=self.c_pair,
             d=self.c_pair,
             n_blocks=self.n_pairformer_blocks_template_embedder,
             n_heads=self.n_paiformer_heads_template_embedder,
@@ -631,7 +414,12 @@ class MainTrunk(nn.Module):
             )
         )
         self.pair_updates: TypedModuleList[PairUpdate] = TypedModuleList(
-            [PairUpdate(self.c_pair) for _ in range(self.K_unit)],
+            [
+                PairUpdate(
+                    self.c_pair,
+                )
+                for _ in range(self.K_unit)
+            ],
         )
 
         self.residue_distogram_head: TypedSequential = TypedSequential(
@@ -677,7 +465,7 @@ class MainTrunk(nn.Module):
         ref_element: Float[torch.Tensor, "B N_atom E"] = batch.ref_element
         ref_space_uid: Int[torch.Tensor, "B N_atom"] = batch.ref_space_uid
         f_distogram: Float[torch.Tensor, "B N_res N_res n_bins"] = (
-            batch.gt_res_distogram.float()
+            batch.noised_res_distogram.float()
         )
         f_pseudo_beta_mask: Float[torch.Tensor, "B N_res"] = (
             batch.f_pseudo_beta_mask.float()
@@ -689,7 +477,6 @@ class MainTrunk(nn.Module):
         t: Float[torch.Tensor, "B N_res N_res"] = batch.t_normalized
         tok_idx: Int[torch.Tensor, "B N_atom"] = batch.tok_idx
         center_uid: Int[torch.Tensor, "B N_atom"] = batch.center_uid
-        aa_indices: Int[torch.Tensor, "B N_res"] = batch.aa_indices
 
         B = r_input.size(0)
         N_atom = r_input.size(1)
@@ -716,19 +503,6 @@ class MainTrunk(nn.Module):
                 num_classes=self.proj_residue_idx.in_features,
             ).float(),
         )
-
-        # ------------------------------------------------------------------
-        # Step 2b: s_init += aa_embedding(aa_indices)
-        # Padding (aa_indices = -100) → zero vector via the valid gate.
-        # PDB-X / conditioning-dropped (aa_indices = 20) → aa_embedding[20]
-        # (null embedding).
-        # Real AAs (0-19) -> their embedding.
-        # ------------------------------------------------------------------
-        valid: Bool[torch.Tensor, "B N_res"] = aa_indices >= 0
-        emb: Float[torch.Tensor, "B N_res c_res"] = self.aa_embedding(
-            aa_indices.clamp(0, 20),
-        )
-        s_init = s_init + emb * rearrange(valid.float(), "b n -> b n 1")
 
         # ------------------------------------------------------------------
         # Step 3: t_i = TimeFourierEmbedding(¼·log(t̂))  [B, N_res, c_res]
@@ -852,7 +626,7 @@ class MainTrunk(nn.Module):
             PredictedOutputs containing r_denoised, seq_logits, residue and
             atom distogram logits, and per-decoder-block intermediate outputs.
         """
-        emb = self.embed_inputs(batch)
+        emb: EmbeddedInputs = self.embed_inputs(batch)
         s_i = emb.s_i
         z_ij = emb.z_ij
         c_l = emb.c_l
@@ -897,14 +671,24 @@ class MainTrunk(nn.Module):
             # Step 12: AtomAttentionDecoder
             r_update: Float[torch.Tensor, "B N_atom 3"]
 
-            q_update, p_update, r_update, c_l = self.atom_decoders[k](
-                emb.q_skip,
-                emb.p_skip,
-                emb.c_skip,
-                c_l,
-                s_i,
-                z_ij,
-                emb.tok_idx,
+            q_update, p_update, r_update, c_l = cast(
+                tuple[
+                    Float[torch.Tensor, "B N_atom c_atom"],
+                    Float[torch.Tensor, "B N_atom K c_atompair"],
+                    Float[torch.Tensor, "B N_atom 3"],
+                    Float[torch.Tensor, "B N_atom c_atom"],
+                ],
+                checkpoint(
+                    self.atom_decoders[k],
+                    emb.q_skip,
+                    emb.p_skip,
+                    emb.c_skip,
+                    c_l,
+                    s_i,
+                    z_ij,
+                    emb.tok_idx,
+                    use_reentrant=False,
+                ),
             )
 
             # Step 13: r_updates += r_update
@@ -952,8 +736,12 @@ class MainTrunk(nn.Module):
             )
 
             # Step 16:
-            z_ij = self.pair_updates[k](z_ij, r_center)
-
+            z_ij = cast(
+                Float[torch.Tensor, "B N_res N_res c_pair"],
+                checkpoint(
+                    self.pair_updates[k], z_ij, r_center, use_reentrant=False,
+                ),
+            )
         # ------------------------------------------------------------------
         # Distogram heads
         # ------------------------------------------------------------------

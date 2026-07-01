@@ -14,6 +14,7 @@ from architecture.layers import (
     LayerNorm,
     LinearNoBias,
     TypedLinear,
+    TypedModuleList,
     TypedSequential,
 )
 from architecture.node_update import AdaLN, AttentionPairBias
@@ -158,8 +159,10 @@ class DiffusionTransformer(nn.Module):
     transition block, matching the AlphaFold 3 DiffusionTransformer loop:
 
         for n in 1 … N_block:
-            b  = AttentionPairBias(a, s, z, β)
-            a  = b + ConditionedTransitionBlock(a, s)
+            b  = AttentionPairBias_n(a, s, z, β)
+            a  = b + ConditionedTransitionBlock_n(a, s)
+
+    Each block has its own independent weights (no weight tying).
 
     Args:
         c_a: Atom single-embedding dimension.
@@ -179,13 +182,21 @@ class DiffusionTransformer(nn.Module):
     ) -> None:
         super().__init__()
         self.N_block: int = N_block
-        self.attn_pair_bias: AttentionPairBias = AttentionPairBias(
-            c_res=c_a,
-            c_pair=c_pair,
-            n_heads=N_head,
+        self.attn_pair_bias_blocks: TypedModuleList[AttentionPairBias] = (
+            TypedModuleList(
+                [
+                    AttentionPairBias(c_res=c_a, c_pair=c_pair, n_heads=N_head)
+                    for _ in range(N_block)
+                ],
+            )
         )
-        self.cond_trans_block: ConditionedTransitionBlock = (
-            ConditionedTransitionBlock(c_a=c_a, c_s=c_s, expansion=2)
+        self.cond_trans_blocks: TypedModuleList[ConditionedTransitionBlock] = (
+            TypedModuleList(
+                [
+                    ConditionedTransitionBlock(c_a=c_a, c_s=c_s, expansion=2)
+                    for _ in range(N_block)
+                ],
+            )
         )
 
     @override
@@ -230,15 +241,19 @@ class DiffusionTransformer(nn.Module):
         Returns:
             Refined atom embeddings of shape ``(B, N_res, c_a)``.
         """
-        for _ in range(self.N_block):
-            a = a + self.attn_pair_bias(
+        for attn_block, trans_block in zip(
+            self.attn_pair_bias_blocks,
+            self.cond_trans_blocks,
+            strict=True,
+        ):
+            a = a + attn_block(
                 a=a,
                 s=s,
                 z=z,
                 beta=beta,
                 neighbor_idx=neighbor_idx,
             )
-            a = a + self.cond_trans_block(a, s)
+            a = a + trans_block(a, s)
         return a
 
 
@@ -561,7 +576,6 @@ class AtomFeatureEncoder(nn.Module):
         self.proj_z_init: LinearNoBias = LinearNoBias(self.c_pair, self.d)
 
         self.mlp_p: TypedSequential = TypedSequential(  # [d, d] each layer
-            LinearNoBias(self.d, self.d),
             nn.ReLU(),
             LinearNoBias(self.d, self.d),
             nn.ReLU(),

@@ -67,6 +67,15 @@ ATOM5_C: int = 2
 ATOM5_CB: int = 4
 ATOM5_O: int = 3
 
+# atom5 slot → atom37 index mapping (N=0, CA=1, C=2, O=3, CB=4)
+ATOM5_TO_ATOM37: list[int] = [
+    ATOM37_N,
+    ATOM37_CA,
+    ATOM37_C,
+    ATOM37_O,
+    ATOM37_CB,
+]
+
 # PDB constants
 PDB_ATOM_NAME_CUTOFF_LEN: int = 4
 PDB_LINE_CUTOFF_LEN: int = 80
@@ -435,7 +444,7 @@ def make_np_example(
         if atom_type in bb_atom_types
     ]
 
-    num_res = np.array(coords_dict["N"]).shape[0]
+    num_res = len(np.array(coords_dict["N"]))
     atom_positions = np.zeros([num_res, 37, 3], dtype=float)
 
     for i, atom_type in enumerate(atom_types):
@@ -472,7 +481,7 @@ def make_fixed_size(
         max_seq_length: Target sequence length to pad or truncate to.
     """
     for k, v in np_example.items():
-        pad = max_seq_length - v.shape[0]
+        pad = max_seq_length - len(v)
         if pad > 0:
             np_example[k] = np.pad(
                 v,
@@ -817,7 +826,7 @@ def to_pdb(prot: Protein) -> str:
     atom_index = 1
     last_chain_index = cast("np.intp", chain_index[0])
     # Add all atom sites.
-    for i in range(aatype.shape[0]):
+    for i in range(len(aatype)):
         # Close the previous chain if in a multichain PDB.
         if last_chain_index != chain_index[i]:
             pdb_lines.append(
@@ -909,6 +918,45 @@ def atom37_to_atom5(
     atom5_mask = atom37_mask[:, :, select]
 
     return atom5_positions, atom5_mask
+
+
+@jaxtyped(typechecker=beartype)
+def atom5_to_atom37(
+    coords_5: Float[torch.Tensor, "B N_res 5 3"],
+    mask_5: Float[torch.Tensor, "B N_res 5"] | None = None,
+) -> tuple[
+    Float[torch.Tensor, "B N_res 37 3"],
+    Float[torch.Tensor, "B N_res 37"],
+]:
+    """Map atom5 coordinates back into the full atom37 layout.
+
+    Args:
+        coords_5: Atom5 coordinates (B, N_res, 5, 3).
+        mask_5: Atom5 presence mask (B, N_res, 5); when None all slots are
+            marked present.
+
+    Returns:
+        Tuple of (x_37, mask_37) with shapes (B, N_res, 37, 3) and
+        (B, N_res, 37).
+    """
+    B: int = coords_5.shape[0]
+    N_res: int = coords_5.shape[1]
+    x_37: Float[torch.Tensor, "B N_res 37 3"] = torch.zeros(
+        (B, N_res, 37, 3),
+        dtype=coords_5.dtype,
+        device=coords_5.device,
+    )
+    mask_37: Float[torch.Tensor, "B N_res 37"] = torch.zeros(
+        (B, N_res, 37),
+        dtype=coords_5.dtype,
+        device=coords_5.device,
+    )
+    for atom5_slot, atom37_idx in enumerate(ATOM5_TO_ATOM37):
+        x_37[:, :, atom37_idx, :] = coords_5[:, :, atom5_slot, :]
+        mask_37[:, :, atom37_idx] = (
+            mask_5[:, :, atom5_slot] if mask_5 is not None else 1.0
+        )
+    return x_37, mask_37
 
 
 @jaxtyped(typechecker=beartype)

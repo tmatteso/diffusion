@@ -61,17 +61,22 @@ class TrainingParams(BaseModel):
             optimizer state) to resume from; skipped when ``None``.
         accumulated_token_budget: Target token count across
             gradient-accumulation steps before a parameter update is applied.
+        lr_decay_steps: Number of optimizer steps between each LR decay.
+        lr_decay_factor: Multiplicative factor applied to the LR every
+            ``lr_decay_steps`` optimizer steps.
     """
 
     model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True)
 
     num_epochs: int = 50
-    lr: float = Field(default=3e-4, gt=0)
+    lr: float = Field(default=1e-3, gt=0)
     weight_decay: float = Field(default=1e-4, ge=0)
-    grad_clip: float | None = Field(default=2.0, gt=0)
+    grad_clip: float | None = Field(default=10.0, gt=0)
     pretrained_weights: pathlib.Path | None = None
     resume_checkpoint: pathlib.Path | None = None
     accumulated_token_budget: int = Field(default=4096, gt=0)
+    lr_decay_steps: int = Field(default=50_000, gt=0)
+    lr_decay_factor: float = Field(default=0.95, gt=0, lt=1)
 
 
 class ModelParams(BaseModel):
@@ -104,10 +109,10 @@ class ModelParams(BaseModel):
 
     window_size: int = Field(default=32, gt=0)
     f_ref_dim: int = Field(default=35, gt=0)  # 5 atoms by 7 features
-    c_atom: int = Field(default=4, gt=0)
-    c_pair: int = Field(default=4, gt=0)
-    c_res: int = Field(default=8, gt=0)
-    c_atompair: int = Field(default=2, gt=0)
+    c_atom: int = Field(default=128, gt=0)  # paper was 128
+    c_pair: int = Field(default=128, gt=0)  # paper was 128
+    c_res: int = Field(default=256, gt=0)  # paper was 256
+    c_atompair: int = Field(default=16, gt=0)  # paper was 16
     K_unit: int = Field(default=8, gt=0)
     max_residues: int = Field(default=128, gt=0)
     n_amino: int = Field(default=20, gt=0)  # canonical AA for now
@@ -221,11 +226,13 @@ class LossParams(BaseModel):
     Attributes:
         model_config: Pydantic config — frozen to prevent mutation after init.
         lam: Scale factor applied to the diffusion denoising loss term.
-        alpha_0: Weight for the auxiliary coordinate loss at intermediate steps.
-        alpha_1: Weight for the sequence cross-entropy loss term.
+        alpha_0: Weight for the sequence cross-entropy loss term.
+        alpha_1: Weight for the smooth lDDT structural quality loss.
         alpha_2: Weight for the residue-level distogram loss.
         alpha_3: Weight for the atom-pair distogram loss.
-        alpha_4: Weight for the smooth lDDT structural quality loss.
+        alpha_4: Weight for the auxiliary loss at intermediate steps.
+
+
         gamma: Exponential moving average decay used when computing auxiliary
             losses across decoder units.
         smooth_lddt_cutoff: Distance cutoff in ångströms used when computing the
@@ -289,8 +296,8 @@ class LoaderConfig(BaseModel):
     model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True)
 
     max_seq_length: int = Field(default=128, gt=0)  # was 256
-    batch_size: int = Field(default=2, gt=0)  # was 2
-    num_workers: int = Field(default=1, gt=0)
+    batch_size: int = Field(default=8, gt=0)  # was 2
+    num_workers: int = Field(default=0, gt=-1)
 
 
 class TrainLoaderConfig(LoaderConfig):
@@ -300,6 +307,8 @@ class TrainLoaderConfig(LoaderConfig):
 
     Attributes:
         model_config: Pydantic config — frozen to prevent mutation after init.
+        num_workers: Number of DataLoader worker processes for the training
+            split.
         token_budget: Upper bound on the total number of residues across all
             samples in a single batch step.
         batch_prefetch_depth: Number of batches to prefetch from the shard
@@ -315,14 +324,14 @@ class TrainLoaderConfig(LoaderConfig):
     """
 
     model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True)
-
-    token_budget: int = Field(default=384, gt=0)
+    num_workers: int = Field(default=1, gt=0)
+    token_budget: int = Field(default=256, gt=0)
     batch_prefetch_depth: int = Field(default=4, gt=0)
     epoch_prefetch_depth: int = Field(default=3, gt=0)
     seed: int = Field(default=0)
     n_threads: int = Field(default=32, gt=0)
     n_shards: int = Field(default=16, gt=0)
-    noise_magnitude: int = Field(default=10, ge=0)
+    noise_magnitude: int = Field(default=0, ge=0)
 
     @model_validator(mode="after")
     def workers_le_shards(self) -> "TrainLoaderConfig":

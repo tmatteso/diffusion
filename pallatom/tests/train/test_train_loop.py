@@ -37,10 +37,11 @@ from pydantic import ValidationError
 from structlog.typing import FilteringBoundLogger
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import Adam
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import StepLR
 from train.train_config import (
     AtomDistogramParams,
     CheckpointParams,
+    LoaderConfig,
     LoggingParams,
     ModelParams,
     NoiseScheduleParams,
@@ -102,7 +103,7 @@ def _make_model_params(
     dgram_res: Distogram,
     dgram_atom: Distogram,
 ) -> ModelSetup:
-    """Construct a ModelSetup with Adam optimizer, CosineAnnealingLR scheduler.
+    """Construct a ModelSetup with Adam optimizer, StepLR scheduler.
 
     Args:
         trunk: The MainTrunk to wrap.
@@ -114,10 +115,10 @@ def _make_model_params(
         Fully initialised ModelSetup.
     """
     optimizer = Adam(trunk.parameters(), lr=train_cfg.training.lr)
-    scheduler = CosineAnnealingLR(
+    scheduler = StepLR(
         optimizer,
-        T_max=train_cfg.training.num_epochs,
-        eta_min=train_cfg.training.lr * 0.01,
+        step_size=train_cfg.training.lr_decay_steps,
+        gamma=train_cfg.training.lr_decay_factor,
     )
     return ModelSetup(
         model=trunk,
@@ -402,7 +403,7 @@ def model_params(
 
     Returns:
         ModelSetup wrapping the model fixture with an Adam optimizer and
-        CosineAnnealingLR scheduler configured from tcfg.
+        StepLR scheduler configured from tcfg.
     """
     return _make_model_params(model, tcfg, distogram_res, distogram_atom)
 
@@ -490,8 +491,9 @@ def loaders(
             save_every=100,
         ),
         logging=LoggingParams(use_wandb=False),
+        test_loader=LoaderConfig(batch_size=2),
         train_loader=TrainLoaderConfig(
-            token_budget=64,
+            token_budget=63,
             n_shards=1,
             num_workers=1,
             epoch_prefetch_depth=1,
@@ -1229,11 +1231,12 @@ def test_train_token_budget_preflush_fires_before_oversized_batch(
 ) -> None:
     """Pre-flush fires when the next batch would push tokens over the budget.
 
-    Loader yields 3 batches of 6 tokens each with budget=7:
+    Loader yields 4 batches of _N_RES_BUCKET tokens each with budget=7:
     - batch1 (buffer empty): added, no pre-flush
-    - batch2: 6+6=12 > 7 → pre-flush batch1, then batch2 added
-    - batch3: 6+6=12 > 7 → pre-flush batch2, then batch3 added
-    - epoch end: batch3 flushed
+    - batch2: tokens+tokens > 7 → pre-flush batch1, then batch2 added
+    - batch3: tokens+tokens > 7 → pre-flush batch2, then batch3 added
+    - batch4: tokens+tokens > 7 → pre-flush batch3, then batch4 added
+    - epoch end: batch4 remains in buffer (no end-of-epoch flush)
     Result: three optimizer windows each of size 1.
     """
     window_sizes: list[int] = []
@@ -1256,7 +1259,7 @@ def test_train_token_budget_preflush_fires_before_oversized_batch(
         _tracking_process,
     )
 
-    budget: int = 7  # 6+6=12 > 7 forces a pre-flush on every 2nd batch
+    budget: int = 7  # tokens+tokens > 7 forces a pre-flush on every 2nd batch
     tcfg_b = TrainConfig(
         training=TrainingParams(
             num_epochs=1,
@@ -1280,6 +1283,7 @@ def test_train_token_budget_preflush_fires_before_oversized_batch(
             save_every=100,
         ),
         logging=LoggingParams(use_wandb=False),
+        test_loader=LoaderConfig(batch_size=1),
         train_loader=TrainLoaderConfig(
             token_budget=_N_RES_BUCKET,
             noise_magnitude=0,
@@ -1450,9 +1454,9 @@ def test_train_config_accepts_any_positive_token_budget() -> None:
     assert cfg.training.accumulated_token_budget == 1
 
 
-_N_RES_BUCKET = 6
-_ENTRY_NAMES_BUCKET = ["1aa.A", "2bb.A", "3cc.A", "4dd.A", "5ee.A"]
-_TRAIN_NAMES_BUCKET = ["1aa.A", "2bb.A", "3cc.A"]
+_N_RES_BUCKET = 42
+_ENTRY_NAMES_BUCKET = ["1aa.A", "2bb.A", "3cc.A", "4dd.A", "5ee.A", "6ff.A"]
+_TRAIN_NAMES_BUCKET = ["1aa.A", "2bb.A", "3cc.A", "6ff.A"]
 _VAL_NAMES_BUCKET = ["4dd.A"]
 _TEST_NAMES_BUCKET = ["5ee.A"]
 
@@ -1465,7 +1469,7 @@ def jsonl_path(tmp_path: pathlib.Path) -> str:
         for name in _ENTRY_NAMES_BUCKET:
             entry = {
                 "name": name,
-                "seq": "ACDEFG"[:_N_RES_BUCKET],
+                "seq": "A" * _N_RES_BUCKET,
                 "coords": {
                     atom: np.zeros((_N_RES_BUCKET, 3)).tolist()
                     for atom in ("N", "CA", "C", "O")

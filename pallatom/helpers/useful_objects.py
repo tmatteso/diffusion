@@ -9,7 +9,6 @@ import dataclasses
 from typing import NoReturn, cast
 
 import torch
-import torch.distributed as dist
 from architecture.main_trunk import MainTrunk
 from beartype import beartype
 from einops import reduce
@@ -17,7 +16,7 @@ from helpers.data import Distogram
 from jaxtyping import Float, jaxtyped
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import Adam
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import StepLR
 from tqdm import tqdm
 from train.train_config import TrainConfig
 from typing_extensions import Self
@@ -51,7 +50,7 @@ class ModelSetup:
         device: Target device string (e.g. ``"cuda:0"`` or ``"cpu"``).
         optimizer: Adam optimizer whose state is saved and restored on
             checkpoint.
-        scheduler: Cosine annealing LR scheduler tied to the optimizer.
+        scheduler: StepLR scheduler tied to the optimizer.
     """
 
     model: MainTrunk | DDP
@@ -60,7 +59,7 @@ class ModelSetup:
     distogram_atom: Distogram
     device: torch.device
     optimizer: Adam
-    scheduler: CosineAnnealingLR
+    scheduler: StepLR
 
 
 @dataclasses.dataclass
@@ -189,14 +188,6 @@ class TensorAccumulatorMixin:
             },
         )
 
-    def all_reduce_(self) -> None:
-        """Sum all tensor fields across DDP ranks in place."""
-        for f in dataclasses.fields(self):
-            _ = dist.all_reduce(  # pyright: ignore[reportUnknownMemberType]
-                cast(torch.Tensor, getattr(self, f.name)),
-                op=dist.ReduceOp.SUM,
-            )
-
 
 @jaxtyped(typechecker=beartype)
 @dataclasses.dataclass
@@ -313,17 +304,16 @@ class StepProgress:
         global_step: Running optimizer step count across all epochs.
         rank: Process rank; used to gate logging to rank 0.
         pbar: tqdm progress bar for the current epoch.
-        step_loss_metrics: Per-step loss metrics appended on each flush.
-        step_throughput_stats: Per-step throughput stats appended on each
-            flush.
-        step_component_norms: Per-step gradient norms appended on each flush.
-        step_n_proteins: Per-step protein counts appended on each flush.
+        loss_sum: Protein-count-weighted running sum of loss metrics.
+        throughput_sum: Protein-count-weighted running sum of throughput stats.
+        norms_sum: Protein-count-weighted running sum of gradient norms.
+        n_proteins_total: Total protein count across all flushed steps.
     """
 
     global_step: int
     rank: int
     pbar: "tqdm[NoReturn]"
-    step_loss_metrics: list[LossMetrics]
-    step_throughput_stats: list[ThroughputStatistics]
-    step_component_norms: list[ComponentNorms]
-    step_n_proteins: list[int]
+    loss_sum: LossMetrics
+    throughput_sum: ThroughputStatistics
+    norms_sum: ComponentNorms
+    n_proteins_total: int

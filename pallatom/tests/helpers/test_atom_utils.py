@@ -17,6 +17,7 @@ import torch
 from helpers.atom_utils import (
     ATOM5_CB,
     ATOM5_NAMES,
+    ATOM5_TO_ATOM37,
     ATOM37_C,
     ATOM37_CA,
     ATOM37_CB,
@@ -41,6 +42,7 @@ from helpers.atom_utils import (
     RNA_RESTYPE_ORDER,
     RNA_RESTYPES,
     Protein,
+    atom5_to_atom37,
     atom37_to_atom5,
     atom37_to_cb,
     atom_types,
@@ -282,6 +284,114 @@ def test_atom37_to_atom5_output_finite(
     pos5, mask5 = atom37_to_atom5(atom37_positions, atom37_mask)
     assert torch.isfinite(pos5).all()
     assert torch.isfinite(mask5).all()
+
+
+# ---------------------------------------------------------------------------
+# atom5_to_atom37 — shapes, coordinate placement, and mask handling
+# ---------------------------------------------------------------------------
+
+_UNOCCUPIED_ATOM37: list[int] = [
+    i for i in range(37) if i not in set(ATOM5_TO_ATOM37)
+]
+
+
+@pytest.fixture
+def coords5() -> Float[torch.Tensor, "B N_RES 5 3"]:
+    """Random atom5 coordinates (B, N_RES, 5, 3) in float64 with fixed seed."""
+    return torch.tensor(
+        np.random.RandomState(1).randn(B, N_RES, 5, 3).astype(np.float64),
+    )
+
+
+@pytest.fixture
+def coords_sentinel() -> Float[torch.Tensor, "B N_RES 5 3"]:
+    """Atom5 tensor where slot s has all coordinates equal to float(s + 1)."""
+    coords = torch.zeros((B, N_RES, 5, 3), dtype=torch.float64)
+    for slot in range(5):
+        coords[:, :, slot, :] = float(slot + 1)
+    return coords
+
+
+@pytest.mark.parametrize(
+    ("slot", "atom37_idx"),
+    list(enumerate(ATOM5_TO_ATOM37)),
+)
+def test_atom5_to_atom37(
+    coords_sentinel: Float[torch.Tensor, "B N_RES 5 3"],
+    slot: int,
+    atom37_idx: int,
+) -> None:
+    """Verify dtype, shape, coordinate placement, mask handling per atom5 slot.
+
+    Unoccupied-slot zeroing is covered by the parametrized
+    ``test_atom5_to_atom37_unoccupied_*`` tests.
+    """
+    x_37, mask_37 = atom5_to_atom37(coords_sentinel)
+    assert x_37.dtype == torch.float64
+    assert mask_37.dtype == torch.float64
+    assert x_37.shape == (B, N_RES, 37, 3)
+    assert mask_37.shape == (B, N_RES, 37)
+    assert torch.allclose(
+        x_37[:, :, atom37_idx, :],
+        torch.tensor(float(slot + 1), dtype=torch.float64),
+    ), f"atom5 slot {slot} → atom37 slot {atom37_idx}: wrong coords"
+    assert torch.allclose(
+        mask_37[:, :, atom37_idx],
+        torch.ones((B, N_RES), dtype=torch.float64),
+    )
+    rng = np.random.RandomState(2)
+    mask_5 = torch.tensor(rng.rand(B, N_RES, 5).astype(np.float64))
+    _, mask_37_explicit = atom5_to_atom37(coords_sentinel, mask_5)
+    assert torch.allclose(
+        mask_37_explicit[:, :, atom37_idx], mask_5[:, :, slot],
+    )
+
+
+@pytest.mark.parametrize("idx", _UNOCCUPIED_ATOM37)
+def test_atom5_to_atom37_unoccupied_coords_zero(
+    coords5: Float[torch.Tensor, "B N_RES 5 3"],
+    idx: int,
+) -> None:
+    """Unoccupied atom37 coordinate slots are zeroed after conversion."""
+    x_37, _ = atom5_to_atom37(coords5)
+    assert torch.allclose(
+        x_37[:, :, idx, :],
+        torch.zeros(1, dtype=torch.float64),
+    ), f"atom37 slot {idx} should be zero (unoccupied)"
+
+
+@pytest.mark.parametrize("idx", _UNOCCUPIED_ATOM37)
+def test_atom5_to_atom37_unoccupied_mask_zero(idx: int) -> None:
+    """Unoccupied atom37 mask slots remain zero when all atom5 masks are 1."""
+    _, mask_37 = atom5_to_atom37(
+        torch.ones((B, N_RES, 5, 3), dtype=torch.float64),
+        torch.ones((B, N_RES, 5), dtype=torch.float64),
+    )
+    assert torch.allclose(
+        mask_37[:, :, idx],
+        torch.zeros((B, N_RES), dtype=torch.float64),
+    )
+
+
+# ---------------------------------------------------------------------------
+# atom5_to_atom37 — type enforcement and edge cases
+# ---------------------------------------------------------------------------
+
+
+def test_atom5_to_atom37_rejects_wrong_third_dimension() -> None:
+    """A jaxtyping TypeCheckError raised when third dimension is not 5."""
+    with pytest.raises(TypeCheckError):
+        _ = atom5_to_atom37(
+            torch.zeros((B, N_RES, 4, 3), dtype=torch.float64),
+        )  # 4 ≠ 5
+
+
+def test_atom5_to_atom37_single_residue() -> None:
+    """Atom5_toatom37 handles single-residue input without error."""
+    coords_5 = torch.randn(1, 1, 5, 3)
+    x_37, mask_37 = atom5_to_atom37(coords_5)
+    assert x_37.shape == (1, 1, 37, 3)
+    assert mask_37.shape == (1, 1, 37)
 
 
 # ---------------------------------------------------------------------------
@@ -761,15 +871,6 @@ def test_center_positions_masked_atoms_remain_zero(
     )
 
 
-def test_center_positions_modifies_in_place(
-    full_mask_np_example: Mapping[str, npt.NDArray[np.float64]],
-) -> None:
-    """center_positions mutates input dict's atom_positions array."""
-    original = full_mask_np_example["atom_positions"].copy()
-    center_positions(full_mask_np_example)
-    assert not np.allclose(full_mask_np_example["atom_positions"], original)
-
-
 # ---------------------------------------------------------------------------
 # chain_end
 # ---------------------------------------------------------------------------
@@ -864,7 +965,7 @@ def roundtrip_protein() -> Protein:
 
     # ALA=0, ARG=1, SER=15, VAL=19, GLY=7  (indices into restypes list)
     _aatype = np.array([0, 1, 15, 19, 7], dtype=np.intp)
-    _num_res = _aatype.shape[0]
+    _num_res = len(_aatype)
 
     _atom_mask = np.zeros((_num_res, N_ATOM_TYPE), dtype=np.float64)
     for _i in range(_num_res - 1):  # residues 0-3: non-GLY

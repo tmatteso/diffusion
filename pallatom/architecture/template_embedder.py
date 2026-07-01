@@ -114,10 +114,10 @@ class TemplateEmbedder(nn.Module):
         )
 
         # ------------------------------------------------------------------
-        # Step 2: b_ij^time = t ⊙ f_i^mask    (broadcast t over j)
+        # Step 2: b_ij^time = t ⊙ f_ij^mask    (broadcast t over i and j)
         # ------------------------------------------------------------------
-        b_time: Float[torch.Tensor, "B N_res N_res 1"] = rearrange(
-            t * rearrange(f_pseudo_beta_mask, "b i -> b i 1"),
+        b_time = rearrange(
+            t * b_mask[..., 0],  # b_mask is (B, N, N, 1); squeeze and multiply
             "b i j -> b i j 1",
         )
 
