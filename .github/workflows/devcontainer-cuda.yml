@@ -93,4 +93,4 @@ jobs:
           configFile: .devcontainer/cuda/devcontainer.json
           imageName: ghcr.io/${{ github.repository }}/devcontainer-cuda
           push: never
-          runCmd: pytest -p no:cacheprovider pallatom
+          runCmd: PYTHONDONTWRITEBYTECODE=1 pytest -p no:cacheprovider pallatom
