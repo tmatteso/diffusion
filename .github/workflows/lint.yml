@@ -3,19 +3,7 @@ name: Lint
 on:
   push:
     branches: [main]
-    paths:
-      - "pyproject.toml"
-      - "uv.lock"
-      - "pallatom/**"
-      - "scripts/**"
-      - ".github/workflows/lint.yml"
   pull_request:
-    paths:
-      - "pyproject.toml"
-      - "uv.lock"
-      - "pallatom/**"
-      - "scripts/**"
-      - ".github/workflows/lint.yml"
   workflow_dispatch:
 
 # Hooks that are versioned via pyproject.toml/uv.lock: invoke the tools
