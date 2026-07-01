@@ -8,6 +8,7 @@ on:
       - ".devcontainer/cuda/devcontainer.json"
       - "pyproject.toml"
       - "uv.lock"
+      - "pallatom/**"
       - ".github/workflows/devcontainer-cuda.yml"
   pull_request:
     paths:
@@ -15,6 +16,7 @@ on:
       - ".devcontainer/cuda/devcontainer.json"
       - "pyproject.toml"
       - "uv.lock"
+      - "pallatom/**"
       - ".github/workflows/devcontainer-cuda.yml"
   workflow_dispatch:
 
@@ -37,3 +39,21 @@ jobs:
           runCmd: |
             show-platform
             python3 -c "import torch; assert torch.cuda.is_available(), 'CUDA not available'"
+
+  test:
+    needs: build
+    runs-on: [self-hosted, cuda-gpu]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Run pytest in CUDA devcontainer
+        uses: devcontainers/ci@v0.3
+        with:
+          configFile: .devcontainer/cuda/devcontainer.json
+          imageName: ghcr.io/${{ github.repository }}/devcontainer-cuda
+          push: never
+          runCmd: pytest pallatom

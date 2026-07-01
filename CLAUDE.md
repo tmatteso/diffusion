@@ -27,7 +27,7 @@ is accepted** — run `pre-commit run --all-files` locally to verify before push
 | `pre-commit` | **enforce-einops** | Bans raw tensor ops (see below) |
 | `pre-commit` | **enforce-jaxtyping** | Bans bare `torch.Tensor` / `Tensor` annotations (see below) |
 | `pre-commit` | **pydoclint** | Google-style docstring linting |
-| `push` (CI) | **pytest** | Full test suite — runs in `.github/workflows/tests.yml` |
+| `push` (CI) | **pytest** | `pytest pallatom` on the self-hosted GPU runner — runs in `.github/workflows/devcontainer-cuda.yml` |
 
 ---
 
