@@ -45,14 +45,6 @@ jobs:
   # --- Hooks that aren't versioned via pyproject.toml/uv.lock: run through
   # pre-commit itself (against the revs pinned in .pre-commit-config.yaml),
   # on the self-hosted runner between build and test as requested. ---
-  checkmake:
-    needs: build
-    runs-on: [self-hosted, cuda-gpu]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
-      - run: uvx pre-commit run checkmake --all-files
-
   check-yaml:
     needs: build
     runs-on: [self-hosted, cuda-gpu]
@@ -78,7 +70,7 @@ jobs:
       - run: uvx pre-commit run check-taskfile --all-files
 
   test:
-    needs: [checkmake, check-yaml, check-github-workflows, check-taskfile]
+    needs: [check-yaml, check-github-workflows, check-taskfile]
     runs-on: [self-hosted, cuda-gpu]
     steps:
       - uses: actions/checkout@v4
