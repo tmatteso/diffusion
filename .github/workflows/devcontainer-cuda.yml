@@ -20,7 +20,7 @@ on:
 
 jobs:
   build:
-    runs-on: [self-hosted, gpu]
+    runs-on: [self-hosted, cuda-gpu]
     steps:
       - uses: actions/checkout@v4
 

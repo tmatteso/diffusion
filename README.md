@@ -113,11 +113,13 @@ tar xzf ./actions-runner-linux-x64.tar.gz
 
 ./config.sh --url https://github.com/<owner>/<repo> \
   --token <registration-token> \
-  --labels gpu
+  --labels cuda-gpu
 ```
 
 Use the label(s) referenced by `runs-on:` in the workflow — currently
-`[self-hosted, gpu]` — so jobs actually get scheduled onto this machine.
+`[self-hosted, cuda-gpu]` — so jobs actually get scheduled onto this
+machine. Labels must match exactly: a runner tagged `gpu` will not
+satisfy `runs-on: [self-hosted, cuda-gpu]` and vice versa.
 
 > Registration tokens are short-lived and single-use — don't paste them into
 > chat logs, issues, or commits. If one leaks, regenerate it from
