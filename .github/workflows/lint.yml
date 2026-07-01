@@ -1,0 +1,114 @@
+name: Lint
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "pyproject.toml"
+      - "uv.lock"
+      - "pallatom/**"
+      - "scripts/**"
+      - ".github/workflows/lint.yml"
+  pull_request:
+    paths:
+      - "pyproject.toml"
+      - "uv.lock"
+      - "pallatom/**"
+      - "scripts/**"
+      - ".github/workflows/lint.yml"
+  workflow_dispatch:
+
+# Hooks that are versioned via pyproject.toml/uv.lock: invoke the tools
+# directly with `uv run` so CI uses the exact locked versions, not
+# whatever revs are separately pinned in .pre-commit-config.yaml.
+# UV_PROJECT_ENVIRONMENT mirrors the devcontainer's venv location so
+# basedpyright's venvPath/venv config (pyproject.toml) resolves the same
+# way it does inside the devcontainer.
+jobs:
+  black:
+    runs-on: ubuntu-latest
+    env:
+      UV_PROJECT_ENVIRONMENT: /opt/venv
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: sudo mkdir -p /opt/venv && sudo chown -R "$USER" /opt/venv
+      - run: uv sync --frozen --group dev
+      - run: uv run black --check .
+
+  ruff:
+    runs-on: ubuntu-latest
+    env:
+      UV_PROJECT_ENVIRONMENT: /opt/venv
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: sudo mkdir -p /opt/venv && sudo chown -R "$USER" /opt/venv
+      - run: uv sync --frozen --group dev
+      - run: uv run ruff check pallatom/
+
+  basedpyright:
+    runs-on: ubuntu-latest
+    env:
+      UV_PROJECT_ENVIRONMENT: /opt/venv
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: sudo mkdir -p /opt/venv && sudo chown -R "$USER" /opt/venv
+      - run: uv sync --frozen --group dev
+      - run: uv run basedpyright pallatom
+
+  pylint:
+    runs-on: ubuntu-latest
+    env:
+      UV_PROJECT_ENVIRONMENT: /opt/venv
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: sudo mkdir -p /opt/venv && sudo chown -R "$USER" /opt/venv
+      - run: uv sync --frozen --group dev
+      - run: uv run pylint pallatom
+
+  xenon:
+    runs-on: ubuntu-latest
+    env:
+      UV_PROJECT_ENVIRONMENT: /opt/venv
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: sudo mkdir -p /opt/venv && sudo chown -R "$USER" /opt/venv
+      - run: uv sync --frozen --group dev
+      - run: uv run xenon --max-absolute B --max-modules A --max-average A pallatom
+
+  pydoclint:
+    runs-on: ubuntu-latest
+    env:
+      UV_PROJECT_ENVIRONMENT: /opt/venv
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: sudo mkdir -p /opt/venv && sudo chown -R "$USER" /opt/venv
+      - run: uv sync --frozen --group dev
+      - run: uv run pydoclint pallatom
+
+  enforce-einops:
+    runs-on: ubuntu-latest
+    env:
+      UV_PROJECT_ENVIRONMENT: /opt/venv
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: sudo mkdir -p /opt/venv && sudo chown -R "$USER" /opt/venv
+      - run: uv sync --frozen --group dev
+      - run: uv run python scripts/check_einops.py $(git ls-files '*.py')
+
+  enforce-jaxtyping:
+    runs-on: ubuntu-latest
+    env:
+      UV_PROJECT_ENVIRONMENT: /opt/venv
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: sudo mkdir -p /opt/venv && sudo chown -R "$USER" /opt/venv
+      - run: uv sync --frozen --group dev
+      - run: uv run python scripts/check_jaxtyping.py $(git ls-files '*.py')
