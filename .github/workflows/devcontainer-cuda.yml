@@ -1,0 +1,35 @@
+name: Build CUDA Devcontainer
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".devcontainer/Dockerfile"
+      - ".devcontainer/cuda/devcontainer.json"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".github/workflows/devcontainer-cuda.yml"
+  pull_request:
+    paths:
+      - ".devcontainer/Dockerfile"
+      - ".devcontainer/cuda/devcontainer.json"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".github/workflows/devcontainer-cuda.yml"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: [self-hosted, gpu]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build CUDA devcontainer image
+        uses: devcontainers/ci@v0.3
+        with:
+          configFile: .devcontainer/cuda/devcontainer.json
+          imageName: ghcr.io/${{ github.repository }}/devcontainer-cuda
+          push: never
+          runCmd: |
+            show-platform
+            python3 -c "import torch; assert torch.cuda.is_available(), 'CUDA not available'"

@@ -20,27 +20,25 @@
   "customizations": {
     "vscode": {
       "extensions": [
-        "ms-python.python",
+        "ms-python.debugpy",
         "detachhead.basedpyright",
         "ms-azuretools.vscode-docker",
         "ms-toolsai.jupyter"
       ],
       "settings": {
         "python.defaultInterpreterPath": "/opt/venv/bin/python",
-        "python.languageServer": "None",
         "python.terminal.activateEnvironment": true
       }
     },
     "cursor": {
       "extensions": [
-        "ms-python.python",
+        "ms-python.debugpy",
         "detachhead.basedpyright",
         "ms-azuretools.vscode-docker",
         "ms-toolsai.jupyter"
       ],
       "settings": {
         "python.defaultInterpreterPath": "/opt/venv/bin/python",
-        "python.languageServer": "None",
         "python.terminal.activateEnvironment": true
       }
     }
@@ -48,3 +46,4 @@
   "postCreateCommand": "python -m ipykernel install --user --name=diffusion --display-name='Python (diffusion)' && echo 'source /opt/venv/bin/activate' >> ~/.bashrc && show-platform",
   "remoteUser": "root"
 }
+

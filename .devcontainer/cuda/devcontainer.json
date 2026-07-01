@@ -18,13 +18,12 @@
   "customizations": {
     "vscode": {
       "extensions": [
-        "ms-python.python",
+        "ms-python.debugpy",
         "detachhead.basedpyright",
         "ms-azuretools.vscode-docker"
       ],
       "settings": {
         "python.defaultInterpreterPath": "/opt/venv/bin/python",
-        "python.languageServer": "None",
         "python.terminal.activateEnvironment": true
       }
     }
@@ -32,3 +31,4 @@
   "postCreateCommand": "echo 'source /opt/venv/bin/activate' >> ~/.bashrc && show-platform",
   "remoteUser": "root"
 }
+
