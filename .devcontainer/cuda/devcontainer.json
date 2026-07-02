@@ -13,7 +13,8 @@
     "PATH": "/opt/venv/bin:${containerEnv:PATH}"
   },
   "runArgs": [
-    "--gpus=all"
+    "--gpus=all",
+    "--shm-size=8g"
   ],
   "customizations": {
     "vscode": {

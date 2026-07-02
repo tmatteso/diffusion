@@ -9,6 +9,12 @@ STDOUT_LOG="$SCRIPT_DIR/train_stdout.log"
 NUM_GPUS=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
 echo "Detected $NUM_GPUS GPU(s). Launching DDP training under nohup..."
 
+# train_loop.py is run by file path, so Python only puts its own directory
+# (pallatom/train/) on sys.path. Its first-party imports (architecture,
+# helpers, ...) resolve relative to pallatom/ as the root, so that needs to
+# be on PYTHONPATH explicitly.
+export PYTHONPATH="$PALLATOM_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+
 nohup "$TORCHRUN" \
     --nproc_per_node="$NUM_GPUS" \
     "$PALLATOM_ROOT/train/train_loop.py" \

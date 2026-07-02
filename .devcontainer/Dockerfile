@@ -57,11 +57,19 @@ RUN if [ "${PLATFORM}" = "cuda" ]; then \
 COPY pyproject.toml uv.lock ./
 # On CUDA, torch/torchvision/torchaudio are already in the base image's conda
 # environment (visible via --system-site-packages), so skip re-downloading them.
+# Since torch is skipped here, uv never generates a torchrun console-script in
+# the venv, so regenerate it by hand, bound to the venv's own interpreter, so
+# torchrun's spawned workers get torch (inherited from conda) AND the venv's
+# own uv-installed deps on the same interpreter — instead of
+# /opt/conda/bin/torchrun's workers, which only see conda's site-packages.
 RUN if [ "${PLATFORM}" = "cuda" ]; then \
         uv sync --frozen \
             --no-install-package torch \
             --no-install-package torchvision \
-            --no-install-package torchaudio; \
+            --no-install-package torchaudio && \
+        printf '#!/opt/venv/bin/python3\nimport sys\nfrom torch.distributed.run import main\nif __name__ == "__main__":\n    sys.exit(main())\n' \
+            > /opt/venv/bin/torchrun && \
+        chmod +x /opt/venv/bin/torchrun; \
     else \
         uv sync --frozen; \
     fi
