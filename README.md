@@ -1,8 +1,6 @@
 # diffusion
 Tinkering with Advances in Diffusion / Flow Modeling
 
-**[API Docs](https://tmatteso.github.io/diffusion/)**
-
 ---
 
 ## Enabling pre-commit hooks (optional)
