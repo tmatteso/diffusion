@@ -203,7 +203,8 @@ class TriangleAttentionStartingNodeWithBias(nn.Module):
         # EFFICIENT_ATTENTION broadcasts over all N_i rows — O(N^2), no loop.
         with sdpa_ctx:
             intermediate: Float[
-                torch.Tensor, "B N_res N_res n_heads head_dim",
+                torch.Tensor,
+                "B N_res N_res n_heads head_dim",
             ] = rearrange(
                 F.scaled_dot_product_attention(
                     rearrange(q, "b i j h d -> i (b h) j d"),
@@ -320,7 +321,8 @@ class TriangleAttentionEndingNodeWithBias(nn.Module):
         )
         with sdpa_ctx:
             intermediate: Float[
-                torch.Tensor, "B N_res N_res n_heads head_dim",
+                torch.Tensor,
+                "B N_res N_res n_heads head_dim",
             ] = rearrange(
                 F.scaled_dot_product_attention(
                     rearrange(q, "b n_j n_i h d -> n_j (b h) n_i d"),

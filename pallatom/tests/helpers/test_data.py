@@ -1829,7 +1829,8 @@ def test_bucketed_debug_run_train_dataset_has_252_items(
         cfg=bucketed_cfg,
         extra_train_args=debug_train_args,
     )
-    assert len(train_loader.dataset) == _N_DEBUG
+    loader_dataset = cast(ProteinDataset, train_loader.dataset)
+    assert len(loader_dataset) == _N_DEBUG
 
 
 _N_FULL = 300  # dataset larger than _N_DEBUG to expose cache-poisoning bug
@@ -1840,7 +1841,7 @@ def test_bucketed_debug_run_not_poisoned_by_prior_full_cache(
     full_train_args: TrainArgs,
     full_debug_train_args: TrainArgs,
 ) -> None:
-    """debug_run=True caps at _N_DEBUG even after a full-dataset loader was built.
+    """debug_run=True caps at _N_DEBUG even after full-dataset loader built.
 
     Building a loader over all _N_FULL proteins must not affect a subsequent
     debug_run=True call that slices train names to _N_DEBUG.
@@ -1856,7 +1857,8 @@ def test_bucketed_debug_run_not_poisoned_by_prior_full_cache(
         cfg=bucketed_cfg,
         extra_train_args=full_debug_train_args,
     )
-    assert len(train_loader.dataset) == _N_DEBUG
+    loader_dataset = cast(ProteinDataset, train_loader.dataset)
+    assert len(loader_dataset) == _N_DEBUG
 
 
 # ---------------------------------------------------------------------------

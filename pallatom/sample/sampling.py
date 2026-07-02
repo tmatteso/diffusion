@@ -677,7 +677,9 @@ class EDMSampler:
             atom37_positions, atom37_mask = atom5_to_atom37(
                 rearrange(r_denoised, "b (n a) d -> b n a d", a=NATOM),
                 rearrange(
-                    self.context.atom5_mask, "b (n a) -> b n a", a=NATOM,
+                    self.context.atom5_mask,
+                    "b (n a) -> b n a",
+                    a=NATOM,
                 ).float(),
             )
             cb_positions: Float[torch.Tensor, "B N_res 3"]
@@ -687,7 +689,8 @@ class EDMSampler:
             )
             f_template_distogram: Float[torch.Tensor, "B N_res N_res n_bins"]
             f_template_distogram, _ = self.template_distogram_fn(
-                cb_positions, self_condition_residue_mask,
+                cb_positions,
+                self_condition_residue_mask,
             )
             # calculate the score function.
             r_denoised, seq_logits = self.denoise(

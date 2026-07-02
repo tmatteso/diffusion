@@ -73,7 +73,10 @@ def atom_loss(
     # Detach so gradients flow only through r_denoised, not through the SVD.
     with torch.no_grad():
         (r_aligned,) = kabsch_align(  # pylint: disable=unpacking-non-sequence
-            r_gt, r_denoised, weights=weights, return_transform=False,
+            r_gt,
+            r_denoised,
+            weights=weights,
+            return_transform=False,
         )
 
     # Squared residuals summed over xyz → (B, N_res)
@@ -287,7 +290,8 @@ def smooth_lddt_loss(
         # Bool outer product avoids materialising a float [N_atom, N_atom]
         # intermediate that would otherwise be created by einsum + .bool().
         pair_valid: Bool[torch.Tensor, "... N_atom N_atom"] = rearrange(
-            mask, "... n -> ... n 1",
+            mask,
+            "... n -> ... n 1",
         ) & rearrange(mask, "... n -> ... 1 n")
         c = c & pair_valid
         del pair_valid

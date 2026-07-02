@@ -108,8 +108,8 @@ class AttentionPairBias(nn.Module):
         # always pass a real s, so norm_a is never called
         self.norm_a: LayerNorm = LayerNorm(c_res, elementwise_affine=False)
         self.a_to_q: TypedLinear = TypedLinear(c_res, c_res)
-        self.a_to_k: TypedLinear = TypedLinear(c_res, c_res)
-        self.a_to_v: TypedLinear = TypedLinear(c_res, c_res)
+        self.a_to_k: TypedLinear = LinearNoBias(c_res, c_res)
+        self.a_to_v: TypedLinear = LinearNoBias(c_res, c_res)
         self.z_to_b: LinearNoBias = LinearNoBias(c_pair, self.n_heads)
         self.a_to_g: LinearNoBias = LinearNoBias(c_res, c_res)
         self.s_to_a: TypedLinear = TypedLinear(c_res, c_res)  # biasinit=-2.0

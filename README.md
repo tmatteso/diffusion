@@ -5,6 +5,27 @@ Tinkering with Advances in Diffusion / Flow Modeling
 
 ---
 
+## Enabling pre-commit hooks (optional)
+
+If you wish to use the pre-commit hooks (formatting, linting, type-checking,
+commit message style, etc. — see `.pre-commit-config.yaml`), install them once
+per clone:
+
+```bash
+pip install pre-commit
+pre-commit install
+```
+
+This wires up both the `pre-commit` and `commit-msg` hook stages, so checks run
+automatically on every `git commit`. You can also run all hooks manually at any
+time without committing:
+
+```bash
+pre-commit run --all-files
+```
+
+---
+
 ## Setting up the devcontainer on a new CUDA machine
 
 ### 1. Install the NVIDIA Container Toolkit

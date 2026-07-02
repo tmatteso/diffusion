@@ -739,7 +739,10 @@ class MainTrunk(nn.Module):
             z_ij = cast(
                 Float[torch.Tensor, "B N_res N_res c_pair"],
                 checkpoint(
-                    self.pair_updates[k], z_ij, r_center, use_reentrant=False,
+                    self.pair_updates[k],
+                    z_ij,
+                    r_center,
+                    use_reentrant=False,
                 ),
             )
         # ------------------------------------------------------------------

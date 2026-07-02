@@ -5,6 +5,7 @@ structures from JSONL files, collate helpers for variable-length batching, and
 a factory function that assembles bucketed train/val/test DataLoaders with
 optional DDP support.
 """
+
 # ruff: noqa: ERA001
 
 import dataclasses
@@ -541,8 +542,8 @@ def featurize_single_item(
         the sampled noise level ``t_hat``, and the uniform template weight
         ``t_normalized``.
     """
-    noise_params=tcfg.noise
-    window_size=tcfg.model.window_size
+    noise_params = tcfg.noise
+    window_size = tcfg.model.window_size
     # you need to pad the pos, res_idx, and mask now
     # do this first, then fix featurize batch
     atom37_positions: Float[torch.Tensor, "N_res 37 3"] = torch.tensor(
@@ -636,7 +637,8 @@ def featurize_single_item(
     )
     c_beta_pos_noised = rearrange(c_beta_pos_noised, "1 n d -> n d")
     noised_res_distogram, _ = c_beta_distogram_fn(
-        c_beta_pos_noised, residue_mask,
+        c_beta_pos_noised,
+        residue_mask,
     )
 
     ref_pos: Float[torch.Tensor, "N_atom 3"] = rearrange(
@@ -682,7 +684,8 @@ def featurize_single_item(
         reduce(diff_sparse**2, "n k d -> n k", "sum").clamp(min=1e-8),
     )
     gt_atom_distogram_sparse: Int[torch.Tensor, "N_atom K"] = torch.bucketize(
-        sparse_dist, atom_distogram_fn.edges[1:],
+        sparse_dist,
+        atom_distogram_fn.edges[1:],
     ).clamp(
         0,
         (

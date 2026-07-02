@@ -12,6 +12,10 @@ from typing import cast
 import pytest
 import structlog
 from helpers.context_managers import StructlogConfig
+from structlog.typing import FilteringBoundLogger
+
+_BELOW_THRESHOLD_EVENT = "below_threshold"
+_ABOVE_THRESHOLD_EVENT = "above_threshold"
 
 
 def test_structlog_config_creates_log_file(tmp_path: pathlib.Path) -> None:
@@ -240,12 +244,12 @@ def test_structlog_config_processors_no_console_renderer_not_rank_zero(
     no output while a WARNING event must appear in the captured output.
     """
     with StructlogConfig(is_rank_zero=False, log_file=tmp_path / "run.jsonl"):
-        log = structlog.get_logger()
-        log.info("below_threshold")
-        log.warning("above_threshold")
+        log = cast(FilteringBoundLogger, structlog.get_logger())
+        log.info(_BELOW_THRESHOLD_EVENT)
+        log.warning(_ABOVE_THRESHOLD_EVENT)
     captured = capsys.readouterr()
-    assert "below_threshold" not in captured.out + captured.err
-    assert "above_threshold" in captured.out + captured.err
+    assert _BELOW_THRESHOLD_EVENT not in captured.out + captured.err
+    assert _ABOVE_THRESHOLD_EVENT in captured.out + captured.err
 
 
 def test_structlog_config_write_log_line_in_processors_with_file(

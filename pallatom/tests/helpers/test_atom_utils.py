@@ -343,7 +343,8 @@ def test_atom5_to_atom37(
     mask_5 = torch.tensor(rng.rand(B, N_RES, 5).astype(np.float64))
     _, mask_37_explicit = atom5_to_atom37(coords_sentinel, mask_5)
     assert torch.allclose(
-        mask_37_explicit[:, :, atom37_idx], mask_5[:, :, slot],
+        mask_37_explicit[:, :, atom37_idx],
+        mask_5[:, :, slot],
     )
 
 

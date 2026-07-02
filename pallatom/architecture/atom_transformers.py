@@ -246,14 +246,14 @@ class DiffusionTransformer(nn.Module):
             self.cond_trans_blocks,
             strict=True,
         ):
-            a = a + attn_block(
+            b: Float[torch.Tensor, "B N_res c_a"] = attn_block(
                 a=a,
                 s=s,
                 z=z,
                 beta=beta,
                 neighbor_idx=neighbor_idx,
             )
-            a = a + trans_block(a, s)
+            a = b + trans_block(a, s)
         return a
 
 
@@ -413,8 +413,28 @@ class AtomTransformer(nn.Module):
     Constructs the sequence-local β mask once — 0 for atom pairs that share a
     sliding window centre, -1e10 elsewhere — then runs n_blocks rounds of
     sparse pair-biased attention (the DiffusionTransformer loop), passing beta
-    as
-    an additive bias to every block.
+    as an additive bias to every block.
+
+    n_queries and n_keys are independent widths, not interchangeable. Block
+    centres are spaced every n_queries atoms, and atom l is assigned to
+    whichever centre c satisfies |l - c| < n_queries / 2. Once assigned, l
+    may attend to any atom m with |m - c| < n_keys / 2 — note the key window
+    is centred on the block centre, not on l itself. An atom sitting exactly
+    at its block's centre sees a full, symmetric window of n_keys / 2 atoms
+    on each side. An atom at the edge of its block (offset by close to
+    n_queries / 2 from the centre) sees an asymmetric window shifted away
+    from it: roughly n_keys/2 - n_queries/2 atoms on the near side and
+    n_keys/2 + n_queries/2 atoms on the far side. Keeping n_keys comfortably
+    larger than n_queries (AF3: n_queries=32, n_keys=128, so
+    half_k - half_q = 48) guarantees every atom, even one at a block edge,
+    still sees dozens of neighbours on every side. If n_keys < n_queries,
+    half_k - half_q goes negative: an atom near a block edge can end up with
+    a key window that doesn't reach back to cover even its own position, so
+    its entire attention row is masked to -1e10 by compute_beta and falls
+    back to a near-uniform softmax over whatever padding/neighbour slots
+    remain in {valid_mask} — not just reduced context, but potentially no
+    valid local context at all. Callers must therefore keep
+    n_keys >= n_queries.
 
     Args:
         c_atom: Atom single-embedding dimension.
@@ -589,8 +609,8 @@ class AtomFeatureEncoder(nn.Module):
             c_atompair=self.d,
             n_blocks=self.n_blocks,
             n_heads=self.n_heads,
-            n_queries=self.window_size * 4,
-            n_keys=self.window_size,
+            n_queries=self.window_size,
+            n_keys=self.window_size * 4,
         )
 
         self.proj_agg: LinearNoBias = LinearNoBias(self.m, self.c)  # [m, c]
@@ -909,8 +929,8 @@ class AtomAttentionDecoder(nn.Module):
         self.n_heads: int = model_params.n_heads_atom_transformer_decoder
 
         self.window_size: int = model_params.window_size
-        self.n_keys: int = self.window_size
-        self.n_queries: int = self.window_size * 4
+        self.n_queries: int = self.window_size
+        self.n_keys: int = self.window_size * 4
 
         self.norm_s_q: LayerNorm = LayerNorm(self.c_res)
         self.proj_s_q: LinearNoBias = LinearNoBias(
@@ -940,8 +960,8 @@ class AtomAttentionDecoder(nn.Module):
             c_atompair=self.c_atompair,
             n_blocks=self.n_blocks,
             n_heads=self.n_heads,
-            n_queries=self.window_size * 4,
-            n_keys=self.window_size,
+            n_queries=self.n_queries,
+            n_keys=self.n_keys,
         )
 
         self.norm_q_out: LayerNorm = LayerNorm(self.c_atom)
@@ -1017,7 +1037,7 @@ class AtomAttentionDecoder(nn.Module):
         per_batch_nidx: list[Int[torch.Tensor, "N_atom K"]] = []
         per_batch_wvalid: list[Bool[torch.Tensor, "N_atom K"]] = []
         for b in range(B):
-            nidx_b, wvalid_b = build_sparse_pairs(tok_idx[b], self.n_keys)
+            nidx_b, wvalid_b = build_sparse_pairs(tok_idx[b], self.window_size)
             per_batch_nidx.append(nidx_b)
             per_batch_wvalid.append(wvalid_b)
 
