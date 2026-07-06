@@ -192,7 +192,6 @@ class TriangleAttentionStartingNodeWithBias(nn.Module):
         # produce 4D tensors; bias is the same for every row so repeat it.
         B = q.shape[0]
 
-
         # Merge B into the heads dim: "head" b*H+h carries both batch and head
         # identity. Mask (1, B*H, N_j, N_k) has a singleton N_i batch dim that
         # EFFICIENT_ATTENTION broadcasts over all N_i rows — O(N^2), no loop.
@@ -201,7 +200,7 @@ class TriangleAttentionStartingNodeWithBias(nn.Module):
         # kernel is inconsistently implemented on Blackwell hardware, leading
         # to catastrophic failure. SDPBackend.MATH is more stable but consumes
         # more VRAM.
-        sdpa_ctx = (sdpa_kernel(SDPBackend.MATH))
+        sdpa_ctx = sdpa_kernel(SDPBackend.MATH)
 
         with sdpa_ctx:
             intermediate: Float[
@@ -321,7 +320,7 @@ class TriangleAttentionEndingNodeWithBias(nn.Module):
         # kernel is inconsistently implemented on Blackwell hardware, leading
         # to catastrophic failure. SDPBackend.MATH is more stable but consumes
         # more VRAM.
-        sdpa_ctx = (sdpa_kernel(SDPBackend.MATH))
+        sdpa_ctx = sdpa_kernel(SDPBackend.MATH)
         with sdpa_ctx:
             intermediate: Float[
                 torch.Tensor,
