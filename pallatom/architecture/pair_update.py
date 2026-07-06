@@ -13,7 +13,6 @@ b_ij))
 5. z_ij += Transition(z_ij)
 """
 
-import contextlib
 import dataclasses
 
 import torch
@@ -192,15 +191,18 @@ class TriangleAttentionStartingNodeWithBias(nn.Module):
         # Fix i, attend j over k. Fold (B, N_i) into SDPA batch dim to
         # produce 4D tensors; bias is the same for every row so repeat it.
         B = q.shape[0]
-        sdpa_ctx = (
-            sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION)
-            if q.is_cuda
-            else contextlib.nullcontext()
-        )
+
 
         # Merge B into the heads dim: "head" b*H+h carries both batch and head
         # identity. Mask (1, B*H, N_j, N_k) has a singleton N_i batch dim that
         # EFFICIENT_ATTENTION broadcasts over all N_i rows — O(N^2), no loop.
+
+        # Reverted to SDPBackend.MATH as the SDPBackend.EFFICIENT_ATTENTION
+        # kernel is inconsistently implemented on Blackwell hardware, leading
+        # to catastrophic failure. SDPBackend.MATH is more stable but consumes
+        # more VRAM.
+        sdpa_ctx = (sdpa_kernel(SDPBackend.MATH))
+
         with sdpa_ctx:
             intermediate: Float[
                 torch.Tensor,
@@ -314,11 +316,12 @@ class TriangleAttentionEndingNodeWithBias(nn.Module):
         # Merge B into the heads dim: "head" b*H+h carries both batch and head
         # identity. Mask (1, B*H, N_j, N_k) has a singleton N_i batch dim that
         # EFFICIENT_ATTENTION broadcasts over all N_i rows — O(N^2), no loop.
-        sdpa_ctx = (
-            sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION)
-            if q.is_cuda
-            else contextlib.nullcontext()
-        )
+
+        # Reverted to SDPBackend.MATH as the SDPBackend.EFFICIENT_ATTENTION
+        # kernel is inconsistently implemented on Blackwell hardware, leading
+        # to catastrophic failure. SDPBackend.MATH is more stable but consumes
+        # more VRAM.
+        sdpa_ctx = (sdpa_kernel(SDPBackend.MATH))
         with sdpa_ctx:
             intermediate: Float[
                 torch.Tensor,
