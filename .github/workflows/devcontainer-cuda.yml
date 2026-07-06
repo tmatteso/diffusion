@@ -32,6 +32,10 @@ jobs:
         with:
           node-version: "20"
 
+      - name: Remove stale devcontainer
+        run: |
+          docker rm -f $(docker ps -aq --filter "label=devcontainer.local_folder=${{ github.workspace }}") 2>/dev/null || true
+
       - name: Build CUDA devcontainer image
         uses: devcontainers/ci@v0.3
         with:
