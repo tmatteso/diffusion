@@ -7,6 +7,7 @@ dependencies = [
     "torch==2.11.0",
     "torchvision==0.26.0",
     "torchaudio==2.11.0",
+    "numpy==2.4.3",
     "wandb>=0.18.0",
     "pandas>=2.0.0",
     "py3Dmol>=2.0.0",
