@@ -1,0 +1,17 @@
+name: ARM64 CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  checks:
+    uses: ./.github/workflows/devcontainer-checks.yml
+    with:
+      runs-on: '["ubuntu-latest"]'
+      devcontainer-config: .devcontainer/arm64/devcontainer.json
+      image-name: devcontainer-arm64
+      stub-ssh-agent: true
+      no-cache: true

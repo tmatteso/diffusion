@@ -1,0 +1,37 @@
+name: CUDA CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".devcontainer/Dockerfile"
+      - ".devcontainer/cuda/devcontainer.json"
+      - "pyproject.toml"
+      - "uv.lock"
+      - "pallatom/**"
+      - ".pre-commit-config.yaml"
+      - ".github/workflows/cuda.yml"
+      - ".github/workflows/devcontainer-checks.yml"
+  pull_request:
+    paths:
+      - ".devcontainer/Dockerfile"
+      - ".devcontainer/cuda/devcontainer.json"
+      - "pyproject.toml"
+      - "uv.lock"
+      - "pallatom/**"
+      - ".pre-commit-config.yaml"
+      - ".github/workflows/cuda.yml"
+      - ".github/workflows/devcontainer-checks.yml"
+  workflow_dispatch:
+
+jobs:
+  checks:
+    uses: ./.github/workflows/devcontainer-checks.yml
+    with:
+      runs-on: '["self-hosted", "cuda-gpu"]'
+      devcontainer-config: .devcontainer/cuda/devcontainer.json
+      image-name: devcontainer-cuda
+      cleanup-stale-container: true
+      build-run-cmd: |
+        show-platform
+        python3 -c "import torch; assert torch.cuda.is_available(), 'CUDA not available'"

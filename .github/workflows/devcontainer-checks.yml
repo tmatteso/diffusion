@@ -1,0 +1,285 @@
+name: Devcontainer Checks
+
+# Reusable workflow: runs the full pre-commit hook inventory plus pytest
+# against a given devcontainer variant. Called once per architecture by
+# cuda.yml and arm64.yml so both devcontainers are exercised identically.
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        description: "JSON array of runner labels, e.g. '[\"ubuntu-latest\"]'"
+        required: true
+        type: string
+      devcontainer-config:
+        description: "Path to the devcontainer.json to build"
+        required: true
+        type: string
+      image-name:
+        description: "Image name suffix under ghcr.io/<repo>/"
+        required: true
+        type: string
+      build-run-cmd:
+        description: "Command(s) to run inside the container after build"
+        required: false
+        type: string
+        default: show-platform
+      stub-ssh-agent:
+        description: "Stub /run/host-services/ssh-auth.sock for plain dockerd runners"
+        required: false
+        type: boolean
+        default: false
+      no-cache:
+        description: "Pass noCache through to devcontainers/ci"
+        required: false
+        type: boolean
+        default: false
+      cleanup-stale-container:
+        description: "Remove leftover devcontainers before building (persistent self-hosted runners)"
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  build:
+    runs-on: ${{ fromJson(inputs.runs-on) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Stub SSH agent socket for Docker Desktop mount
+        if: inputs.stub-ssh-agent
+        run: sudo mkdir -p /run/host-services && sudo touch /run/host-services/ssh-auth.sock
+
+      - name: Remove stale devcontainer
+        if: inputs.cleanup-stale-container
+        run: |
+          docker rm -f $(docker ps -aq --filter "label=devcontainer.local_folder=${{ github.workspace }}") 2>/dev/null || true
+
+      - name: Build devcontainer image
+        uses: devcontainers/ci@v0.3
+        with:
+          configFile: ${{ inputs.devcontainer-config }}
+          imageName: ghcr.io/${{ github.repository }}/${{ inputs.image-name }}
+          push: never
+          noCache: ${{ inputs.no-cache }}
+          runCmd: ${{ inputs.build-run-cmd }}
+
+  # --- Hooks that aren't versioned via pyproject.toml/uv.lock: run through
+  # pre-commit itself (against the revs pinned in .pre-commit-config.yaml).
+  # These are lightweight file validators that don't need the project's
+  # Python env, so they run directly on the runner instead of in-container. ---
+  check-yaml:
+    needs: build
+    runs-on: ${{ fromJson(inputs.runs-on) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uvx pre-commit run check-yaml --all-files
+
+  check-github-workflows:
+    needs: build
+    runs-on: ${{ fromJson(inputs.runs-on) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uvx pre-commit run check-github-workflows --all-files
+
+  check-taskfile:
+    needs: build
+    runs-on: ${{ fromJson(inputs.runs-on) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uvx pre-commit run check-taskfile --all-files
+
+  # --- Hooks that are versioned via pyproject.toml/uv.lock: run them inside
+  # the devcontainer built above, so CI lints with the exact same environment
+  # devs get locally. ---
+  black:
+    needs: build
+    runs-on: ${{ fromJson(inputs.runs-on) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Stub SSH agent socket for Docker Desktop mount
+        if: inputs.stub-ssh-agent
+        run: sudo mkdir -p /run/host-services && sudo touch /run/host-services/ssh-auth.sock
+      - uses: devcontainers/ci@v0.3
+        with:
+          configFile: ${{ inputs.devcontainer-config }}
+          imageName: ghcr.io/${{ github.repository }}/${{ inputs.image-name }}
+          push: never
+          noCache: ${{ inputs.no-cache }}
+          runCmd: uv run black --check .
+
+  ruff:
+    needs: build
+    runs-on: ${{ fromJson(inputs.runs-on) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Stub SSH agent socket for Docker Desktop mount
+        if: inputs.stub-ssh-agent
+        run: sudo mkdir -p /run/host-services && sudo touch /run/host-services/ssh-auth.sock
+      - uses: devcontainers/ci@v0.3
+        with:
+          configFile: ${{ inputs.devcontainer-config }}
+          imageName: ghcr.io/${{ github.repository }}/${{ inputs.image-name }}
+          push: never
+          noCache: ${{ inputs.no-cache }}
+          runCmd: uv run ruff check pallatom/
+
+  basedpyright:
+    needs: build
+    runs-on: ${{ fromJson(inputs.runs-on) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Stub SSH agent socket for Docker Desktop mount
+        if: inputs.stub-ssh-agent
+        run: sudo mkdir -p /run/host-services && sudo touch /run/host-services/ssh-auth.sock
+      - uses: devcontainers/ci@v0.3
+        with:
+          configFile: ${{ inputs.devcontainer-config }}
+          imageName: ghcr.io/${{ github.repository }}/${{ inputs.image-name }}
+          push: never
+          noCache: ${{ inputs.no-cache }}
+          runCmd: uv run basedpyright pallatom
+
+  pylint:
+    needs: build
+    runs-on: ${{ fromJson(inputs.runs-on) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Stub SSH agent socket for Docker Desktop mount
+        if: inputs.stub-ssh-agent
+        run: sudo mkdir -p /run/host-services && sudo touch /run/host-services/ssh-auth.sock
+      - uses: devcontainers/ci@v0.3
+        with:
+          configFile: ${{ inputs.devcontainer-config }}
+          imageName: ghcr.io/${{ github.repository }}/${{ inputs.image-name }}
+          push: never
+          noCache: ${{ inputs.no-cache }}
+          runCmd: uv run pylint pallatom
+
+  xenon:
+    needs: build
+    runs-on: ${{ fromJson(inputs.runs-on) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Stub SSH agent socket for Docker Desktop mount
+        if: inputs.stub-ssh-agent
+        run: sudo mkdir -p /run/host-services && sudo touch /run/host-services/ssh-auth.sock
+      - uses: devcontainers/ci@v0.3
+        with:
+          configFile: ${{ inputs.devcontainer-config }}
+          imageName: ghcr.io/${{ github.repository }}/${{ inputs.image-name }}
+          push: never
+          noCache: ${{ inputs.no-cache }}
+          runCmd: uv run xenon --max-absolute B --max-modules A --max-average A pallatom
+
+  pydoclint:
+    needs: build
+    runs-on: ${{ fromJson(inputs.runs-on) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Stub SSH agent socket for Docker Desktop mount
+        if: inputs.stub-ssh-agent
+        run: sudo mkdir -p /run/host-services && sudo touch /run/host-services/ssh-auth.sock
+      - uses: devcontainers/ci@v0.3
+        with:
+          configFile: ${{ inputs.devcontainer-config }}
+          imageName: ghcr.io/${{ github.repository }}/${{ inputs.image-name }}
+          push: never
+          noCache: ${{ inputs.no-cache }}
+          runCmd: uv run pydoclint pallatom
+
+  enforce-einops:
+    needs: build
+    runs-on: ${{ fromJson(inputs.runs-on) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Stub SSH agent socket for Docker Desktop mount
+        if: inputs.stub-ssh-agent
+        run: sudo mkdir -p /run/host-services && sudo touch /run/host-services/ssh-auth.sock
+      - uses: devcontainers/ci@v0.3
+        with:
+          configFile: ${{ inputs.devcontainer-config }}
+          imageName: ghcr.io/${{ github.repository }}/${{ inputs.image-name }}
+          push: never
+          noCache: ${{ inputs.no-cache }}
+          runCmd: uv run python scripts/check_einops.py $(git ls-files '*.py')
+
+  enforce-jaxtyping:
+    needs: build
+    runs-on: ${{ fromJson(inputs.runs-on) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Stub SSH agent socket for Docker Desktop mount
+        if: inputs.stub-ssh-agent
+        run: sudo mkdir -p /run/host-services && sudo touch /run/host-services/ssh-auth.sock
+      - uses: devcontainers/ci@v0.3
+        with:
+          configFile: ${{ inputs.devcontainer-config }}
+          imageName: ghcr.io/${{ github.repository }}/${{ inputs.image-name }}
+          push: never
+          noCache: ${{ inputs.no-cache }}
+          runCmd: uv run python scripts/check_jaxtyping.py $(git ls-files '*.py')
+
+  test:
+    needs:
+      - check-yaml
+      - check-github-workflows
+      - check-taskfile
+      - black
+      - ruff
+      - basedpyright
+      - pylint
+      - xenon
+      - pydoclint
+      - enforce-einops
+      - enforce-jaxtyping
+    runs-on: ${{ fromJson(inputs.runs-on) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Stub SSH agent socket for Docker Desktop mount
+        if: inputs.stub-ssh-agent
+        run: sudo mkdir -p /run/host-services && sudo touch /run/host-services/ssh-auth.sock
+
+      - name: Run pytest in devcontainer
+        uses: devcontainers/ci@v0.3
+        with:
+          configFile: ${{ inputs.devcontainer-config }}
+          imageName: ghcr.io/${{ github.repository }}/${{ inputs.image-name }}
+          push: never
+          noCache: ${{ inputs.no-cache }}
+          runCmd: PYTHONDONTWRITEBYTECODE=1 pytest -p no:cacheprovider pallatom
