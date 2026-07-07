@@ -6,15 +6,18 @@ log_epoch, and the end-to-end train() function including gradient
 accumulation and W&B logging.
 """
 
+import contextlib
 import dataclasses
 import json
 import pathlib
+from collections.abc import Generator
 from typing import cast
 
 import numpy as np
 import pytest
 import structlog
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from architecture.main_trunk import MainTrunk
 from einops import reduce
@@ -988,6 +991,128 @@ def test_checkpoint_round_trip_preserves_weights_and_loss(
         ), f"Param '{k}' differs after round trip"
     second_ckpt_loss = cast(torch.Tensor, second_ckpt["best_val_loss"])
     assert abs(second_ckpt_loss.item() - best_val_loss.item()) < TOLERANCE
+
+
+def test_checkpoint_round_trip_preserves_optimizer_and_scheduler_state(
+    model_params: ModelSetup,
+    log: FilteringBoundLogger,
+) -> None:
+    """save->load restores Adam moments and StepLR step count exactly.
+
+    Populates optimizer/scheduler state with a manual step, saves it,
+    corrupts the in-memory state, then confirms load_checkpoint restores the
+    original values rather than the assertions trivially passing.
+    """
+    for p in model_params.model.parameters():
+        p.grad = torch.ones_like(p)
+    _ = (
+        model_params.optimizer.step()  # pyright: ignore[reportUnknownMemberType]
+    )
+    model_params.scheduler.step()
+    model_params.optimizer.zero_grad()
+
+    save_checkpoint(
+        model_params=model_params,
+        rank=0,
+        log=log,
+        best_val_loss=torch.tensor(0.1),
+    )
+    saved_opt_state = cast(
+        dict[int, dict[str, torch.Tensor]],
+        cast(
+            dict[str, object],
+            model_params.optimizer.state_dict(),
+        )["state"],
+    )
+    saved_exp_avg = {
+        i: state[_ADAM_EXP_AVG_KEY].clone()
+        for i, state in saved_opt_state.items()
+    }
+    saved_last_epoch = cast(
+        int,
+        cast(dict[str, object], model_params.scheduler.state_dict())[
+            "last_epoch"
+        ],
+    )
+
+    live_opt_state = cast(
+        dict[torch.nn.Parameter, dict[str, torch.Tensor]],
+        model_params.optimizer.state,
+    )
+    for state in live_opt_state.values():
+        _ = state[_ADAM_EXP_AVG_KEY].zero_()
+    model_params.scheduler.last_epoch = -1
+
+    restored, _ = load_checkpoint(model_params=model_params, rank=0, log=log)
+
+    restored_opt_state = cast(
+        dict[int, dict[str, torch.Tensor]],
+        cast(
+            dict[str, object],
+            restored.optimizer.state_dict(),
+        )["state"],
+    )
+    for i, exp_avg in saved_exp_avg.items():
+        assert torch.allclose(
+            restored_opt_state[i][_ADAM_EXP_AVG_KEY],
+            exp_avg,
+        ), f"Adam exp_avg for param {i} not restored"
+    restored_last_epoch = cast(
+        int,
+        cast(dict[str, object], restored.scheduler.state_dict())["last_epoch"],
+    )
+    assert restored_last_epoch == saved_last_epoch
+
+
+@contextlib.contextmanager
+def _single_process_gloo_group() -> Generator[None]:
+    """Init and tear down a single-process gloo group for DDP-wrapping tests."""
+    dist.init_process_group(
+        backend="gloo",
+        store=dist.HashStore(),  # pyright: ignore[reportPrivateLocalImportUsage]
+        rank=0,
+        world_size=1,
+    )
+    try:
+        yield
+    finally:
+        dist.destroy_process_group()
+
+
+def test_save_checkpoint_strips_ddp_wrapper_prefix(
+    model_params: ModelSetup,
+    log: FilteringBoundLogger,
+) -> None:
+    """Checkpoint saved from a DDP-wrapped model has unprefixed model keys.
+
+    Wraps model_params.model in DDP under a single-process gloo group (no
+    network ports or GPUs needed) and confirms save_checkpoint unwraps
+    ``.module`` before calling state_dict(), so the saved keys match the
+    plain model and never carry a "module." prefix.
+    """
+    plain_keys = set(model_params.model.state_dict().keys())
+    with _single_process_gloo_group():
+        ddp_model_params = dataclasses.replace(
+            model_params,
+            model=DDP(model_params.model),
+        )
+        save_checkpoint(
+            model_params=ddp_model_params,
+            rank=0,
+            log=log,
+            best_val_loss=torch.tensor(0.3),
+        )
+
+    ckpt = cast(
+        dict[str, object],
+        torch.load(
+            model_params.tcfg.checkpoint.checkpoint_path,
+            weights_only=True,
+        ),
+    )
+    model_sd = cast(dict[str, torch.Tensor], ckpt["model"])
+    assert not any(k.startswith("module.") for k in model_sd)
+    assert model_sd.keys() == plain_keys
 
 
 # ---------------------------------------------------------------------------

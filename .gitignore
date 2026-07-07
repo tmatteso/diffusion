@@ -40,3 +40,5 @@ pallatom/train/*.json
 pallatom/train/*.jsonl
 # commit messages
 commit_msg.txt
+# log files
+*.log

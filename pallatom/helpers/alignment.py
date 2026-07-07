@@ -275,12 +275,15 @@ def kabsch_rmsd(
 @jaxtyped(typechecker=beartype)
 def centre_random_augment(
     coords: Float[torch.Tensor, "B N_atom 3"],
+    s_trans: float = 1.0,
+    mask: Bool[torch.Tensor, "B N_atom"] | None = None,
 ) -> Float[torch.Tensor, "B N_atom 3"]:
-    """Centre and randomly rotate coordinates uniformly from SO(3).
+    """Centre, randomly rotate, and randomly translate coordinates.
 
-    Implements CentreRandomAugmentation from Algorithm 18: subtracts the
-    per-batch centroid then applies one independent Haar-uniform SO(3) rotation
-    per batch element.
+    Implements CentreRandomAugmentation from Algorithm 19: subtracts the
+    per-batch centroid, applies one independent Haar-uniform SO(3) rotation
+    per batch element, then adds independent Gaussian translation noise
+    t ~ s_trans * N(0, I3) per batch element.
 
     Rotation is sampled via QR decomposition of a Gaussian matrix (Mezzadri
     2007). Column j of Q is rescaled by sign(R_jj) to fix the canonical sign
@@ -289,17 +292,32 @@ def centre_random_augment(
 
     Args:
         coords: (B, N_atom, 3) batched atom positions.
+        s_trans: Standard deviation (Å) of the per-batch translation noise.
+        mask: (B, N_atom) optional validity mask; when given, the centroid
+            is the mean over valid atoms only, so zero-padded atoms don't
+            bias it toward the origin. All-ones when None.
 
     Returns:
-        (B, N_atom, 3) centred and randomly rotated coordinates.
+        (B, N_atom, 3) centred, randomly rotated and translated coordinates.
     """
     B: int = coords.shape[0]
 
-    centroid: Float[torch.Tensor, "B 1 3"] = reduce(
-        coords,
-        "b n d -> b 1 d",
-        "mean",
-    )
+    if mask is not None:
+        weights: Float[torch.Tensor, "B N_atom 1"] = rearrange(
+            mask.float(),
+            "b n -> b n 1",
+        )
+        centroid: Float[torch.Tensor, "B 1 3"] = reduce(
+            coords * weights,
+            "b n d -> b 1 d",
+            "sum",
+        ) / reduce(weights, "b n d -> b 1 d", "sum").clamp(min=1)
+    else:
+        centroid = reduce(
+            coords,
+            "b n d -> b 1 d",
+            "mean",
+        )
     coords_centred: Float[torch.Tensor, "B N_atom 3"] = coords - centroid
 
     z: Float[torch.Tensor, "B 3 3"] = torch.randn(
@@ -332,7 +350,20 @@ def centre_random_augment(
     )
     q = q * rearrange(col_scale, "b d -> b 1 d")
 
-    return einsum(coords_centred, q, "b n i, b i j -> b n j")
+    rotated: Float[torch.Tensor, "B N_atom 3"] = einsum(
+        coords_centred,
+        q,
+        "b n i, b i j -> b n j",
+    )
+
+    t: Float[torch.Tensor, "B 1 3"] = s_trans * torch.randn(
+        B,
+        1,
+        3,
+        device=coords.device,
+        dtype=coords.dtype,
+    )
+    return rotated + t
 
 
 @jaxtyped(typechecker=beartype)

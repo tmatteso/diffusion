@@ -31,6 +31,7 @@ import webdataset as wds
 from architecture.atom_transformers import build_sparse_pairs
 from beartype import beartype
 from einops import rearrange, reduce, repeat
+from helpers.alignment import centre_random_augment
 from helpers.atom_utils import (
     ATOM5_CA,
     ATOM5_ELEMENTS,
@@ -601,16 +602,26 @@ def featurize_single_item(
     # template at this residue, where 1 indicates existing residues and 0 is
     # used for padding residues. f_pseudo_beta == residue_mask
 
+    # Random rigid augmentation (AF3 Algorithm 20): centre + Haar-uniform
+    # SO(3) rotation and translation, applied before noising so r_gt and
+    # r_gt_noised share the same augmented frame.
     flat_pos: Float[torch.Tensor, "N_atom 3"] = rearrange(
-        atom5_pos,
-        "n a d -> (n a) d",
+        centre_random_augment(
+            rearrange(atom5_pos, "n a d -> 1 (n a) d"),
+        ),
+        "1 n d -> n d",
     )
     atom_mask_flat: Bool[torch.Tensor, "N_atom"] = rearrange(
         atom5_mask.bool(),
         "n a -> (n a)",
     )
 
-    # GT Cβ from unnoised atom37_positions → loss target
+    # GT Cβ from unnoised atom37_positions → loss target. Deliberately NOT
+    # taken from the post-augmentation flat_pos: centre_random_augment is a
+    # rigid transform (rotation + translation, det forced to +1), so pairwise
+    # distances — and therefore this distogram — are identical either way.
+    # Don't "fix" this into recomputing from the augmented frame; it's
+    # unnecessary work for a numerically identical result.
     c_beta_pos_clean, _ = atom37_to_cb(
         rearrange(atom37_positions, "n a d -> 1 n a d"),
         rearrange(atom37_mask, "n a -> 1 n a"),
