@@ -27,6 +27,7 @@ jobs:
           configFile: .devcontainer/arm64/devcontainer.json
           imageName: ghcr.io/${{ github.repository }}/devcontainer-arm64
           push: never
+          noCache: true
           runCmd: show-platform
 
   black:
@@ -42,6 +43,7 @@ jobs:
           configFile: .devcontainer/arm64/devcontainer.json
           imageName: ghcr.io/${{ github.repository }}/devcontainer-arm64
           push: never
+          noCache: true
           runCmd: uv run black --check .
 
   ruff:
@@ -57,6 +59,7 @@ jobs:
           configFile: .devcontainer/arm64/devcontainer.json
           imageName: ghcr.io/${{ github.repository }}/devcontainer-arm64
           push: never
+          noCache: true
           runCmd: uv run ruff check pallatom/
 
   basedpyright:
@@ -72,6 +75,7 @@ jobs:
           configFile: .devcontainer/arm64/devcontainer.json
           imageName: ghcr.io/${{ github.repository }}/devcontainer-arm64
           push: never
+          noCache: true
           runCmd: uv run basedpyright pallatom
 
   pylint:
@@ -87,6 +91,7 @@ jobs:
           configFile: .devcontainer/arm64/devcontainer.json
           imageName: ghcr.io/${{ github.repository }}/devcontainer-arm64
           push: never
+          noCache: true
           runCmd: uv run pylint pallatom
 
   xenon:
@@ -102,6 +107,7 @@ jobs:
           configFile: .devcontainer/arm64/devcontainer.json
           imageName: ghcr.io/${{ github.repository }}/devcontainer-arm64
           push: never
+          noCache: true
           runCmd: uv run xenon --max-absolute B --max-modules A --max-average A pallatom
 
   pydoclint:
@@ -117,6 +123,7 @@ jobs:
           configFile: .devcontainer/arm64/devcontainer.json
           imageName: ghcr.io/${{ github.repository }}/devcontainer-arm64
           push: never
+          noCache: true
           runCmd: uv run pydoclint pallatom
 
   enforce-einops:
@@ -132,6 +139,7 @@ jobs:
           configFile: .devcontainer/arm64/devcontainer.json
           imageName: ghcr.io/${{ github.repository }}/devcontainer-arm64
           push: never
+          noCache: true
           runCmd: uv run python scripts/check_einops.py $(git ls-files '*.py')
 
   enforce-jaxtyping:
@@ -147,4 +155,5 @@ jobs:
           configFile: .devcontainer/arm64/devcontainer.json
           imageName: ghcr.io/${{ github.repository }}/devcontainer-arm64
           push: never
+          noCache: true
           runCmd: uv run python scripts/check_jaxtyping.py $(git ls-files '*.py')
