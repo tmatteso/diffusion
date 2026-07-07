@@ -273,6 +273,35 @@ def kabsch_rmsd(
 
 
 @jaxtyped(typechecker=beartype)
+def masked_com(
+    coords: Float[torch.Tensor, "B N_atom 3"],
+    mask: Bool[torch.Tensor, "B N_atom"] | None = None,
+) -> Float[torch.Tensor, "B 1 3"]:
+    """Per-batch centre of mass, optionally restricted to valid atoms.
+
+    Args:
+        coords: (B, N_atom, 3) batched atom positions.
+        mask: (B, N_atom) optional validity mask; when given, the mean is
+            taken over valid atoms only, so zero-padded atoms don't bias it
+            toward the origin. All-ones when None.
+
+    Returns:
+        (B, 1, 3) per-batch centre of mass.
+    """
+    if mask is None:
+        return reduce(coords, "b n d -> b 1 d", "mean")
+    weights: Float[torch.Tensor, "B N_atom 1"] = rearrange(
+        mask.float(),
+        "b n -> b n 1",
+    )
+    return reduce(coords * weights, "b n d -> b 1 d", "sum") / reduce(
+        weights,
+        "b n d -> b 1 d",
+        "sum",
+    ).clamp(min=1)
+
+
+@jaxtyped(typechecker=beartype)
 def centre_random_augment(
     coords: Float[torch.Tensor, "B N_atom 3"],
     s_trans: float = 1.0,
@@ -302,22 +331,7 @@ def centre_random_augment(
     """
     B: int = coords.shape[0]
 
-    if mask is not None:
-        weights: Float[torch.Tensor, "B N_atom 1"] = rearrange(
-            mask.float(),
-            "b n -> b n 1",
-        )
-        centroid: Float[torch.Tensor, "B 1 3"] = reduce(
-            coords * weights,
-            "b n d -> b 1 d",
-            "sum",
-        ) / reduce(weights, "b n d -> b 1 d", "sum").clamp(min=1)
-    else:
-        centroid = reduce(
-            coords,
-            "b n d -> b 1 d",
-            "mean",
-        )
+    centroid: Float[torch.Tensor, "B 1 3"] = masked_com(coords, mask=mask)
     coords_centred: Float[torch.Tensor, "B N_atom 3"] = coords - centroid
 
     z: Float[torch.Tensor, "B 3 3"] = torch.randn(

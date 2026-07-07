@@ -15,6 +15,7 @@ from helpers.alignment import (
     kabsch_align,
     kabsch_rmsd,
     kabsch_rotation,
+    masked_com,
     rmsd,
 )
 from helpers.useful_objects import manual_seed
@@ -259,6 +260,77 @@ def test_apply_transform_wrong_shape() -> None:
     t = torch.zeros(1, 1, 3)
     with pytest.raises(TypeCheckError):
         _ = apply_transform(coords_bad, R, t, t)
+
+
+# ---------------------------------------------------------------------------
+# masked_com
+# ---------------------------------------------------------------------------
+
+
+def test_masked_com_no_mask_matches_plain_mean(
+    aug_coords: Float[torch.Tensor, "B N 3"],
+) -> None:
+    """Without a mask, masked_com reduces to the plain per-batch mean."""
+    out: Float[torch.Tensor, "B 1 3"] = masked_com(aug_coords)
+    expected: Float[torch.Tensor, "B 1 3"] = reduce(
+        aug_coords,
+        "b n d -> b 1 d",
+        "mean",
+    )
+    assert torch.allclose(out, expected, atol=TOLERANCE)
+
+
+def test_masked_com_ignores_zero_padded_atoms() -> None:
+    """Zero-padded atoms don't bias the centre of mass toward the origin.
+
+    A structure with real atoms offset from the origin, plus zero-padded
+    atoms appended, must have the same masked_com as the real atoms alone.
+    """
+    real: Float[torch.Tensor, "1 N 3"] = rearrange(
+        torch.randn(N, 3) + 5.0,
+        "n d -> 1 n d",
+    )
+    padded: Float[torch.Tensor, "1 N2 3"] = torch.cat(
+        [real, torch.zeros(1, N, 3)],
+        dim=1,
+    )
+    mask: Bool[torch.Tensor, "1 N2"] = torch.cat(
+        [
+            torch.ones(1, N, dtype=torch.bool),
+            torch.zeros(1, N, dtype=torch.bool),
+        ],
+        dim=1,
+    )
+    out: Float[torch.Tensor, "1 1 3"] = masked_com(padded, mask=mask)
+    expected: Float[torch.Tensor, "1 1 3"] = reduce(
+        real,
+        "b n d -> b 1 d",
+        "mean",
+    )
+    assert torch.allclose(out, expected, atol=TOLERANCE)
+
+
+def test_masked_com_all_valid_mask_matches_unmasked(
+    aug_coords: Float[torch.Tensor, "B N 3"],
+) -> None:
+    """An all-True mask reproduces the unmasked result exactly."""
+    mask: Bool[torch.Tensor, "B N"] = torch.ones(B, N, dtype=torch.bool)
+    out_masked: Float[torch.Tensor, "B 1 3"] = masked_com(aug_coords, mask=mask)
+    out_unmasked: Float[torch.Tensor, "B 1 3"] = masked_com(aug_coords)
+    assert torch.equal(out_masked, out_unmasked)
+
+
+def test_masked_com_wrong_shape_raises_type_error(
+    aug_coords: Float[torch.Tensor, "B N 3"],
+) -> None:
+    """A mask with a mismatched atom dimension raises TypeCheckError."""
+    bad_mask: Bool[torch.Tensor, "B N_plus_one"] = torch.ones(
+        B,
+        N + 1,
+        dtype=torch.bool,
+    )
+    with pytest.raises(TypeCheckError):
+        _ = masked_com(aug_coords, mask=bad_mask)
 
 
 # ---------------------------------------------------------------------------

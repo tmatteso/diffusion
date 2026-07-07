@@ -1067,9 +1067,16 @@ def test_checkpoint_round_trip_preserves_optimizer_and_scheduler_state(
 @contextlib.contextmanager
 def _single_process_gloo_group() -> Generator[None]:
     """Init and tear down a single-process gloo group for DDP-wrapping tests."""
+    # HashStore is a private torch.distributed C-extension symbol that
+    # isn't officially re-exported; getattr() sidesteps the static
+    # private-import check, whose result is otherwise inconsistent
+    # across torch's per-platform packaging.
     dist.init_process_group(
         backend="gloo",
-        store=dist.HashStore(),  # pyright: ignore[reportPrivateLocalImportUsage]
+        store=getattr(  # noqa: B009  # pyright: ignore[reportAny]
+            dist,
+            "HashStore",
+        )(),
         rank=0,
         world_size=1,
     )

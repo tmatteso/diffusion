@@ -31,7 +31,7 @@ import webdataset as wds
 from architecture.atom_transformers import build_sparse_pairs
 from beartype import beartype
 from einops import rearrange, reduce, repeat
-from helpers.alignment import centre_random_augment
+from helpers.alignment import centre_random_augment, masked_com
 from helpers.atom_utils import (
     ATOM5_CA,
     ATOM5_ELEMENTS,
@@ -602,18 +602,21 @@ def featurize_single_item(
     # template at this residue, where 1 indicates existing residues and 0 is
     # used for padding residues. f_pseudo_beta == residue_mask
 
-    # Random rigid augmentation (AF3 Algorithm 20): centre + Haar-uniform
-    # SO(3) rotation and translation, applied before noising so r_gt and
-    # r_gt_noised share the same augmented frame.
-    flat_pos: Float[torch.Tensor, "N_atom 3"] = rearrange(
-        centre_random_augment(
-            rearrange(atom5_pos, "n a d -> 1 (n a) d"),
-        ),
-        "1 n d -> n d",
-    )
     atom_mask_flat: Bool[torch.Tensor, "N_atom"] = rearrange(
         atom5_mask.bool(),
         "n a -> (n a)",
+    )
+
+    # Random rigid augmentation (AF3 Algorithm 20): centre + Haar-uniform
+    # SO(3) rotation and translation, applied before noising so r_gt and
+    # r_gt_noised share the same augmented frame. The mask keeps padded
+    # atom slots from biasing the centroid toward the origin.
+    flat_pos: Float[torch.Tensor, "N_atom 3"] = rearrange(
+        centre_random_augment(
+            rearrange(atom5_pos, "n a d -> 1 (n a) d"),
+            mask=rearrange(atom_mask_flat, "n -> 1 n"),
+        ),
+        "1 n d -> n d",
     )
 
     # GT Cβ from unnoised atom37_positions → loss target. Deliberately NOT
@@ -632,7 +635,17 @@ def featurize_single_item(
         gt_res_disto_onehot.argmax(dim=-1)
     )
     noise = torch.randn_like(flat_pos)  # (N_atom, 3)
-    r_gt_noised = flat_pos + t_hat * (noise - noise.mean(0))  # zero CoM
+    # zero CoM over valid atoms only, so padded atom slots don't bias it
+    r_gt_noised = flat_pos + t_hat * (
+        noise
+        - rearrange(
+            masked_com(
+                rearrange(noise, "n d -> 1 n d"),
+                mask=rearrange(atom_mask_flat, "n -> 1 n"),
+            ),
+            "1 1 d -> 1 d",
+        )
+    )
 
     # Noised Cβ → self-conditioning template
     atom37_noised, _ = atom5_to_atom37(

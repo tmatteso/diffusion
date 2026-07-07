@@ -18,8 +18,8 @@ import torch
 from architecture.atom_transformers import WINDOW_SIZE, build_sparse_pairs
 from architecture.main_trunk import MainTrunk, PredictedOutputs
 from beartype import beartype
-from einops import rearrange, reduce, repeat
-from helpers.alignment import centre_random_augment
+from einops import rearrange, repeat
+from helpers.alignment import centre_random_augment, masked_com
 from helpers.atom_utils import (
     ATOM5_ELEMENTS,
     ATOM37_CA,
@@ -408,13 +408,11 @@ def build_sampling_context(
         return repeat(t, "... -> b ...", b=B)
 
     packed_t_hat = 1.0 * torch.ones(B, device=device)
-    # Apply zero-centered noise to turn r_gt into r_input.
+    # Apply zero-centered noise to turn r_gt into r_input. The mean is taken
+    # over valid atoms only, so padded atom slots don't bias it toward the
+    # origin (match sampling convention).
     noise = torch.randn_like(aa_ctx.r_gt, device=device)
-    noise = noise - reduce(
-        noise,
-        "b n d -> b 1 d",
-        "mean",
-    )  # match sampling convention
+    noise = noise - masked_com(noise, mask=aa_ctx.atom5_mask)
     r_input: Float[torch.Tensor, "B N_atom 3"] = (
         aa_ctx.r_gt + rearrange(packed_t_hat, "b -> b 1 1") * noise
     )
@@ -623,12 +621,13 @@ class EDMSampler:
             1 - (torch.rand((), device=self.device)) * delta_t,
         )
         # r_l ~ c_T * N(0, I), centred so prior matches zero center of mass
-        # training data
+        # training data. Centring uses valid atoms only so padded atom slots
+        # don't bias it toward the origin.
         r_l: Float[torch.Tensor, "B N_atom 3"] = c_T * torch.randn(
             (shape),
             device=self.device,
         )
-        r_l = r_l - reduce(r_l, "b n d -> b 1 d", "mean")
+        r_l = r_l - masked_com(r_l, mask=self.context.atom5_mask)
 
         # init to sentinel values to please the type checker.
         r_denoised: Float[torch.Tensor, "B N_atom 3"] = r_l
@@ -645,7 +644,10 @@ class EDMSampler:
             c_T_minus_one: Float[torch.Tensor, ""] = self.noise_schedule(
                 t_p - delta_t,
             )
-            r_l = centre_random_augment(coords=r_l)
+            r_l = centre_random_augment(
+                coords=r_l,
+                mask=self.context.atom5_mask,
+            )
             # ── optional stochastic noise injection (S_churn) ──────────────
             gamma: float = (
                 self.S_churn
@@ -657,8 +659,8 @@ class EDMSampler:
 
             # Add new noise to move from t_p to t_hat
             eps = torch.randn((shape), device=self.device)
-            # zero the center of mass of the noise.
-            eps = eps - reduce(eps, "b n d -> b 1 d", "mean")
+            # zero the center of mass of the noise, over valid atoms only.
+            eps = eps - masked_com(eps, mask=self.context.atom5_mask)
             noisy_r_l = r_l + (
                 self.S_noise * torch.sqrt(t_hat**2 - c_T**2) * eps
             )
@@ -718,7 +720,10 @@ class EDMSampler:
             torch.softmax((seq_logits) / self.seq_temperature, dim=-1),
             dim=-1,
         ).float()
-        r_denoised = r_denoised - reduce(r_denoised, "b n d -> b 1 d", "mean")
+        r_denoised = r_denoised - masked_com(
+            r_denoised,
+            mask=self.context.atom5_mask,
+        )
         return r_denoised, decode_seqs
 
 
