@@ -6,97 +6,145 @@ on:
   pull_request:
   workflow_dispatch:
 
-# Hooks that are versioned via pyproject.toml/uv.lock: invoke the tools
-# directly with `uv run` so CI uses the exact locked versions, not
-# whatever revs are separately pinned in .pre-commit-config.yaml.
-# UV_PROJECT_ENVIRONMENT mirrors the devcontainer's venv location so
-# basedpyright's venvPath/venv config (pyproject.toml) resolves the same
-# way it does inside the devcontainer.
+# Hooks that are versioned via pyproject.toml/uv.lock: run them inside the
+# arm64 devcontainer itself (built once in `build`, then reused by each lint
+# job below) so CI lints with the exact same environment devs get locally,
+# instead of a bare ubuntu-latest venv — mirroring how devcontainer-cuda.yml
+# builds the CUDA devcontainer before its own jobs.
 jobs:
-  black:
+  build:
     runs-on: ubuntu-latest
-    env:
-      UV_PROJECT_ENVIRONMENT: /opt/venv
     steps:
       - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
-      - run: sudo mkdir -p /opt/venv && sudo chown -R "$USER" /opt/venv
-      - run: uv sync --frozen --group dev
-      - run: uv run black --check .
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Build arm64 devcontainer image
+        uses: devcontainers/ci@v0.3
+        with:
+          configFile: .devcontainer/arm64/devcontainer.json
+          imageName: ghcr.io/${{ github.repository }}/devcontainer-arm64
+          push: never
+          runCmd: show-platform
+
+  black:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - uses: devcontainers/ci@v0.3
+        with:
+          configFile: .devcontainer/arm64/devcontainer.json
+          imageName: ghcr.io/${{ github.repository }}/devcontainer-arm64
+          push: never
+          runCmd: uv run black --check .
 
   ruff:
+    needs: build
     runs-on: ubuntu-latest
-    env:
-      UV_PROJECT_ENVIRONMENT: /opt/venv
     steps:
       - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
-      - run: sudo mkdir -p /opt/venv && sudo chown -R "$USER" /opt/venv
-      - run: uv sync --frozen --group dev
-      - run: uv run ruff check pallatom/
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - uses: devcontainers/ci@v0.3
+        with:
+          configFile: .devcontainer/arm64/devcontainer.json
+          imageName: ghcr.io/${{ github.repository }}/devcontainer-arm64
+          push: never
+          runCmd: uv run ruff check pallatom/
 
   basedpyright:
+    needs: build
     runs-on: ubuntu-latest
-    env:
-      UV_PROJECT_ENVIRONMENT: /opt/venv
     steps:
       - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
-      - run: sudo mkdir -p /opt/venv && sudo chown -R "$USER" /opt/venv
-      - run: uv sync --frozen --group dev
-      - run: uv run basedpyright pallatom
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - uses: devcontainers/ci@v0.3
+        with:
+          configFile: .devcontainer/arm64/devcontainer.json
+          imageName: ghcr.io/${{ github.repository }}/devcontainer-arm64
+          push: never
+          runCmd: uv run basedpyright pallatom
 
   pylint:
+    needs: build
     runs-on: ubuntu-latest
-    env:
-      UV_PROJECT_ENVIRONMENT: /opt/venv
     steps:
       - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
-      - run: sudo mkdir -p /opt/venv && sudo chown -R "$USER" /opt/venv
-      - run: uv sync --frozen --group dev
-      - run: uv run pylint pallatom
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - uses: devcontainers/ci@v0.3
+        with:
+          configFile: .devcontainer/arm64/devcontainer.json
+          imageName: ghcr.io/${{ github.repository }}/devcontainer-arm64
+          push: never
+          runCmd: uv run pylint pallatom
 
   xenon:
+    needs: build
     runs-on: ubuntu-latest
-    env:
-      UV_PROJECT_ENVIRONMENT: /opt/venv
     steps:
       - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
-      - run: sudo mkdir -p /opt/venv && sudo chown -R "$USER" /opt/venv
-      - run: uv sync --frozen --group dev
-      - run: uv run xenon --max-absolute B --max-modules A --max-average A pallatom
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - uses: devcontainers/ci@v0.3
+        with:
+          configFile: .devcontainer/arm64/devcontainer.json
+          imageName: ghcr.io/${{ github.repository }}/devcontainer-arm64
+          push: never
+          runCmd: uv run xenon --max-absolute B --max-modules A --max-average A pallatom
 
   pydoclint:
+    needs: build
     runs-on: ubuntu-latest
-    env:
-      UV_PROJECT_ENVIRONMENT: /opt/venv
     steps:
       - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
-      - run: sudo mkdir -p /opt/venv && sudo chown -R "$USER" /opt/venv
-      - run: uv sync --frozen --group dev
-      - run: uv run pydoclint pallatom
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - uses: devcontainers/ci@v0.3
+        with:
+          configFile: .devcontainer/arm64/devcontainer.json
+          imageName: ghcr.io/${{ github.repository }}/devcontainer-arm64
+          push: never
+          runCmd: uv run pydoclint pallatom
 
   enforce-einops:
+    needs: build
     runs-on: ubuntu-latest
-    env:
-      UV_PROJECT_ENVIRONMENT: /opt/venv
     steps:
       - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
-      - run: sudo mkdir -p /opt/venv && sudo chown -R "$USER" /opt/venv
-      - run: uv sync --frozen --group dev
-      - run: uv run python scripts/check_einops.py $(git ls-files '*.py')
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - uses: devcontainers/ci@v0.3
+        with:
+          configFile: .devcontainer/arm64/devcontainer.json
+          imageName: ghcr.io/${{ github.repository }}/devcontainer-arm64
+          push: never
+          runCmd: uv run python scripts/check_einops.py $(git ls-files '*.py')
 
   enforce-jaxtyping:
+    needs: build
     runs-on: ubuntu-latest
-    env:
-      UV_PROJECT_ENVIRONMENT: /opt/venv
     steps:
       - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
-      - run: sudo mkdir -p /opt/venv && sudo chown -R "$USER" /opt/venv
-      - run: uv sync --frozen --group dev
-      - run: uv run python scripts/check_jaxtyping.py $(git ls-files '*.py')
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - uses: devcontainers/ci@v0.3
+        with:
+          configFile: .devcontainer/arm64/devcontainer.json
+          imageName: ghcr.io/${{ github.repository }}/devcontainer-arm64
+          push: never
+          runCmd: uv run python scripts/check_jaxtyping.py $(git ls-files '*.py')

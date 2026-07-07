@@ -2,11 +2,11 @@
 name = "diffusion"
 version = "0.1.0"
 description = "PyTorch diffusion project"
-requires-python = ">=3.10"
+requires-python = "==3.12"
 dependencies = [
-    "torch>=2.7.0",
-    "torchvision>=0.22.0",
-    "torchaudio>=2.7.0",
+    "torch==2.11.0",
+    "torchvision==0.26.0",
+    "torchaudio==2.11.0",
     "wandb>=0.18.0",
     "pandas>=2.0.0",
     "py3Dmol>=2.0.0",
@@ -62,11 +62,11 @@ dev = [
 
 [tool.black]
 line-length = 80
-target-version = ["py310"]
+target-version = ["py312"]
 
 [tool.ruff]
 line-length = 80
-target-version = "py310"
+target-version = "py312"
 extend-exclude = ["*.ipynb", "REST_APIs/**",]
 
 [tool.ruff.lint]
@@ -98,10 +98,15 @@ max-args = 6
 known-first-party = ["diffusion"]
 
 [tool.basedpyright]
-extraPaths = ["pallatom"]
+# The CUDA devcontainer's venv inherits torch/torchvision/torchaudio from the
+# base image's system Python via --system-site-packages (see .devcontainer/Dockerfile)
+# rather than installing them into /opt/venv, to avoid re-downloading them.
+# basedpyright doesn't honor a venv's include-system-site-packages fallback,
+# so point it at the base image's dist-packages directly or it can't resolve torch.
+extraPaths = ["pallatom", "/usr/local/lib/python3.12/dist-packages"]
 venvPath = "/opt"
 venv = "venv"
-pythonVersion = "3.10"
+pythonVersion = "3.12"
 typeCheckingMode = "all"
 exclude = ["**/*.ipynb"]
 # Loosen rules specifically for your test files
@@ -119,7 +124,7 @@ reportPrivateImportUsage = "none" # not sure I agree with this one
 # Reference: https://google.github.io/styleguide/pylintrc
 # ---------------------------------------------------------------------------
 [tool.pylint.main]
-py-version = "3.10"
+py-version = "3.12"
 source-roots = ["pallatom"]
 ignore = ["third_party"]
 ignore-patterns = []

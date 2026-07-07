@@ -6,7 +6,7 @@ that are threaded through training and evaluation passes.
 """
 
 import dataclasses
-from typing import NoReturn, cast
+from typing import NoReturn, Self, cast
 
 import torch
 from architecture.main_trunk import MainTrunk
@@ -19,7 +19,6 @@ from torch.optim import Adam
 from torch.optim.lr_scheduler import StepLR
 from tqdm import tqdm
 from train.train_config import TrainConfig
-from typing_extensions import Self
 
 
 def manual_seed(seed: int) -> torch.Generator:

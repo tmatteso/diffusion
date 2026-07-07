@@ -6,6 +6,7 @@ AtomFeatureEncoder, and AtomAttentionDecoder.
 """
 
 import math
+from typing import override
 
 import torch
 import torch.nn as nn
@@ -22,7 +23,6 @@ from beartype import beartype
 from einops import einsum, rearrange, reduce, repeat
 from jaxtyping import Bool, Float, Int, jaxtyped
 from train.train_config import ModelParams
-from typing_extensions import override
 
 # Local attention window size, matching AlphaFold 3 atom transformer.
 # Each atom l attends only to atoms m where

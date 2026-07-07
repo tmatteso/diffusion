@@ -39,7 +39,11 @@ EOF
 
 if timeout 30 "$TORCHRUN" --nproc_per_node="$NUM_GPUS" "$PREFLIGHT_SCRIPT" \
     > /dev/null 2>&1; then
-    echo "NCCL preflight OK, using the default (fastest available) transport."
+    echo "NCCL P2P preflight OK, using NCCL P2P (fastest available) transport."
+elif timeout 30 NCCL_P2P_DISABLE=1 "$TORCHRUN" --nproc_per_node="$NUM_GPUS" "$PREFLIGHT_SCRIPT" \
+    > /dev/null 2>&1; then
+    echo "NCCL SHM preflight OK, using NCCL SHM transport."
+    export NCCL_P2P_DISABLE=1
 else
     echo "NCCL preflight failed; falling back to NCCL over sockets."
     export NCCL_P2P_DISABLE=1

@@ -19,7 +19,7 @@ f_seq_logits    : (B, N_token, 20)      — amino-acid sequence logits
 
 import dataclasses
 import math
-from typing import cast
+from typing import cast, override
 
 import torch
 import torch.nn as nn
@@ -49,7 +49,6 @@ from train.train_config import (
     NoiseScheduleParams,
     ResidueDistogramParams,
 )
-from typing_extensions import override
 
 # ---------------------------------------------------------------------------
 # EmbeddedInputs — output of MainTrunk.embed_inputs (steps 1-8)

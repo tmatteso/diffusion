@@ -4,10 +4,10 @@
 ARG PLATFORM=arm64
 
 # For CUDA: Use PyTorch CUDA image
-FROM pytorch/pytorch:2.7.0-cuda12.8-cudnn9-devel AS base-cuda
+FROM pytorch/pytorch:2.11.0-cuda12.8-cudnn9-devel AS base-cuda
 
 # For ARM64: Use Ubuntu with CPU PyTorch
-FROM ubuntu:22.04 AS base-arm64
+FROM ubuntu:24.04 AS base-arm64
 
 # Select base based on PLATFORM arg — this makes the devcontainer CLI pick the right stage
 ARG PLATFORM
@@ -46,11 +46,16 @@ ENV UV_PROJECT_ENVIRONMENT=/opt/venv
 # Re-declare after FROM so it's in scope for the rest of this stage
 ARG PLATFORM
 
-# For CUDA: inherit conda's PyTorch into the venv to avoid re-downloading it
+# For CUDA: inherit the base image's own PyTorch into the venv (its interpreter
+# must match the one torch is installed against, so use the system python3).
+# For arm64/CPU: no such constraint, so let uv manage its own Python 3.12.3
+# build directly instead of depending on whatever the base OS's apt-installed
+# python3 happens to be.
 RUN if [ "${PLATFORM}" = "cuda" ]; then \
-        uv venv /opt/venv --system-site-packages --python /opt/conda/bin/python3; \
+        uv venv /opt/venv --system-site-packages --python "$(command -v python3)"; \
     else \
-        uv venv /opt/venv; \
+        uv python install 3.12.3 && \
+        uv venv /opt/venv --python 3.12.3; \
     fi
 
 # Install project dependencies into the image — cached as a layer, only re-runs when lockfile changes

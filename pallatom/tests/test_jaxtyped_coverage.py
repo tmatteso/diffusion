@@ -8,8 +8,7 @@ name appears as an AST identifier in the corresponding test file under
 
 import ast
 import pathlib
-
-from typing_extensions import override
+from typing import override
 
 _JAXTYPED_NAME = "jaxtyped"
 _TESTS_DIR = "tests"

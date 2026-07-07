@@ -14,6 +14,7 @@ b_ij))
 """
 
 import dataclasses
+from typing import override
 
 import torch
 import torch.nn as nn
@@ -24,7 +25,6 @@ from beartype import beartype
 from einops import rearrange, reduce
 from jaxtyping import Float, jaxtyped
 from torch.nn.attention import SDPBackend, sdpa_kernel
-from typing_extensions import override
 
 # ---------------------------------------------------------------------------
 # RBF transform  (Transform_RBF in step 2)

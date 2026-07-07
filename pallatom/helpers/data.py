@@ -17,7 +17,7 @@ import queue
 from collections.abc import Iterable, Iterator, Sequence
 from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor
 from pathlib import Path
-from typing import ClassVar, cast
+from typing import ClassVar, cast, override
 
 import numpy as np
 import numpy.typing as npt
@@ -61,7 +61,6 @@ from pydantic import (
 from structlog.typing import FilteringBoundLogger
 from torch.utils.data.distributed import DistributedSampler
 from train.train_config import TrainArgs, TrainConfig
-from typing_extensions import override
 from webdataset.writer import TarWriter
 
 
@@ -926,6 +925,7 @@ class ProteinDataset(
             self._file = self.jsonl_path.open("rb")
         return self._file
 
+    @override
     def __getstate__(self) -> dict[str, object]:
         """Return picklable state with the open file handle set to None.
 

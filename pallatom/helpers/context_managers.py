@@ -15,7 +15,7 @@ from collections.abc import Callable, Generator
 from datetime import timedelta
 from pathlib import Path
 from types import TracebackType
-from typing import ClassVar, cast
+from typing import ClassVar, Self, cast
 
 import numpy as np
 import numpy.typing as npt
@@ -23,7 +23,6 @@ import structlog
 import torch
 import torch.distributed as dist
 from structlog.typing import EventDict, FilteringBoundLogger, Processor
-from typing_extensions import Self
 
 log: FilteringBoundLogger = cast("FilteringBoundLogger", structlog.get_logger())
 
@@ -114,7 +113,8 @@ class DistProcessGroup:
         if not dist.is_initialized():
             yield
             return
-        device = f"cuda:{int(os.environ.get('LOCAL_RANK', '0'))}"
+        local_rank = os.environ.get("LOCAL_RANK", "0")
+        device = f"cuda:{int(local_rank)}"
         world_size: int = dist.get_world_size()
         rank: int = dist.get_rank()
         healthy: torch.Tensor = torch.ones(1, device=device)

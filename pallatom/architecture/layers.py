@@ -6,14 +6,11 @@ call-site return types propagate without ``Any``.
 """
 
 from collections.abc import Iterator
-from typing import Generic, TypeVar, overload
+from typing import overload, override
 
 import torch
 import torch.nn as nn
 from jaxtyping import Float, Int
-from typing_extensions import override
-
-TypedModule = TypeVar("TypedModule", bound=nn.Module)
 
 
 class TypedLinear(nn.Linear):
@@ -97,7 +94,7 @@ class TypedSequential(nn.Sequential):
         return self.forward(input)  # pyright: ignore[reportUnknownMemberType]
 
 
-class TypedModuleList(nn.ModuleList, Generic[TypedModule]):
+class TypedModuleList[TypedModule: nn.Module](nn.ModuleList):
     """nn.ModuleList with typed __iter__ and __getitem__ to keep element types.
 
     Generic over ``TypedModule`` so iteration and indexing preserve the
@@ -105,7 +102,9 @@ class TypedModuleList(nn.ModuleList, Generic[TypedModule]):
     """
 
     @override
-    def __iter__(self) -> Iterator[TypedModule]:
+    def __iter__(
+        self,
+    ) -> Iterator[TypedModule]:  # pylint: disable=undefined-variable
         """Iterate over submodules with their concrete type preserved.
 
         Returns:
@@ -117,7 +116,10 @@ class TypedModuleList(nn.ModuleList, Generic[TypedModule]):
     @overload
     def __getitem__(self, index: slice) -> "TypedModuleList[TypedModule]": ...
     @overload
-    def __getitem__(self, index: int) -> TypedModule: ...
+    def __getitem__(
+        self,
+        index: int,
+    ) -> TypedModule: ...  # pylint: disable=undefined-variable
     @override
     def __getitem__(
         self,

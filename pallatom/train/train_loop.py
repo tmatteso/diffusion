@@ -18,7 +18,6 @@ import structlog
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-import wandb
 from architecture.losses import (
     atom_loss,
     distogram_loss_atom,
@@ -58,6 +57,8 @@ from torch.optim import Adam
 from torch.optim.lr_scheduler import StepLR
 from tqdm import tqdm
 from train.train_config import TrainArgs, TrainConfig
+
+import wandb
 
 
 @dataclasses.dataclass

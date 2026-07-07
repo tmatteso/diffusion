@@ -6,7 +6,7 @@ the full ``PairformerBlock`` implementing the AF3 update sequence, and the
 ``PairformerStack`` that chains those blocks sequentially.
 """
 
-from typing import cast, overload
+from typing import cast, overload, override
 
 import torch
 import torch.nn as nn
@@ -29,7 +29,6 @@ from beartype import beartype
 from einops import einsum
 from jaxtyping import Float, jaxtyped
 from torch.utils.checkpoint import checkpoint
-from typing_extensions import override
 
 
 # ---------------------------------------------------------------------------

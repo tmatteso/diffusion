@@ -5,6 +5,8 @@ architecture: it projects distogram-based template representation together with
 time-conditioning and trunk pair embedding into fixed-size pair output tensor.
 """
 
+from typing import override
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -13,7 +15,6 @@ from architecture.pairformer_stack import PairformerStack
 from beartype import beartype
 from einops import einsum, rearrange
 from jaxtyping import Float, jaxtyped
-from typing_extensions import override
 
 # ---------------------------------------------------------------------------
 # TemplateEmbedder — Algorithm 3

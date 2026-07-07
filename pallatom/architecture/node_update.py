@@ -5,6 +5,7 @@ self-attention), and NodeUpdate (Algorithm 6 single-embedding update step).
 """
 
 import math
+from typing import override
 
 import torch
 import torch.nn as nn
@@ -14,7 +15,6 @@ from architecture.pair_update import DropoutRowwise, Transition
 from beartype import beartype
 from einops import einsum, rearrange
 from jaxtyping import Float, Int, jaxtyped
-from typing_extensions import override
 
 
 class InvalidSingleHeadDimensionError(ValueError):
