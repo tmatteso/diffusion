@@ -96,6 +96,14 @@ max-args = 6
 
 [tool.ruff.lint.isort]
 known-first-party = ["diffusion"]
+# Without this, ruff's isort auto-detects "first-party" packages by scanning
+# for filesystem directories matching import names. A leftover local wandb/
+# run-log directory at the repo root (gitignored, created by actually running
+# training) then shadows the real third-party wandb package, moving `import
+# wandb` into its own trailing section — passing here but failing on a clean
+# checkout (e.g. CI) where no such directory exists. Pin it explicitly so
+# classification doesn't depend on what's lying around in the working tree.
+known-third-party = ["wandb"]
 
 [tool.basedpyright]
 # The CUDA devcontainer's venv inherits torch/torchvision/torchaudio from the
