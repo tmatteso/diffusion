@@ -172,7 +172,7 @@ jobs:
           imageName: ghcr.io/${{ github.repository }}/${{ inputs.image-name }}
           push: never
           noCache: ${{ inputs.no-cache }}
-          runCmd: uv run pylint pallatom
+          runCmd: PYTEST_ADDOPTS="-p no:cacheprovider" uv run pylint pallatom
 
   xenon:
     needs: build
