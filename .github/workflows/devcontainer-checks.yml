@@ -134,7 +134,7 @@ jobs:
           imageName: ghcr.io/${{ github.repository }}/${{ inputs.image-name }}
           push: never
           noCache: ${{ inputs.no-cache }}
-          runCmd: uv run ruff check pallatom/
+          runCmd: uv run ruff check --no-cache pallatom/
 
   basedpyright:
     needs: build
