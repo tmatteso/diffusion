@@ -19,7 +19,7 @@ import structlog
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from architecture.main_trunk import MainTrunk
+from architecture.main_trunk import EMA, MainTrunk
 from einops import reduce
 from helpers.atom_utils import RESTYPE_NUM, RESTYPE_NUM_NO_X, Protein
 from helpers.data import (
@@ -33,6 +33,7 @@ from helpers.useful_objects import (
     EpochMetrics,
     LossMetrics,
     ModelSetup,
+    TensorAccumulatorMixin,
     ThroughputStatistics,
     manual_seed,
 )
@@ -62,6 +63,7 @@ from train.train_loop import (
     optimizer_step,
     process_accum_window,
     save_checkpoint,
+    swapped_in_ema_weights,
     take_step,
     train,
 )
@@ -95,7 +97,7 @@ LEARNING_RATE = 1e-4
 TOLERANCE = 1e-5
 TIGHT_TOLERANCE = 1e-3
 EXPECTED_CHECKPOINT_KEYS = frozenset(
-    {"model", "optimizer", "scheduler", "best_val_loss"},
+    {"model", "optimizer", "scheduler", "ema", "best_val_loss"},
 )
 _ADAM_EXP_AVG_KEY = "exp_avg"
 
@@ -131,6 +133,7 @@ def _make_model_params(
         device=torch.device("cpu"),
         optimizer=optimizer,
         scheduler=scheduler,
+        ema=EMA(trunk, decay=train_cfg.training.ema_decay),
     )
 
 
@@ -822,6 +825,46 @@ def test_optimizer_step_outputs(
     )
 
 
+def test_optimizer_step_updates_ema_shadow(
+    featurized_batch: FeaturizedBatch,
+    model_params: ModelSetup,
+) -> None:
+    """optimizer_step advances the EMA shadow using the pre-step global_step.
+
+    Verifies the shadow after one optimizer_step call matches the
+    bias-corrected decay formula applied to the model's post-step
+    parameters, confirming optimizer_step actually wires ``EMA.update``
+    into the training loop rather than only stepping the optimizer.
+    """
+    name, _ = next(model_params.model.named_parameters())
+    shadow_before = model_params.ema.shadow[name].clone()
+
+    _ = model_params.model.train()
+    model_params.model.zero_grad()
+    global_step = 5
+    _ = optimizer_step(
+        [featurized_batch],
+        [1],
+        model_params,
+        global_step=global_step,
+    )
+
+    param_after = cast(
+        dict[str, torch.Tensor],
+        model_params.model.state_dict(),
+    )[name].clone()
+    decay = model_params.tcfg.training.ema_decay
+    effective_decay = min(decay, (global_step + 1) / (global_step + 10))
+    expected = (
+        effective_decay * shadow_before + (1 - effective_decay) * param_after
+    )
+    assert torch.allclose(
+        model_params.ema.shadow[name],
+        expected,
+        atol=TOLERANCE,
+    )
+
+
 # ---------------------------------------------------------------------------
 # evaluate
 # ---------------------------------------------------------------------------
@@ -864,6 +907,184 @@ def test_evaluate_outputs(
     assert loss_metrics.RMSD.item() >= 0.0
     for p in model_params.model.parameters():
         assert p.grad is None
+
+
+# ---------------------------------------------------------------------------
+# swapped_in_ema_weights
+# ---------------------------------------------------------------------------
+
+
+def test_swapped_in_ema_weights_loads_shadow_and_restores_raw_after(
+    model_params: ModelSetup,
+) -> None:
+    """Entering swaps in the EMA shadow; exiting restores the raw weights.
+
+    Advances the EMA shadow away from the model's raw weights first (via a
+    manual perturbation) so the swap is actually observable, then checks
+    the model matches the shadow inside the context and matches the
+    original raw weights again once it exits. ``state_dict()`` is called
+    fresh at each checkpoint rather than reused, since ``swapped_in_ema_
+    weights`` now reassigns ``.data`` in place (zero-copy) instead of
+    copying values -- a state_dict captured before the swap holds
+    ``.detach()``-ed views of the pre-swap storage and would look
+    unchanged forever if reused, regardless of whether the swap actually
+    happened.
+    """
+    with torch.no_grad():
+        for p in model_params.model.parameters():
+            _ = p.add_(1.0)
+    model_params.ema.update(model_params.model, step=0)
+
+    raw_sd = {
+        k: v.clone()
+        for k, v in cast(
+            dict[str, torch.Tensor],
+            model_params.model.state_dict(),
+        ).items()
+    }
+    ema_sd = {k: v.clone() for k, v in model_params.ema.state_dict().items()}
+
+    with swapped_in_ema_weights(model_params):
+        live_sd = cast(dict[str, torch.Tensor], model_params.model.state_dict())
+        for k, v in live_sd.items():
+            assert torch.equal(v, ema_sd[k]), f"Param '{k}' not swapped to EMA"
+
+    live_sd_after = cast(
+        dict[str, torch.Tensor],
+        model_params.model.state_dict(),
+    )
+    for k, v in live_sd_after.items():
+        assert torch.equal(v, raw_sd[k]), f"Param '{k}' not restored after swap"
+
+
+def test_swapped_in_ema_weights_restores_raw_weights_on_exception(
+    model_params: ModelSetup,
+) -> None:
+    """Raw weights are restored even when the wrapped block raises.
+
+    Ensures a mid-block failure (e.g. an eval-time error) can't leave the
+    model stuck on EMA weights for subsequent training steps. Perturbs the
+    model and advances the EMA shadow first so raw and shadow values
+    genuinely differ -- otherwise this would pass trivially even if the
+    ``finally`` swap-back never ran, since raw and shadow would already be
+    identical.
+    """
+    with torch.no_grad():
+        for p in model_params.model.parameters():
+            _ = p.add_(1.0)
+    model_params.ema.update(model_params.model, step=0)
+
+    raw_sd = {
+        k: v.clone()
+        for k, v in cast(
+            dict[str, torch.Tensor],
+            model_params.model.state_dict(),
+        ).items()
+    }
+
+    eval_failure_message = "simulated eval failure"
+    with (
+        pytest.raises(RuntimeError, match=eval_failure_message),
+        swapped_in_ema_weights(model_params),
+    ):
+        raise RuntimeError(eval_failure_message)
+
+    live_sd = cast(dict[str, torch.Tensor], model_params.model.state_dict())
+    for k, v in live_sd.items():
+        assert torch.equal(
+            v,
+            raw_sd[k],
+        ), f"Param '{k}' not restored after error"
+
+
+def test_swapped_in_ema_weights_unwraps_ddp(
+    model_params: ModelSetup,
+) -> None:
+    """Swap operates on the unwrapped .module when the model is DDP-wrapped.
+
+    Mirrors test_save_checkpoint_strips_ddp_wrapper_prefix: wraps the model
+    in a single-process gloo DDP group and confirms the swap-in/swap-out
+    still works against the underlying MainTrunk rather than erroring on a
+    "module."-prefix key mismatch.
+    """
+    with torch.no_grad():
+        for p in model_params.model.parameters():
+            _ = p.add_(1.0)
+    model_params.ema.update(model_params.model, step=0)
+    raw_sd = {
+        k: v.clone()
+        for k, v in cast(
+            dict[str, torch.Tensor],
+            model_params.model.state_dict(),
+        ).items()
+    }
+    ema_sd = {k: v.clone() for k, v in model_params.ema.state_dict().items()}
+
+    with _single_process_gloo_group():
+        ddp_model_params = dataclasses.replace(
+            model_params,
+            model=DDP(model_params.model),
+        )
+        with swapped_in_ema_weights(ddp_model_params):
+            live_sd = cast(
+                dict[str, torch.Tensor],
+                model_params.model.state_dict(),
+            )
+            for k, v in live_sd.items():
+                assert torch.equal(v, ema_sd[k])
+
+        live_sd_after = cast(
+            dict[str, torch.Tensor],
+            model_params.model.state_dict(),
+        )
+        for k, v in live_sd_after.items():
+            assert torch.equal(v, raw_sd[k])
+
+
+def test_swapped_in_ema_weights_unwraps_ddp_and_restores_on_exception(
+    model_params: ModelSetup,
+) -> None:
+    """DDP-wrapped raw weights are restored even when the wrapped block raises.
+
+    Combines test_swapped_in_ema_weights_restores_raw_weights_on_exception
+    and test_swapped_in_ema_weights_unwraps_ddp: a mid-block failure under a
+    DDP-wrapped model must still restore the raw weights via ``.module``
+    rather than leaving the model stuck on EMA weights or erroring on the
+    "module."-prefix key mismatch.
+    """
+    with torch.no_grad():
+        for p in model_params.model.parameters():
+            _ = p.add_(1.0)
+    model_params.ema.update(model_params.model, step=0)
+    raw_sd = {
+        k: v.clone()
+        for k, v in cast(
+            dict[str, torch.Tensor],
+            model_params.model.state_dict(),
+        ).items()
+    }
+
+    eval_failure_message = "simulated eval failure under ddp"
+    with _single_process_gloo_group():
+        ddp_model_params = dataclasses.replace(
+            model_params,
+            model=DDP(model_params.model),
+        )
+        with (
+            pytest.raises(RuntimeError, match=eval_failure_message),
+            swapped_in_ema_weights(ddp_model_params),
+        ):
+            raise RuntimeError(eval_failure_message)
+
+        live_sd = cast(
+            dict[str, torch.Tensor],
+            model_params.model.state_dict(),
+        )
+        for k, v in live_sd.items():
+            assert torch.equal(
+                v,
+                raw_sd[k],
+            ), f"Param '{k}' not restored after error"
 
 
 # ---------------------------------------------------------------------------
@@ -939,6 +1160,43 @@ def test_load_checkpoint_restores_model_state(
         assert torch.allclose(v, original_sd[k]), f"Param '{k}' not restored"
 
 
+def test_load_checkpoint_restores_ema_state(
+    model_params: ModelSetup,
+    log: FilteringBoundLogger,
+) -> None:
+    """load_checkpoint restores EMA shadow weights matching the saved state.
+
+    Mirrors test_load_checkpoint_restores_model_state but for the EMA
+    shadow: advances it away from its initial (model-matching) values,
+    saves, zeroes the in-memory shadow, then confirms load_checkpoint
+    restores the exact saved values rather than the assertion trivially
+    passing.
+    """
+    with torch.no_grad():
+        for p in model_params.model.parameters():
+            _ = p.add_(1.0)
+    model_params.ema.update(model_params.model, step=0)
+    save_checkpoint(
+        model_params=model_params,
+        rank=0,
+        log=log,
+        best_val_loss=torch.tensor(0.42),
+    )
+    original_ema_sd = {
+        k: v.clone() for k, v in model_params.ema.state_dict().items()
+    }
+
+    for tensor in model_params.ema.shadow.values():
+        _ = tensor.zero_()
+
+    restored, _ = load_checkpoint(model_params=model_params, rank=0, log=log)
+    for k, v in restored.ema.state_dict().items():
+        assert torch.allclose(
+            v,
+            original_ema_sd[k],
+        ), f"EMA param '{k}' not restored"
+
+
 def test_checkpoint_round_trip_preserves_weights_and_loss(
     model_params: ModelSetup,
     log: FilteringBoundLogger,
@@ -991,6 +1249,59 @@ def test_checkpoint_round_trip_preserves_weights_and_loss(
         ), f"Param '{k}' differs after round trip"
     second_ckpt_loss = cast(torch.Tensor, second_ckpt["best_val_loss"])
     assert abs(second_ckpt_loss.item() - best_val_loss.item()) < TOLERANCE
+
+
+def test_checkpoint_round_trip_preserves_ema_state(
+    model_params: ModelSetup,
+    log: FilteringBoundLogger,
+) -> None:
+    """save->load->save is lossless for EMA shadow weights.
+
+    Mirrors test_checkpoint_round_trip_preserves_weights_and_loss but for
+    the EMA shadow: saves a checkpoint, reloads it, saves again, and
+    confirms the EMA weights are identical across both saved files.
+    """
+    path = model_params.tcfg.checkpoint.checkpoint_path
+    with torch.no_grad():
+        for p in model_params.model.parameters():
+            _ = p.add_(1.0)
+    model_params.ema.update(model_params.model, step=0)
+
+    save_checkpoint(
+        model_params=model_params,
+        rank=0,
+        log=log,
+        best_val_loss=torch.tensor(0.271),
+    )
+    first_ema_sd = {
+        k: v.clone() for k, v in model_params.ema.state_dict().items()
+    }
+
+    for tensor in model_params.ema.shadow.values():
+        _ = tensor.zero_()
+
+    restored, loaded_loss = load_checkpoint(
+        model_params=model_params,
+        rank=0,
+        log=log,
+    )
+    save_checkpoint(
+        model_params=restored,
+        rank=0,
+        log=log,
+        best_val_loss=loaded_loss,
+    )
+
+    second_ckpt = cast(
+        dict[str, object],
+        torch.load(path, weights_only=True),
+    )
+    second_ckpt_ema = cast(dict[str, torch.Tensor], second_ckpt["ema"])
+    for k, v in first_ema_sd.items():
+        assert torch.allclose(
+            v,
+            second_ckpt_ema[k],
+        ), f"EMA param '{k}' differs after round trip"
 
 
 def test_checkpoint_round_trip_preserves_optimizer_and_scheduler_state(
@@ -1257,6 +1568,72 @@ def test_train_updates_model_parameters(
             model_params.model.parameters(),
             strict=False,
         )
+    )
+
+
+def test_train_calls_all_reduce_mean_on_all_epoch_metrics(
+    model_params: ModelSetup,
+    loaders: tuple[
+        torch.utils.data.DataLoader[FeaturizedBatch],
+        torch.utils.data.DataLoader[FeaturizedBatch],
+    ],
+    log: FilteringBoundLogger,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """train() calls all_reduce_mean() on every metric feeding EpochMetrics.
+
+    Arrange: wrap TensorAccumulatorMixin.all_reduce_mean with a spy that
+    records every instance it's called on before delegating to the real
+    implementation (which no-ops here, since no distributed process group
+    is active in this test -- the reduction arithmetic itself is proven
+    separately, with real multi-rank processes, by
+    test_all_reduce_mean_averages_across_real_ranks in
+    test_useful_objects.py). This test only proves train() invokes the
+    reduction on the right objects, not the arithmetic.
+    Act: run train() for one epoch.
+    Assert: the spy was invoked on exactly four metric instances: two
+    LossMetrics (train and val), one ThroughputStatistics, and one
+    ComponentNorms -- matching every metric field of EpochMetrics.
+    """
+    train_loader, test_loader = loaders
+    calls: list[TensorAccumulatorMixin] = []
+    original = TensorAccumulatorMixin.all_reduce_mean
+
+    def _spy(self: TensorAccumulatorMixin) -> None:
+        calls.append(self)
+        original(self)
+
+    monkeypatch.setattr(TensorAccumulatorMixin, "all_reduce_mean", _spy)
+
+    train(
+        best_val_loss=torch.tensor(float("inf")),
+        train_loader=train_loader,
+        test_loader=test_loader,
+        model_params=model_params,
+        log=log,
+    )
+
+    expected_loss_metrics_calls = 2  # train_loss_metrics + val_loss_metrics
+    expected_throughput_calls = 1  # train_throughput_stats
+    expected_norms_calls = 1  # train_gradient_norms
+    expected_total_calls = (
+        expected_loss_metrics_calls
+        + expected_throughput_calls
+        + expected_norms_calls
+    )
+
+    assert len(calls) == expected_total_calls
+    assert (
+        sum(isinstance(c, LossMetrics) for c in calls)
+        == expected_loss_metrics_calls
+    )
+    assert (
+        sum(isinstance(c, ThroughputStatistics) for c in calls)
+        == expected_throughput_calls
+    )
+    assert (
+        sum(isinstance(c, ComponentNorms) for c in calls)
+        == expected_norms_calls
     )
 
 

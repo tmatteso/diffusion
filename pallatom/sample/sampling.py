@@ -772,10 +772,11 @@ def _parse_args() -> SamplingArgs:
 def main(args: SamplingArgs, scfg: SampleConfig, device: str) -> None:
     """Run EDM sampling for the Pallatom model end-to-end.
 
-    Loads the model checkpoint, builds the sampling context, runs the EDM
-    sampler, converts the resulting atom5 coordinates to atom37 PDB format,
-    and writes all sampled structures as a JSON list of PDB strings to the
-    configured output path.
+    Loads the EMA shadow weights from the checkpoint (not the raw trained
+    weights), builds the sampling context, runs the EDM sampler, converts
+    the resulting atom5 coordinates to atom37 PDB format, and writes all
+    sampled structures as a JSON list of PDB strings to the configured
+    output path.
 
     Args:
         args: Parsed command-line arguments containing the config path and log
@@ -813,7 +814,7 @@ def main(args: SamplingArgs, scfg: SampleConfig, device: str) -> None:
             "dict[str, dict[str, Float[torch.Tensor, ...]]]",
             torch.load(scfg.checkpoint.checkpoint_path, map_location=device),
         )
-        _ = model.load_state_dict(ckpt["model"])
+        _ = model.load_state_dict(ckpt["ema"])
         _ = model.eval()
         log.info(
             "model loaded",

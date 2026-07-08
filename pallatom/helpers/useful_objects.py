@@ -9,7 +9,8 @@ import dataclasses
 from typing import NoReturn, Self, cast
 
 import torch
-from architecture.main_trunk import MainTrunk
+import torch.distributed as dist
+from architecture.main_trunk import EMA, MainTrunk
 from beartype import beartype
 from einops import reduce
 from helpers.data import Distogram
@@ -50,6 +51,9 @@ class ModelSetup:
         optimizer: Adam optimizer whose state is saved and restored on
             checkpoint.
         scheduler: StepLR scheduler tied to the optimizer.
+        ema: Exponential moving average of model parameters, updated after
+            every optimizer step; its shadow weights are what get validated
+            and saved for inference rather than the raw trained weights.
     """
 
     model: MainTrunk | DDP
@@ -59,6 +63,7 @@ class ModelSetup:
     device: torch.device
     optimizer: Adam
     scheduler: StepLR
+    ema: EMA
 
 
 @dataclasses.dataclass
@@ -135,6 +140,25 @@ class TensorAccumulatorMixin:
         for f in dataclasses.fields(self):
             setattr(self, f.name, getattr(self, f.name) / scalar)
         return self
+
+    def all_reduce_mean(self) -> None:
+        """Average every scalar field across all ranks in place.
+
+        No-op when no distributed process group is initialised (ordinary
+        single-device training). Uses a SUM all-reduce followed by a
+        division rather than ``ReduceOp.AVG``, since AVG isn't uniformly
+        supported across every backend/version this project targets.
+        """
+        if not dist.is_initialized():
+            return
+        world_size = dist.get_world_size()
+        for f in dataclasses.fields(self):
+            tensor = cast(torch.Tensor, getattr(self, f.name))
+            _ = dist.all_reduce(  # pyright: ignore[reportUnknownMemberType]
+                tensor,
+                op=dist.ReduceOp.SUM,
+            )
+            _ = tensor.div_(world_size)
 
     def __mul__(self, scalar: float) -> Self:
         """Return a new instance with every field multiplied by a scalar.

@@ -20,7 +20,7 @@ import numpy.typing as npt
 import pytest
 import torch
 import torch.nn as nn
-from architecture.main_trunk import MainTrunk
+from architecture.main_trunk import EMA, MainTrunk
 from einops import rearrange, reduce, repeat
 from helpers.atom_utils import RESTYPE_NUM_NO_X, Protein, restype_order
 from helpers.data import (
@@ -921,6 +921,7 @@ def model_params(
         device=torch.device("cpu"),
         optimizer=optimizer,
         scheduler=scheduler,
+        ema=EMA(trunk, decay=tcfg.training.ema_decay),
     )
 
 

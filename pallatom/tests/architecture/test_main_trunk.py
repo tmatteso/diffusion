@@ -6,10 +6,14 @@ pass including output shapes, symmetry properties, loss computability, and
 gradient flow through a composite training loss.
 """
 
+import contextlib
 import dataclasses
+from collections.abc import Generator
+from typing import cast
 
 import pytest
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from architecture.losses import (
     atom_loss,
@@ -19,6 +23,7 @@ from architecture.losses import (
     smooth_lddt_loss,
 )
 from architecture.main_trunk import (
+    EMA,
     MainTrunk,
     PredictedOutputs,
     RelativePositionEncoding,
@@ -30,6 +35,8 @@ from helpers.atom_utils import RESTYPE_NUM_NO_X
 from helpers.data import FeaturizedBatch, sinusoidal_encoding
 from helpers.useful_objects import manual_seed
 from jaxtyping import Bool, Float, Int, jaxtyped
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.optim import Adam
 from train.train_config import (
     AtomDistogramParams,
     ModelParams,
@@ -791,3 +798,334 @@ def test_integration_gradient_flow_composite_loss(
     torch.autograd.backward([total_loss])
 
     _assert_submodule_grads(model)
+
+
+# ---------------------------------------------------------------------------
+# EMA
+# ---------------------------------------------------------------------------
+
+_EMA_TOLERANCE = 1e-6
+_SYNTHETIC_STEP_COUNT = 7
+
+
+def test_ema_init_shadow_matches_model_and_is_independent_copy(
+    model: MainTrunk,
+) -> None:
+    """Shadow starts equal to model weights but is a detached, independent copy.
+
+    Not parametrized: this test exercises a single invariant (the shadow is
+    a snapshot, not a view) with no meaningful axis of variation; the decay
+    arithmetic itself is covered by the parametrized formula test below.
+    """
+    ema = EMA(model, decay=0.999)
+    state_dict = cast(dict[str, torch.Tensor], model.state_dict())
+    for name, tensor in state_dict.items():
+        assert torch.equal(ema.shadow[name], tensor)
+
+    name, param = next(model.named_parameters())
+    original = param.detach().clone()
+    with torch.no_grad():
+        _ = param.add_(1.0)
+    assert torch.equal(ema.shadow[name], original)
+
+
+@pytest.mark.parametrize(
+    ("decay", "step", "expected_effective_decay"),
+    [
+        pytest.param(0.999, 0, 1.0 / 10.0, id="step0_ramp_dominates"),
+        pytest.param(0.999, 89, 90.0 / 99.0, id="mid_ramp_below_target"),
+        pytest.param(0.9, 10_000, 0.9, id="late_step_target_decay_dominates"),
+    ],
+)
+def test_ema_update_matches_bias_corrected_decay_formula(
+    model: MainTrunk,
+    decay: float,
+    step: int,
+    expected_effective_decay: float,
+) -> None:
+    """update() blends shadow and param by min(decay, (step+1)/(step+10)).
+
+    Covers the ramp's dominant regime at step 0, a mid-ramp step where the
+    bias-correction term is still below the target decay, and a late step
+    where the target decay has taken over.
+    """
+    ema = EMA(model, decay=decay)
+    name, param = next(model.named_parameters())
+    before = ema.shadow[name].clone()
+
+    with torch.no_grad():
+        _ = param.add_(1.0)
+    after_param = cast(
+        dict[str, torch.Tensor],
+        model.state_dict(),
+    )[name].clone()
+    ema.update(model, step=step)
+
+    expected = (
+        expected_effective_decay * before
+        + (1.0 - expected_effective_decay) * after_param
+    )
+    assert torch.allclose(ema.shadow[name], expected, atol=_EMA_TOLERANCE)
+
+
+def test_ema_non_floating_point_buffer_is_copied_not_averaged(
+    model: MainTrunk,
+) -> None:
+    """Non-float buffers are copied verbatim instead of decay-blended.
+
+    Not parametrized: MainTrunk has no integer buffers today (freqs, phases,
+    and centers are all float and fixed at init), so this test registers a
+    synthetic int64 buffer to exercise the copy-not-blend branch directly.
+    """
+    model.register_buffer("step_count", torch.tensor(0, dtype=torch.int64))
+    ema = EMA(model, decay=0.999)
+
+    _ = model.get_buffer("step_count").fill_(_SYNTHETIC_STEP_COUNT)
+    ema.update(model, step=0)
+
+    assert ema.shadow["step_count"].item() == _SYNTHETIC_STEP_COUNT
+
+
+@contextlib.contextmanager
+def _single_process_gloo_group() -> Generator[None]:
+    """Init and tear down a single-process gloo group for DDP-wrapping tests."""
+    # HashStore is a private torch.distributed C-extension symbol that
+    # isn't officially re-exported; getattr() sidesteps the static
+    # private-import check, whose result is otherwise inconsistent
+    # across torch's per-platform packaging.
+    dist.init_process_group(
+        backend="gloo",
+        store=getattr(  # noqa: B009  # pyright: ignore[reportAny]
+            dist,
+            "HashStore",
+        )(),
+        rank=0,
+        world_size=1,
+    )
+    try:
+        yield
+    finally:
+        dist.destroy_process_group()
+
+
+def test_ema_unwraps_ddp_module_prefix_on_init_and_update(
+    model: MainTrunk,
+) -> None:
+    """EMA strips the DDP "module." prefix so shadow keys match a plain model.
+
+    Not parametrized: this is a single structural invariant (DDP-wrapped and
+    plain models must produce identically-keyed shadows, matching the
+    prefix-stripped keys ``save_checkpoint`` writes for the raw model) with
+    no meaningful axis of variation.
+    """
+    plain_keys = set(model.state_dict().keys())
+    with _single_process_gloo_group():
+        ddp_model = DDP(model)
+        ema = EMA(ddp_model, decay=0.999)
+        assert set(ema.shadow.keys()) == plain_keys
+        assert not any(k.startswith("module.") for k in ema.shadow)
+
+        with torch.no_grad():
+            for p in ddp_model.parameters():
+                _ = p.add_(1.0)
+        ema.update(ddp_model, step=0)
+        assert set(ema.shadow.keys()) == plain_keys
+
+
+def test_ema_state_dict_and_load_state_dict_round_trip(
+    model: MainTrunk,
+) -> None:
+    """load_state_dict restores a previously saved shadow exactly.
+
+    Not parametrized: this exercises a single serialization round trip with
+    no meaningful axis of variation beyond what the decay-formula and
+    buffer-handling tests above already cover.
+    """
+    ema = EMA(model, decay=0.999)
+    with torch.no_grad():
+        for p in model.parameters():
+            _ = p.add_(1.0)
+    ema.update(model, step=500)
+    saved = {name: tensor.clone() for name, tensor in ema.state_dict().items()}
+
+    fresh_ema = EMA(model, decay=0.999)
+    fresh_ema.load_state_dict(saved)
+
+    for name, tensor in saved.items():
+        assert torch.equal(fresh_ema.shadow[name], tensor)
+
+
+# ---------------------------------------------------------------------------
+# EMA.swap (zero-copy pointer swap, used by swapped_in_ema_weights)
+# ---------------------------------------------------------------------------
+
+
+def test_ema_swap_exchanges_parameter_and_buffer_storage_with_shadow(
+    model: MainTrunk,
+) -> None:
+    """swap() moves the shadow's values onto the model and vice versa.
+
+    Arrange: build an EMA (shadow == initial weights), then perturb both a
+    parameter and a buffer (``time_fourier.freqs``) on the live model so
+    the model and the shadow diverge from each other and from their
+    pre-perturbation values.
+    Act: call ``ema.swap(model)`` once.
+    Assert: the model's parameter and buffer now hold what the shadow held
+    immediately before the swap; the shadow now holds what the model held
+    (the perturbed values) immediately before the swap.
+    """
+    ema = EMA(model, decay=0.999)
+    param_name, param = next(model.named_parameters())
+    buffer_name = "time_fourier.freqs"
+    shadow_param_before = ema.shadow[param_name].clone()
+    shadow_buffer_before = ema.shadow[buffer_name].clone()
+
+    with torch.no_grad():
+        _ = param.add_(1.0)
+        _ = model.time_fourier.freqs.add_(1.0)
+    perturbed_param = param.clone()
+    perturbed_buffer = model.time_fourier.freqs.clone()
+
+    ema.swap(model)
+
+    assert torch.equal(
+        dict(model.named_parameters())[param_name],
+        shadow_param_before,
+    )
+    assert torch.equal(model.time_fourier.freqs, shadow_buffer_before)
+    assert torch.equal(ema.shadow[param_name], perturbed_param)
+    assert torch.equal(ema.shadow[buffer_name], perturbed_buffer)
+
+
+def test_ema_swap_twice_restores_original_state(model: MainTrunk) -> None:
+    """Calling swap() twice is a no-op: it's its own inverse.
+
+    Arrange: build an EMA, perturb the model's parameters and a buffer so
+    the model and shadow diverge, then snapshot both the model's and the
+    shadow's values at that divergent point.
+    Act: call ``ema.swap(model)`` twice in a row.
+    Assert: the model and the shadow both match their respective
+    snapshots exactly, confirming swap()/swap() round-trips losslessly.
+    """
+    ema = EMA(model, decay=0.999)
+    with torch.no_grad():
+        for p in model.parameters():
+            _ = p.add_(1.0)
+        _ = model.time_fourier.freqs.add_(1.0)
+
+    model_snapshot = {
+        name: tensor.clone()
+        for name, tensor in cast(
+            "dict[str, torch.Tensor]",
+            model.state_dict(),
+        ).items()
+    }
+    shadow_snapshot = {
+        name: tensor.clone() for name, tensor in ema.shadow.items()
+    }
+
+    ema.swap(model)
+    ema.swap(model)
+
+    current_model_sd = cast("dict[str, torch.Tensor]", model.state_dict())
+    for name, tensor in model_snapshot.items():
+        assert torch.equal(current_model_sd[name], tensor)
+    for name, tensor in shadow_snapshot.items():
+        assert torch.equal(ema.shadow[name], tensor)
+
+
+def test_ema_swap_preserves_parameter_object_identity(model: MainTrunk) -> None:
+    """swap() reassigns `.data` in place rather than replacing parameters.
+
+    Arrange: build an EMA and record the Python object identity (``id()``)
+    of every parameter the model currently holds.
+    Act: call ``ema.swap(model)``.
+    Assert: every parameter name still resolves to the exact same Python
+    object as before (``is``, not just equal-valued) -- this is the
+    property that keeps Adam's per-parameter state (keyed by object
+    identity) valid across the swap.
+    """
+    ema = EMA(model, decay=0.999)
+    params_before = dict(model.named_parameters())
+    ids_before = {name: id(param) for name, param in params_before.items()}
+
+    ema.swap(model)
+
+    params_after = dict(model.named_parameters())
+    for name, param in params_after.items():
+        assert id(param) == ids_before[name], f"Parameter '{name}' was replaced"
+
+
+def test_ema_swap_reuses_shadow_storage_without_copying(
+    model: MainTrunk,
+) -> None:
+    """swap() exchanges storage pointers rather than copying values.
+
+    Arrange: build an EMA and record the shadow tensor's storage address
+    (``data_ptr()``) for one parameter before any swap happens.
+    Act: call ``ema.swap(model)``.
+    Assert: the model's parameter now shares that exact storage address --
+    proof the swap reused the shadow's existing memory rather than
+    allocating a new tensor and copying values into it.
+    """
+    ema = EMA(model, decay=0.999)
+    name, _ = next(model.named_parameters())
+    shadow_ptr_before = ema.shadow[name].data_ptr()
+
+    ema.swap(model)
+
+    assert dict(model.named_parameters())[name].data_ptr() == shadow_ptr_before
+
+
+def test_ema_swap_preserves_optimizer_state_for_swapped_parameters(
+    model: MainTrunk,
+) -> None:
+    """swap() doesn't break Adam's per-parameter state (keyed by identity).
+
+    Arrange: attach an Adam optimizer to the model's parameters and run one
+    manual step so ``optimizer.state`` is populated per parameter object.
+    Act: build an EMA and call ``ema.swap(model)``.
+    Assert: every parameter object the optimizer already holds a state
+    entry for is still a valid key in ``optimizer.state`` after the swap --
+    confirming the swap only reassigns ``.data`` rather than replacing the
+    Parameter objects the optimizer references.
+    """
+    optimizer = Adam(model.parameters(), lr=1e-3)
+    for p in model.parameters():
+        p.grad = torch.ones_like(p)
+    _ = optimizer.step()  # pyright: ignore[reportUnknownMemberType]
+    optimizer.zero_grad()
+    params_before = list(model.parameters())
+
+    ema = EMA(model, decay=0.999)
+    ema.swap(model)
+
+    for p in params_before:
+        assert p in optimizer.state
+
+
+def test_ema_swap_unwraps_ddp(model: MainTrunk) -> None:
+    """swap() operates on the unwrapped .module when the model is DDP-wrapped.
+
+    Arrange: wrap the model in a single-process gloo DDP group, build an
+    EMA from the DDP-wrapped model, then perturb the underlying model's
+    parameters so the shadow and the live weights diverge.
+    Act: call ``ema.swap(ddp_model)``, passing the DDP wrapper directly.
+    Assert: shadow keys carry no "module." prefix, and the model's
+    parameters now hold the pre-swap shadow values -- confirming the swap
+    reached through the DDP wrapper to the real MainTrunk rather than
+    operating on wrapper-prefixed keys that would never match.
+    """
+    with _single_process_gloo_group():
+        ddp_model = DDP(model)
+        ema = EMA(ddp_model, decay=0.999)
+        assert not any(k.startswith("module.") for k in ema.shadow)
+
+        name, param = next(model.named_parameters())
+        shadow_before = ema.shadow[name].clone()
+        with torch.no_grad():
+            _ = param.add_(1.0)
+
+        ema.swap(ddp_model)
+
+        assert torch.equal(dict(model.named_parameters())[name], shadow_before)

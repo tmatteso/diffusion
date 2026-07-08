@@ -10,7 +10,7 @@ import dataclasses
 import math
 import os
 import time
-from collections.abc import Iterable, Iterator
+from collections.abc import Generator, Iterable, Iterator
 from pathlib import Path
 from typing import NoReturn, cast
 
@@ -27,7 +27,7 @@ from architecture.losses import (
     seq_ce_loss,
     smooth_lddt_loss,
 )
-from architecture.main_trunk import MainTrunk, PredictedOutputs
+from architecture.main_trunk import EMA, MainTrunk, PredictedOutputs
 from beartype import beartype
 from einops import reduce
 from helpers.alignment import kabsch_align
@@ -62,18 +62,20 @@ from train.train_config import TrainArgs, TrainConfig
 
 @dataclasses.dataclass
 class Checkpoint:
-    """Serialisable snapshot of model, optimizer, and scheduler state.
+    """Serialisable snapshot of model, optimizer, scheduler, and EMA state.
 
     Attributes:
         model: Model parameter state dict.
         optimizer: Optimizer state dict.
         scheduler: LR scheduler state dict.
+        ema: EMA shadow-weight state dict.
         best_val_loss: Best validation loss seen so far.
     """
 
     model: dict[str, Float[torch.Tensor, "..."]]
     optimizer: dict[str, Float[torch.Tensor, "..."]]
     scheduler: dict[str, Float[torch.Tensor, "..."]]
+    ema: dict[str, Float[torch.Tensor, "..."]]
     best_val_loss: Float[torch.Tensor, ""]
 
 
@@ -109,6 +111,7 @@ def load_checkpoint(
             dict[str, Float[torch.Tensor, "..."]],
             raw["scheduler"],
         ),
+        ema=cast(dict[str, Float[torch.Tensor, "..."]], raw["ema"]),
         best_val_loss=cast(Float[torch.Tensor, ""], raw["best_val_loss"]),
     )
     _ = (
@@ -120,6 +123,7 @@ def load_checkpoint(
     )
     model_params.optimizer.load_state_dict(ckpt.optimizer)
     model_params.scheduler.load_state_dict(ckpt.scheduler)
+    model_params.ema.load_state_dict(ckpt.ema)
     if rank == 0:
         log.info("resumed from checkpoint", path=path)
     return model_params, ckpt.best_val_loss
@@ -170,6 +174,7 @@ def save_checkpoint(
             dict[str, Float[torch.Tensor, "..."]],
             model_params.scheduler.state_dict(),
         ),
+        ema=model_params.ema.state_dict(),
         best_val_loss=best_val_loss,
     )
     torch.save(
@@ -177,6 +182,7 @@ def save_checkpoint(
             "model": ckpt.model,
             "optimizer": ckpt.optimizer,
             "scheduler": ckpt.scheduler,
+            "ema": ckpt.ema,
             "best_val_loss": ckpt.best_val_loss,
         },
         path,
@@ -533,8 +539,9 @@ def optimizer_step(
     captures
     per-component gradient L2 norms before clipping, clips the total gradient
     norm
-    to ``training_cfg.grad_clip``, steps the optimizer, and zeros gradients.
-    The LR scheduler is not stepped here.
+    to ``training_cfg.grad_clip``, steps the optimizer, updates the EMA
+    shadow weights, and zeros gradients. The LR scheduler is not stepped
+    here.
 
     Args:
         micro_buffer: Micro-batches accumulated for this optimizer step.
@@ -568,6 +575,7 @@ def optimizer_step(
     _ = (
         model_params.optimizer.step()  # pyright: ignore[reportUnknownMemberType]
     )
+    model_params.ema.update(model_params.model, step=global_step)
     model_params.scheduler.step()
     model_params.optimizer.zero_grad()
     return loss_metrics, throughput_statistics, component_norms, global_step + 1
@@ -709,6 +717,78 @@ def collect_distributed_vars() -> tuple[int, int, int]:
     )
 
 
+@contextlib.contextmanager
+def swapped_in_ema_weights(
+    model_params: ModelSetup,
+) -> Generator[None, None, None]:
+    """Temporarily load EMA shadow weights into the model for evaluation.
+
+    Swaps the EMA shadow's tensors onto the model in place (zero-copy, no
+    extra allocation) for the duration of the ``with`` block, then swaps
+    them back on exit (even if an exception occurs) -- since
+    ``EMA.swap`` is its own inverse, entering and exiting call the exact
+    same operation. This matches AlphaFold2's practice of selecting the
+    best checkpoint by validating the EMA weights rather than the raw
+    trained weights, without corrupting the raw training trajectory or
+    spiking memory with a second full-model copy in the process.
+
+    Args:
+        model_params: Bundled model and EMA state; ``.module`` is unwrapped
+            automatically when the model is DDP-wrapped.
+
+    Yields:
+        None: No value is yielded; the context manager only provides
+            scoped side effects.
+    """
+    model_params.ema.swap(model_params.model)
+    try:
+        yield
+    finally:
+        model_params.ema.swap(model_params.model)
+
+
+def _reduced_epoch_metrics(
+    *,
+    epoch: int,
+    global_step: int,
+    step: StepProgress,
+    val_loss_metrics: LossMetrics,
+) -> EpochMetrics:
+    """Build EpochMetrics from per-rank running sums, averaged across ranks.
+
+    Divides each running sum by the epoch's total protein count to get a
+    per-rank mean, then all-reduces every metric to its mean across ranks
+    (a no-op outside a distributed process group) before packaging them
+    into EpochMetrics.
+
+    Args:
+        epoch: 1-indexed epoch number.
+        global_step: Total optimizer steps completed so far.
+        step: Per-epoch accumulator holding running weighted sums.
+        val_loss_metrics: Validation loss metrics from this epoch's
+            ``evaluate()`` call (already computed against EMA weights).
+
+    Returns:
+        EpochMetrics with every metric field averaged across ranks.
+    """
+    n_proteins_epoch: int = max(step.n_proteins_total, 1)
+    train_loss_metrics = step.loss_sum * (1.0 / n_proteins_epoch)
+    train_throughput_stats = step.throughput_sum * (1.0 / n_proteins_epoch)
+    train_gradient_norms = step.norms_sum * (1.0 / n_proteins_epoch)
+    train_loss_metrics.all_reduce_mean()
+    train_throughput_stats.all_reduce_mean()
+    train_gradient_norms.all_reduce_mean()
+    val_loss_metrics.all_reduce_mean()
+    return EpochMetrics(
+        epoch=epoch,
+        global_step=global_step,
+        train_loss_metrics=train_loss_metrics,
+        train_throughput_stats=train_throughput_stats,
+        train_gradient_norms=train_gradient_norms,
+        val_loss_metrics=val_loss_metrics,
+    )
+
+
 def train(
     best_val_loss: Float[torch.Tensor, ""],
     train_loader: torch.utils.data.DataLoader[FeaturizedBatch],
@@ -726,6 +806,17 @@ def train(
     ``tcfg.training.accumulated_token_budget`` is divided by ``world_size`` to
     get the per-rank token threshold; micro-batches accumulate until their
     combined token count hits that threshold before each optimizer step.
+
+    Per-epoch validation runs against the EMA shadow weights rather than
+    the raw trained weights (matching AlphaFold2's checkpoint-selection
+    practice), via ``swapped_in_ema_weights``; the raw weights are restored
+    immediately afterward so training resumes from the actual trajectory.
+
+    Every metric that feeds ``EpochMetrics`` (train loss, train throughput,
+    train gradient norms, and val loss) is all-reduced to its mean across
+    ranks before being logged or used for checkpoint selection, via
+    ``TensorAccumulatorMixin.all_reduce_mean``; this is a no-op outside a
+    distributed process group.
 
     Args:
         best_val_loss: Incumbent best validation loss; updated and returned
@@ -825,21 +916,18 @@ def train(
             accum_tokens += n_all_tokens
             step.pbar.update(1)  # pyright: ignore[reportUnusedCallResult]
 
-        epoch_val_metrics, _ = evaluate(
-            loader=test_loader,
-            model_params=model_params,
-            log=log,
-        )
+        with swapped_in_ema_weights(model_params):
+            epoch_val_metrics, _ = evaluate(
+                loader=test_loader,
+                model_params=model_params,
+                log=log,
+            )
 
         global_step = step.global_step
-        n_proteins_epoch: int = max(step.n_proteins_total, 1)
-        epoch_metrics = EpochMetrics(
+        epoch_metrics = _reduced_epoch_metrics(
             epoch=epoch,
             global_step=global_step,
-            train_loss_metrics=step.loss_sum * (1.0 / n_proteins_epoch),
-            train_throughput_stats=step.throughput_sum
-            * (1.0 / n_proteins_epoch),
-            train_gradient_norms=step.norms_sum * (1.0 / n_proteins_epoch),
+            step=step,
             val_loss_metrics=epoch_val_metrics,
         )
         log_epoch(
@@ -996,6 +1084,7 @@ def main(args: TrainArgs, tcfg: TrainConfig) -> None:
             device=device,
             optimizer=optimizer,
             scheduler=scheduler,
+            ema=EMA(model, decay=tp.ema_decay),
         )
 
         if tcfg.training.pretrained_weights is not None:

@@ -1,7 +1,4 @@
-# diffusion
-Tinkering with Advances in Diffusion / Flow Modeling
-
-## What is pallatom?
+## P(all-atom)
 
 `pallatom/` is a from-scratch reimplementation of
 [Pallatom](https://www.biorxiv.org/content/10.1101/2024.08.16.608235v4.full.pdf), an all-atom protein

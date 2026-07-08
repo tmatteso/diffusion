@@ -42,6 +42,7 @@ from beartype import beartype
 from einops import rearrange, repeat
 from helpers.data import FeaturizedBatch
 from jaxtyping import Bool, Float, Int, jaxtyped
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.checkpoint import checkpoint
 from train.train_config import (
     AtomDistogramParams,
@@ -785,3 +786,117 @@ class MainTrunk(nn.Module):
             intermediate_denoised_coord_stack=intermediate_denoised_coord_stack,
             intermediate_pred_aa_logit_stack=intermediate_pred_aa_logit_stack,
         )
+
+
+# ---------------------------------------------------------------------------
+# EMA — exponential moving average of MainTrunk parameters for inference
+# ---------------------------------------------------------------------------
+
+
+class EMA:
+    """Exponential moving average of a MainTrunk's parameters and buffers.
+
+    Maintains a shadow copy of ``model.state_dict()`` updated once per
+    optimizer step via ``update``. The shadow -- not the raw trained
+    weights -- is what should be loaded for inference, since it smooths
+    out step-to-step noise from minibatch gradients.
+
+    Uses a TensorFlow-style bias-corrected decay ramp
+    (``min(decay, (step + 1) / (step + 10))``) so the shadow is not
+    dominated by the random initial weights for the first ~9000 steps.
+
+    Args:
+        model: MainTrunk, plain or DDP-wrapped; the DDP wrapper (if any) is
+            unwrapped before the state_dict is cloned to seed the shadow
+            weights, since ``DDP.state_dict()`` otherwise prefixes every
+            key with ``"module."``.
+        decay: Target EMA decay once past the bias-correction ramp.
+    """
+
+    def __init__(self, model: "MainTrunk | DDP", decay: float) -> None:
+        inner = (
+            cast(MainTrunk, model.module) if isinstance(model, DDP) else model
+        )
+        self.decay: float = decay
+        state_dict = cast(
+            dict[str, Float[torch.Tensor, "..."]],
+            inner.state_dict(),
+        )
+        self.shadow: dict[str, Float[torch.Tensor, "..."]] = {
+            name: tensor.detach().clone() for name, tensor in state_dict.items()
+        }
+
+    @torch.no_grad()
+    def update(self, model: "MainTrunk | DDP", step: int) -> None:
+        """Update the shadow weights in place from the model's current state.
+
+        Args:
+            model: MainTrunk, plain or DDP-wrapped, holding the
+                just-updated parameters; the DDP wrapper (if any) is
+                unwrapped before reading its state_dict, since
+                ``DDP.state_dict()`` otherwise prefixes every key with
+                ``"module."``.
+            step: Current global optimizer step count (0-indexed), used to
+                compute the bias-corrected effective decay.
+        """
+        inner = (
+            cast(MainTrunk, model.module) if isinstance(model, DDP) else model
+        )
+        effective_decay = min(self.decay, (step + 1) / (step + 10))
+        state_dict = cast(
+            dict[str, Float[torch.Tensor, "..."]],
+            inner.state_dict(),
+        )
+        for name, tensor in state_dict.items():
+            shadow_tensor = self.shadow[name]
+            _ = (
+                shadow_tensor.mul_(effective_decay).add_(
+                    tensor.detach(),
+                    alpha=1.0 - effective_decay,
+                )
+                if torch.is_floating_point(shadow_tensor)
+                else shadow_tensor.copy_(tensor)
+            )
+
+    def swap(self, model: "MainTrunk | DDP") -> None:
+        """Exchange this EMA's shadow tensors with the model's live weights.
+
+        Swaps ``.data`` in place -- no allocation, no value copy -- rather
+        than copying values, so calling this twice in a row (once on
+        entry, once on exit) restores the original state at zero extra
+        memory cost. Every Parameter and buffer's Python object identity
+        is preserved (only ``.data`` is reassigned), so Adam's
+        per-parameter state, keyed by the Parameter object itself, stays
+        valid across the swap.
+
+        Args:
+            model: MainTrunk, plain or DDP-wrapped; the DDP wrapper (if
+                any) is unwrapped before swapping, since parameters and
+                buffers must be reached on the real MainTrunk, not a
+                wrapper.
+        """
+        inner = (
+            cast(MainTrunk, model.module) if isinstance(model, DDP) else model
+        )
+        tensors = list(inner.named_parameters()) + list(inner.named_buffers())
+        for name, tensor in tensors:
+            tensor.data, self.shadow[name] = self.shadow[name], tensor.data
+
+    def state_dict(self) -> dict[str, Float[torch.Tensor, "..."]]:
+        """Return the shadow weights for checkpointing."""
+        return self.shadow
+
+    def load_state_dict(
+        self,
+        state_dict: dict[str, Float[torch.Tensor, "..."]],
+    ) -> None:
+        """Restore shadow weights from a saved checkpoint.
+
+        Args:
+            state_dict: Previously saved shadow state dict (from
+                ``state_dict``), keyed identically to a MainTrunk's
+                ``state_dict()``.
+        """
+        self.shadow = {
+            name: tensor.clone() for name, tensor in state_dict.items()
+        }

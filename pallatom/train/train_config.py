@@ -64,6 +64,10 @@ class TrainingParams(BaseModel):
         lr_decay_steps: Number of optimizer steps between each LR decay.
         lr_decay_factor: Multiplicative factor applied to the LR every
             ``lr_decay_steps`` optimizer steps.
+        ema_decay: Target decay for the exponential moving average of
+            trained parameters. The EMA weights (not the raw trained
+            weights) are what get validated during training and loaded for
+            inference, matching AlphaFold2/3 convention.
     """
 
     model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True)
@@ -77,6 +81,7 @@ class TrainingParams(BaseModel):
     accumulated_token_budget: int = Field(default=4096, gt=0)
     lr_decay_steps: int = Field(default=50_000, gt=0)
     lr_decay_factor: float = Field(default=0.95, gt=0, lt=1)
+    ema_decay: float = Field(default=0.999, gt=0, lt=1)
 
 
 class ModelParams(BaseModel):
