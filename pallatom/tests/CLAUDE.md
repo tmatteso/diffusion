@@ -3,13 +3,19 @@
 ## Structure
 
 - Write all tests as **module-level functions** (`def test_...`). Never group tests inside a class.
-- Use **`pytest` fixtures** for all shared tensors and inputs. Fixtures should return a single `torch.Tensor`. Avoid fixtures that return dicts, tuples, or other composite types.
-- Fixtures may depend on other fixtures via argument injection — prefer composing small fixtures over writing large monolithic ones.
-
+- Use **`pytest` fixtures** for all shared tensors and inputs. Prefer factory fixtures over hard coded data fixtures. Factory fixtures construct data fixtures from input arguments. Use indirect=True for `@pytest.mark.parametrize` to pass parameters directly from the test function to fixture factory. Data fixtures should return a single `torch.Tensor`, dataclass,  custom object. Avoid fixtures that return dicts, tuples, or other composite builtin types. Fixtures may depend on other fixtures via argument injection — prefer composing small fixtures over writing large monolithic ones.
+- Brainstorm with the Arrange-Act-Assert (AAA) Pattern: Always structure your thoughts using this triad to define exactly what you are testing: Arrange: Set up the exact state of the world, initial inputs, and necessary mocks.Act: Perform the specific function, method, or API call you are testing.Assert: Verify the exact outcome (return values, exceptions, or side effects).
+- Aggressively use the `@pytest.mark.parametrize` marker for tests. Instead of writing 10 different test functions for 10 different inputs, use the @pytest.mark.parametrize decorator to cover base cases, boundaries, and edge cases in a single, readable function. Add ids so failures to the parameterized tests tell a story.
+- A great test suite is reliable and order-independent. Brainstorm potential hidden dependencies between your tests. If your tests rely on global states or network calls, design them to use monkeypatch to isolate environments securely.
+- Avoid Mocking as much as possible. Functional tests and integration tests are always superior to highly mocked unit tests.
+- Data Pipelines, deep learning models, file input and output, training and sampling scripts, all MUST have End to End tests to validate the entire workflow.
+- All tests must take at least one fixture as input. If a pytest does not use `@pytest.mark.parametrize`, justify why this test should test no other edge cases. Never construct objects to test or expected outputs to tests againt inside a test. Use pytest fixtures and `@pytest.mark.parametrize`.
 ## Type checking and shape contracts
 
 - Annotate helper functions with **`jaxtyping`** (`Float`, `Int`, `Bool`, etc.) and `@jaxtyped(typechecker=beartype)` so shape contracts are verified at call time.
 - Use named dimensions in jaxtyping annotations (e.g. `"B N 3"`, `"N_atoms N_atoms"`) to make shape intent explicit.
+- All tensor functions and methods should have tests that verify shape and data type to enforce runtime compliance to jaxtyping annotations.
+- Avoid constructing random tensor and numpy array fixtures as much as possible. Force exactness with concrete, human readable, deterministic tensor and numpy array fixtures.
 
 ## Tensor operations
 
@@ -21,13 +27,9 @@
 
 ## Pytest best practices
 
-- **Fixtures:** Use `@pytest.fixture` for all shared setup/teardown; prefer `yield` fixtures for cleanup. Place shared fixtures in `conftest.py`.
-- **Parametrization:** Use `@pytest.mark.parametrize` for data-driven tests; group cases with the same expected behavior under a single parametrized test.
-- **Markers:** Use markers (e.g., `@pytest.mark.slow`) to categorize tests.
 - **Style:** Prefer functional tests over class-based tests.
-- **Comments:** Code should be self-explanatory. If explanation is needed, write a multi-line Google-style docstring — no inline comments.
-- **Imports:** Import at module level only; import inside functions only when absolutely necessary.
-- **Fixtures:** Reuse existing fixtures; create new ones only when needed.
-- **Mocking:** Avoid mocks for internal code; mock only external services. Use the `monkeypatch` fixture for patching.
+- **Comments:** Code should be self-explanatory. If explanation is needed, write a multi-line Google-style docstring — no inline comments. Be complete and understandable in your docstring explanations. Always prefer longer, understandable docstrings over shorter confusing ones.
+- **Imports:** Import at module level only.
+- **Fixtures:** Reuse existing fixtures; create new ones only when needed. When constructing a hard coded data fixture, always attempt to construct a factory fixture. If it cannot be factory fixture, explain why in the docstring.
 - **Temp files:** Use the `tmp_path` fixture for filesystem tests.
 - **Assertions:** Use `pytest.raises(ExceptionType)` for exception testing.
