@@ -139,10 +139,8 @@ def save_checkpoint(
 
     Only rank 0 writes to disk; other ranks return immediately so there are no
     concurrent-write races under DDP. The DDP wrapper is stripped before
-    calling
-    ``state_dict()`` so the checkpoint is loadable by ``load_checkpoint``
-    regardless
-    of whether the next run uses DDP.
+    calling ``state_dict()`` so the checkpoint is loadable by
+    ``load_checkpoint`` regardless of whether the next run uses DDP.
 
     Args:
         model_params: ModelSetup holding the model, optimizer, and scheduler to
@@ -366,15 +364,13 @@ def process_accum_window(
     """Forward + backward over one accumulation window; returns protein metrics.
 
     Each micro-batch's loss is scaled by ``total_proteins / n_proteins_i`` so
-    that the
-    accumulated gradient is equivalent to a single large-batch backward over
-    all proteins
-    in the window.  Metrics are averaged with the same protein-count weights.
+    that the accumulated gradient is equivalent to a single large-batch
+    backward over all proteins in the window. Metrics are averaged with the
+    same protein-count weights.
 
     The ``no_sync()`` context manager is used on all but the last micro-batch
-    when the
-    model exposes it (DDP), so gradient all-reduces happen only once per
-    window.
+    when the model exposes it (DDP), so gradient all-reduces happen only once
+    per window.
 
     Args:
         micro_buffer: Micro-batches to process.
@@ -487,13 +483,12 @@ def evaluate(
 def component_grad_norms(model: MainTrunk | DDP) -> ComponentNorms:
     """Return gradient L2 norm for each named MainTrunk sub-module.
 
-    Computes per-component norms from pre-clip gradients.  Call this after the
+    Computes per-component norms from pre-clip gradients. Call this after the
     backward pass and before ``clip_grad_norm_``.
 
     Args:
         model: Plain ``MainTrunk`` or DDP-wrapped model; ``.module`` is
-            unwrapped
-            automatically.
+            unwrapped automatically.
 
     Returns:
         ComponentNorms with the L2 norm of all gradients in each sub-module
@@ -535,14 +530,11 @@ def optimizer_step(
     """Run one accumulation window, clip gradients, and step the optimizer.
 
     Processes all micro-batches in ``micro_buffer`` via
-    ``process_accum_window``
-    (which accumulates gradients across micro-batches without stepping),
-    captures
-    per-component gradient L2 norms before clipping, clips the total gradient
-    norm
-    to ``training_cfg.grad_clip``, steps the optimizer, updates the EMA
-    shadow weights, and zeros gradients. The LR scheduler is not stepped
-    here.
+    ``process_accum_window`` (which accumulates gradients across micro-batches
+    without stepping), captures per-component gradient L2 norms before
+    clipping, clips the total gradient norm to ``training_cfg.grad_clip``,
+    steps the optimizer, updates the EMA shadow weights, and zeros gradients.
+    The LR scheduler is not stepped here.
 
     Args:
         micro_buffer: Micro-batches accumulated for this optimizer step.
@@ -553,13 +545,11 @@ def optimizer_step(
 
     Returns:
         A 4-tuple ``(loss_metrics, throughput_statistics, component_norms,
-        next_step)``
-        where ``loss_metrics`` contains mean per-metric losses over the window,
-        ``throughput_statistics`` contains batch size and tokens-per-second
-        stats,
-        ``component_norms`` contains per-module gradient L2 norms measured
-        before clipping,
-        and ``next_step`` is ``global_step + 1``.
+        next_step)`` where ``loss_metrics`` contains mean per-metric losses
+        over the window, ``throughput_statistics`` contains batch size and
+        tokens-per-second stats, ``component_norms`` contains per-module
+        gradient L2 norms measured before clipping, and ``next_step`` is
+        ``global_step + 1``.
     """
     loss_metrics, throughput_statistics = process_accum_window(
         micro_buffer=micro_buffer,
@@ -603,9 +593,8 @@ def log_epoch(
 
     Args:
         epoch_metrics: Aggregated metrics for this epoch, including epoch
-            number,
-            global step, train/val loss metrics, throughput statistics, and
-            gradient norms.
+            number, global step, train/val loss metrics, throughput statistics,
+            and gradient norms.
         model_params: Model, optimizer, scheduler, and training configuration
             for this run.
         log: Bound structlog logger.

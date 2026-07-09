@@ -557,10 +557,8 @@ def test_tmo_proj_layers_are_layernorm_scale_invariant(
     """With outer gate pinned to 1, output is identical for z and 2·z.
 
     LayerNorm is scale-invariant in its input, so proj_a and proj_b (which
-    receive
-    norm(z)) produce the same result for z and 2·z. Pinning the outer gate
-    removes
-    the only path that sees raw z.
+    receive norm(z)) produce the same result for z and 2·z. Pinning the outer
+    gate removes the only path that sees raw z.
     """
     with torch.no_grad():
         _ = tmo.gate.bias.fill_(100.0)
@@ -634,8 +632,8 @@ def test_tmo_equals_incoming_for_symmetric_input_with_shared_weights(
     Substituting into the incoming sum:
       Σ_k f_a(zn[k,i]) ⊙ f_b(zn[j,k]) = Σ_k f_a(zn[i,k]) ⊙ f_b(zn[k,j])
     which equals the outgoing sum. The outer gate g[i,j] =
-    sigmoid(gate(z[i,j]))
-    is identical for both since they share weights and receive the same z.
+    sigmoid(gate(z[i,j])) is identical for both since they share weights and
+    receive the same z.
     """
     _ = tmi.load_state_dict(tmo.state_dict())
     with torch.no_grad():
@@ -703,10 +701,9 @@ def test_tmo_output_other_rows_change_when_row_i_of_z_is_perturbed(
     dependency that is the hallmark of the outgoing contraction.
 
     The perturbation must be channel-varying (not a uniform constant shift)
-    because
-    LayerNorm is invariant to uniform additive shifts across channels, which
-    would
-    leave zn — and therefore b — unchanged and make the test trivially pass.
+    because LayerNorm is invariant to uniform additive shifts across channels,
+    which would leave zn — and therefore b — unchanged and make the test
+    trivially pass.
     """
     z_pert = z_single.clone()
     # Channel-varying noise changes relative channel distribution so LayerNorm
@@ -981,8 +978,7 @@ def test_tmi_equals_outgoing_for_symmetric_input_with_shared_weights(
     """For spatially symmetric z, incoming == outgoing when weights are shared.
 
     With z[b,k,i,c] = z[b,i,k,c], LayerNorm preserves symmetry so a[k,i] =
-    a[i,k]
-    and b[j,k] = b[k,j].  Substituting into the incoming sum:
+    a[i,k] and b[j,k] = b[k,j].  Substituting into the incoming sum:
       Σ_k a[k,i] ⊙ b[j,k] = Σ_k a[i,k] ⊙ b[k,j]  (= outgoing sum).
     The outer gate g[i,j] is identical for both (shared weights, same z).
     """
@@ -1001,16 +997,14 @@ def test_tmi_incoming_z_equals_outgoing_transposed_z_when_inner_gates_pinned(
     """incoming(z) == outgoing(transpose(z)) when all inner gates pinned to 1.
 
     Mathematical identity: with gate_a and gate_b pinned (sigmoid ≈ 1), the
-    inner sums
-    reduce to:
+    inner sums reduce to:
       incoming m[i,j]         = Σ_k proj_a(zn[k,i]) ⊙ proj_b(zn[j,k])
       outgoing m[i,j] on z_T  = Σ_k proj_a(zn_T[i,k]) ⊙ proj_b(zn_T[k,j])
                                = Σ_k proj_a(zn[k,i]) ⊙ proj_b(zn[j,k]) ←
                                identical
-    (because zn_T[i,k] = LN(z_T[i,k]) = LN(z[k,i]) = zn[k,i]).
-    With the outer gate also pinned (gate.weight=0 makes sigmoid constant for
-    both
-    inputs), the final outputs match exactly.  This test would fail if either
+    (because zn_T[i,k] = LN(z_T[i,k]) = LN(z[k,i]) = zn[k,i]). With the outer
+    gate also pinned (gate.weight=0 makes sigmoid constant for both inputs),
+    the final outputs match exactly.  This test would fail if either
     contraction were implemented as the other.
     """
     _ = tmo.load_state_dict(tmi.state_dict())
@@ -1098,10 +1092,8 @@ def test_tmi_output_other_first_dims_change_when_column_i_of_z_is_perturbed(
 
     m[i', j] = Σ_k a[k, i'] ⊙ b[j, k].  At k=i the term b[j, i] = f_b(zn[j, i])
     changes when z[:, :, i, :] is perturbed, propagating to ALL first-dim
-    indices.
-    This cross-column spread is the hallmark of the incoming contraction (the
-    transpose
-    of outgoing's cross-row spread).
+    indices. This cross-column spread is the hallmark of the incoming
+    contraction (the transpose of outgoing's cross-row spread).
 
     A channel-varying perturbation is used so LayerNorm cannot cancel the
     shift.

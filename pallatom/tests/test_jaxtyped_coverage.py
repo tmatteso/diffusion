@@ -138,11 +138,9 @@ def test_every_jaxtyped_function_has_a_test() -> None:
     Scans all source files under ``pallatom/`` (excluding ``tests/``), collects
     every @jaxtyped-decorated function or class, derives the expected test file
     path (``pallatom/{pkg}/{mod}.py`` →
-    ``pallatom/tests/{pkg}/test_{mod}.py``),
-    and asserts that the decorated name appears as an AST identifier in that
-    file.
-    Fails with a complete list of missing entries so all gaps can be fixed at
-    once.
+    ``pallatom/tests/{pkg}/test_{mod}.py``), and asserts that the decorated
+    name appears as an AST identifier in that file. Fails with a complete list
+    of missing entries so all gaps can be fixed at once.
     """
     pallatom_root = pathlib.Path(__file__).parent.parent
     missing: list[str] = []

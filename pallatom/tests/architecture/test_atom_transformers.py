@@ -733,9 +733,8 @@ def test_compute_beta_all_zero_when_n_leq_n_queries(
     """When N <= n_queries, every valid pair is in-window — no -1e10 entries.
 
     N_ATOM=24 < n_queries=32: single centre at 15.5 (half_q=16.0) covers all
-    atoms.
-    n_keys=128, half_k=64.0: all atoms are keys too. Every valid pair gets
-    beta=0.0.
+    atoms. n_keys=128, half_k=64.0: all atoms are keys too. Every valid pair
+    gets beta=0.0.
     """
     ref = torch.randn(B, N_ATOM, C_ATOM)
     beta = compute_beta(
@@ -764,10 +763,9 @@ def test_compute_beta_no_inf_in_output(
     """compute_beta output contains no -inf values when ref dtype is float16.
 
     Regression guard for the float16 fill-value fix in compute_beta: the
-    original
-    -1e10 constant raises RuntimeError when cast to float16 (overflow). After
-    the
-    fix, a dtype-safe value is used and the output contains no -inf.
+    original -1e10 constant raises RuntimeError when cast to float16
+    (overflow). After the fix, a dtype-safe value is used and the output
+    contains no -inf.
     """
     ref = torch.zeros(B, N_ATOM, C_ATOM, dtype=torch.float16)
     beta = compute_beta(
@@ -784,11 +782,9 @@ def test_compute_beta_asymmetric() -> None:
     """Beta is directional: (l=0, m=4) admitted while (l=4, m=0) is blocked.
 
     n_queries=2, n_keys=8, N=8: half_q=1.0, half_k=4.0.
-    Centres at 0.5, 2.5, 4.5, 6.5.
-    l=0 queries centre 0 (|0-0.5|=0.5 < 1.0); m=4 is a key (|4-0.5|=3.5 < 4.0)
-    -> 0.0.
-    l=4 queries centre 2 (|4-4.5|=0.5 < 1.0); m=0 NOT a key (|0-4.5|=4.5 > 4.0)
-    -> -1e10.
+    Centres at 0.5, 2.5, 4.5, 6.5. l=0 queries centre 0 (|0-0.5|=0.5 < 1.0);
+    m=4 is a key (|4-0.5|=3.5 < 4.0) -> 0.0. l=4 queries centre 2
+    (|4-4.5|=0.5 < 1.0); m=0 NOT a key (|0-4.5|=4.5 > 4.0) -> -1e10.
     """
     N_t, n_q, n_k, B_t = 8, 2, 8, 1
     neighbor_idx_t: Int[torch.Tensor, "B_t N_t K_t"] = repeat(
@@ -1039,12 +1035,10 @@ def test_atom_transformer_gradient_isolation() -> None:
     """Backprop from block-0 outputs gives zero gradient for block-1 inputs.
 
     With n_queries=n_keys=4 and N=8, the two blocks are disjoint. Softmax
-    weights
-    for cross-block pairs are exactly 0.0 in float32, so the softmax gradient
-    (s_lm * (delta - s_lm) = 0 when s_lm=0) propagates zero back to block-1
-    inputs.
-    ConditionedTransitionBlock is pointwise, so it contributes no cross-block
-    gradient.
+    weights for cross-block pairs are exactly 0.0 in float32, so the softmax
+    gradient (s_lm * (delta - s_lm) = 0 when s_lm=0) propagates zero back to
+    block-1 inputs. ConditionedTransitionBlock is pointwise, so it contributes
+    no cross-block gradient.
     """
     n_q, N_t, B_t = 4, 8, 1
     model = AtomTransformer(

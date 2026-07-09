@@ -208,11 +208,10 @@ def test_attn_pair_bias_norm_a_has_no_learnable_params() -> None:
     """norm_a must be non-learnable (elementwise_affine=False).
 
     All callers that exist in the current model (NodeUpdate,
-    DiffusionTransformer)
-    always supply a real conditioning tensor, so the s=None fallback path
-    through
-    norm_a is never taken.  If norm_a had learnable parameters they would never
-    receive gradients, triggering a DDP "unused parameter" crash at runtime.
+    DiffusionTransformer) always supply a real conditioning tensor, so the
+    s=None fallback path through norm_a is never taken.  If norm_a had
+    learnable parameters they would never receive gradients, triggering a DDP
+    "unused parameter" crash at runtime.
     """
     module = AttentionPairBias(C_RES, C_PAIR, n_heads=N_HEADS)
     assert not list(module.norm_a.parameters()), (
@@ -404,8 +403,7 @@ def test_attn_pair_bias_all_masked_beta_no_nan(
     """Output is finite when beta suppresses every key position with -1e10.
 
     Guards against the softmax([-inf, ...]) = NaN failure that arises in
-    float16
-    mixed-precision when -1e10 overflows to -inf.
+    float16 mixed-precision when -1e10 overflows to -inf.
     """
     beta = torch.full((B, N_RES, N_RES), -1e10)
     with torch.no_grad():
@@ -669,10 +667,9 @@ def test_attn_pair_bias_residual_gain_contractive(
     """Attention delta is contractive at random init: ||delta|| / ||s|| < 1.0.
 
     AttentionPairBias.forward returns the additive update that NodeUpdate
-    applies as
-    s = s + attn(s, t, z). A gain >= 1.0 at init predicts compounding norm
-    explosions
-    across 8 decoder recycling blocks in late training.
+    applies as s = s + attn(s, t, z). A gain >= 1.0 at init predicts
+    compounding norm explosions across 8 decoder recycling blocks in late
+    training.
     """
     module = AttentionPairBias(C_RES, C_PAIR, n_heads=N_HEADS).eval()
     with torch.no_grad():
@@ -691,10 +688,8 @@ def test_attn_pair_bias_repeated_application_bounded(
     """RMS stays bounded after 20 rounds of s = s + attn(s, t, z) with fixed z.
 
     Simulates the decoder recycling loop. An intrinsically expansive operator
-    shows
-    exponential RMS growth even without training; a contractive one stays near
-    the
-    initial scale. Threshold 5.0 allows healthy growth while catching
+    shows exponential RMS growth even without training; a contractive one stays
+    near the initial scale. Threshold 5.0 allows healthy growth while catching
     explosions.
     """
     module = AttentionPairBias(C_RES, C_PAIR, n_heads=N_HEADS).eval()
@@ -715,10 +710,9 @@ def test_attn_pair_bias_param_grads_finite_after_recycling(
     """All parameter gradients remain finite after 20 recycling steps.
 
     An expansive operator causes gradient norms to grow with recycling depth
-    via
-    backpropagation-through-time. Finite gradients after the full 20-step
-    unrolled
-    loop is a necessary condition for stable training in an 8-block decoder.
+    via backpropagation-through-time. Finite gradients after the full 20-step
+    unrolled loop is a necessary condition for stable training in an 8-block
+    decoder.
     """
     module = AttentionPairBias(C_RES, C_PAIR, n_heads=N_HEADS)
     s_cycle = s.clone()

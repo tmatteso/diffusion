@@ -788,10 +788,10 @@ def to_pdb(prot: Protein) -> str:
     therefore contain 0.00, 1.00, or 2.00 for model-generated structures.
 
     Args:
-      prot: The protein to convert to PDB.
+        prot: The protein to convert to PDB.
 
     Returns:
-      PDB string.
+        PDB string.
 
     Raises:
         InvalidAAtypesError: If any residue has an out-of-range aatype index.

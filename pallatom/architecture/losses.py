@@ -538,10 +538,8 @@ def seq_ce_loss(
     """CE loss for the sequence head; ignores padding and null/unknown tokens.
 
     Positions are ignored when aa_indices < 0 (padding) or aa_indices >=
-    n_amino
-    (PDB-X at index 20, conditioning-dropped at index 20). Only real visible
-    amino
-    acids (indices 0 to n_amino-1) contribute to the loss.
+    n_amino (PDB-X at index 20, conditioning-dropped at index 20). Only real
+    visible amino acids (indices 0 to n_amino-1) contribute to the loss.
 
     Args:
         logits: Sequence logits from any head (final or intermediate).
