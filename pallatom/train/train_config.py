@@ -409,29 +409,6 @@ class TrainLoaderConfig(LoaderConfig):
         return self
 
 
-class ConditioningDropoutConfig(BaseModel):
-    """Per-conditioning-signal dropout probabilities used during training.
-
-    Each field controls the probability that the corresponding conditioning
-    input is zeroed out for a given sample, encouraging the model to operate
-    robustly in the absence of any single conditioning signal.
-
-    Attributes:
-        model_config: Pydantic config — frozen to prevent mutation after init.
-        p_distogram: Dropout probability for the residue-level Cβ distogram
-            conditioning signal.
-        p_atom: Dropout probability for the atom-pair distogram conditioning
-            signal.
-        p_seq: Dropout probability for the sequence conditioning signal.
-    """
-
-    model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True)
-
-    p_distogram: float = Field(default=0.15, ge=0.0, le=1.0)
-    p_atom: float = Field(default=0.15, ge=0.0, le=1.0)
-    p_seq: float = Field(default=0.15, ge=0.0, le=1.0)
-
-
 class TrainConfig(BaseModel):
     """Top-level frozen config aggregating all training sub-configs.
 
@@ -477,9 +454,6 @@ class TrainConfig(BaseModel):
     logging: LoggingParams = Field(default_factory=LoggingParams)
     train_loader: TrainLoaderConfig = Field(default_factory=TrainLoaderConfig)
     test_loader: LoaderConfig = Field(default_factory=LoaderConfig)
-    conditioning_dropout: ConditioningDropoutConfig = Field(
-        default_factory=ConditioningDropoutConfig,
-    )
 
 
 @dataclasses.dataclass
