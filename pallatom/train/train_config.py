@@ -2,8 +2,7 @@
 
 Contains frozen Pydantic models that collectively define every knob available
 during a training run: optimizer settings, model capacity, EDM noise schedule,
-distogram binning, loss weights, checkpointing, logging, data-loading, and
-conditioning dropout.
+distogram binning, loss weights, checkpointing, logging, and data-loading.
 """
 
 import dataclasses
@@ -431,8 +430,6 @@ class TrainConfig(BaseModel):
         logging: Logging and W&B project settings.
         train_loader: DataLoader settings used for the training split.
         test_loader: DataLoader settings used for the evaluation split.
-        conditioning_dropout: Dropout probabilities for each conditioning
-            signal.
     """
 
     model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True)
