@@ -248,14 +248,13 @@ class AtomDistogramParams(DistogramParams):
         max_dist: Upper edge of the last distance bin (default 10.0 Å).
         n_bins: Total number of distance bins (default 22).
         overflow_bin: Whether the last bin also captures distances beyond
-            ``max_dist`` (default False — out-of-range atom pairs are masked
-            out instead).
+            ``max_dist`` (default True).
     """
 
     min_dist: float = Field(default=0.0, ge=0)
     max_dist: float = Field(default=10.0, gt=0)
     n_bins: int = Field(default=22, gt=0)
-    overflow_bin: bool = Field(default=False)
+    overflow_bin: bool = Field(default=True)
 
 
 class ResidueDistogramParams(DistogramParams):

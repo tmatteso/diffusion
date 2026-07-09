@@ -1456,9 +1456,9 @@ def residue_distogram_fn() -> Distogram:
 def atom_distogram_fn() -> Distogram:
     """Minimal atom distogram function for featurize_single_item tests.
 
-    Built from AtomDistogramParams (overflow_bin=False by default) to match
-    the atom-level distance convention where distances beyond max_dist are
-    not collapsed into an overflow bin.
+    Built from AtomDistogramParams (overflow_bin=True by default) so
+    distances beyond max_dist are clipped into the last bin, matching the
+    atom-level distance convention used in the full pipeline.
     """
     return build_distogram_module(
         AtomDistogramParams(n_bins=_N_BINS, min_dist=2.0, max_dist=22.0),
