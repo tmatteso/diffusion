@@ -43,8 +43,9 @@ class ModelSetup:
             multi-GPU training.
         tcfg: Training configuration holding hyperparameters, paths, and loss
             weights.
-        distogram_res: Residue-level distogram head for computing pairwise
-            distance logits.
+        distogram_template: Self-conditioning template distogram module.
+        distogram_residue: Residue-level distogram head for computing
+            pairwise distance logits.
         distogram_atom: Atom-level distogram head for computing sparse
             atom-pair distance logits.
         device: Target device string (e.g. ``"cuda:0"`` or ``"cpu"``).
@@ -58,7 +59,8 @@ class ModelSetup:
 
     model: MainTrunk | DDP
     tcfg: TrainConfig
-    distogram_res: Distogram
+    distogram_template: Distogram
+    distogram_residue: Distogram
     distogram_atom: Distogram
     device: torch.device
     optimizer: Adam

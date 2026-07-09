@@ -50,6 +50,7 @@ from train.train_config import (
     ModelParams,
     NoiseScheduleParams,
     ResidueDistogramParams,
+    TemplateDistogramParams,
     TrainArgs,
     TrainConfig,
     TrainingParams,
@@ -105,7 +106,8 @@ _ADAM_EXP_AVG_KEY = "exp_avg"
 def _make_model_params(
     trunk: MainTrunk | DDP,
     train_cfg: TrainConfig,
-    dgram_res: Distogram,
+    dgram_template: Distogram,
+    dgram_residue: Distogram,
     dgram_atom: Distogram,
 ) -> ModelSetup:
     """Construct a ModelSetup with Adam optimizer, StepLR scheduler.
@@ -113,7 +115,8 @@ def _make_model_params(
     Args:
         trunk: The MainTrunk to wrap.
         train_cfg: Training configuration.
-        dgram_res: Residue-level distogram module.
+        dgram_template: Self-conditioning template distogram module.
+        dgram_residue: Residue-level distogram module.
         dgram_atom: Atom-level distogram module.
 
     Returns:
@@ -128,7 +131,8 @@ def _make_model_params(
     return ModelSetup(
         model=trunk,
         tcfg=train_cfg,
-        distogram_res=dgram_res,
+        distogram_template=dgram_template,
+        distogram_residue=dgram_residue,
         distogram_atom=dgram_atom,
         device=torch.device("cpu"),
         optimizer=optimizer,
@@ -260,7 +264,22 @@ def zero_component_norms() -> ComponentNorms:
 
 
 @pytest.fixture
-def distogram_res() -> Distogram:
+def distogram_template() -> Distogram:
+    """Provide a self-conditioning template Distogram in eval mode.
+
+    Returns:
+        Distogram configured for template Cβ distances, set to eval mode.
+    """
+    return Distogram(
+        n_bins=_N_BINS,
+        min_dist=3.25,
+        max_dist=50.75,
+        overflow_bin=False,
+    ).eval()
+
+
+@pytest.fixture
+def distogram_residue() -> Distogram:
     """Provide a residue-level Distogram in eval mode.
 
     Returns:
@@ -268,8 +287,8 @@ def distogram_res() -> Distogram:
     """
     return Distogram(
         n_bins=_N_BINS,
-        min_dist=3.25,
-        max_dist=50.75,
+        min_dist=2.0,
+        max_dist=22.0,
         overflow_bin=False,
     ).eval()
 
@@ -314,10 +333,15 @@ def model() -> MainTrunk:
             n_amino=N_AMINO,
             max_residues=RESIDUE_NUMBER,
         ),
-        res_distogram_params=ResidueDistogramParams(
+        template_distogram_params=TemplateDistogramParams(
             n_bins=_N_BINS,
             min_dist=3.25,
             max_dist=50.75,
+        ),
+        residue_distogram_params=ResidueDistogramParams(
+            n_bins=_N_BINS,
+            min_dist=2.0,
+            max_dist=22.0,
         ),
         atom_distogram_params=AtomDistogramParams(
             n_bins=_N_ATOM_BINS,
@@ -396,7 +420,8 @@ def tcfg3(model_params: ModelSetup, tmp_path: pathlib.Path) -> TrainConfig:
 def model_params(
     model: MainTrunk,
     tcfg: TrainConfig,
-    distogram_res: Distogram,
+    distogram_template: Distogram,
+    distogram_residue: Distogram,
     distogram_atom: Distogram,
 ) -> ModelSetup:
     """Provide a ModelSetup bundling model, optimizer, scheduler, and config.
@@ -404,14 +429,22 @@ def model_params(
     Args:
         model: Fixture providing the MainTrunk model.
         tcfg: Fixture providing the single-epoch TrainConfig.
-        distogram_res: Fixture providing the residue-level distogram head.
+        distogram_template: Fixture providing the self-conditioning template
+            distogram head.
+        distogram_residue: Fixture providing the residue-level distogram head.
         distogram_atom: Fixture providing the atom-level distogram head.
 
     Returns:
         ModelSetup wrapping the model fixture with an Adam optimizer and
         StepLR scheduler configured from tcfg.
     """
-    return _make_model_params(model, tcfg, distogram_res, distogram_atom)
+    return _make_model_params(
+        model,
+        tcfg,
+        distogram_template,
+        distogram_residue,
+        distogram_atom,
+    )
 
 
 @pytest.fixture
@@ -443,7 +476,8 @@ def featurized_batch(
     return featurize_batch(
         protein_batch,
         model_params.tcfg,
-        model_params.distogram_res,
+        model_params.distogram_template,
+        model_params.distogram_residue,
         model_params.distogram_atom,
     )
 
@@ -482,10 +516,15 @@ def loaders(
             c_atompair=_C_ATOMPAIR,
             K_unit=_K_UNIT,
         ),
-        distogram_res=ResidueDistogramParams(
+        distogram_template=TemplateDistogramParams(
             n_bins=_N_BINS,
             min_dist=3.25,
             max_dist=50.75,
+        ),
+        distogram_residue=ResidueDistogramParams(
+            n_bins=_N_BINS,
+            min_dist=2.0,
+            max_dist=22.0,
         ),
         distogram_atom=AtomDistogramParams(
             n_bins=_N_ATOM_BINS,
@@ -1665,7 +1704,8 @@ def test_train_no_grad_clip_completes(
     mp_nc = _make_model_params(
         model_params.model,
         tcfg_nc,
-        model_params.distogram_res,
+        model_params.distogram_template,
+        model_params.distogram_residue,
         model_params.distogram_atom,
     )
     assert (
@@ -1713,7 +1753,8 @@ def test_train_partial_window_at_epoch_end_updates_params(
     mp_acc = _make_model_params(
         model_params.model,
         tcfg_acc,
-        model_params.distogram_res,
+        model_params.distogram_template,
+        model_params.distogram_residue,
         model_params.distogram_atom,
     )
     params_before = [p.clone().detach() for p in mp_acc.model.parameters()]
@@ -1777,10 +1818,15 @@ def test_train_token_budget_preflush_fires_before_oversized_batch(
             accumulated_token_budget=budget,
         ),
         model=model_params.tcfg.model,
-        distogram_res=ResidueDistogramParams(
+        distogram_template=TemplateDistogramParams(
             n_bins=_N_BINS,
             min_dist=3.25,
             max_dist=50.75,
+        ),
+        distogram_residue=ResidueDistogramParams(
+            n_bins=_N_BINS,
+            min_dist=2.0,
+            max_dist=22.0,
         ),
         distogram_atom=AtomDistogramParams(
             n_bins=_N_ATOM_BINS,
@@ -1806,7 +1852,8 @@ def test_train_token_budget_preflush_fires_before_oversized_batch(
     mp_b = _make_model_params(
         model_params.model,
         tcfg_b,
-        model_params.distogram_res,
+        model_params.distogram_template,
+        model_params.distogram_residue,
         model_params.distogram_atom,
     )
     args = TrainArgs(
@@ -1861,7 +1908,8 @@ def test_train_wandb_called_once_per_epoch_when_enabled(
     mp_w = _make_model_params(
         model_params.model,
         tcfg_w,
-        model_params.distogram_res,
+        model_params.distogram_template,
+        model_params.distogram_residue,
         model_params.distogram_atom,
     )
     train(
@@ -1928,7 +1976,8 @@ def test_train_metrics_nonzero_when_budget_exceeds_total_tokens(
     mp_large = _make_model_params(
         model_params.model,
         tcfg_large,
-        model_params.distogram_res,
+        model_params.distogram_template,
+        model_params.distogram_residue,
         model_params.distogram_atom,
     )
     train(
@@ -2058,7 +2107,8 @@ def test_train_accum_full_window_updates_params(
     mp_acc = _make_model_params(
         model_params.model,
         tcfg_acc,
-        model_params.distogram_res,
+        model_params.distogram_template,
+        model_params.distogram_residue,
         model_params.distogram_atom,
     )
     params_before = [p.clone().detach() for p in mp_acc.model.parameters()]
@@ -2154,7 +2204,8 @@ def test_train_wandb_epoch_increments_across_epochs(
     mp3 = _make_model_params(
         model_params.model,
         _tcfg_with_wandb(base=tcfg3, use_wandb=True),
-        model_params.distogram_res,
+        model_params.distogram_template,
+        model_params.distogram_residue,
         model_params.distogram_atom,
     )
     train(

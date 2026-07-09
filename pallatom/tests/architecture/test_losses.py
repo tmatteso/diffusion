@@ -11,28 +11,49 @@ import numpy as np
 import pytest
 import torch
 import torch.nn.functional as F
-from architecture.errors import BlockCountMismatchError
+from architecture.errors import (
+    AtomResidueCountMismatchError,
+    BlockCountMismatchError,
+)
 from architecture.losses import (
+    NONPOLAR_RESIDUE_WEIGHT,
+    POLAR_RESIDUE_WEIGHT,
+    POLAR_RESIDUES,
+    RESIDUE_TYPE_WEIGHTS,
     atom_loss,
     distogram_loss_atom,
     distogram_loss_residue,
     med_loss,
     pairwise_dist,
+    residue_type_weight,
     seq_ce_loss,
     smooth_lddt_loss,
 )
 from beartype import beartype
 from einops import einsum, rearrange, repeat
-from helpers.atom_utils import RESTYPE_NUM_NO_X, Protein, restype_order
+from helpers.alignment import kabsch_align
+from helpers.atom_utils import (
+    RESTYPE_NUM_NO_X,
+    RESTYPES_NO_X,
+    Protein,
+    restype_order,
+)
 from helpers.data import (
     Distogram,
     FeaturizedBatch,
     FeaturizedItem,
+    build_distogram_module,
     featurize_single_item,
 )
 from helpers.useful_objects import manual_seed
 from jaxtyping import Bool, Float, Int, TypeCheckError, jaxtyped
-from train.train_config import LossParams, TrainConfig
+from train.train_config import (
+    AtomDistogramParams,
+    LossParams,
+    ResidueDistogramParams,
+    TemplateDistogramParams,
+    TrainConfig,
+)
 
 _ = manual_seed(42)
 
@@ -182,6 +203,20 @@ def coords() -> Float[torch.Tensor, "B N_atoms 3"]:
         Random float tensor of shape (B, N, 3).
     """
     return torch.randn(B, N, 3)
+
+
+@pytest.fixture
+def uniform_aa_indices() -> Int[torch.Tensor, "B N_atoms"]:
+    """Amino-acid indices of a single nonpolar residue type ('A' = 0).
+
+    Used by atom_loss tests that don't care about residue-type weighting;
+    a uniform residue type makes that weighting a constant factor that
+    doesn't affect relative comparisons between losses.
+
+    Returns:
+        Integer tensor of shape (B, N), all entries 0.
+    """
+    return torch.zeros(B, N, dtype=torch.long)
 
 
 @pytest.fixture
@@ -405,6 +440,7 @@ def atom_local_mask() -> Bool[torch.Tensor, "B N_atoms N_atoms"]:
 
 def test_atom_loss_perfect_near_zero(
     coords: Float[torch.Tensor, "B N_atoms 3"],
+    uniform_aa_indices: Int[torch.Tensor, "B N_atoms"],
 ) -> None:
     """Same coords for both pred and GT yields near zero loss.
 
@@ -412,13 +448,19 @@ def test_atom_loss_perfect_near_zero(
     whose maximum is below numerical tolerance when prediction equals ground
     truth.
     """
-    loss = atom_loss(coords, coords, lambda_sigma_weight=torch.ones(B))
+    loss = atom_loss(
+        coords,
+        coords,
+        aa_indices=uniform_aa_indices,
+        lambda_sigma_weight=torch.ones(B),
+    )
     assert loss.shape == (B,)
     assert loss.max().item() < TOLERANCE
 
 
 def test_atom_loss_known_translation_near_zero(
     coords: Float[torch.Tensor, "B N_atoms 3"],
+    uniform_aa_indices: Int[torch.Tensor, "B N_atoms"],
 ) -> None:
     """Gobal translation removed by alignment, leaving near-zero loss.
 
@@ -428,13 +470,19 @@ def test_atom_loss_known_translation_near_zero(
     """
     translation = rearrange(torch.tensor([10.0, 5.0, -3.0]), "d -> 1 1 d")
     r_translated = coords + translation
-    loss = atom_loss(r_translated, coords, lambda_sigma_weight=torch.ones(B))
+    loss = atom_loss(
+        r_translated,
+        coords,
+        aa_indices=uniform_aa_indices,
+        lambda_sigma_weight=torch.ones(B),
+    )
     assert (loss < TIGHT_TOLERANCE).all()
 
 
 def test_atom_loss_full_mask_matches_no_mask(
     coords: Float[torch.Tensor, "B N_atoms 3"],
     noisy_coords: Float[torch.Tensor, "B N_atoms 3"],
+    uniform_aa_indices: Int[torch.Tensor, "B N_atoms"],
 ) -> None:
     """All-True mask equal to calling atom_loss without a mask argument.
 
@@ -444,14 +492,26 @@ def test_atom_loss_full_mask_matches_no_mask(
     mask_all = torch.ones(B, N, dtype=torch.float)
     w = torch.ones(B)
     assert torch.allclose(
-        atom_loss(coords, noisy_coords, mask=mask_all, lambda_sigma_weight=w),
-        atom_loss(coords, noisy_coords, lambda_sigma_weight=w),
+        atom_loss(
+            coords,
+            noisy_coords,
+            mask=mask_all,
+            aa_indices=uniform_aa_indices,
+            lambda_sigma_weight=w,
+        ),
+        atom_loss(
+            coords,
+            noisy_coords,
+            aa_indices=uniform_aa_indices,
+            lambda_sigma_weight=w,
+        ),
         atol=TOLERANCE,
     )
 
 
 def test_atom_loss_increases_with_noise_level(
     coords: Float[torch.Tensor, "B N_atoms 3"],
+    uniform_aa_indices: Int[torch.Tensor, "B N_atoms"],
 ) -> None:
     """Loss monotone in noise magnitude, larger perturbations -> higher loss.
 
@@ -465,16 +525,19 @@ def test_atom_loss_increases_with_noise_level(
     loss_low = atom_loss(
         coords + 0.1 * noise_dir,
         coords,
+        aa_indices=uniform_aa_indices,
         lambda_sigma_weight=w,
     )
     loss_mid = atom_loss(
         coords + 1.0 * noise_dir,
         coords,
+        aa_indices=uniform_aa_indices,
         lambda_sigma_weight=w,
     )
     loss_high = atom_loss(
         coords + 5.0 * noise_dir,
         coords,
+        aa_indices=uniform_aa_indices,
         lambda_sigma_weight=w,
     )
     assert (loss_low < loss_mid).all()
@@ -488,16 +551,31 @@ def test_atom_loss_gradient_flow() -> None:
     and that backward leaves r_gt.grad as None, confirming ground-truth
     coordinates are treated as constants.
     """
+    aa_indices = torch.zeros(1, N, dtype=torch.long)
     r_pred = torch.randn(1, N, 3, requires_grad=True)
     w1 = torch.ones(1)
     (grad,) = torch.autograd.grad(
-        atom_loss(r_pred, torch.randn(1, N, 3), lambda_sigma_weight=w1),
+        atom_loss(
+            r_pred,
+            torch.randn(1, N, 3),
+            aa_indices=aa_indices,
+            lambda_sigma_weight=w1,
+        ),
         r_pred,
     )
     assert torch.isfinite(grad).all()
     r_pred2 = torch.randn(1, N, 3, requires_grad=True)
     r_gt2 = torch.randn(1, N, 3, requires_grad=True)
-    torch.autograd.backward([atom_loss(r_pred2, r_gt2, lambda_sigma_weight=w1)])
+    torch.autograd.backward(
+        [
+            atom_loss(
+                r_pred2,
+                r_gt2,
+                aa_indices=aa_indices,
+                lambda_sigma_weight=w1,
+            ),
+        ],
+    )
     assert r_gt2.grad is None
 
 
@@ -505,6 +583,7 @@ def test_atom_loss_rotation_invariant(
     coords: Float[torch.Tensor, "B N_atoms 3"],
     rotation: Float[torch.Tensor, "3 3"],
     r_gt: Float[torch.Tensor, "B N_atoms 3"],
+    uniform_aa_indices: Int[torch.Tensor, "B N_atoms"],
 ) -> None:
     """Global rotation to GT structure does not change loss after alignment.
 
@@ -515,8 +594,18 @@ def test_atom_loss_rotation_invariant(
     r_gt_rot = einsum(r_gt, rotation, "b n d, d e -> b n e")
     w = torch.ones(B)
     assert torch.allclose(
-        atom_loss(coords, r_gt, lambda_sigma_weight=w),
-        atom_loss(coords, r_gt_rot, lambda_sigma_weight=w),
+        atom_loss(
+            coords,
+            r_gt,
+            aa_indices=uniform_aa_indices,
+            lambda_sigma_weight=w,
+        ),
+        atom_loss(
+            coords,
+            r_gt_rot,
+            aa_indices=uniform_aa_indices,
+            lambda_sigma_weight=w,
+        ),
         atol=1e-4,
     )
 
@@ -1010,8 +1099,183 @@ def test_atom_loss_wrong_shape() -> None:
     """
     r_bad = torch.zeros(B, N, 4)  # last dim must be 3
     r_target = torch.zeros(B, N, 3)
+    aa_indices = torch.zeros(B, N, dtype=torch.long)
     with pytest.raises(TypeCheckError):
-        _ = atom_loss(r_bad, r_target, lambda_sigma_weight=torch.ones(B))
+        _ = atom_loss(
+            r_bad,
+            r_target,
+            aa_indices=aa_indices,
+            lambda_sigma_weight=torch.ones(B),
+        )
+
+
+def test_atom_loss_residue_count_mismatch_raises() -> None:
+    """N_res not a multiple of N_aa raises AtomResidueCountMismatchError.
+
+    Verifies that supplying an aa_indices tensor whose residue count doesn't
+    evenly divide the number of points in r_denoised/r_gt is rejected, since
+    there would be no well-defined way to broadcast residue-type weights
+    onto the points.
+    """
+    r = torch.zeros(B, N, 3)
+    aa_indices = torch.zeros(B, N - 1, dtype=torch.long)
+    with pytest.raises(AtomResidueCountMismatchError):
+        _ = atom_loss(
+            r,
+            r,
+            aa_indices=aa_indices,
+            lambda_sigma_weight=torch.ones(B),
+        )
+
+
+@pytest.mark.parametrize(
+    ("aa_letter", "expected_weight"),
+    [
+        pytest.param("S", POLAR_RESIDUE_WEIGHT, id="polar-serine"),
+        pytest.param("D", POLAR_RESIDUE_WEIGHT, id="polar-aspartate"),
+        pytest.param("K", POLAR_RESIDUE_WEIGHT, id="polar-lysine"),
+        pytest.param("A", NONPOLAR_RESIDUE_WEIGHT, id="nonpolar-alanine"),
+        pytest.param("V", NONPOLAR_RESIDUE_WEIGHT, id="nonpolar-valine"),
+    ],
+)
+def test_atom_loss_weights_deviation_by_residue_polarity(
+    aa_letter: str,
+    expected_weight: float,
+) -> None:
+    """atom_loss weights one residue's contribution by its polarity.
+
+    Verifies the residue-type weighting end to end by independently
+    recomputing the Kabsch-aligned squared residuals with the
+    ``kabsch_align`` primitive (the same primitive atom_loss uses
+    internally) and combining them with a hand-built weight vector — 2.0
+    for the residue under test if it is polar, 1.0 otherwise, 1.0 for
+    every other (always-nonpolar 'A') residue — then checking that
+    atom_loss's output matches this independently-derived reference.
+    """
+    _ = manual_seed(3)
+    n_res = 6
+    aa_indices = torch.full((1, n_res), restype_order["A"], dtype=torch.long)
+    aa_indices[0, 0] = restype_order[aa_letter]
+
+    gt_coords = torch.randn(1, n_res, 3)
+    pred_coords = gt_coords + 0.3 * torch.randn(1, n_res, 3)
+
+    with torch.no_grad():
+        (r_aligned,) = kabsch_align(  # pylint: disable=unpacking-non-sequence
+            gt_coords,
+            pred_coords,
+            weights=None,
+            return_transform=False,
+        )
+    diff = pred_coords - r_aligned
+    sq = einsum(diff, diff, "b n d, b n d -> b n")
+    weights = torch.tensor(
+        [[expected_weight, *([NONPOLAR_RESIDUE_WEIGHT] * (n_res - 1))]],
+    )
+    expected = einsum(sq, weights, "b n, b n -> b") / (
+        3.0 * weights.sum(dim=-1)
+    )
+
+    loss = atom_loss(
+        pred_coords,
+        gt_coords,
+        aa_indices=aa_indices,
+        lambda_sigma_weight=torch.ones(1),
+    )
+    assert torch.allclose(loss, expected, atol=1e-4)
+
+
+@pytest.mark.parametrize(
+    ("aa_letters", "expected_weights"),
+    [
+        pytest.param(
+            ["A", "S", "D", "V", "K", "G"],
+            [
+                NONPOLAR_RESIDUE_WEIGHT,
+                POLAR_RESIDUE_WEIGHT,
+                POLAR_RESIDUE_WEIGHT,
+                NONPOLAR_RESIDUE_WEIGHT,
+                POLAR_RESIDUE_WEIGHT,
+                NONPOLAR_RESIDUE_WEIGHT,
+            ],
+            id="mixed-polarity",
+        ),
+        pytest.param(
+            ["X", "X"],
+            [NONPOLAR_RESIDUE_WEIGHT, NONPOLAR_RESIDUE_WEIGHT],
+            id="unknown-clamped-in-range",
+        ),
+    ],
+)
+def test_residue_type_weight_matches_polarity_table(
+    aa_letters: list[str],
+    expected_weights: list[float],
+) -> None:
+    """residue_type_weight looks up the correct weight for each residue.
+
+    Verifies the helper directly: mixed polar/nonpolar residues map to
+    their table weights, and the out-of-vocabulary 'X' token (index 20,
+    used for unknown/conditioning-dropped residues) is clamped into range
+    rather than raising an index error.
+    """
+    aa_indices = torch.tensor(
+        [[restype_order[letter] for letter in aa_letters]],
+    )
+    weight = residue_type_weight(aa_indices)
+    assert torch.allclose(weight, torch.tensor([expected_weights]))
+
+
+def test_residue_type_weights_cover_all_canonical_residues() -> None:
+    """Every canonical residue is classified as exactly polar or nonpolar.
+
+    Verifies RESIDUE_TYPE_WEIGHTS assigns POLAR_RESIDUE_WEIGHT to exactly
+    the residues listed in POLAR_RESIDUES and NONPOLAR_RESIDUE_WEIGHT to
+    every other residue in RESTYPES_NO_X, with no residue left
+    unclassified and no unexpected weight values.
+    """
+    assert len(RESIDUE_TYPE_WEIGHTS) == RESTYPE_NUM_NO_X
+    for restype, weight in zip(
+        RESTYPES_NO_X,
+        RESIDUE_TYPE_WEIGHTS,
+        strict=True,
+    ):
+        expected = (
+            POLAR_RESIDUE_WEIGHT
+            if restype in POLAR_RESIDUES
+            else NONPOLAR_RESIDUE_WEIGHT
+        )
+        assert weight == expected
+
+
+def test_atom_loss_padded_residue_ignored_regardless_of_polarity() -> None:
+    """A masked-out residue contributes zero weight even if it is polar.
+
+    Verifies that padding (mask=0) always overrides residue-type weighting:
+    a large deviation placed on a polar residue that is masked out must not
+    affect the loss at all.
+    """
+    n_res = 4
+    aa_indices = torch.full(
+        (1, n_res),
+        restype_order["A"],
+        dtype=torch.long,
+    )
+    aa_indices[0, 0] = restype_order["D"]  # polar, but will be masked out
+    mask = torch.ones(1, n_res)
+    mask[0, 0] = 0.0
+
+    gt_coords = torch.zeros(1, n_res, 3)
+    pred_coords = gt_coords.clone()
+    pred_coords[0, 0, 0] = 100.0  # large deviation on the masked-out residue
+
+    loss = atom_loss(
+        pred_coords,
+        gt_coords,
+        mask=mask,
+        aa_indices=aa_indices,
+        lambda_sigma_weight=torch.ones(1),
+    )
+    assert loss.item() < TOLERANCE
 
 
 def testpairwise_dist_wrong_shape() -> None:
@@ -1162,18 +1426,29 @@ def minimal_batch() -> FeaturizedBatch:
 
 
 @pytest.fixture
-def c_beta_distogram_fn() -> Distogram:
-    """Minimal Cβ distogram function for featurize_single_item tests.
+def template_distogram_fn() -> Distogram:
+    """Minimal self-conditioning template distogram function for tests.
 
-    Uses overflow_bin=True so distances beyond max_dist are clipped into the
-    last bin, matching the residue-level Cβ distance convention used in the
-    full pipeline.
+    Built from TemplateDistogramParams (overflow_bin=True by default) so
+    distances beyond max_dist are clipped into the last bin, matching the
+    template Cβ distance convention used in the full pipeline.
     """
-    return Distogram(
-        n_bins=_N_BINS,
-        min_dist=2.0,
-        max_dist=22.0,
-        overflow_bin=True,
+    return build_distogram_module(
+        TemplateDistogramParams(n_bins=_N_BINS, min_dist=2.0, max_dist=22.0),
+    ).eval()
+
+
+@pytest.fixture
+def residue_distogram_fn() -> Distogram:
+    """Minimal residue-level Cβ distogram function for tests.
+
+    Built from ResidueDistogramParams (overflow_bin=True by default) so
+    distances beyond max_dist are clipped into the last bin, matching the
+    residue_distogram_loss ground-truth convention used in the full
+    pipeline.
+    """
+    return build_distogram_module(
+        ResidueDistogramParams(n_bins=_N_BINS, min_dist=2.0, max_dist=22.0),
     ).eval()
 
 
@@ -1181,14 +1456,12 @@ def c_beta_distogram_fn() -> Distogram:
 def atom_distogram_fn() -> Distogram:
     """Minimal atom distogram function for featurize_single_item tests.
 
-    Uses overflow_bin=False to match the atom-level distance convention where
-    distances beyond max_dist are not collapsed into an overflow bin.
+    Built from AtomDistogramParams (overflow_bin=False by default) to match
+    the atom-level distance convention where distances beyond max_dist are
+    not collapsed into an overflow bin.
     """
-    return Distogram(
-        n_bins=_N_BINS,
-        min_dist=2.0,
-        max_dist=22.0,
-        overflow_bin=False,
+    return build_distogram_module(
+        AtomDistogramParams(n_bins=_N_BINS, min_dist=2.0, max_dist=22.0),
     ).eval()
 
 
@@ -1233,7 +1506,8 @@ def test_seq_ce_loss_ignores_minus_100() -> None:
 
 
 def test_pipeline_preserves_pdb_x_as_index_20(
-    c_beta_distogram_fn: Distogram,
+    template_distogram_fn: Distogram,
+    residue_distogram_fn: Distogram,
     atom_distogram_fn: Distogram,
 ) -> None:
     """featurize_single_item maps aatype==20 (unknown 'X') to aa_indices==20.
@@ -1261,7 +1535,8 @@ def test_pipeline_preserves_pdb_x_as_index_20(
 
     item: FeaturizedItem = featurize_single_item(
         prot,
-        c_beta_distogram_fn,
+        template_distogram_fn,
+        residue_distogram_fn,
         atom_distogram_fn,
         TrainConfig(),
         max_seq_len_in_batch=n_res,

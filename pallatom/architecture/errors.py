@@ -29,3 +29,13 @@ class BlockCountMismatchError(ValueError):
         super().__init__(
             f"{struct} structure decoder blocks != {seq} seq decoder blocks.",
         )
+
+
+class AtomResidueCountMismatchError(ValueError):
+    """Raised when a point count is not an integer multiple of residues."""
+
+    def __init__(self, n_points: int, n_residues: int) -> None:
+        super().__init__(
+            f"{n_points} points is not a multiple of "
+            + f"{n_residues} residues.",
+        )

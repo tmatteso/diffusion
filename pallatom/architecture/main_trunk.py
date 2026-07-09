@@ -32,8 +32,8 @@ from architecture.atom_transformers import (
 from architecture.layers import (
     LayerNorm,
     LinearNoBias,
+    TypedLinear,
     TypedModuleList,
-    TypedSequential,
 )
 from architecture.node_update import NodeUpdate
 from architecture.pair_update import PairUpdate
@@ -49,6 +49,7 @@ from train.train_config import (
     ModelParams,
     NoiseScheduleParams,
     ResidueDistogramParams,
+    TemplateDistogramParams,
 )
 
 # ---------------------------------------------------------------------------
@@ -310,10 +311,13 @@ class MainTrunk(nn.Module):
 
     ----------
     f_ref_dim    : per-atom f^ref feature size (3 + element_dim after tile)
-    n_bins: number of distance bins; used for both TemplateEmbedder input and
-                   distogram head output — must equal the number of bins the
-                   data
-                   distogram produces (base bins + 1 overflow when
+    n_template_bins: number of distance bins for the TemplateEmbedder's
+                   self-conditioning input — must equal the number of bins
+                   the template distogram produces (base bins + 1 overflow
+                   when overflow_bin=True)
+    n_residue_bins: number of distance bins for the residue_distogram_head
+                   output — must equal the number of bins the residue
+                   distogram target produces (base bins + 1 overflow when
                    overflow_bin=True)
     c_atom       : atom single dim
     c_pair       : trunk pair dim         (default 128)
@@ -327,7 +331,8 @@ class MainTrunk(nn.Module):
     def __init__(
         self,
         model_params: ModelParams,
-        res_distogram_params: ResidueDistogramParams,
+        template_distogram_params: TemplateDistogramParams,
+        residue_distogram_params: ResidueDistogramParams,
         atom_distogram_params: AtomDistogramParams,
         noise_params: NoiseScheduleParams,
     ) -> None:
@@ -361,7 +366,8 @@ class MainTrunk(nn.Module):
             model_params.n_paiformer_heads_template_embedder
         )
 
-        self.n_residue_bins: int = res_distogram_params.n_bins
+        self.n_template_bins: int = template_distogram_params.n_bins
+        self.n_residue_bins: int = residue_distogram_params.n_bins
         self.n_atom_bins: int = atom_distogram_params.n_bins
         # Step 2: residue-idx feature → s_init
         self.proj_residue_idx: LinearNoBias = LinearNoBias(
@@ -379,7 +385,7 @@ class MainTrunk(nn.Module):
 
         # Step 6: template embedder
         self.template_embedder: TemplateEmbedder = TemplateEmbedder(
-            n_bins=self.n_residue_bins,
+            n_bins=self.n_template_bins,
             c_z=self.c_pair,
             c=self.c_pair,
             d=self.c_pair,
@@ -422,18 +428,14 @@ class MainTrunk(nn.Module):
             ],
         )
 
-        self.residue_distogram_head: TypedSequential = TypedSequential(
-            LayerNorm(self.c_pair),
-            LinearNoBias(self.c_pair, self.c_pair),
-            nn.ReLU(),
-            LinearNoBias(self.c_pair, self.n_residue_bins),
+        self.residue_distogram_head: TypedLinear = TypedLinear(
+            self.c_pair,
+            self.n_residue_bins,
         )
 
-        self.atom_distogram_head: TypedSequential = TypedSequential(
-            LayerNorm(self.c_atompair),
-            LinearNoBias(self.c_atompair, self.c_atompair),
-            nn.ReLU(),
-            LinearNoBias(self.c_atompair, self.n_atom_bins),
+        self.atom_distogram_head: TypedLinear = TypedLinear(
+            self.c_atompair,
+            self.n_atom_bins,
         )
 
         # Per-decoder-unit sequence heads for intermediate aa logit supervision
@@ -748,10 +750,17 @@ class MainTrunk(nn.Module):
         # ------------------------------------------------------------------
         # Distogram heads
         # ------------------------------------------------------------------
-        residue_distogram_logits: Float[
+        half_residue_distogram_logits: Float[
             torch.Tensor,
             "B N_res N_res n_bins",
         ] = self.residue_distogram_head(z_ij)
+        residue_distogram_logits: Float[
+            torch.Tensor,
+            "B N_res N_res n_bins",
+        ] = half_residue_distogram_logits + rearrange(
+            half_residue_distogram_logits,
+            "b i j c -> b j i c",
+        )
 
         # Project atom-pair representation from local atomic attention into
         # distance bins. Local region defined by the attention window within

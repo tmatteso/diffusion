@@ -171,29 +171,32 @@ class NoiseScheduleParams(BaseModel):
         return self
 
 
-class ResidueDistogramParams(BaseModel):
-    """Binning configuration for the residue-level Cβ distance distogram.
+class DistogramParams(BaseModel):
+    """Shared binning configuration for all distogram configs.
+
+    Base class for ``TemplateDistogramParams``, ``AtomDistogramParams``, and
+    ``ResidueDistogramParams``. Each subclass overrides the defaults below for
+    its own distance range, bin count, and overflow behaviour.
 
     Attributes:
         model_config: Pydantic config — frozen to prevent mutation after init.
         min_dist: Lower edge of the first distance bin in ångströms.
         max_dist: Upper edge of the last distance bin in ångströms.
-        n_bins: Total number of distance bins, including the overflow bin.
-        tok_emb_dim: Dimensionality of the learned bin-token embedding.
+        n_bins: Total number of distance bins, including the overflow bin
+            when ``overflow_bin`` is True.
+        overflow_bin: If True, the last bin also captures distances beyond
+            ``max_dist`` instead of being dropped from the valid-pair mask.
     """
 
     model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True)
 
-    min_dist: float = Field(default=3.25, ge=0)
-    max_dist: float = Field(default=50.75, gt=0)
-    n_bins: int = Field(
-        default=39,
-        gt=0,
-    )  # 38 + 1. need another arg here for overflow
-    tok_emb_dim: int = Field(default=32, gt=0)
+    min_dist: float = Field(default=2.0, ge=0)
+    max_dist: float = Field(default=22.0, gt=0)
+    n_bins: int = Field(default=64, gt=0)
+    overflow_bin: bool = Field(default=True)
 
     @model_validator(mode="after")
-    def min_lt_max(self) -> "ResidueDistogramParams":
+    def min_lt_max(self) -> "DistogramParams":
         """Validate that min_dist is strictly less than max_dist.
 
         Returns:
@@ -208,21 +211,74 @@ class ResidueDistogramParams(BaseModel):
         return self
 
 
-class AtomDistogramParams(ResidueDistogramParams):
+class TemplateDistogramParams(DistogramParams):
+    """Binning configuration for the self-conditioning template distogram.
+
+    Governs the pairwise Cβ distance distribution fed into the
+    ``TemplateEmbedder`` as a self-conditioning signal (``f_distogram`` /
+    ``noised_res_distogram``). Distinct from ``ResidueDistogramParams``, which
+    configures the (differently binned) residue distogram *prediction head*
+    and its training target.
+
+    Attributes:
+        min_dist: Lower edge of the first distance bin (default 3.25 Å).
+        max_dist: Upper edge of the last distance bin (default 50.75 Å).
+        n_bins: Total number of distance bins, including the overflow bin
+            (default 39 = 38 + 1 overflow).
+        tok_emb_dim: Dimensionality of the learned bin-token embedding.
+        overflow_bin: Whether the last bin also captures distances beyond
+            ``max_dist`` (default True).
+    """
+
+    min_dist: float = Field(default=3.25, ge=0)
+    max_dist: float = Field(default=50.75, gt=0)
+    n_bins: int = Field(default=39, gt=0)  # 38 + 1 overflow
+    tok_emb_dim: int = Field(default=32, gt=0)
+    overflow_bin: bool = Field(default=True)
+
+
+class AtomDistogramParams(DistogramParams):
     """Binning configuration for the sparse atom-pair distance distogram.
 
-    Overrides residue distogram defaults with tighter distance bounds suited
-    for covalent and near-covalent atom-atom distances.
+    Overrides the shared defaults with tighter distance bounds suited for
+    covalent and near-covalent atom-atom distances.
 
     Attributes:
         min_dist: Lower edge of the first distance bin (default 0.0 Å).
         max_dist: Upper edge of the last distance bin (default 10.0 Å).
         n_bins: Total number of distance bins (default 22).
+        overflow_bin: Whether the last bin also captures distances beyond
+            ``max_dist`` (default False — out-of-range atom pairs are masked
+            out instead).
     """
 
     min_dist: float = Field(default=0.0, ge=0)
     max_dist: float = Field(default=10.0, gt=0)
     n_bins: int = Field(default=22, gt=0)
+    overflow_bin: bool = Field(default=False)
+
+
+class ResidueDistogramParams(DistogramParams):
+    """Binning configuration for the residue-level Cβ distogram head.
+
+    Governs ``MainTrunk.residue_distogram_head`` output binning and the
+    ground-truth target used by ``residue_distogram_loss``. Matches the
+    AlphaFold 3 distogram-prediction spec (Eq. 41): 64 bins spanning 2-22 Å,
+    with the last bin also catching any more distant residue pairs.
+
+    Attributes:
+        min_dist: Lower edge of the first distance bin (default 2.0 Å).
+        max_dist: Upper edge of the last distance bin (default 22.0 Å).
+        n_bins: Total number of distance bins, including the overflow bin
+            (default 64 = 63 + 1 overflow).
+        overflow_bin: Whether the last bin also captures distances beyond
+            ``max_dist`` (default True).
+    """
+
+    min_dist: float = Field(default=2.0, ge=0)
+    max_dist: float = Field(default=22.0, gt=0)
+    n_bins: int = Field(default=64, gt=0)  # 63 + 1 overflow
+    overflow_bin: bool = Field(default=True)
 
 
 class LossParams(BaseModel):
@@ -389,7 +445,10 @@ class TrainConfig(BaseModel):
         training: Optimizer and training loop settings.
         model: Architecture channel dimensions and capacity.
         noise: EDM noise schedule parameters.
-        distogram_res: Binning config for the residue-level Cβ distogram.
+        distogram_template: Binning config for the self-conditioning template
+            distogram.
+        distogram_residue: Binning config for the residue-level Cβ distogram
+            head and its training target.
         distogram_atom: Binning config for the atom-pair distogram.
         loss: Weights and thresholds for the composite training loss.
         checkpoint: Checkpoint path and save frequency.
@@ -405,7 +464,10 @@ class TrainConfig(BaseModel):
     training: TrainingParams = Field(default_factory=TrainingParams)
     model: ModelParams = Field(default_factory=ModelParams)
     noise: NoiseScheduleParams = Field(default_factory=NoiseScheduleParams)
-    distogram_res: ResidueDistogramParams = Field(
+    distogram_template: TemplateDistogramParams = Field(
+        default_factory=TemplateDistogramParams,
+    )
+    distogram_residue: ResidueDistogramParams = Field(
         default_factory=ResidueDistogramParams,
     )
     distogram_atom: AtomDistogramParams = Field(

@@ -61,7 +61,7 @@ from pydantic import (
 )
 from structlog.typing import FilteringBoundLogger
 from torch.utils.data.distributed import DistributedSampler
-from train.train_config import TrainArgs, TrainConfig
+from train.train_config import DistogramParams, TrainArgs, TrainConfig
 from webdataset.writer import TarWriter
 
 
@@ -455,6 +455,30 @@ class Distogram(nn.Module):
         return f_distogram, f_pair_mask
 
 
+def build_distogram_module(params: DistogramParams) -> Distogram:
+    """Construct a Distogram module from a binning config.
+
+    ``params.n_bins`` counts the overflow bin when ``overflow_bin`` is True
+    (matching the config convention), while ``Distogram.n_bins`` counts only
+    the base bins, so the overflow bin is subtracted back out here.
+
+    Args:
+        params: Binning config — ``TemplateDistogramParams``,
+            ``AtomDistogramParams``, or ``ResidueDistogramParams`` — supplying
+            ``n_bins``, ``min_dist``, ``max_dist``, and ``overflow_bin``.
+
+    Returns:
+        A Distogram module with bin edges computed from ``params``.
+    """
+    n_bins = params.n_bins - 1 if params.overflow_bin else params.n_bins
+    return Distogram(
+        n_bins=n_bins,
+        min_dist=params.min_dist,
+        max_dist=params.max_dist,
+        overflow_bin=params.overflow_bin,
+    )
+
+
 @jaxtyped(typechecker=beartype)
 def sinusoidal_encoding(
     positions: Float[torch.Tensor, "batch N_res"],
@@ -508,7 +532,8 @@ def ref_pos_for_residue(resname: str) -> Float[torch.Tensor, "5 3"]:
 @jaxtyped(typechecker=beartype)
 def featurize_single_item(
     prot: Protein,
-    c_beta_distogram_fn: Distogram,
+    template_distogram_fn: Distogram,
+    residue_distogram_fn: Distogram,
     atom_distogram_fn: Distogram,
     tcfg: TrainConfig,
     max_seq_len_in_batch: int,
@@ -524,9 +549,11 @@ def featurize_single_item(
     Args:
         prot: Protein with atom37 coordinates, mask, sequence,
             and residue indices.
-        c_beta_distogram_fn: Residue-level Cβ distogram head used for both
-            the GT distogram loss target and the noised self-conditioning
-            template.
+        template_distogram_fn: Distogram module used to bin the noised Cβ
+            positions into the self-conditioning template fed to the model.
+        residue_distogram_fn: Distogram module used to bin the clean
+            (unnoised) Cβ positions into the ``residue_distogram_loss``
+            ground-truth target.
         atom_distogram_fn: Atom-level sparse distogram head used to bucket
             ground-truth pairwise atom distances within the neighbour window.
         tcfg: Training configuration; provides the lognormal noise schedule
@@ -630,7 +657,10 @@ def featurize_single_item(
         rearrange(atom37_mask, "n a -> 1 n a"),
     )
     c_beta_pos_clean = rearrange(c_beta_pos_clean, "1 n d -> n d")
-    gt_res_disto_onehot, _ = c_beta_distogram_fn(c_beta_pos_clean, residue_mask)
+    gt_res_disto_onehot, _ = residue_distogram_fn(
+        c_beta_pos_clean,
+        residue_mask,
+    )
     gt_res_distogram_indices: Int[torch.Tensor, "N_res N_res"] = (
         gt_res_disto_onehot.argmax(dim=-1)
     )
@@ -659,7 +689,7 @@ def featurize_single_item(
         rearrange(atom37_mask, "n a -> 1 n a"),
     )
     c_beta_pos_noised = rearrange(c_beta_pos_noised, "1 n d -> n d")
-    noised_res_distogram, _ = c_beta_distogram_fn(
+    noised_res_distogram, _ = template_distogram_fn(
         c_beta_pos_noised,
         residue_mask,
     )
@@ -758,7 +788,8 @@ def featurize_single_item(
 def featurize_batch(
     batch: list[Protein],
     tcfg: TrainConfig,
-    distogram_res: Distogram,
+    distogram_template: Distogram,
+    distogram_residue: Distogram,
     distogram_atom: Distogram,
 ) -> FeaturizedBatch:
     """Featurize a list of proteins into a batched FeaturizedBatch.
@@ -771,7 +802,9 @@ def featurize_batch(
         batch: List of B proteins, all pre-padded to the same
             sequence length.
         tcfg: Training config supplying noise schedule parameters.
-        distogram_res: Residue-level Cβ distogram module.
+        distogram_template: Self-conditioning template distogram module.
+        distogram_residue: Residue-level Cβ distogram module used to build
+            the ``residue_distogram_loss`` ground-truth target.
         distogram_atom: Atom-level sparse distogram module.
 
     Returns:
@@ -785,7 +818,8 @@ def featurize_batch(
     items: list[FeaturizedItem] = [
         featurize_single_item(
             prot=batch[ix],
-            c_beta_distogram_fn=distogram_res,
+            template_distogram_fn=distogram_template,
+            residue_distogram_fn=distogram_residue,
             atom_distogram_fn=distogram_atom,
             tcfg=tcfg,
             max_seq_len_in_batch=max_seq_len_in_batch,
@@ -830,12 +864,15 @@ class FeaturizeCollate:
 
     Attributes:
         tcfg: Training configuration supplying noise schedule parameters.
-        distogram_res: Residue-level Cβ distogram module.
+        distogram_template: Self-conditioning template distogram module.
+        distogram_residue: Residue-level Cβ distogram module used to build
+            the ``residue_distogram_loss`` ground-truth target.
         distogram_atom: Atom-level sparse distogram module.
     """
 
     tcfg: TrainConfig
-    distogram_res: Distogram
+    distogram_template: Distogram
+    distogram_residue: Distogram
     distogram_atom: Distogram
 
     @jaxtyped(typechecker=beartype)
@@ -852,7 +889,8 @@ class FeaturizeCollate:
         return featurize_batch(
             batch,
             self.tcfg,
-            self.distogram_res,
+            self.distogram_template,
+            self.distogram_residue,
             self.distogram_atom,
         )
 
@@ -1538,8 +1576,11 @@ class ShardDataLoader(torch.utils.data.DataLoader[FeaturizedBatch]):
         tcfg: Training configuration; supplies num_workers,
             batch_prefetch_depth, epoch_prefetch_depth, and featurization
             parameters.
-        distogram_res: Residue-level Cβ distogram module used by
-            FeaturizeCollate.
+        distogram_template: Self-conditioning template distogram module used
+            by FeaturizeCollate.
+        distogram_residue: Residue-level Cβ distogram module used by
+            FeaturizeCollate to build the ``residue_distogram_loss``
+            ground-truth target.
         distogram_atom: Atom-level sparse distogram module used by
             FeaturizeCollate.
     """
@@ -1550,7 +1591,8 @@ class ShardDataLoader(torch.utils.data.DataLoader[FeaturizedBatch]):
         dataset: ProteinShardDataset,
         budget: ShardBudgetParameters,
         tcfg: TrainConfig,
-        distogram_res: Distogram,
+        distogram_template: Distogram,
+        distogram_residue: Distogram,
         distogram_atom: Distogram,
     ) -> None:
         self.shard_dataset: ProteinShardDataset = dataset
@@ -1558,7 +1600,8 @@ class ShardDataLoader(torch.utils.data.DataLoader[FeaturizedBatch]):
         self.prefetch_epochs: int = tcfg.train_loader.epoch_prefetch_depth
         collate = FeaturizeCollate(
             tcfg=tcfg,
-            distogram_res=distogram_res,
+            distogram_template=distogram_template,
+            distogram_residue=distogram_residue,
             distogram_atom=distogram_atom,
         )
         super().__init__(  # pyright: ignore[reportUnknownMemberType]
@@ -1981,23 +2024,19 @@ def make_bucketed_data_loaders(
         extra_train_args.keys_for_splits_json.read_bytes(),
     )
 
-    dr = cfg.distogram_res
-    da = cfg.distogram_atom
-    distogram_res: Distogram = Distogram(
-        n_bins=dr.n_bins - 1,
-        min_dist=dr.min_dist,
-        max_dist=dr.max_dist,
-        overflow_bin=True,
+    distogram_template: Distogram = build_distogram_module(
+        cfg.distogram_template,
     ).eval()
-    distogram_atom: Distogram = Distogram(
-        n_bins=da.n_bins,
-        overflow_bin=False,
-        min_dist=da.min_dist,
-        max_dist=da.max_dist,
+    distogram_residue: Distogram = build_distogram_module(
+        cfg.distogram_residue,
+    ).eval()
+    distogram_atom: Distogram = build_distogram_module(
+        cfg.distogram_atom,
     ).eval()
     collate: FeaturizeCollate = FeaturizeCollate(
         tcfg=cfg,
-        distogram_res=distogram_res,
+        distogram_template=distogram_template,
+        distogram_residue=distogram_residue,
         distogram_atom=distogram_atom,
     )
 
@@ -2038,7 +2077,8 @@ def make_bucketed_data_loaders(
     #     dataset=train_set,
     #     budget=budget,
     #     tcfg=cfg,
-    #     distogram_res=distogram_res,
+    #     distogram_template=distogram_template,
+    #     distogram_residue=distogram_residue,
     #     distogram_atom=distogram_atom,
     # )
 

@@ -13,6 +13,7 @@ from train.train_config import (
     ModelParams,
     NoiseScheduleParams,
     ResidueDistogramParams,
+    TemplateDistogramParams,
 )
 
 
@@ -101,7 +102,8 @@ class SampleConfig(BaseModel):
     Attributes:
         model_config: Pydantic config — frozen to prevent mutation after init.
         model: Architecture hyperparameters for the denoising model.
-        distogram_res: Residue-level distogram head parameters.
+        distogram_template: Self-conditioning template distogram parameters.
+        distogram_residue: Residue-level distogram head parameters.
         distogram_atom: Atom-level distogram head parameters.
         noise: Noise schedule parameters (sigma range, sigma_data, etc.).
         sampler: DDIM sampler hyperparameters.
@@ -113,7 +115,10 @@ class SampleConfig(BaseModel):
     model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True)
 
     model: ModelParams = Field(default_factory=ModelParams)
-    distogram_res: ResidueDistogramParams = Field(
+    distogram_template: TemplateDistogramParams = Field(
+        default_factory=TemplateDistogramParams,
+    )
+    distogram_residue: ResidueDistogramParams = Field(
         default_factory=ResidueDistogramParams,
     )
     distogram_atom: AtomDistogramParams = Field(

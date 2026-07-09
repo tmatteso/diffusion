@@ -19,12 +19,25 @@ from helpers.alignment import (
     rmsd,
 )
 from helpers.useful_objects import manual_seed
-from jaxtyping import Bool, Float, TypeCheckError
+from jaxtyping import Bool, Float, Int, TypeCheckError
 
 _ = manual_seed(42)
 N, B = 50, 8
 TOLERANCE = 1e-5
 TIGHT_TOLERANCE = 1e-3
+
+
+@pytest.fixture
+def uniform_aa_indices() -> Int[torch.Tensor, "B N"]:
+    """Amino-acid indices of a single nonpolar residue type ('A' = 0).
+
+    Used by atom_loss tests that don't care about residue-type weighting;
+    a uniform residue type makes that weighting a constant factor.
+
+    Returns:
+        Integer tensor of shape (B, N), all entries 0.
+    """
+    return torch.zeros(B, N, dtype=torch.long)
 
 
 @pytest.fixture
@@ -170,28 +183,52 @@ def test_identity_alignment_unchanged(ref: Float[torch.Tensor, "N 3"]) -> None:
     assert torch.allclose(aligned, ref, atol=TOLERANCE)
 
 
-def test_atom_loss_perfect_prediction_near_zero() -> None:
+def test_atom_loss_perfect_prediction_near_zero(
+    uniform_aa_indices: Int[torch.Tensor, "B N"],
+) -> None:
     """atom_loss is near zero when prediction equals ground truth.
 
     Verifies that atom_loss returns a negligible value when the predicted
     coordinates are identical to the target coordinates.
+
+    Args:
+        uniform_aa_indices: Amino-acid indices, shape (B, N), all the same
+            residue type so the residue-type weighting has no effect.
     """
     r = torch.randn(B, N, 3)
     assert (
-        atom_loss(r, r, lambda_sigma_weight=torch.ones(B)).mean().item()
+        atom_loss(
+            r,
+            r,
+            aa_indices=uniform_aa_indices,
+            lambda_sigma_weight=torch.ones(B),
+        )
+        .mean()
+        .item()
         < TOLERANCE
     )
 
 
-def test_atom_loss_noisy_prediction_positive_and_finite() -> None:
+def test_atom_loss_noisy_prediction_positive_and_finite(
+    uniform_aa_indices: Int[torch.Tensor, "B N"],
+) -> None:
     """atom_loss is positive and finite for a noisy prediction.
 
     Verifies that atom_loss returns strictly positive, finite values when
     the predicted coordinates differ from the target by Gaussian noise.
+
+    Args:
+        uniform_aa_indices: Amino-acid indices, shape (B, N), all the same
+            residue type so the residue-type weighting has no effect.
     """
     r = torch.randn(B, N, 3)
     r_noisy = r + 0.5 * torch.randn(B, N, 3)
-    loss = atom_loss(r, r_noisy, lambda_sigma_weight=torch.ones(B))
+    loss = atom_loss(
+        r,
+        r_noisy,
+        aa_indices=uniform_aa_indices,
+        lambda_sigma_weight=torch.ones(B),
+    )
     assert (loss > 0).all()
     assert torch.isfinite(loss).all()
 

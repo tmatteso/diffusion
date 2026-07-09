@@ -8,21 +8,71 @@ cross-entropy losses.
 import torch
 import torch.nn.functional as F
 from architecture.errors import (
+    AtomResidueCountMismatchError,
     BlockCountMismatchError,
     LossComputationError,
     NoDenoiserBlockError,
 )
 from beartype import beartype
-from einops import einsum, rearrange
+from einops import einsum, rearrange, repeat
 from helpers.alignment import kabsch_align
+from helpers.atom_utils import RESTYPES_NO_X
 from helpers.data import FeaturizedBatch
 from jaxtyping import Bool, Float, Int, jaxtyped
 from train.train_config import LossParams
 
 PAD_TOKEN = -100
+
+# Polar side chains (capable of hydrogen bonding via a side-chain O/N/S,
+# including the charged residues) vs. the nonpolar/hydrophobic aliphatic
+# and aromatic residues (G, A, V, L, I, P, F, M, W).
+POLAR_RESIDUES: frozenset[str] = frozenset(
+    {"S", "T", "C", "Y", "N", "Q", "D", "E", "K", "R", "H"},
+)
+POLAR_RESIDUE_WEIGHT: float = 2.0
+NONPOLAR_RESIDUE_WEIGHT: float = 1.0
+RESIDUE_TYPE_WEIGHTS: list[float] = [
+    (
+        POLAR_RESIDUE_WEIGHT
+        if restype in POLAR_RESIDUES
+        else NONPOLAR_RESIDUE_WEIGHT
+    )
+    for restype in RESTYPES_NO_X
+]
+
 # ---------------------------------------------------------------------------
 # atom_loss  (Algorithm 2 structure term)
 # ---------------------------------------------------------------------------
+
+
+@jaxtyped(typechecker=beartype)
+def residue_type_weight(
+    aa_indices: Int[torch.Tensor, "B N_aa"],
+) -> Float[torch.Tensor, "B N_aa"]:
+    """Look up the structural-loss weight for each residue's amino-acid type.
+
+    Polar residues (see ``POLAR_RESIDUES``) receive ``POLAR_RESIDUE_WEIGHT``
+    (2.0); every other canonical residue receives ``NONPOLAR_RESIDUE_WEIGHT``
+    (1.0). Padding (``PAD_TOKEN``) and unknown/conditioning-dropped ("X")
+    indices fall outside the canonical vocabulary and are clamped into it
+    before lookup — the caller is responsible for zeroing those positions
+    out via a validity mask, since their weight here is otherwise arbitrary.
+
+    Args:
+        aa_indices: Per-residue amino-acid class indices.
+
+    Returns:
+        Per-residue weight tensor with the same shape as ``aa_indices``.
+    """
+    lookup: Float[torch.Tensor, "n_amino"] = torch.tensor(
+        RESIDUE_TYPE_WEIGHTS,
+        device=aa_indices.device,
+    )
+    safe_indices: Int[torch.Tensor, "B N_aa"] = aa_indices.clamp(
+        min=0,
+        max=lookup.numel() - 1,
+    )
+    return lookup[safe_indices]
 
 
 @jaxtyped(typechecker=beartype)
@@ -31,19 +81,24 @@ def atom_loss(
     r_gt: Float[torch.Tensor, "B N_res 3"],
     mask: Float[torch.Tensor, "B N_res"] | None = None,
     *,
+    aa_indices: Int[torch.Tensor, "B N_aa"],
     lambda_sigma_weight: Float[torch.Tensor, "B"],
 ) -> Float[torch.Tensor, "B"]:
     """Kabsch-aligned atom-coordinate MSE loss with EDM noise weighting.
 
     Rigidly aligns the ground-truth structure onto the denoised structure
     (i.e. the *prediction* is held fixed; the GT is rotated/translated to
-    match it), then computes the mean squared deviation per coordinate:
+    match it), then computes the residue-type-weighted mean squared
+    deviation per coordinate:
 
-        L_atom = lambda_sigma · ||r_denoised - r_aligned||² / (3L)
+        L_atom = lambda_sigma · Σ w_l · ||r_denoised_l - r_aligned_l||² /
+        (3 · Σ w_l)
 
-    where L is the number of (unmasked) residues, the factor 3 accounts
-    for the x, y, z dimensions, and ``lambda_sigma = (t̂² + sigma_data²) /
-    (t̂ · sigma_data)²`` is the per-sample EDM noise weighting.
+    where w_l is ``POLAR_RESIDUE_WEIGHT`` (2.0) for polar residues and
+    ``NONPOLAR_RESIDUE_WEIGHT`` (1.0) otherwise (zeroed at padded positions
+    by `mask`), the factor 3 accounts for the x, y, z dimensions, and
+    ``lambda_sigma = (t̂² + sigma_data²) / (t̂ · sigma_data)²`` is the
+    per-sample EDM noise weighting.
 
     Args:
         r_denoised: (B, N_res, 3) — model output / denoised coordinates.
@@ -52,6 +107,10 @@ def atom_loss(
                                     When None, all N_res residues are used.
                                     Must be pre-converted to float by the
                                     caller to avoid repeated allocation.
+        aa_indices: (B, N_aa) — per-residue amino-acid class indices used
+            to build the polar/nonpolar weight tensor. N_aa must evenly
+            divide N_res (each residue's weight is repeated across the
+            points — e.g. atoms — that belong to it).
         lambda_sigma_weight: Per-batch EDM loss weight
             ``(t̂² + sigma_data²) / (t̂ · sigma_data)²``, shape ``(B,)``.
 
@@ -59,23 +118,24 @@ def atom_loss(
         (B,) EDM-weighted loss per batch element.
 
     Raises:
+        AtomResidueCountMismatchError: If N_res is not an integer multiple
+            of N_aa.
         LossComputationError: If the computed loss contains NaN values.
 
     Notes:
-        • Alignment is done with float weights derived from `mask`, so
-          missing / padded residues do not pollute the rotation estimate.
+        • Alignment is done with float weights derived from `mask` only
+          (not residue type), so missing / padded residues do not pollute
+          the rotation estimate and polarity doesn't bias the SVD.
         • Gradients flow through r_denoised (r_aligned is treated as a
           constant frame — the GT is being moved, not the prediction).
     """
-    weights: Float[torch.Tensor, "B N_res"] | None = mask
-
     # Align GT → denoised  (mobile=r_gt, target=r_denoised).
     # Detach so gradients flow only through r_denoised, not through the SVD.
     with torch.no_grad():
         (r_aligned,) = kabsch_align(  # pylint: disable=unpacking-non-sequence
             r_gt,
             r_denoised,
-            weights=weights,
+            weights=mask,
             return_transform=False,
         )
 
@@ -87,16 +147,29 @@ def atom_loss(
         "b l d, b l d -> b l",
     )
 
-    if weights is not None:
-        L_eff: Float[torch.Tensor, "B"] = weights.sum(dim=-1).clamp(min=1)
-        loss: Float[torch.Tensor, "B"] = einsum(
-            sq,
-            weights,
-            "b l, b l -> b",
-        ) / (3.0 * L_eff)
-    else:
-        L = r_denoised.shape[-2]
-        loss = sq.sum(dim=-1) / (3.0 * L)
+    N_points = r_denoised.shape[-2]
+    N_aa = aa_indices.shape[-1]
+    if N_points % N_aa != 0:
+        raise AtomResidueCountMismatchError(N_points, N_aa)
+    points_per_residue = N_points // N_aa
+
+    residue_weight: Float[torch.Tensor, "B N_aa"] = residue_type_weight(
+        aa_indices,
+    )
+    weights: Float[torch.Tensor, "B N_res"] = repeat(
+        residue_weight,
+        "b n -> b (n p)",
+        p=points_per_residue,
+    )
+    if mask is not None:
+        weights = weights * mask
+
+    L_eff: Float[torch.Tensor, "B"] = weights.sum(dim=-1).clamp(min=1)
+    loss: Float[torch.Tensor, "B"] = einsum(
+        sq,
+        weights,
+        "b l, b l -> b",
+    ) / (3.0 * L_eff)
 
     loss = loss * lambda_sigma_weight
 
@@ -177,6 +250,7 @@ def med_loss(
             intermediate_denoised_coord,
             batch.r_gt,
             atom5_mask_f,
+            aa_indices=batch.aa_indices,
             lambda_sigma_weight=lambda_sigma_weight,
         )
 

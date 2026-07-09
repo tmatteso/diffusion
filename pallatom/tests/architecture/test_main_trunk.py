@@ -42,6 +42,7 @@ from train.train_config import (
     ModelParams,
     NoiseScheduleParams,
     ResidueDistogramParams,
+    TemplateDistogramParams,
 )
 
 # there should exist a set of enums that are imported here and in the configs
@@ -145,7 +146,8 @@ def model() -> MainTrunk:
             n_pairformer_blocks_template_embedder=N_PAIRFORMER_BLOCKS_TEMPLATE_EMBEDDER,
             n_paiformer_heads_template_embedder=N_HEADS_ATOM_TRANSFORMER_DECODER,
         ),
-        res_distogram_params=ResidueDistogramParams(n_bins=N_BINS),
+        template_distogram_params=TemplateDistogramParams(n_bins=N_BINS),
+        residue_distogram_params=ResidueDistogramParams(n_bins=N_BINS),
         atom_distogram_params=AtomDistogramParams(n_bins=N_ATOM_BINS),
         noise_params=NoiseScheduleParams(sigma_data=SIGMA_DATA),
     ).eval()
@@ -744,6 +746,7 @@ def test_integration_gradient_flow_composite_loss(
         pred.r_denoised,
         featurized_batch.r_gt,
         featurized_batch.atom5_mask.float(),
+        aa_indices=featurized_batch.aa_indices,
         lambda_sigma_weight=torch.ones(B),
     ).mean()
     ce_loss = seq_ce_loss(pred.seq_logits, featurized_batch.aa_indices)
@@ -782,6 +785,7 @@ def test_integration_gradient_flow_composite_loss(
             inter_coords,
             featurized_batch.r_gt,
             featurized_batch.atom5_mask.float(),
+            aa_indices=featurized_batch.aa_indices,
             lambda_sigma_weight=torch.ones(B),
         ) + seq_ce_loss(inter_logits, featurized_batch.aa_indices)
         intermediate_loss = intermediate_loss + gamma * k_loss

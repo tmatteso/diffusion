@@ -31,7 +31,12 @@ from helpers.atom_utils import (
     to_pdb,
 )
 from helpers.context_managers import FatalOnError, StructlogConfig
-from helpers.data import Distogram, FeaturizedBatch, ref_pos_for_residue
+from helpers.data import (
+    Distogram,
+    FeaturizedBatch,
+    build_distogram_module,
+    ref_pos_for_residue,
+)
 from jaxtyping import Bool, Float, Int, jaxtyped
 from sample.sample_config import SampleConfig, SamplerParams
 from structlog.typing import FilteringBoundLogger
@@ -806,7 +811,8 @@ def main(args: SamplingArgs, scfg: SampleConfig, device: str) -> None:
 
         model = MainTrunk(
             model_params=mp,
-            res_distogram_params=scfg.distogram_res,
+            template_distogram_params=scfg.distogram_template,
+            residue_distogram_params=scfg.distogram_residue,
             atom_distogram_params=scfg.distogram_atom,
             noise_params=noise,
         ).to(device)
@@ -826,18 +832,10 @@ def main(args: SamplingArgs, scfg: SampleConfig, device: str) -> None:
         N_atom: int = N_RES * NATOM
         B_SAMPLE: int = gen.n_samples
 
-        _atom_disto = Distogram(
-            n_bins=scfg.distogram_atom.n_bins,
-            min_dist=scfg.distogram_atom.min_dist,
-            max_dist=scfg.distogram_atom.max_dist,
-            overflow_bin=False,
-        ).to(device)
-        _templ_disto = Distogram(
-            n_bins=scfg.distogram_res.n_bins - 1,
-            min_dist=scfg.distogram_res.min_dist,
-            max_dist=scfg.distogram_res.max_dist,
-            overflow_bin=True,
-        ).to(device)
+        _atom_disto = build_distogram_module(scfg.distogram_atom).to(device)
+        _templ_disto = build_distogram_module(scfg.distogram_template).to(
+            device,
+        )
         context: FeaturizedBatch = build_sampling_context(
             pdb_file_path=None,  # single template only. for now it is None.
             atom_distogram_fn=_atom_disto,

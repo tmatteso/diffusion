@@ -34,6 +34,7 @@ from helpers.data import (
     ShardBudgetParameters,
     ShardDataLoader,
     ShardMetadata,
+    build_distogram_module,
     featurize_batch,
     featurize_single_item,
     make_bucketed_data_loaders,
@@ -871,39 +872,35 @@ def tcfg() -> TrainConfig:
 
 
 @pytest.fixture
-def c_beta_distogram_fn(tcfg: TrainConfig) -> Distogram:
-    """Provide residue-level Cβ Distogram from tcfg.distogram_res."""
-    dr = tcfg.distogram_res
-    return Distogram(
-        n_bins=dr.n_bins - 1,
-        min_dist=dr.min_dist,
-        max_dist=dr.max_dist,
-        overflow_bin=True,
-    ).eval()
+def template_distogram_fn(tcfg: TrainConfig) -> Distogram:
+    """Provide the self-conditioning template Distogram from tcfg."""
+    return build_distogram_module(tcfg.distogram_template).eval()
+
+
+@pytest.fixture
+def residue_distogram_fn(tcfg: TrainConfig) -> Distogram:
+    """Provide the residue-level Cβ Distogram from tcfg.distogram_residue."""
+    return build_distogram_module(tcfg.distogram_residue).eval()
 
 
 @pytest.fixture
 def atom_distogram_fn(tcfg: TrainConfig) -> Distogram:
     """Provide the atom-level Distogram configured from tcfg.distogram_atom."""
-    da = tcfg.distogram_atom
-    return Distogram(
-        n_bins=da.n_bins,
-        overflow_bin=False,
-        min_dist=da.min_dist,
-        max_dist=da.max_dist,
-    ).eval()
+    return build_distogram_module(tcfg.distogram_atom).eval()
 
 
 @pytest.fixture
 def model_params(
     tcfg: TrainConfig,
-    c_beta_distogram_fn: Distogram,
+    template_distogram_fn: Distogram,
+    residue_distogram_fn: Distogram,
     atom_distogram_fn: Distogram,
 ) -> ModelSetup:
     """Provide ModelSetup bundling MainTrunk with training configuration."""
     trunk: MainTrunk = MainTrunk(
         model_params=tcfg.model,
-        res_distogram_params=tcfg.distogram_res,
+        template_distogram_params=tcfg.distogram_template,
+        residue_distogram_params=tcfg.distogram_residue,
         atom_distogram_params=tcfg.distogram_atom,
         noise_params=tcfg.noise,
     ).eval()
@@ -916,7 +913,8 @@ def model_params(
     return ModelSetup(
         model=trunk,
         tcfg=tcfg,
-        distogram_res=c_beta_distogram_fn,
+        distogram_template=template_distogram_fn,
+        distogram_residue=residue_distogram_fn,
         distogram_atom=atom_distogram_fn,
         device=torch.device("cpu"),
         optimizer=optimizer,
@@ -929,7 +927,8 @@ def model_params(
 def featurized_item(
     single_protein: Protein,
     tcfg: TrainConfig,
-    c_beta_distogram_fn: Distogram,
+    template_distogram_fn: Distogram,
+    residue_distogram_fn: Distogram,
     atom_distogram_fn: Distogram,
 ) -> FeaturizedItem:
     """FeaturizedItem produced by featurize_single_item on single_protein.
@@ -941,7 +940,8 @@ def featurized_item(
     _ = manual_seed(1)
     return featurize_single_item(
         prot=single_protein,
-        c_beta_distogram_fn=c_beta_distogram_fn,
+        template_distogram_fn=template_distogram_fn,
+        residue_distogram_fn=residue_distogram_fn,
         atom_distogram_fn=atom_distogram_fn,
         tcfg=tcfg,
         max_seq_len_in_batch=N_RES,
@@ -963,7 +963,8 @@ def featurized_batch(
     return featurize_batch(
         batch=featurize_protein_batch,
         tcfg=model_params.tcfg,
-        distogram_res=model_params.distogram_res,
+        distogram_template=model_params.distogram_template,
+        distogram_residue=model_params.distogram_residue,
         distogram_atom=model_params.distogram_atom,
     )
 
@@ -1134,13 +1135,15 @@ def test_featurize_batch_rejects_wrong_atom_count() -> None:
 def test_featurize_collate_returns_featurized_batch(
     featurize_protein_batch: list[Protein],
     tcfg: TrainConfig,
-    c_beta_distogram_fn: Distogram,
+    template_distogram_fn: Distogram,
+    residue_distogram_fn: Distogram,
     atom_distogram_fn: Distogram,
 ) -> None:
     """FeaturizeCollate.__call__ returns a FeaturizedBatch."""
     collate = FeaturizeCollate(
         tcfg=tcfg,
-        distogram_res=c_beta_distogram_fn,
+        distogram_template=template_distogram_fn,
+        distogram_residue=residue_distogram_fn,
         distogram_atom=atom_distogram_fn,
     )
     result = collate(featurize_protein_batch)
@@ -1150,13 +1153,15 @@ def test_featurize_collate_returns_featurized_batch(
 def test_featurize_collate_is_picklable(
     featurize_protein_batch: list[Protein],
     tcfg: TrainConfig,
-    c_beta_distogram_fn: Distogram,
+    template_distogram_fn: Distogram,
+    residue_distogram_fn: Distogram,
     atom_distogram_fn: Distogram,
 ) -> None:
     """FeaturizeCollate survives a pickle round-trip for num_workers > 0."""
     collate = FeaturizeCollate(
         tcfg=tcfg,
-        distogram_res=c_beta_distogram_fn,
+        distogram_template=template_distogram_fn,
+        distogram_residue=residue_distogram_fn,
         distogram_atom=atom_distogram_fn,
     )
     restored = cast(
@@ -1617,25 +1622,19 @@ def shard_data_loader(
 ) -> ShardDataLoader:
     """A minimal ShardDataLoader over two synthetic proteins."""
     ds = protein_shard_dataset_factory(["p1", "p2"], [10, 20])
-    dr = bucketed_cfg.distogram_res
-    da = bucketed_cfg.distogram_atom
-    distogram_res = Distogram(
-        n_bins=dr.n_bins - 1,
-        min_dist=dr.min_dist,
-        max_dist=dr.max_dist,
-        overflow_bin=True,
+    distogram_template = build_distogram_module(
+        bucketed_cfg.distogram_template,
     ).eval()
-    distogram_atom = Distogram(
-        n_bins=da.n_bins,
-        overflow_bin=False,
-        min_dist=da.min_dist,
-        max_dist=da.max_dist,
+    distogram_residue = build_distogram_module(
+        bucketed_cfg.distogram_residue,
     ).eval()
+    distogram_atom = build_distogram_module(bucketed_cfg.distogram_atom).eval()
     return ShardDataLoader(
         dataset=ds,
         budget=shard_budget,
         tcfg=bucketed_cfg,
-        distogram_res=distogram_res,
+        distogram_template=distogram_template,
+        distogram_residue=distogram_residue,
         distogram_atom=distogram_atom,
     )
 

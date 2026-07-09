@@ -39,8 +39,8 @@ from helpers.context_managers import (
     StructlogConfig,
 )
 from helpers.data import (
-    Distogram,
     FeaturizedBatch,
+    build_distogram_module,
     make_bucketed_data_loaders,
 )
 from helpers.useful_objects import (
@@ -254,6 +254,7 @@ def take_step(
             pred_outputs.r_denoised,
             featurized_batch.r_gt,
             atom5_mask_f,
+            aa_indices=featurized_batch.aa_indices,
             lambda_sigma_weight=lambda_sigma_loss_weight,
         ).mean()
 
@@ -1045,7 +1046,8 @@ def main(args: TrainArgs, tcfg: TrainConfig) -> None:
         tp = tcfg.training
         model: MainTrunk = MainTrunk(
             model_params=mp,
-            res_distogram_params=tcfg.distogram_res,
+            template_distogram_params=tcfg.distogram_template,
+            residue_distogram_params=tcfg.distogram_residue,
             atom_distogram_params=tcfg.distogram_atom,
             noise_params=tcfg.noise,
         ).to(device)
@@ -1061,25 +1063,15 @@ def main(args: TrainArgs, tcfg: TrainConfig) -> None:
             gamma=tp.lr_decay_factor,
         )
 
-        dr = tcfg.distogram_res
-        da = tcfg.distogram_atom
-        distogram_res = Distogram(
-            n_bins=dr.n_bins - 1,
-            min_dist=dr.min_dist,
-            max_dist=dr.max_dist,
-            overflow_bin=True,
-        )
-        distogram_atom = Distogram(
-            n_bins=da.n_bins,
-            min_dist=da.min_dist,
-            max_dist=da.max_dist,
-            overflow_bin=False,
-        )
+        distogram_template = build_distogram_module(tcfg.distogram_template)
+        distogram_residue = build_distogram_module(tcfg.distogram_residue)
+        distogram_atom = build_distogram_module(tcfg.distogram_atom)
 
         model_params = ModelSetup(
             model=model,
             tcfg=tcfg,
-            distogram_res=distogram_res,
+            distogram_template=distogram_template,
+            distogram_residue=distogram_residue,
             distogram_atom=distogram_atom,
             device=device,
             optimizer=optimizer,
