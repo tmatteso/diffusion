@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  checks:
+  checks-arm64:
     uses: ./.github/workflows/devcontainer-checks.yml
     with:
       runs-on: '["ubuntu-latest"]'
