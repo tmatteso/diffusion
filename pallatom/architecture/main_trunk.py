@@ -34,7 +34,6 @@ from architecture.layers import (
     LinearNoBias,
     TypedLinear,
     TypedModuleList,
-    TypedSequential,
 )
 from architecture.node_update import NodeUpdate
 from architecture.pair_update import PairUpdate
@@ -430,7 +429,8 @@ class MainTrunk(nn.Module):
         )
 
         self.residue_distogram_head: TypedLinear = TypedLinear(
-            self.c_pair, self.n_residue_bins
+            self.c_pair,
+            self.n_residue_bins,
         )
 
         self.atom_distogram_head: TypedLinear = TypedLinear(
