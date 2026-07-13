@@ -34,6 +34,7 @@ from architecture.layers import (
     LinearNoBias,
     TypedLinear,
     TypedModuleList,
+    TypedSequential,
 )
 from architecture.node_update import NodeUpdate
 from architecture.pair_update import PairUpdate
@@ -429,8 +430,7 @@ class MainTrunk(nn.Module):
         )
 
         self.residue_distogram_head: TypedLinear = TypedLinear(
-            self.c_pair,
-            self.n_residue_bins,
+            self.c_pair, self.n_residue_bins
         )
 
         self.atom_distogram_head: TypedLinear = TypedLinear(
@@ -750,17 +750,13 @@ class MainTrunk(nn.Module):
         # ------------------------------------------------------------------
         # Distogram heads
         # ------------------------------------------------------------------
-        half_residue_distogram_logits: Float[
-            torch.Tensor,
-            "B N_res N_res n_bins",
-        ] = self.residue_distogram_head(z_ij)
+        z_ij_sym: Float[torch.Tensor, "B N_res N_res c_pair"] = (
+            z_ij + rearrange(z_ij, "b i j c -> b j i c")
+        )
         residue_distogram_logits: Float[
             torch.Tensor,
             "B N_res N_res n_bins",
-        ] = half_residue_distogram_logits + rearrange(
-            half_residue_distogram_logits,
-            "b i j c -> b j i c",
-        )
+        ] = self.residue_distogram_head(z_ij_sym)
 
         # Project atom-pair representation from local atomic attention into
         # distance bins. Local region defined by the attention window within

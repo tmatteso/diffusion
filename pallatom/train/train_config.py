@@ -253,7 +253,7 @@ class AtomDistogramParams(DistogramParams):
     min_dist: float = Field(default=0.0, ge=0)
     max_dist: float = Field(default=10.0, gt=0)
     n_bins: int = Field(default=22, gt=0)
-    overflow_bin: bool = Field(default=True)
+    overflow_bin: bool = Field(default=False)
 
 
 class ResidueDistogramParams(DistogramParams):
