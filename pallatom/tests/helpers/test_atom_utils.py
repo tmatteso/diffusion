@@ -5,19 +5,25 @@ dataclass, make_np_example, make_fixed_size, center_positions, chain_end,
 to_pdb, protein_from_pdb, truncate_to_length, and molecule-type constants.
 """
 
+import enum
 import pathlib
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from types import MappingProxyType
 from typing import cast
 
+import einops
 import numpy as np
 import numpy.typing as npt
 import pytest
 import torch
 from helpers.atom_utils import (
+    ATOM5_C,
+    ATOM5_CA,
     ATOM5_CB,
+    ATOM5_N,
     ATOM5_NAMES,
-    ATOM5_TO_ATOM37,
+    ATOM5_O,
     ATOM37_C,
     ATOM37_CA,
     ATOM37_CB,
@@ -42,18 +48,16 @@ from helpers.atom_utils import (
     RNA_RESTYPE_ORDER,
     RNA_RESTYPES,
     Protein,
-    atom5_to_atom37,
+    ResidueRepresentation,
     atom37_to_atom5,
     atom37_to_cb,
     atom_types,
     center_positions,
     chain_end,
     classify_mol_type,
-    get_cb_coords,
     make_fixed_size,
     make_np_example,
     protein_from_pdb,
-    pseudo_cb,
     restype_1to3,
     to_pdb,
     truncate_to_length,
@@ -73,573 +77,411 @@ PROT_LEN = 3
 # Fixtures
 # ---------------------------------------------------------------------------
 
+class TensorCase(enum.Enum):
+    """Enumeration of named test scenarios for atom position and mask tensors.
+
+    Each member selects a distinct structural configuration used to parametrize
+    fixtures via ``indirect=True``. The string value doubles as human-readable
+    label that appears in pytest output when a test fails.
+
+    Members:
+        standard: A well-formed backbone with valid positions and a fully
+            populated mask — the happy-path baseline.
+        all_zeros: All atom positions set to the origin; exercises behaviour
+            when coordinates carry no geometric information.
+        no_beta_carbon: The beta-carbon slot is absent (masked out) for every
+            residue; validates that functions degrade gracefully without Cβ.
+        half_mask: Exactly half the residues are unmasked; probes boundary
+            handling and partial-visibility logic.
+        collinear: All atoms placed on a single line; tests robustness against
+            degenerate geometry where cross-products vanish.
+    """
+
+    standard = "standard"
+    all_zeros = "all_zeros"
+    no_beta_carbon = "no_beta_carbon"
+    half_mask = "half_mask"
+    collinear = "collinear"
+
+
+class ExpectedBetaCarbon(enum.Enum):
+    """Whether atom37_to_cb is expected to report Cβ as present.
+
+    Members:
+        present: All residues should have CB marked present in the output
+            mask — the happy-path case where atom37 has the CB slot filled.
+        absent: No residues should have CB present; the function must fall
+            back to a finite pseudo-Cβ computed from backbone geometry.
+        half_present: The first half of residues are fully masked (CB absent)
+            and the second half are fully unmasked (CB present); validates
+            that atom37_to_cb handles partial visibility correctly.
+    """
+
+    present = True
+    absent = False
+    half_present = "half_present"
+
 
 @pytest.fixture
-def atom37_positions() -> Float[torch.Tensor, "B N_res 37 3"]:
-    """Provide random atom37 coordinate tensor (B, N_RES, 37, 3).
+def atom_position_and_mask_factory(
+    request: pytest.FixtureRequest,
+) -> tuple[
+    Float[torch.Tensor, "B N_res atom_rep 3"],
+    Float[torch.Tensor, "B N_res atom_rep"],
+]:
+    """Construct atom position and mask tensors from indirect parametrize args.
+
+    Receives a 4-tuple via ``request.param`` when used with
+    ``indirect=["atom_position_and_mask_factory"]``.
+
+    Args:
+        request: Pytest fixture request whose ``.param`` attribute is a
+            4-tuple of (residue_representation_type, tensor_content,
+            batch_size, residue_number).
 
     Returns:
-        A randomly initialised float tensor of shape (B, N_RES, 37, 3).
+        Tuple of (atom_positions, atom_mask) with shapes
+        ``(B, N_res, atom_rep, 3)`` and ``(B, N_res, atom_rep)``.
     """
-    return torch.randn(B, N_RES, 37, 3)
+    (
+        residue_representation_type,
+        tensor_content,
+        batch_size,
+        residue_number,
+    ) = cast(
+        tuple[ResidueRepresentation, TensorCase, int, int],
+        request.param,
+    )
+    n_atoms_per_residue: int = residue_representation_type.value
+    per_residue = torch.zeros(n_atoms_per_residue, 3)
 
+    if tensor_content in (
+        TensorCase.standard,
+        TensorCase.no_beta_carbon,
+    ):
+        per_residue[ATOM37_N] = torch.tensor([1.0, 0.0, 0.0])
+        per_residue[ATOM37_CA] = torch.tensor([0.0, 0.0, 0.0])
+        per_residue[ATOM37_C] = torch.tensor([0.0, 1.0, 0.0])
+        per_residue[ATOM37_O] = torch.tensor([1.0, 1.0, 0.0])
+        if tensor_content == TensorCase.standard:
+            per_residue[ATOM37_CB] = torch.tensor([0.0, 0.0, 1.0])
+    elif tensor_content == TensorCase.collinear:
+        # N, CA, C on the x-axis: cross(CA-N, C-CA) = [0,0,0]
+        per_residue[ATOM37_N] = torch.tensor([0.0, 0.0, 0.0])
+        per_residue[ATOM37_CA] = torch.tensor([1.0, 0.0, 0.0])
+        per_residue[ATOM37_C] = torch.tensor([2.0, 0.0, 0.0])
+        per_residue[ATOM37_O] = torch.tensor([2.0, 1.0, 0.0])
+        # CB slot stays zero; mask will be zeroed below
 
-@pytest.fixture
-def atom37_mask() -> Float[torch.Tensor, "B N_res 37"]:
-    """Provide all-ones atom37 mask (B, N_RES, 37).
-
-    Returns:
-        A ones tensor of shape (B, N_RES, 37) indicating all atoms present.
-    """
-    return torch.ones(B, N_RES, 37)
-
-
-@pytest.fixture
-def atom5_positions() -> Float[torch.Tensor, "B N_res 5 3"]:
-    """Provide random atom5 coordinate tensor (B, N_RES, 5, 3).
-
-    Returns:
-        A randomly initialised float tensor of shape (B, N_RES, 5, 3).
-    """
-    return torch.randn(B, N_RES, 5, 3)
-
-
-@pytest.fixture
-def atom5_mask() -> Float[torch.Tensor, "B N_res 5"]:
-    """Provide all-ones atom5 mask (B, N_RES, 5).
-
-    Returns:
-        A ones tensor of shape (B, N_RES, 5) indicating all five atoms present.
-    """
-    return torch.ones(B, N_RES, 5)
-
-
-@pytest.fixture
-def n() -> Float[torch.Tensor, "B N_res 3"]:
-    """Provide random backbone N atom positions (B, N_RES, 3).
-
-    Returns:
-        A randomly initialised float tensor of shape (B, N_RES, 3).
-    """
-    return torch.randn(B, N_RES, 3)
-
-
-@pytest.fixture
-def ca() -> Float[torch.Tensor, "B N_res 3"]:
-    """Provide random C alpha atom positions (B, N_RES, 3).
-
-    Returns:
-        A randomly initialised float tensor of shape (B, N_RES, 3).
-    """
-    return torch.randn(B, N_RES, 3)
-
-
-@pytest.fixture
-def c() -> Float[torch.Tensor, "B N_res 3"]:
-    """Provide random backbone C atom positions (B, N_RES, 3).
-
-    Returns:
-        A randomly initialised float tensor of shape (B, N_RES, 3).
-    """
-    return torch.randn(B, N_RES, 3)
-
-
-# ---------------------------------------------------------------------------
-# pseudo_cb
-# ---------------------------------------------------------------------------
-
-
-def test_pseudo_cb_output_shape(
-    n: Float[torch.Tensor, "B N_res 3"],
-    ca: Float[torch.Tensor, "B N_res 3"],
-    c: Float[torch.Tensor, "B N_res 3"],
-) -> None:
-    """pseudo_cb output shape is (B, N_RES, 3).
-
-    Verifies that the pseudo-Cβ positions tensor has expected batched shape.
-    """
-    out = pseudo_cb(n, ca, c)
-    assert out.shape == (B, N_RES, 3)
-
-
-def test_pseudo_cb_output_finite(
-    n: Float[torch.Tensor, "B N_res 3"],
-    ca: Float[torch.Tensor, "B N_res 3"],
-    c: Float[torch.Tensor, "B N_res 3"],
-) -> None:
-    """pseudo_cb output is finite for random backbone atoms.
-
-    Verifies that no NaN or Inf values appear in computed pseudo-Cβ positions.
-    """
-    out = pseudo_cb(n, ca, c)
-    assert torch.isfinite(out).all()
-
-
-def test_pseudo_cb_unbatched_shape() -> None:
-    """pseudo_cb works on unbatched (N_RES, 3) inputs and returns (N_RES, 3).
-
-    Verifies that the function does not require a leading batch dimension.
-    """
-    n_ = torch.randn(N_RES, 3)
-    ca_ = torch.randn(N_RES, 3)
-    c_ = torch.randn(N_RES, 3)
-    out = pseudo_cb(n_, ca_, c_)
-    assert out.shape == (N_RES, 3)
-
-
-def test_pseudo_cb_output_not_equal_ca(
-    n: Float[torch.Tensor, "B N_res 3"],
-    ca: Float[torch.Tensor, "B N_res 3"],
-    c: Float[torch.Tensor, "B N_res 3"],
-) -> None:
-    """pseudo_cb coordinates differ from C alpha coordinates.
-
-    Verifies that the virtual Cβ position is not simply a copy of the CA atom.
-    """
-    out = pseudo_cb(n, ca, c)
-    assert not torch.allclose(out, ca)
-
-
-def test_pseudo_cb_single_residue_finite() -> None:
-    """pseudo_cb handles scalar (3,) input without batch or residue dimensions.
-
-    Verifies that function accepts single-atom input and returns finite vector.
-    """
-    out = pseudo_cb(torch.randn(3), torch.randn(3), torch.randn(3))
-    assert out.shape == (3,)
-    assert torch.isfinite(out).all()
-
-
-def test_pseudo_cb_collinear_backbone_finite() -> None:
-    """pseudo_cb finite when N, CA, C are collinear so cross product is zero.
-
-    The epsilon guard in linalg.norm must prevent NaN in the normalised output.
-    """
-    n_ = torch.zeros(N_RES, 3)
-    ca_ = torch.zeros(N_RES, 3)
-    c_ = torch.zeros(N_RES, 3)
-    out = pseudo_cb(n_, ca_, c_)
-    assert torch.isfinite(out).all()
-
-
-# ---------------------------------------------------------------------------
-# atom37_to_atom5
-# ---------------------------------------------------------------------------
-
-
-def test_atom37_to_atom5_output_shapes(
-    atom37_positions: Float[torch.Tensor, "B N_res 37 3"],
-    atom37_mask: Float[torch.Tensor, "B N_res 37"],
-) -> None:
-    """atom37_to_atom5 returns position and mask tensors with correct shapes.
-
-    Verifies that the output position tensor is (B, N_RES, 5, 3) and the mask
-    tensor is (B, N_RES, 5).
-    """
-    pos5, mask5 = atom37_to_atom5(atom37_positions, atom37_mask)
-    assert pos5.shape == (B, N_RES, 5, 3)
-    assert mask5.shape == (B, N_RES, 5)
-
-
-def test_atom37_to_atom5_selects_correct_atoms(
-    atom37_positions: Float[torch.Tensor, "B N_res 37 3"],
-    atom37_mask: Float[torch.Tensor, "B N_res 37"],
-) -> None:
-    """atom37_to_atom5 places N, CA, C, O, CB into the expected atom5 slots.
-
-    Verifies that each of five output channels exactly matches corresponding
-    atom37 slice identified by the ATOM37_* index constants.
-    """
-    pos5, _ = atom37_to_atom5(atom37_positions, atom37_mask)
-    assert torch.equal(pos5[:, :, 0, :], atom37_positions[:, :, ATOM37_N, :])
-    assert torch.equal(pos5[:, :, 1, :], atom37_positions[:, :, ATOM37_CA, :])
-    assert torch.equal(pos5[:, :, 2, :], atom37_positions[:, :, ATOM37_C, :])
-    assert torch.equal(pos5[:, :, 3, :], atom37_positions[:, :, ATOM37_O, :])
-    assert torch.equal(pos5[:, :, 4, :], atom37_positions[:, :, ATOM37_CB, :])
-
-
-def test_atom37_to_atom5_mask_preserved(
-    atom37_positions: Float[torch.Tensor, "B N_res 37 3"],
-) -> None:
-    """atom37_to_atom5 propagates atom37 mask entries to correct atom5 slots.
-
-    Verifies that backbone atoms present in atom37 are marked present in atom5,
-    and that absent CB atoms produce a zero mask in the CB slot.
-    """
-    mask = torch.zeros(B, N_RES, 37)
-    mask[:, :, [ATOM37_N, ATOM37_CA, ATOM37_C, ATOM37_O]] = 1.0
-    _, mask5 = atom37_to_atom5(atom37_positions, mask)
-    assert (mask5[:, :, :4] == 1.0).all()  # backbone present
-    assert (mask5[:, :, 4] == 0.0).all()  # CB absent
-
-
-def test_atom37_to_atom5_output_finite(
-    atom37_positions: Float[torch.Tensor, "B N_res 37 3"],
-    atom37_mask: Float[torch.Tensor, "B N_res 37"],
-) -> None:
-    """atom37_to_atom5 produces finite position, mask values for random input.
-
-    Verifies that no NaN or Inf values appear in the position or mask outputs.
-    """
-    pos5, mask5 = atom37_to_atom5(atom37_positions, atom37_mask)
-    assert torch.isfinite(pos5).all()
-    assert torch.isfinite(mask5).all()
-
-
-# ---------------------------------------------------------------------------
-# atom5_to_atom37 — shapes, coordinate placement, and mask handling
-# ---------------------------------------------------------------------------
-
-_UNOCCUPIED_ATOM37: list[int] = [
-    i for i in range(37) if i not in set(ATOM5_TO_ATOM37)
-]
-
-
-@pytest.fixture
-def coords5() -> Float[torch.Tensor, "B N_RES 5 3"]:
-    """Random atom5 coordinates (B, N_RES, 5, 3) in float64 with fixed seed."""
-    return torch.tensor(
-        np.random.RandomState(1).randn(B, N_RES, 5, 3).astype(np.float64),
+    atom_positions = einops.repeat(
+        per_residue,
+        "atom_rep three -> B N_res atom_rep three",
+        B=batch_size,
+        N_res=residue_number,
     )
 
+    atom_mask = torch.ones(batch_size, residue_number, n_atoms_per_residue)
+    if tensor_content == TensorCase.half_mask:
+        atom_mask[:, : residue_number // 2, :] = 0
+    if tensor_content in (TensorCase.no_beta_carbon, TensorCase.collinear):
+        atom_mask[:, :, ATOM37_CB] = 0
 
-@pytest.fixture
-def coords_sentinel() -> Float[torch.Tensor, "B N_RES 5 3"]:
-    """Atom5 tensor where slot s has all coordinates equal to float(s + 1)."""
-    coords = torch.zeros((B, N_RES, 5, 3), dtype=torch.float64)
-    for slot in range(5):
-        coords[:, :, slot, :] = float(slot + 1)
-    return coords
+    return atom_positions, atom_mask
+
+@pytest.mark.parametrize(
+    ("atom_position_and_mask_factory", "expected_pos_shape"),
+    [
+        pytest.param(
+            (ResidueRepresentation.atom37, TensorCase.standard, 2, 10),
+            (2, 10, 5, 3),
+            id="batched-standard",
+        ),
+        pytest.param(
+            (ResidueRepresentation.atom37, TensorCase.all_zeros, 1, 10),
+            (1, 10, 5, 3),
+            id="single-batch-zeros",
+        ),
+        pytest.param(
+            (ResidueRepresentation.atom37, TensorCase.no_beta_carbon, 2, 10),
+            (2, 10, 5, 3),
+            id="batched-missing-cb",
+        ),
+        pytest.param(
+            (ResidueRepresentation.atom37, TensorCase.half_mask, 2, 10),
+            (2, 10, 5, 3),
+            id="batched-half-mask",
+        ),
+    ],
+    indirect=["atom_position_and_mask_factory"],
+)
+def test_atom37_to_atom5(
+    atom_position_and_mask_factory: tuple[
+        Float[torch.Tensor, "B N_res 37 3"],
+        Float[torch.Tensor, "B N_res 37"],
+    ],
+    expected_pos_shape: tuple[int, ...],
+) -> None:
+    """Verify atom37_to_atom5 behavior.
+
+    1. That it returns position and masks with correct shapes and data types.
+    2. That it places N, CA, C, O, CB into the expected atom5 slots.
+    3. That it propagates atom37 mask entries to correct atom5 slots.
+    4. That it verifies that backbone atoms present in atom37 are present in
+        atom5, and that absent CB atoms produce a zero mask in the CB slot.
+
+    Args:
+        atom_position_and_mask_factory: Fixture-produced (atom37_positions,
+            atom37_mask) pair parametrized via indirect.
+        expected_pos_shape: The expected shape returned by atom37_to_atom5()
+            for the appropriate input. The expected shape of the mask is
+            the same except for lacking the final dimension.
+    """
+    atom37_positions, atom37_mask = atom_position_and_mask_factory
+
+    atom5_positions, atom5_mask = atom37_to_atom5(
+        atom37_positions, atom37_mask,
+    )
+
+    # 1. Shape and dtype
+    assert atom5_positions.shape == expected_pos_shape
+    assert atom5_mask.shape == expected_pos_shape[:-1]
+    assert atom5_positions.dtype == atom37_positions.dtype
+    assert atom5_mask.dtype == atom37_mask.dtype
+
+    atom5_indices: list[int] = [ATOM5_N, ATOM5_CA, ATOM5_C, ATOM5_O, ATOM5_CB]
+    atom37_backbone_indices: list[int] = [
+        ATOM37_N,
+        ATOM37_CA,
+        ATOM37_C,
+        ATOM37_O,
+        ATOM37_CB,
+    ]
+
+    # 2. Slot placement: each atom5 channel equals the corresponding atom37
+    for a5, a37 in zip(atom5_indices, atom37_backbone_indices, strict=True):
+        assert torch.equal(
+            atom5_positions[:, :, a5, :],
+            atom37_positions[:, :, a37, :],
+        )
+
+    # 3 & 4. Mask propagation; the batched-missing-cb case exercises that
+    # atom5_mask[:, :, ATOM5_CB] is all-zero when atom37 CB slot is zero.
+    for a5, a37 in zip(atom5_indices, atom37_backbone_indices, strict=True):
+        assert torch.equal(
+            atom5_mask[:, :, a5], atom37_mask[:, :, a37],
+        )
 
 
 @pytest.mark.parametrize(
-    ("slot", "atom37_idx"),
-    list(enumerate(ATOM5_TO_ATOM37)),
+    ("atom_position_and_mask_factory", "expect_cb_present"),
+    [
+        pytest.param(
+            (ResidueRepresentation.atom37, TensorCase.standard, 2, 10),
+            ExpectedBetaCarbon.present,
+            id="standard-all-cb-present",
+        ),
+        pytest.param(
+            (ResidueRepresentation.atom37, TensorCase.no_beta_carbon, 2, 10),
+            ExpectedBetaCarbon.absent,
+            id="no-beta-carbon-pseudo-cb",
+        ),
+        pytest.param(
+            (ResidueRepresentation.atom37, TensorCase.collinear, 2, 10),
+            ExpectedBetaCarbon.absent,
+            id="collinear-no-cb-pseudo-cb-finite",
+        ),
+        pytest.param(
+            (ResidueRepresentation.atom37, TensorCase.half_mask, 2, 10),
+            ExpectedBetaCarbon.half_present,
+            id="half-mask-mixed-cb-presence",
+        ),
+    ],
+    indirect=["atom_position_and_mask_factory"],
 )
-def test_atom5_to_atom37(
-    coords_sentinel: Float[torch.Tensor, "B N_RES 5 3"],
-    slot: int,
-    atom37_idx: int,
+def test_atom37_to_cb(
+    atom_position_and_mask_factory: tuple[
+        Float[torch.Tensor, "B N_res 37 3"],
+        Float[torch.Tensor, "B N_res 37"],
+    ],
+    expect_cb_present: ExpectedBetaCarbon,
 ) -> None:
-    """Verify dtype, shape, coordinate placement, mask handling per atom5 slot.
+    """Verify atom37_to_cb output shapes, CB presence, and pseudo-CB fallback.
 
-    Unoccupied-slot zeroing is covered by the parametrized
-    ``test_atom5_to_atom37_unoccupied_*`` tests.
+    1. Returns Cβ positions (B, N_RES, 3) and a bool presence mask (B, N_RES)
+       for all input cases.
+    2. Marks all residues CB-present when the atom37 mask has CB set
+       (TensorCase.standard).
+    3. Falls back to finite pseudo-Cβ positions and marks every residue
+       CB-absent when CB is zeroed in the mask (TensorCase.no_beta_carbon,
+       matching glycine-like residues).
+    4. Verifies that the virtual Cβ position is not simply a copy of CA atom.
+    5. Verifies that pseudo_cb is finite when N, CA, C are collinear
+        (cross product is zero). The epsilon guard in linalg.norm must prevent
+        NaN in the normalised output.
+
+    Args:
+        atom_position_and_mask_factory: Fixture-produced (atom37_positions,
+            atom37_mask) pair parametrized via indirect.
+        expect_cb_present: ExpectedBetaCarbon.present when parametrized input
+            has CB in the mask; ExpectedBetaCarbon.absent for no-beta-carbon
+            glycine case.
     """
-    x_37, mask_37 = atom5_to_atom37(coords_sentinel)
-    assert x_37.dtype == torch.float64
-    assert mask_37.dtype == torch.float64
-    assert x_37.shape == (B, N_RES, 37, 3)
-    assert mask_37.shape == (B, N_RES, 37)
-    assert torch.allclose(
-        x_37[:, :, atom37_idx, :],
-        torch.tensor(float(slot + 1), dtype=torch.float64),
-    ), f"atom5 slot {slot} → atom37 slot {atom37_idx}: wrong coords"
-    assert torch.allclose(
-        mask_37[:, :, atom37_idx],
-        torch.ones((B, N_RES), dtype=torch.float64),
-    )
-    rng = np.random.RandomState(2)
-    mask_5 = torch.tensor(rng.rand(B, N_RES, 5).astype(np.float64))
-    _, mask_37_explicit = atom5_to_atom37(coords_sentinel, mask_5)
-    assert torch.allclose(
-        mask_37_explicit[:, :, atom37_idx],
-        mask_5[:, :, slot],
-    )
-
-
-@pytest.mark.parametrize("idx", _UNOCCUPIED_ATOM37)
-def test_atom5_to_atom37_unoccupied_coords_zero(
-    coords5: Float[torch.Tensor, "B N_RES 5 3"],
-    idx: int,
-) -> None:
-    """Unoccupied atom37 coordinate slots are zeroed after conversion."""
-    x_37, _ = atom5_to_atom37(coords5)
-    assert torch.allclose(
-        x_37[:, :, idx, :],
-        torch.zeros(1, dtype=torch.float64),
-    ), f"atom37 slot {idx} should be zero (unoccupied)"
-
-
-@pytest.mark.parametrize("idx", _UNOCCUPIED_ATOM37)
-def test_atom5_to_atom37_unoccupied_mask_zero(idx: int) -> None:
-    """Unoccupied atom37 mask slots remain zero when all atom5 masks are 1."""
-    _, mask_37 = atom5_to_atom37(
-        torch.ones((B, N_RES, 5, 3), dtype=torch.float64),
-        torch.ones((B, N_RES, 5), dtype=torch.float64),
-    )
-    assert torch.allclose(
-        mask_37[:, :, idx],
-        torch.zeros((B, N_RES), dtype=torch.float64),
-    )
-
-
-# ---------------------------------------------------------------------------
-# atom5_to_atom37 — type enforcement and edge cases
-# ---------------------------------------------------------------------------
-
-
-def test_atom5_to_atom37_rejects_wrong_third_dimension() -> None:
-    """A jaxtyping TypeCheckError raised when third dimension is not 5."""
-    with pytest.raises(TypeCheckError):
-        _ = atom5_to_atom37(
-            torch.zeros((B, N_RES, 4, 3), dtype=torch.float64),
-        )  # 4 ≠ 5
-
-
-def test_atom5_to_atom37_single_residue() -> None:
-    """Atom5_toatom37 handles single-residue input without error."""
-    coords_5 = torch.randn(1, 1, 5, 3)
-    x_37, mask_37 = atom5_to_atom37(coords_5)
-    assert x_37.shape == (1, 1, 37, 3)
-    assert mask_37.shape == (1, 1, 37)
-
-
-# ---------------------------------------------------------------------------
-# get_cb_coords
-# ---------------------------------------------------------------------------
-
-
-def test_get_cb_coords_output_shapes(
-    atom5_positions: Float[torch.Tensor, "B N_res 5 3"],
-    atom5_mask: Float[torch.Tensor, "B N_res 5"],
-) -> None:
-    """get_cb_coords returns Cβ positions (B, N_RES, 3), bool mask (B, N_RES).
-
-    Verifies that the coordinate output has three spatial dimensions and the
-    presence mask has boolean dtype.
-    """
-    cb, cb_present = get_cb_coords(atom5_positions, atom5_mask)
-    assert cb.shape == (B, N_RES, 3)
-    assert cb_present.shape == (B, N_RES)
-    assert cb_present.dtype == torch.bool
-
-
-def test_get_cb_coords_real_cb_used_when_present(
-    atom5_positions: Float[torch.Tensor, "B N_res 5 3"],
-    atom5_mask: Float[torch.Tensor, "B N_res 5"],
-) -> None:
-    """get_cb_coords returns the real atom5 CB slot when CB is present in mask.
-
-    Verifies that the returned coordinates equal the atom5 CB channel and that
-    the presence mask is all-True when all residues have CB.
-    """
-    cb, cb_present = get_cb_coords(atom5_positions, atom5_mask)
-    assert torch.allclose(cb, atom5_positions[:, :, ATOM5_CB, :])
-    assert cb_present.all()
-
-
-def test_get_cb_coords_pseudo_when_cb_absent(
-    atom5_positions: Float[torch.Tensor, "B N_res 5 3"],
-) -> None:
-    """get_cb_coords falls back to the pseudo-Cβ position when CB is absent.
-
-    Verifies that the presence mask is all-False, the fallback coordinates are
-    finite, and they differ from the raw CB slot values.
-    """
-    mask = torch.ones(B, N_RES, 5)
-    mask[:, :, ATOM5_CB] = 0.0
-    cb, cb_present = get_cb_coords(atom5_positions, mask)
-    assert not cb_present.any()
-    assert torch.isfinite(cb).all()
-    assert not torch.allclose(cb, atom5_positions[:, :, ATOM5_CB, :])
-
-
-def test_get_cb_coords_mixed_residues(
-    atom5_positions: Float[torch.Tensor, "B N_res 5 3"],
-) -> None:
-    """get_cb_coords gets pseudo-Cβ for residue 0 only and real CB for others.
-
-    Verifies per-residue branching when only first residue is missing CB atom.
-    """
-    mask = torch.ones(B, N_RES, 5)
-    mask[:, 0, ATOM5_CB] = 0.0  # residue 0 has no CB (Gly-like)
-    cb, cb_present = get_cb_coords(atom5_positions, mask)
-    assert not cb_present[:, 0].any()
-    assert cb_present[:, 1:].all()
-    assert torch.allclose(cb[:, 1:, :], atom5_positions[:, 1:, ATOM5_CB, :])
-
-
-def test_get_cb_coords_pseudo_beta_mask_dtype(
-    atom5_positions: Float[torch.Tensor, "B N_res 5 3"],
-    atom5_mask: Float[torch.Tensor, "B N_res 5"],
-) -> None:
-    """get_cb_coords always returns a bool tensor for the CB-present mask.
-
-    Verifies that dtype of the second return value is torch.bool regardless of
-    the input mask dtype.
-    """
-    _, cb_present = get_cb_coords(atom5_positions, atom5_mask)
-    assert cb_present.dtype == torch.bool
-
-
-# ---------------------------------------------------------------------------
-# atom37_to_cb
-# ---------------------------------------------------------------------------
-
-
-def test_atom37_to_cb_output_shapes(
-    atom37_positions: Float[torch.Tensor, "B N_res 37 3"],
-    atom37_mask: Float[torch.Tensor, "B N_res 37"],
-) -> None:
-    """atom37_to_cb returns Cβ positions (B, N_RES, 3) and bool presence mask.
-
-    Verifies that both the coordinate tensor and the presence mask have the
-    expected shapes and that the mask dtype is torch.bool.
-    """
+    atom37_positions, atom37_mask = atom_position_and_mask_factory
     cb, cb_present = atom37_to_cb(atom37_positions, atom37_mask)
+
     assert cb.shape == (B, N_RES, 3)
     assert cb_present.shape == (B, N_RES)
     assert cb_present.dtype == torch.bool
 
-
-def test_atom37_to_cb_output_finite(
-    atom37_positions: Float[torch.Tensor, "B N_res 37 3"],
-    atom37_mask: Float[torch.Tensor, "B N_res 37"],
-) -> None:
-    """atom37_to_cb produces finite Cβ coordinates from random backbone atoms.
-
-    Verifies that no NaN or Inf values appear in returned Cβ position tensor.
-    """
-    cb, _ = atom37_to_cb(atom37_positions, atom37_mask)
-    assert torch.isfinite(cb).all()
-
-
-def test_atom37_to_cb_all_cb_present(
-    atom37_positions: Float[torch.Tensor, "B N_res 37 3"],
-    atom37_mask: Float[torch.Tensor, "B N_res 37"],
-) -> None:
-    """atom37_to_cb marks all residues as CB-present when CB is set in mask.
-
-    Verifies that the presence mask is all-True when the input atom37 mask has
-    the CB slot set to 1.0 for every residue.
-    """
-    _, cb_present = atom37_to_cb(atom37_positions, atom37_mask)
-    assert cb_present.all()
-
-
-def test_atom37_to_cb_glycine_gets_pseudo_cb(
-    atom37_positions: Float[torch.Tensor, "B N_res 37 3"],
-) -> None:
-    """atom37_to_cb falls back to pseudo-Cβ for glycine-like residues.
-
-    Verifies that when CB is absent from the atom37 mask the presence mask is
-    all-False and the returned positions remain finite.
-    """
-    mask = torch.ones(B, N_RES, 37)
-    mask[:, :, ATOM37_CB] = 0.0
-    cb, cb_present = atom37_to_cb(atom37_positions, mask)
-    assert not cb_present.any()
-    assert torch.isfinite(cb).all()
-
-
-def test_atom37_to_cb_matches_manual_pipeline(
-    atom37_positions: Float[torch.Tensor, "B N_res 37 3"],
-    atom37_mask: Float[torch.Tensor, "B N_res 37"],
-) -> None:
-    """atom37_to_cb is equivalent to atom37_to_atom5 followed by get_cb_coords.
-
-    Verifies that composed pipeline produces identical coordinates and masks
-    to the direct atom37_to_cb call.
-    """
-    cb_direct, mask_direct = atom37_to_cb(atom37_positions, atom37_mask)
-    pos5, mask5 = atom37_to_atom5(atom37_positions, atom37_mask)
-    cb_manual, mask_manual = get_cb_coords(pos5, mask5)
-    assert torch.equal(cb_direct, cb_manual)
-    assert torch.equal(mask_direct, mask_manual)
+    if expect_cb_present is ExpectedBetaCarbon.present:
+        assert cb_present.all()
+        assert torch.allclose(cb, atom37_positions[:, :, ATOM37_CB, :])
+    elif expect_cb_present is ExpectedBetaCarbon.absent:
+        assert not cb_present.any()
+        assert torch.isfinite(cb).all()
+        assert not torch.allclose(cb, atom37_positions[:, :, ATOM37_CB, :])
+        # assertion 4: pseudo-Cβ is a distinct point, not simply CA
+        assert not torch.allclose(
+            cb, atom37_positions[:, :, ATOM37_CA, :],
+        )
+    else:  # half_present: first half masked out, second half unmasked
+        assert not cb_present[:, : N_RES // 2].any()
+        assert cb_present[:, N_RES // 2 :].all()
+        assert torch.isfinite(cb).all()
+        assert torch.allclose(
+            cb[:, N_RES // 2 :, :],
+            atom37_positions[:, N_RES // 2 :, ATOM37_CB, :],
+        )
 
 
 # ---------------------------------------------------------------------------
 # Protein dataclass
 # ---------------------------------------------------------------------------
 
-N_ATOM_TYPE = 37
+N_ATOM_TYPE = len(atom_types) # 37
+
+
+
+@dataclass(frozen=True)
+class ProteinFieldOverride:
+    """Describes a single Protein constructor field to break for negative tests.
+
+    Attributes:
+        field_name: Name of the Protein constructor keyword to override.
+        shape: The deliberately wrong shape to allocate for that field.
+    """
+
+    field_name: str
+    shape: tuple[int, ...]
 
 
 @pytest.fixture
-def valid_protein() -> Protein:
-    """Minimal valid Protein with N_RES residues and all atoms unmasked.
+def invalid_protein_factory(
+    request: pytest.FixtureRequest,
+) -> Callable[[], Protein]:
+    """Build a thunk that constructs a Protein with one field shape broken.
+
+    Receives a ProteinFieldOverride via ``request.param`` when used with
+    ``indirect=["invalid_protein_factory"]``.
+
+    Args:
+        request: Pytest fixture request whose ``.param`` attribute is a
+            ProteinFieldOverride naming the field and shape to break.
 
     Returns:
-        A Protein with zero atom positions, sequential residue indices, and a
-        fully-set atom mask.
+        A zero-argument callable that constructs a Protein using the
+        override; invoking it raises TypeCheckError.
     """
-    return Protein(
-        atom_positions=np.zeros((N_RES, N_ATOM_TYPE, 3), dtype=np.float64),
-        aatype=np.zeros(N_RES, dtype=np.intp),
-        atom_mask=np.ones((N_RES, N_ATOM_TYPE), dtype=np.float64),
-        residue_index=np.arange(N_RES, dtype=np.intp),
-        chain_index=np.zeros(N_RES, dtype=np.intp),
-        b_factors=np.zeros((N_RES, N_ATOM_TYPE), dtype=np.float64),
-    )
+    override = cast(ProteinFieldOverride, request.param)
+    int_fields = frozenset({"aatype", "residue_index", "chain_index"})
+    dtype = np.intp if override.field_name in int_fields else np.float64
+    kwargs: dict[str, npt.NDArray[np.float64] | npt.NDArray[np.intp]] = {
+        "atom_positions": np.zeros((N_RES, N_ATOM_TYPE, 3), dtype=np.float64),
+        "aatype": np.zeros(N_RES, dtype=np.intp),
+        "atom_mask": np.ones((N_RES, N_ATOM_TYPE), dtype=np.float64),
+        "residue_index": np.arange(N_RES, dtype=np.intp),
+        "chain_index": np.zeros(N_RES, dtype=np.intp),
+        "b_factors": np.zeros((N_RES, N_ATOM_TYPE), dtype=np.float64),
+    }
+    kwargs[override.field_name] = np.zeros(override.shape, dtype=dtype)
+    return lambda: Protein(**kwargs)
 
 
-def test_protein_accepts_valid_input(valid_protein: Protein) -> None:
-    """Protein stores fields with expected shapes for a valid construction.
+@pytest.mark.parametrize(
+    "invalid_protein_factory",
+    [
+        pytest.param(
+            ProteinFieldOverride("atom_positions", (N_RES, N_ATOM_TYPE)),
+            id="atom_positions_missing_coord_axis",
+        ),
+        pytest.param(
+            ProteinFieldOverride("atom_positions", (N_RES, N_ATOM_TYPE, 4)),
+            id="atom_positions_extra_coord_component",
+        ),
+        pytest.param(
+            ProteinFieldOverride(
+                "atom_positions", (N_RES + 1, N_ATOM_TYPE, 3),
+            ),
+            id="atom_positions_residue_count_drift",
+        ),
+        pytest.param(
+            ProteinFieldOverride(
+                "atom_positions", (N_RES, N_ATOM_TYPE + 1, 3),
+            ),
+            id="atom_positions_atom_table_drift",
+        ),
+        pytest.param(
+            ProteinFieldOverride("atom_mask", (N_RES,)),
+            id="atom_mask_missing_atom_axis",
+        ),
+        pytest.param(
+            ProteinFieldOverride("atom_mask", (N_RES, N_ATOM_TYPE + 1)),
+            id="atom_mask_atom_table_drift_independent_of_positions",
+        ),
+        pytest.param(
+            ProteinFieldOverride("aatype", (N_RES, 1)),
+            id="aatype_column_vector_bug",
+        ),
+        pytest.param(
+            ProteinFieldOverride("residue_index", (N_RES + 1,)),
+            id="residue_index_count_drift_independent_of_aatype",
+        ),
+    ],
+    indirect=["invalid_protein_factory"],
+)
+def test_protein_rejects_invalid_shapes(
+    invalid_protein_factory: Callable[[], Protein],
+) -> None:
+    """Protein raises TypeCheckError for shape-contract violations.
 
-    Verifies that each attribute of the constructed Protein has the correct
-    NumPy array shape after construction.
-    """
-    assert valid_protein.atom_positions.shape == (N_RES, N_ATOM_TYPE, 3)
-    assert valid_protein.aatype.shape == (N_RES,)
-    assert valid_protein.atom_mask.shape == (N_RES, N_ATOM_TYPE)
-    assert valid_protein.residue_index.shape == (N_RES,)
-    assert valid_protein.chain_index.shape == (N_RES,)
-    assert valid_protein.b_factors.shape == (N_RES, N_ATOM_TYPE)
+    Protein is validated by a single ``jaxtyped(typechecker=beartype)``
+    check spanning the whole dataclass, so every field sharing a shape
+    signature exercises the identical enforcement code path. Rather than
+    breaking all six fields exhaustively, this covers each of the three
+    distinct signatures exactly once for rank ((num_res, num_atom_type, 3)
+    via atom_positions, (num_res, num_atom_type) via atom_mask, (num_res,)
+    via aatype), once for the atom_positions-only fixed coordinate-width
+    contract, and twice each (on two different fields) for the num_res and
+    num_atom_type named-dimension consistency checks, to confirm those
+    checks are not anchored to whichever field happens to be checked first.
+    ``chain_index`` and ``b_factors`` are intentionally not parametrized
+    here: they share the exact (num_res,) and (num_res, num_atom_type)
+    signatures already exercised by ``residue_index`` and ``atom_mask``
+    above, so adding them would restate the same mechanism rather than
+    cover new behavior.
 
+    Each case is also chosen to mirror a plausible bug in
+    ``protein_from_pdb``'s array-assembly loop (dropped coordinate axis,
+    a stray extra column, residue-count drift from insertion-code/altloc
+    handling, or an atom-type table that has grown out of sync with a
+    hardcoded dimension) rather than an arbitrary shape permutation.
 
-def test_protein_rejects_wrong_atom_positions_rank() -> None:
-    """Protein raises when atom_positions is 2-D instead of (N_res, 37, 3).
-
-    Verifies jaxtyping enforces the rank-3 shape contract on atom_positions.
+    Args:
+        invalid_protein_factory: Fixture-produced thunk parametrized via
+            indirect to construct a Protein with one field shape broken.
     """
     with pytest.raises(TypeCheckError):
-        _ = Protein(
-            atom_positions=np.zeros(
-                (N_RES, N_ATOM_TYPE),
-                dtype=np.float64,
-            ),  # missing 3
-            aatype=np.zeros(N_RES, dtype=np.intp),
-            atom_mask=np.ones((N_RES, N_ATOM_TYPE), dtype=np.float64),
-            residue_index=np.arange(N_RES, dtype=np.intp),
-            chain_index=np.zeros(N_RES, dtype=np.intp),
-            b_factors=np.zeros((N_RES, N_ATOM_TYPE), dtype=np.float64),
-        )
-
-
-def test_protein_rejects_wrong_coord_dim() -> None:
-    """Protein raises when coordinate dimension is 4 instead of the required 3.
-
-    Verifies jaxtyping enforces last-axis size-3 constraint on atom_positions.
-    """
-    with pytest.raises(TypeCheckError):
-        _ = Protein(
-            atom_positions=np.zeros(
-                (N_RES, N_ATOM_TYPE, 4),
-                dtype=np.float64,
-            ),  # 4 not 3
-            aatype=np.zeros(N_RES, dtype=np.intp),
-            atom_mask=np.ones((N_RES, N_ATOM_TYPE), dtype=np.float64),
-            residue_index=np.arange(N_RES, dtype=np.intp),
-            chain_index=np.zeros(N_RES, dtype=np.intp),
-            b_factors=np.zeros((N_RES, N_ATOM_TYPE), dtype=np.float64),
-        )
-
-
-def test_protein_rejects_inconsistent_num_res() -> None:
-    """Protein raises error when aatype len not same as atom_positions.
-
-    Verifies that jaxtyping enforces consistent N_res across Protein fields.
-    """
-    with pytest.raises(TypeCheckError):
-        _ = Protein(
-            atom_positions=np.zeros((N_RES, N_ATOM_TYPE, 3), dtype=np.float64),
-            aatype=np.zeros(N_RES + 1, dtype=np.intp),  # mismatched num_res
-            atom_mask=np.ones((N_RES, N_ATOM_TYPE), dtype=np.float64),
-            residue_index=np.arange(N_RES, dtype=np.intp),
-            chain_index=np.zeros(N_RES, dtype=np.intp),
-            b_factors=np.zeros((N_RES, N_ATOM_TYPE), dtype=np.float64),
-        )
+        _ = invalid_protein_factory()
 
 
 # ---------------------------------------------------------------------------
@@ -872,6 +714,15 @@ def test_center_positions_masked_atoms_remain_zero(
     )
 
 
+def test_center_positions_modifies_in_place(
+    full_mask_np_example: Mapping[str, npt.NDArray[np.float64]],
+) -> None:
+    """center_positions mutates input dict's atom_positions array."""
+    original = full_mask_np_example["atom_positions"].copy()
+    center_positions(full_mask_np_example)
+    assert not np.allclose(full_mask_np_example["atom_positions"], original)
+
+
 # ---------------------------------------------------------------------------
 # chain_end
 # ---------------------------------------------------------------------------
@@ -966,7 +817,7 @@ def roundtrip_protein() -> Protein:
 
     # ALA=0, ARG=1, SER=15, VAL=19, GLY=7  (indices into restypes list)
     _aatype = np.array([0, 1, 15, 19, 7], dtype=np.intp)
-    _num_res = len(_aatype)
+    _num_res = _aatype.shape[0]
 
     _atom_mask = np.zeros((_num_res, N_ATOM_TYPE), dtype=np.float64)
     for _i in range(_num_res - 1):  # residues 0-3: non-GLY
@@ -1090,48 +941,6 @@ def test_to_pdb_protein_from_pdb_roundtrip(
 # ---------------------------------------------------------------------------
 # Shape-contract enforcement — negative tests
 # ---------------------------------------------------------------------------
-
-
-def test_protein_wrong_shape() -> None:
-    """Wrong atom_positions last dim triggers TypeCheckError."""
-    n_res = 5
-    with pytest.raises(TypeCheckError):
-        _ = Protein(
-            atom_positions=np.zeros(
-                (n_res, 37, 4),
-                dtype=np.float64,
-            ),  # last dim must be 3
-            aatype=np.zeros(n_res, dtype=np.intp),
-            atom_mask=np.zeros((n_res, 37), dtype=np.float64),
-            residue_index=np.zeros(n_res, dtype=np.intp),
-            chain_index=np.zeros(n_res, dtype=np.intp),
-            b_factors=np.zeros((n_res, 37), dtype=np.float64),
-        )
-
-
-def test_atom37_to_atom5_wrong_shape() -> None:
-    """Wrong last dim on atom37_positions triggers TypeCheckError."""
-    positions_bad = torch.zeros(B, N_RES, 37, 4)  # last dim must be 3
-    mask = torch.ones(B, N_RES, 37)
-    with pytest.raises(TypeCheckError):
-        _ = atom37_to_atom5(positions_bad, mask)
-
-
-def test_pseudo_cb_wrong_shape() -> None:
-    """Wrong last dim on n triggers TypeCheckError."""
-    n_bad = torch.zeros(10, 4)  # last dim must be 3
-    ca_good = torch.zeros(10, 3)
-    c_good = torch.zeros(10, 3)
-    with pytest.raises(TypeCheckError):
-        _ = pseudo_cb(n_bad, ca_good, c_good)
-
-
-def test_get_cb_coords_wrong_shape() -> None:
-    """Wrong last dim on atom5_positions triggers TypeCheckError."""
-    positions_bad = torch.zeros(B, N_RES, 5, 4)  # last dim must be 3
-    mask = torch.ones(B, N_RES, 5)
-    with pytest.raises(TypeCheckError):
-        _ = get_cb_coords(positions_bad, mask)
 
 
 def test_atom37_to_cb_wrong_shape() -> None:

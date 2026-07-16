@@ -6,6 +6,7 @@ and Cβ coordinate representations.
 """
 
 import dataclasses
+import enum
 from collections.abc import Mapping, MutableMapping
 from pathlib import Path
 from types import MappingProxyType
@@ -22,6 +23,14 @@ from helpers.errors import (
     TooManyChainsError,
 )
 from jaxtyping import Bool, Float, Int, jaxtyped
+
+
+class ResidueRepresentation(enum.IntEnum):
+    """Enum of per-residue atom-representation sizes used in this codebase."""
+
+    atom5 = 5
+    atom37 = 37
+
 
 # Data utils
 
@@ -60,21 +69,12 @@ ATOM37_C: int = 2
 ATOM37_CB: int = 4
 ATOM37_O: int = 3
 
-# atom5 slot indices
-ATOM5_N: int = 0
-ATOM5_CA: int = 1
-ATOM5_C: int = 2
-ATOM5_CB: int = 4
-ATOM5_O: int = 3
-
-# atom5 slot → atom37 index mapping (N=0, CA=1, C=2, O=3, CB=4)
-ATOM5_TO_ATOM37: list[int] = [
-    ATOM37_N,
-    ATOM37_CA,
-    ATOM37_C,
-    ATOM37_O,
-    ATOM37_CB,
-]
+# atom5 slot indices -- same as ATOM37.
+ATOM5_N: int = ATOM37_N
+ATOM5_CA: int = ATOM37_CA
+ATOM5_C: int = ATOM37_C
+ATOM5_CB: int = ATOM37_CB
+ATOM5_O: int = ATOM37_O
 
 # PDB constants
 PDB_ATOM_NAME_CUTOFF_LEN: int = 4
@@ -444,7 +444,7 @@ def make_np_example(
         if atom_type in bb_atom_types
     ]
 
-    num_res = len(np.array(coords_dict["N"]))
+    num_res = np.array(coords_dict["N"]).shape[0]
     atom_positions = np.zeros([num_res, 37, 3], dtype=float)
 
     for i, atom_type in enumerate(atom_types):
@@ -481,7 +481,7 @@ def make_fixed_size(
         max_seq_length: Target sequence length to pad or truncate to.
     """
     for k, v in np_example.items():
-        pad = max_seq_length - len(v)
+        pad = max_seq_length - v.shape[0]
         if pad > 0:
             np_example[k] = np.pad(
                 v,
@@ -788,10 +788,10 @@ def to_pdb(prot: Protein) -> str:
     therefore contain 0.00, 1.00, or 2.00 for model-generated structures.
 
     Args:
-        prot: The protein to convert to PDB.
+      prot: The protein to convert to PDB.
 
     Returns:
-        PDB string.
+      PDB string.
 
     Raises:
         InvalidAAtypesError: If any residue has an out-of-range aatype index.
@@ -826,7 +826,7 @@ def to_pdb(prot: Protein) -> str:
     atom_index = 1
     last_chain_index = cast("np.intp", chain_index[0])
     # Add all atom sites.
-    for i in range(len(aatype)):
+    for i in range(aatype.shape[0]):
         # Close the previous chain if in a multichain PDB.
         if last_chain_index != chain_index[i]:
             pdb_lines.append(
@@ -895,32 +895,6 @@ def to_pdb(prot: Protein) -> str:
 
 
 @jaxtyped(typechecker=beartype)
-def atom37_to_atom5(
-    atom37_positions: Float[torch.Tensor, "B N_res 37 3"],
-    atom37_mask: Float[torch.Tensor, "B N_res 37"],
-) -> tuple[
-    Float[torch.Tensor, "B N_res 5 3"],
-    Float[torch.Tensor, "B N_res 5"],
-]:
-    """Extract the 5 backbone+Cβ atoms from atom37 representation.
-
-    Args:
-        atom37_positions: Full atom37 coordinates (B, N_res, 37, 3).
-        atom37_mask: Atom37 presence mask (B, N_res, 37).
-
-    Returns:
-        Tuple of (atom5_positions, atom5_mask) with shapes (B, N_res, 5, 3)
-        and (B, N_res, 5).
-    """
-    select = [ATOM37_N, ATOM37_CA, ATOM37_C, ATOM37_O, ATOM37_CB]
-
-    atom5_positions = atom37_positions[:, :, select, :]
-    atom5_mask = atom37_mask[:, :, select]
-
-    return atom5_positions, atom5_mask
-
-
-@jaxtyped(typechecker=beartype)
 def atom5_to_atom37(
     coords_5: Float[torch.Tensor, "B N_res 5 3"],
     mask_5: Float[torch.Tensor, "B N_res 5"] | None = None,
@@ -960,20 +934,62 @@ def atom5_to_atom37(
 
 
 @jaxtyped(typechecker=beartype)
-def pseudo_cb(
-    n: Float[torch.Tensor, "... 3"],
-    ca: Float[torch.Tensor, "... 3"],
-    c: Float[torch.Tensor, "... 3"],
-) -> Float[torch.Tensor, "... 3"]:
-    """Compute a virtual Cβ from backbone geometry (Gly-safe).
+def atom37_to_atom5(
+    atom37_positions: Float[torch.Tensor, "B N_res 37 3"],
+    atom37_mask: Float[torch.Tensor, "B N_res 37"],
+) -> tuple[
+    Float[torch.Tensor, "B N_res 5 3"],
+    Float[torch.Tensor, "B N_res 5"],
+]:
+    """Extract the 5 backbone+Cβ atoms from atom37 representation.
 
-    Uses the standard ideal-geometry recipe:
+    Args:
+        atom37_positions: Full atom37 coordinates (B, N_res, 37, 3).
+        atom37_mask: Atom37 presence mask (B, N_res, 37).
+
+    Returns:
+        Tuple of (atom5_positions, atom5_mask) with shapes (B, N_res, 5, 3)
+        and (B, N_res, 5).
+    """
+    select = [ATOM37_N, ATOM37_CA, ATOM37_C, ATOM37_O, ATOM37_CB]
+
+    atom5_positions = atom37_positions[:, :, select, :]
+    atom5_mask = atom37_mask[:, :, select]
+
+    return atom5_positions, atom5_mask
+
+
+@jaxtyped(typechecker=beartype)
+def atom37_to_cb(
+    atom37_positions: Float[torch.Tensor, "B N_res 37 3"],
+    atom37_mask: Float[torch.Tensor, "B N_res 37"],
+) -> tuple[Float[torch.Tensor, "B N_res 3"], Bool[torch.Tensor, "B N_res"]]:
+    """Compute Cβ / pseudo-Cβ directly from atom37 coordinates.
+
+    Extract N, CA, C, Cβ from atom37 using their fixed indices, then compute
+    a virtual Cβ from backbone geometry (Gly-safe), matching the AlphaFold2 /
+    ESMFold convention exactly.
+
+    Use the standard ideal-geometry recipe:
       b = C alpha - N        (N→C alpha bond vector)
       d = C  - C alpha       (C alpha→C  bond vector)
       Cross them, then combine with ideal tetrahedral offsets.
 
-    This matches the AlphaFold2 / ESMFold convention exactly.
+    Args:
+        atom37_positions: Full atom37 coordinates (B, N_res, 37, 3).
+        atom37_mask: Atom37 presence mask (B, N_res, 37).
+
+    Returns:
+        Tuple of (cb, pseudo_beta_mask): cb is (B, N_res, 3) with real Cβ
+        where available and pseudo-Cβ otherwise; pseudo_beta_mask is
+        (B, N_res) True where real Cβ was present.
     """
+    n = atom37_positions[:, :, ATOM37_N, :]  # (B, N_res, 3)
+    ca = atom37_positions[:, :, ATOM37_CA, :]
+    c = atom37_positions[:, :, ATOM37_C, :]
+    cb = atom37_positions[:, :, ATOM37_CB, :]  # zero / garbage where missing
+    # compute pseudo-Cβ wherever Cβ is absent
+    cb_present = atom37_mask[:, :, ATOM37_CB].bool()  # (B, N_res)
     b = ca - n
     d = c - ca
     bc: Float[torch.Tensor, "... 3"] = b / (
@@ -993,55 +1009,7 @@ def pseudo_cb(
     s = 0.56802827
     c_ = 0.54463904
 
-    return ca + m * n_vec + s * (bc + dc) + c_ * (bc - dc)
-
-
-@jaxtyped(typechecker=beartype)
-def get_cb_coords(
-    atom5_positions: Float[torch.Tensor, "B N_res 5 3"],
-    atom5_mask: Float[torch.Tensor, "B N_res 5"],
-) -> tuple[Float[torch.Tensor, "B N_res 3"], Bool[torch.Tensor, "B N_res"]]:
-    """Extract beta carbon from atom5, replace missing beta carbon for Gly.
-
-    Args:
-        atom5_positions: Atom5 coordinates (B, N_res, 5, 3).
-        atom5_mask: Atom5 presence mask (B, N_res, 5); 1 where atom is present.
-
-    Returns:
-        Tuple of (cb, pseudo_beta_mask): cb is (B, N_res, 3) with real Cβ
-        where available and pseudo-Cβ otherwise; pseudo_beta_mask is
-        (B, N_res) True where real Cβ was present.
-    """
-    n = atom5_positions[:, :, ATOM5_N, :]  # (B, N_res, 3)
-    ca = atom5_positions[:, :, ATOM5_CA, :]
-    c = atom5_positions[:, :, ATOM5_C, :]
-    cb = atom5_positions[:, :, ATOM5_CB, :]  # zero / garbage where missing
-    # compute pseudo-Cβ wherever Cβ is absent
-    cb_present = atom5_mask[:, :, ATOM5_CB].bool()  # (B, N_res)
-    p_cb = pseudo_cb(n, ca, c)  # (B, N_res, 3)
+    p_cb = ca + m * n_vec + s * (bc + dc) + c_ * (bc - dc)
     cb = torch.where(rearrange(cb_present, "b n -> b n 1"), cb, p_cb)
 
     return cb, cb_present
-
-
-# ── convenience wrapper ─────────────────────────────────────────────────────
-
-
-@jaxtyped(typechecker=beartype)
-def atom37_to_cb(
-    atom37_positions: Float[torch.Tensor, "B N_res 37 3"],
-    atom37_mask: Float[torch.Tensor, "B N_res 37"],
-) -> tuple[Float[torch.Tensor, "B N_res 3"], Bool[torch.Tensor, "B N_res"]]:
-    """Full pipeline: atom37 → atom5 → Cβ / pseudo-Cβ.
-
-    Args:
-        atom37_positions: Full atom37 coordinates (B, N_res, 37, 3).
-        atom37_mask: Atom37 presence mask (B, N_res, 37).
-
-    Returns:
-        Tuple of (cb, pseudo_beta_mask): cb is (B, N_res, 3) with real Cβ
-        where available and pseudo-Cβ otherwise; pseudo_beta_mask is
-        (B, N_res) True where real Cβ was present.
-    """
-    atom5_pos, atom5_mask = atom37_to_atom5(atom37_positions, atom37_mask)
-    return get_cb_coords(atom5_pos, atom5_mask)
