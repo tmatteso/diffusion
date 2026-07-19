@@ -8,7 +8,7 @@ to_pdb, protein_from_pdb, truncate_to_length, and molecule-type constants.
 import enum
 import pathlib
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import MappingProxyType
 from typing import cast
 
@@ -77,6 +77,7 @@ PROT_LEN = 3
 # Fixtures
 # ---------------------------------------------------------------------------
 
+
 class TensorCase(enum.Enum):
     """Enumeration of named test scenarios for atom position and mask tensors.
 
@@ -104,22 +105,39 @@ class TensorCase(enum.Enum):
     collinear = "collinear"
 
 
-class ExpectedBetaCarbon(enum.Enum):
-    """Whether atom37_to_cb is expected to report Cβ as present.
+class BetaCarbonExpectation(enum.Enum):
+    """Per-scenario expected behavior of ``atom37_to_cb``.
+
+    Each member bundles the two facts that vary across
+    ``test_atom37_to_cb`` cases: where CB presence turns on, and whether the
+    pseudo-Cβ fallback is expected to be a distinct point from CB and CA.
+    Members are read via their properties rather than branched on, so adding
+    a case never adds a decision point to the test body.
 
     Members:
-        present: All residues should have CB marked present in the output
-            mask — the happy-path case where atom37 has the CB slot filled.
-        absent: No residues should have CB present; the function must fall
-            back to a finite pseudo-Cβ computed from backbone geometry.
-        half_present: The first half of residues are fully masked (CB absent)
-            and the second half are fully unmasked (CB present); validates
-            that atom37_to_cb handles partial visibility correctly.
+        present: All residues have CB present; the pseudo-Cβ fallback path
+            is never exercised, so distinctness is not checked.
+        absent: No residues have CB present; the fallback must produce a
+            finite pseudo-Cβ distinct from both CB and CA.
+        half_present: The first half of residues are CB-absent and the
+            second half CB-present. The fixture backbone for this case is
+            all zeros, so the fallback pseudo-Cβ coincides with CB/CA by
+            construction — distinctness is not checked here.
     """
 
-    present = True
-    absent = False
-    half_present = "half_present"
+    present = (0, False)
+    absent = (N_RES, True)
+    half_present = (N_RES // 2, False)
+
+    @property
+    def present_from(self) -> int:
+        """Residue index at which CB presence turns on."""
+        return self.value[0]
+
+    @property
+    def expect_distinct_pseudo_cb(self) -> bool:
+        """Whether the fallback pseudo-Cβ must differ from CB and CA."""
+        return self.value[1]
 
 
 @pytest.fixture
@@ -188,6 +206,7 @@ def atom_position_and_mask_factory(
 
     return atom_positions, atom_mask
 
+
 @pytest.mark.parametrize(
     ("atom_position_and_mask_factory", "expected_pos_shape"),
     [
@@ -239,7 +258,8 @@ def test_atom37_to_atom5(
     atom37_positions, atom37_mask = atom_position_and_mask_factory
 
     atom5_positions, atom5_mask = atom37_to_atom5(
-        atom37_positions, atom37_mask,
+        atom37_positions,
+        atom37_mask,
     )
 
     # 1. Shape and dtype
@@ -268,31 +288,32 @@ def test_atom37_to_atom5(
     # atom5_mask[:, :, ATOM5_CB] is all-zero when atom37 CB slot is zero.
     for a5, a37 in zip(atom5_indices, atom37_backbone_indices, strict=True):
         assert torch.equal(
-            atom5_mask[:, :, a5], atom37_mask[:, :, a37],
+            atom5_mask[:, :, a5],
+            atom37_mask[:, :, a37],
         )
 
 
 @pytest.mark.parametrize(
-    ("atom_position_and_mask_factory", "expect_cb_present"),
+    ("atom_position_and_mask_factory", "expectation"),
     [
         pytest.param(
             (ResidueRepresentation.atom37, TensorCase.standard, 2, 10),
-            ExpectedBetaCarbon.present,
+            BetaCarbonExpectation.present,
             id="standard-all-cb-present",
         ),
         pytest.param(
             (ResidueRepresentation.atom37, TensorCase.no_beta_carbon, 2, 10),
-            ExpectedBetaCarbon.absent,
+            BetaCarbonExpectation.absent,
             id="no-beta-carbon-pseudo-cb",
         ),
         pytest.param(
             (ResidueRepresentation.atom37, TensorCase.collinear, 2, 10),
-            ExpectedBetaCarbon.absent,
+            BetaCarbonExpectation.absent,
             id="collinear-no-cb-pseudo-cb-finite",
         ),
         pytest.param(
             (ResidueRepresentation.atom37, TensorCase.half_mask, 2, 10),
-            ExpectedBetaCarbon.half_present,
+            BetaCarbonExpectation.half_present,
             id="half-mask-mixed-cb-presence",
         ),
     ],
@@ -303,7 +324,7 @@ def test_atom37_to_cb(
         Float[torch.Tensor, "B N_res 37 3"],
         Float[torch.Tensor, "B N_res 37"],
     ],
-    expect_cb_present: ExpectedBetaCarbon,
+    expectation: BetaCarbonExpectation,
 ) -> None:
     """Verify atom37_to_cb output shapes, CB presence, and pseudo-CB fallback.
 
@@ -314,7 +335,8 @@ def test_atom37_to_cb(
     3. Falls back to finite pseudo-Cβ positions and marks every residue
        CB-absent when CB is zeroed in the mask (TensorCase.no_beta_carbon,
        matching glycine-like residues).
-    4. Verifies that the virtual Cβ position is not simply a copy of CA atom.
+    4. Verifies that the virtual Cβ position is not simply a copy of CA atom,
+       for cases with non-degenerate backbone geometry to fall back on.
     5. Verifies that pseudo_cb is finite when N, CA, C are collinear
         (cross product is zero). The epsilon guard in linalg.norm must prevent
         NaN in the normalised output.
@@ -322,9 +344,8 @@ def test_atom37_to_cb(
     Args:
         atom_position_and_mask_factory: Fixture-produced (atom37_positions,
             atom37_mask) pair parametrized via indirect.
-        expect_cb_present: ExpectedBetaCarbon.present when parametrized input
-            has CB in the mask; ExpectedBetaCarbon.absent for no-beta-carbon
-            glycine case.
+        expectation: Bundles where CB presence turns on and whether the
+            pseudo-Cβ fallback must be distinct from CB/CA for this case.
     """
     atom37_positions, atom37_mask = atom_position_and_mask_factory
     cb, cb_present = atom37_to_cb(atom37_positions, atom37_mask)
@@ -333,33 +354,28 @@ def test_atom37_to_cb(
     assert cb_present.shape == (B, N_RES)
     assert cb_present.dtype == torch.bool
 
-    if expect_cb_present is ExpectedBetaCarbon.present:
-        assert cb_present.all()
-        assert torch.allclose(cb, atom37_positions[:, :, ATOM37_CB, :])
-    elif expect_cb_present is ExpectedBetaCarbon.absent:
-        assert not cb_present.any()
-        assert torch.isfinite(cb).all()
-        assert not torch.allclose(cb, atom37_positions[:, :, ATOM37_CB, :])
-        # assertion 4: pseudo-Cβ is a distinct point, not simply CA
-        assert not torch.allclose(
-            cb, atom37_positions[:, :, ATOM37_CA, :],
-        )
-    else:  # half_present: first half masked out, second half unmasked
-        assert not cb_present[:, : N_RES // 2].any()
-        assert cb_present[:, N_RES // 2 :].all()
-        assert torch.isfinite(cb).all()
-        assert torch.allclose(
-            cb[:, N_RES // 2 :, :],
-            atom37_positions[:, N_RES // 2 :, ATOM37_CB, :],
-        )
+    expected_cb_present = torch.zeros(B, N_RES, dtype=torch.bool)
+    expected_cb_present[:, expectation.present_from :] = True
+    assert torch.equal(cb_present, expected_cb_present)
+
+    reference_cb = atom37_positions[:, :, ATOM37_CB, :]
+    reference_ca = atom37_positions[:, :, ATOM37_CA, :]
+    present, absent = expected_cb_present, ~expected_cb_present
+
+    # Vacuously true when a mask is all-False, so no per-case branch needed.
+    assert torch.allclose(cb[present], reference_cb[present])
+    assert torch.isfinite(cb[absent]).all()
+
+    if expectation.expect_distinct_pseudo_cb:
+        assert not torch.allclose(cb[absent], reference_cb[absent])
+        assert not torch.allclose(cb[absent], reference_ca[absent])
 
 
 # ---------------------------------------------------------------------------
 # Protein dataclass
 # ---------------------------------------------------------------------------
 
-N_ATOM_TYPE = len(atom_types) # 37
-
+N_ATOM_TYPE = len(atom_types)  # 37
 
 
 @dataclass(frozen=True)
@@ -395,16 +411,16 @@ def invalid_protein_factory(
     override = cast(ProteinFieldOverride, request.param)
     int_fields = frozenset({"aatype", "residue_index", "chain_index"})
     dtype = np.intp if override.field_name in int_fields else np.float64
-    kwargs: dict[str, npt.NDArray[np.float64] | npt.NDArray[np.intp]] = {
-        "atom_positions": np.zeros((N_RES, N_ATOM_TYPE, 3), dtype=np.float64),
-        "aatype": np.zeros(N_RES, dtype=np.intp),
-        "atom_mask": np.ones((N_RES, N_ATOM_TYPE), dtype=np.float64),
-        "residue_index": np.arange(N_RES, dtype=np.intp),
-        "chain_index": np.zeros(N_RES, dtype=np.intp),
-        "b_factors": np.zeros((N_RES, N_ATOM_TYPE), dtype=np.float64),
-    }
-    kwargs[override.field_name] = np.zeros(override.shape, dtype=dtype)
-    return lambda: Protein(**kwargs)
+    base = Protein(
+        atom_positions=np.zeros((N_RES, N_ATOM_TYPE, 3), dtype=np.float64),
+        aatype=np.zeros(N_RES, dtype=np.intp),
+        atom_mask=np.ones((N_RES, N_ATOM_TYPE), dtype=np.float64),
+        residue_index=np.arange(N_RES, dtype=np.intp),
+        chain_index=np.zeros(N_RES, dtype=np.intp),
+        b_factors=np.zeros((N_RES, N_ATOM_TYPE), dtype=np.float64),
+    )
+    broken = np.zeros(override.shape, dtype=dtype)
+    return lambda: replace(base, **{override.field_name: broken})
 
 
 @pytest.mark.parametrize(
@@ -420,13 +436,15 @@ def invalid_protein_factory(
         ),
         pytest.param(
             ProteinFieldOverride(
-                "atom_positions", (N_RES + 1, N_ATOM_TYPE, 3),
+                "atom_positions",
+                (N_RES + 1, N_ATOM_TYPE, 3),
             ),
             id="atom_positions_residue_count_drift",
         ),
         pytest.param(
             ProteinFieldOverride(
-                "atom_positions", (N_RES, N_ATOM_TYPE + 1, 3),
+                "atom_positions",
+                (N_RES, N_ATOM_TYPE + 1, 3),
             ),
             id="atom_positions_atom_table_drift",
         ),
@@ -492,23 +510,28 @@ NP_NUM_RES = 6
 
 
 @pytest.fixture
-def coords_dict() -> Mapping[str, npt.NDArray[np.float64]]:
-    """Provide a random backbone coordinate dict with N, CA, C, O keys.
+def coords_dict() -> dict[str, list[list[float]]]:
+    """Provide a concrete backbone coordinate dict with N, CA, C, O keys.
+
+    Mirrors the `dict[str, list[list[float]]]` shape that
+    `ProteinEntry.coords` yields when loaded from a JSONL record.
 
     Returns:
-        A dict mapping atom name to (NP_NUM_RES, 3) float64 array of random
-        positions.
+        A dict mapping atom name to an (NP_NUM_RES, 3) list of deterministic
+        Cartesian coordinates.
     """
-    rng = np.random.default_rng(0)
     return {
-        name: rng.standard_normal((NP_NUM_RES, 3))
-        for name in ("N", "CA", "C", "O")
+        atom_name: [
+            [float(res_idx + atom_offset + xyz) for xyz in range(3)]
+            for res_idx in range(NP_NUM_RES)
+        ]
+        for atom_offset, atom_name in enumerate(("N", "CA", "C", "O"))
     }
 
 
 @pytest.fixture
 def np_example(
-    coords_dict: Mapping[str, npt.NDArray[np.float64]],
+    coords_dict: dict[str, list[list[float]]],
 ) -> Mapping[str, npt.NDArray[np.float64] | npt.NDArray[np.intp]]:
     """Provide the numpy example dict built from the coords_dict fixture."""
     return make_np_example(coords_dict)
@@ -559,7 +582,7 @@ def test_make_np_example_backbone_atoms_masked(
 
 
 def test_make_np_example_nan_coords_zeroed(
-    coords_dict: Mapping[str, npt.NDArray[np.float64]],
+    coords_dict: dict[str, list[list[float]]],
 ) -> None:
     """make_np_example replaces NaN coords with zero to keep coords finite."""
     coords_dict["N"][0] = [float("nan"), float("nan"), float("nan")]
@@ -568,7 +591,7 @@ def test_make_np_example_nan_coords_zeroed(
 
 
 def test_make_np_example_nan_coords_zero_mask(
-    coords_dict: Mapping[str, npt.NDArray[np.float64]],
+    coords_dict: dict[str, list[list[float]]],
 ) -> None:
     """make_np_example sets atom_mask to 0 for residues with NaN coords."""
     coords_dict["N"][0] = [float("nan"), float("nan"), float("nan")]
@@ -817,7 +840,7 @@ def roundtrip_protein() -> Protein:
 
     # ALA=0, ARG=1, SER=15, VAL=19, GLY=7  (indices into restypes list)
     _aatype = np.array([0, 1, 15, 19, 7], dtype=np.intp)
-    _num_res = _aatype.shape[0]
+    _num_res = len(_aatype)
 
     _atom_mask = np.zeros((_num_res, N_ATOM_TYPE), dtype=np.float64)
     for _i in range(_num_res - 1):  # residues 0-3: non-GLY

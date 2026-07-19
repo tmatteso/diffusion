@@ -7,7 +7,7 @@ and Cβ coordinate representations.
 
 import dataclasses
 import enum
-from collections.abc import Mapping, MutableMapping
+from collections.abc import Mapping, MutableMapping, Sequence
 from pathlib import Path
 from types import MappingProxyType
 from typing import Final, cast
@@ -75,6 +75,15 @@ ATOM5_CA: int = ATOM37_CA
 ATOM5_C: int = ATOM37_C
 ATOM5_CB: int = ATOM37_CB
 ATOM5_O: int = ATOM37_O
+
+# atom5 slot (index) -> atom37 slot (value), ordered per ATOM5_NAMES.
+ATOM5_TO_ATOM37: list[int] = [
+    ATOM37_N,
+    ATOM37_CA,
+    ATOM37_C,
+    ATOM37_O,
+    ATOM37_CB,
+]
 
 # PDB constants
 PDB_ATOM_NAME_CUTOFF_LEN: int = 4
@@ -422,7 +431,7 @@ rigid_group_atom_positions = {
 
 
 def make_np_example(
-    coords_dict: Mapping[str, npt.ArrayLike],
+    coords_dict: Mapping[str, Sequence[Sequence[float]]],
 ) -> Mapping[str, npt.NDArray[np.float64] | npt.NDArray[np.intp]]:
     """Make a dictionary of non-batched numpy protein features.
 
@@ -430,8 +439,8 @@ def make_np_example(
     arrays from a raw coordinate dict, masking out any NaN entries.
 
     Args:
-        coords_dict: Mapping from atom-type name (e.g. "N", "CA") to an
-            array-like of shape (N_res, 3) with Cartesian coordinates.
+        coords_dict: Mapping from atom-type name (e.g. "N", "CA") to a
+            sequence of shape (N_res, 3) with Cartesian coordinates.
 
     Returns:
         A dict with keys "atom_positions", "atom_mask", and "residue_index"
@@ -444,7 +453,7 @@ def make_np_example(
         if atom_type in bb_atom_types
     ]
 
-    num_res = np.array(coords_dict["N"]).shape[0]
+    num_res: int = len(coords_dict["N"])
     atom_positions = np.zeros([num_res, 37, 3], dtype=float)
 
     for i, atom_type in enumerate(atom_types):
@@ -481,7 +490,7 @@ def make_fixed_size(
         max_seq_length: Target sequence length to pad or truncate to.
     """
     for k, v in np_example.items():
-        pad = max_seq_length - v.shape[0]
+        pad = max_seq_length - len(v)
         if pad > 0:
             np_example[k] = np.pad(
                 v,
@@ -826,7 +835,7 @@ def to_pdb(prot: Protein) -> str:
     atom_index = 1
     last_chain_index = cast("np.intp", chain_index[0])
     # Add all atom sites.
-    for i in range(aatype.shape[0]):
+    for i in range(len(aatype)):
         # Close the previous chain if in a multichain PDB.
         if last_chain_index != chain_index[i]:
             pdb_lines.append(
