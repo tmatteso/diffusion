@@ -24,6 +24,7 @@ from helpers.atom_utils import (
     ATOM5_N,
     ATOM5_NAMES,
     ATOM5_O,
+    ATOM5_TO_ATOM37,
     ATOM37_C,
     ATOM37_CA,
     ATOM37_CB,
@@ -49,6 +50,7 @@ from helpers.atom_utils import (
     RNA_RESTYPES,
     Protein,
     ResidueRepresentation,
+    atom5_to_atom37,
     atom37_to_atom5,
     atom37_to_cb,
     atom_types,
@@ -291,6 +293,117 @@ def test_atom37_to_atom5(
             atom5_mask[:, :, a5],
             atom37_mask[:, :, a37],
         )
+
+
+@pytest.mark.parametrize(
+    ("atom_position_and_mask_factory", "provide_mask"),
+    [
+        pytest.param(
+            (ResidueRepresentation.atom5, TensorCase.standard, 2, 10),
+            True,
+            id="batched-standard",
+        ),
+        pytest.param(
+            (ResidueRepresentation.atom5, TensorCase.no_beta_carbon, 2, 10),
+            True,
+            id="batched-missing-cb",
+        ),
+        pytest.param(
+            (ResidueRepresentation.atom5, TensorCase.half_mask, 2, 10),
+            True,
+            id="batched-half-mask",
+        ),
+        pytest.param(
+            (ResidueRepresentation.atom5, TensorCase.standard, 1, 10),
+            True,
+            id="single-batch",
+        ),
+        pytest.param(
+            (ResidueRepresentation.atom5, TensorCase.standard, 2, 10),
+            False,
+            id="mask-defaults-to-all-present",
+        ),
+    ],
+    indirect=["atom_position_and_mask_factory"],
+)
+def test_atom5_to_atom37(
+    atom_position_and_mask_factory: tuple[
+        Float[torch.Tensor, "B N_res 5 3"],
+        Float[torch.Tensor, "B N_res 5"],
+    ],
+    *,
+    provide_mask: bool,
+) -> None:
+    """Verify atom5_to_atom37 behavior.
+
+    1. That it returns positions and masks with the correct shapes and
+        data types.
+    2. That it scatters each atom5 slot into its fixed atom37 index.
+    3. That it propagates (or synthesizes, when mask_5 is None) the mask
+        into the matching atom37 slots.
+    4. That every atom37 slot outside the 5 backbone indices stays zero
+        in both the position and mask tensors, regardless of scenario.
+
+    Args:
+        atom_position_and_mask_factory: Fixture-produced (atom5_positions,
+            atom5_mask) pair parametrized via indirect.
+        provide_mask: Whether to pass the fixture mask through to
+            atom5_to_atom37 or omit it (None) to exercise the
+            all-slots-present default.
+    """
+    # Arrange
+    atom5_positions, atom5_mask = atom_position_and_mask_factory
+    mask_arg, expected_backbone_mask = (
+        (atom5_mask, atom5_mask)
+        if provide_mask
+        else (None, torch.ones_like(atom5_mask))
+    )
+    batch_size, residue_number = atom5_positions.shape[:2]
+    expected_pos_shape = (
+        batch_size,
+        residue_number,
+        ResidueRepresentation.atom37.value,
+        3,
+    )
+    unpopulated = sorted(set(range(37)) - set(ATOM5_TO_ATOM37))
+
+    # Act
+    atom37_positions, atom37_mask = atom5_to_atom37(atom5_positions, mask_arg)
+
+    # Assert
+    # 1. Shape and dtype
+    assert (atom37_positions.shape, atom37_mask.shape) == (
+        expected_pos_shape,
+        expected_pos_shape[:-1],
+    )
+    assert (atom37_positions.dtype, atom37_mask.dtype) == (
+        atom5_positions.dtype,
+        atom5_mask.dtype,
+    )
+
+    # 2. Slot placement: each atom5 channel lands at its atom37 index.
+    assert torch.equal(
+        atom37_positions[:, :, ATOM5_TO_ATOM37, :],
+        atom5_positions,
+    )
+
+    # 3. Mask propagation, or synthesis of an all-ones mask when mask_5
+    # is None.
+    assert torch.equal(
+        atom37_mask[:, :, ATOM5_TO_ATOM37],
+        expected_backbone_mask,
+    )
+
+    # 4. Every non-backbone atom37 slot stays zero, independent of
+    # scenario content or masking.
+    assert torch.equal(
+        atom37_positions[:, :, unpopulated, :],
+        torch.zeros_like(atom37_positions[:, :, unpopulated, :]),
+    )
+    assert torch.equal(
+        atom37_mask[:, :, unpopulated],
+        torch.zeros_like(atom37_mask[:, :, unpopulated]),
+    )
 
 
 @pytest.mark.parametrize(
