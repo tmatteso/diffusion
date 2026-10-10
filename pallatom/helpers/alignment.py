@@ -309,7 +309,7 @@ def centre_random_augment(
 ) -> Float[torch.Tensor, "B N_atom 3"]:
     """Centre, randomly rotate, and randomly translate coordinates.
 
-    Implements CentreRandomAugmentation from Algorithm 19: subtracts the
+    Implements CentreRandomAugmentation from AF3 Algorithm 19: subtracts the
     per-batch centroid, applies one independent Haar-uniform SO(3) rotation
     per batch element, then adds independent Gaussian translation noise
     t ~ s_trans * N(0, I3) per batch element.

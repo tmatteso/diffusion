@@ -40,10 +40,6 @@ RESIDUE_TYPE_WEIGHTS: list[float] = [
     for restype in RESTYPES_NO_X
 ]
 
-# ---------------------------------------------------------------------------
-# atom_loss  (Algorithm 2 structure term)
-# ---------------------------------------------------------------------------
-
 
 @jaxtyped(typechecker=beartype)
 def residue_type_weight(
@@ -179,11 +175,6 @@ def atom_loss(
     return loss
 
 
-# ---------------------------------------------------------------------------
-# Intermediate supervision loss with decoder-block weight decay  (L_med)
-# ---------------------------------------------------------------------------
-
-
 def med_loss(
     r_denoised_blocks: list[Float[torch.Tensor, "K N_atom 3"]],
     logits_aa_blocks: list[Float[torch.Tensor, "K N_res n_amino"]],
@@ -264,11 +255,6 @@ def med_loss(
     return (intermediate_loss / max(K, 1)).mean()
 
 
-# ---------------------------------------------------------------------------
-# Smooth lDDT loss
-# ---------------------------------------------------------------------------
-
-
 @jaxtyped(typechecker=beartype)
 def pairwise_dist(
     x: Float[torch.Tensor, "... N_atom 3"],
@@ -303,7 +289,7 @@ def smooth_lddt_loss(
     mask: Bool[torch.Tensor, "... N_atom"] | None = None,
     cutoff: float = 15.0,
 ) -> Float[torch.Tensor, ""]:
-    """Smooth lDDT loss — Algorithm 8 (from Pallatom).
+    """Smooth lDDT loss — from P(all-atom) Algorithm 8.
 
     Exact algorithm:
 
@@ -383,11 +369,6 @@ def smooth_lddt_loss(
     lddt: Float[torch.Tensor, ...] = numer / denom
 
     return (1.0 - lddt).mean()
-
-
-# ---------------------------------------------------------------------------
-# Distogram losses
-# ---------------------------------------------------------------------------
 
 
 @jaxtyped(typechecker=beartype)
@@ -523,11 +504,6 @@ def distogram_loss_atom(
         raise LossComputationError
 
     return loss
-
-
-# ---------------------------------------------------------------------------
-# Sequence cross-entropy loss
-# ---------------------------------------------------------------------------
 
 
 @jaxtyped(typechecker=beartype)

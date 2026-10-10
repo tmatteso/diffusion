@@ -1,6 +1,6 @@
 """Template embedder for encoding structural template information.
 
-Contains ``TemplateEmbedder``, which implements Algorithm 3 of the Pallatom
+Contains ``TemplateEmbedder``, which implements Algorithm 3 of the P(all-atom)
 architecture: it projects distogram-based template representation together with
 time-conditioning and trunk pair embedding into fixed-size pair output tensor.
 """
@@ -15,10 +15,6 @@ from architecture.pairformer_stack import PairformerStack
 from beartype import beartype
 from einops import einsum, rearrange
 from jaxtyping import Float, jaxtyped
-
-# ---------------------------------------------------------------------------
-# TemplateEmbedder — Algorithm 3
-# ---------------------------------------------------------------------------
 
 
 class TemplateEmbedder(nn.Module):
@@ -117,7 +113,7 @@ class TemplateEmbedder(nn.Module):
         # ------------------------------------------------------------------
         # Step 2: b_ij^time = t ⊙ f_ij^mask    (broadcast t over i and j)
         # ------------------------------------------------------------------
-        b_time = rearrange(
+        b_time = rearrange(  # t is rank (B, N, N)
             t * b_mask[..., 0],  # b_mask is (B, N, N, 1); squeeze and multiply
             "b i j -> b i j 1",
         )
@@ -129,8 +125,6 @@ class TemplateEmbedder(nn.Module):
             [f_distogram, b_mask, b_time],
             dim=-1,
         )
-
-        # This part has to be done once for each template.
 
         # ------------------------------------------------------------------
         # Step 4: v_ij = LinearNoBias(LayerNorm(z_ij)) + LinearNoBias(a_ij)

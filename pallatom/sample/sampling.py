@@ -454,19 +454,8 @@ def build_sampling_context(
     )
 
 
-# ────────────────────────────────────────────────────────────────────────────
-# EDM Sampler  —  deterministic Heun ODE  (Algorithm 2 in the paper)
-#
-#  ODE:  dr/dsigma = (r - D_θ(r,sigma)) / sigma   (the "probability flow ODE")
-#  Heun = one Euler predictor + one corrector for 2nd-order accuracy.
-#
-#  Optional stochasticity: inject a small amount of noise at each step
-#  (S_churn > 0) to get the SDE variant, analogous to DDIM η > 0.
-# ────────────────────────────────────────────────────────────────────────────
-
-
 class EDMSampler:
-    """Karras et al. 2022 deterministic (Heun) sampler.
+    """Karras et al. 2022 inspired stochastic sampler.
 
     Parameters
     ----------
@@ -725,6 +714,9 @@ class EDMSampler:
             torch.softmax((seq_logits) / self.seq_temperature, dim=-1),
             dim=-1,
         ).float()
+        # centre_random_augment does a masked_com()
+        # so masked_com() for r_denoised not needed in the loop
+        # used here to masked_com() the final structure output
         r_denoised = r_denoised - masked_com(
             r_denoised,
             mask=self.context.atom5_mask,
@@ -891,7 +883,7 @@ def main(args: SamplingArgs, scfg: SampleConfig, device: str) -> None:
                 atom_mask=atom_mask,
                 residue_index=np.arange(N_RES, dtype=np.intp),
                 aatype=aatype,
-                chain_index=np.zeros(N_RES, dtype=np.intp),  # obvious problem
+                chain_index=np.zeros(N_RES, dtype=np.intp),  # single chain
                 b_factors=np.ones((N_RES, 37), dtype=np.float64),
             )
             pdb_strings.append(to_pdb(prot))

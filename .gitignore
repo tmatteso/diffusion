@@ -42,3 +42,6 @@ pallatom/train/*.jsonl
 commit_msg.txt
 # log files
 *.log
+# local claude code agents/commands
+.claude/agents/
+.claude/commands/
