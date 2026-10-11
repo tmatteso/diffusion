@@ -1032,12 +1032,12 @@ def atom37_to_atom14(
         (B, N_res, 14, 3) and (B, N_res, 14).
     """
     aatype_safe = aatype.clamp(min=0, max=RESTYPE_NUM - 1)
-    idx14_to_37: Int[torch.Tensor, "B N_res 14"] = RESIDX_ATOM14_TO_ATOM37[
-        aatype_safe
-    ]
-    exists14: Float[torch.Tensor, "B N_res 14"] = ATOM14_ATOM_EXISTS[
-        aatype_safe
-    ].float()
+    idx14_to_37: Int[torch.Tensor, "B N_res 14"] = RESIDX_ATOM14_TO_ATOM37.to(
+        aatype_safe.device,
+    )[aatype_safe]
+    exists14: Float[torch.Tensor, "B N_res 14"] = ATOM14_ATOM_EXISTS.to(
+        aatype_safe.device,
+    )[aatype_safe].float()
 
     atom14_positions = atom37_positions.gather(
         2,
@@ -1070,12 +1070,12 @@ def atom14_to_atom37(
         (B, N_res, 37).
     """
     aatype_safe = aatype.clamp(min=0, max=RESTYPE_NUM - 1)
-    idx37_to_14: Int[torch.Tensor, "B N_res 37"] = RESIDX_ATOM37_TO_ATOM14[
-        aatype_safe
-    ]
-    exists37: Float[torch.Tensor, "B N_res 37"] = ATOM37_ATOM_EXISTS[
-        aatype_safe
-    ].float()
+    idx37_to_14: Int[torch.Tensor, "B N_res 37"] = RESIDX_ATOM37_TO_ATOM14.to(
+        aatype_safe.device,
+    )[aatype_safe]
+    exists37: Float[torch.Tensor, "B N_res 37"] = ATOM37_ATOM_EXISTS.to(
+        aatype_safe.device,
+    )[aatype_safe].float()
 
     x_37 = coords_14.gather(
         2,
@@ -1106,10 +1106,12 @@ def gather_ref_pos_and_element(
 
     Returns:
         Tuple of (ref_pos, ref_elem) with shapes (N_res, 14, 3) and
-        (N_res, 14, 4).
+        (N_res, 14, 4), on the same device as ``aatype``.
     """
     aatype_safe = aatype.clamp(min=0, max=RESTYPE_NUM - 1)
-    return ATOM14_REF_POS[aatype_safe], ATOM14_ELEMENTS[aatype_safe]
+    ref_pos = ATOM14_REF_POS.to(aatype_safe.device)[aatype_safe]
+    ref_elem = ATOM14_ELEMENTS.to(aatype_safe.device)[aatype_safe]
+    return ref_pos, ref_elem
 
 
 @jaxtyped(typechecker=beartype)
