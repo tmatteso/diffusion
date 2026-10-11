@@ -8,6 +8,7 @@ accumulation and W&B logging.
 
 import contextlib
 import dataclasses
+import functools
 import json
 import pathlib
 from collections.abc import Generator
@@ -41,7 +42,7 @@ from pydantic import ValidationError
 from structlog.typing import FilteringBoundLogger
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import Adam
-from torch.optim.lr_scheduler import StepLR
+from torch.optim.lr_scheduler import LambdaLR
 from train.train_config import (
     AtomDistogramParams,
     CheckpointParams,
@@ -57,6 +58,7 @@ from train.train_config import (
     TrainLoaderConfig,
 )
 from train.train_loop import (
+    alphafold_lr_lambda,
     component_grad_norms,
     evaluate,
     load_checkpoint,
@@ -110,7 +112,7 @@ def _make_model_params(
     dgram_residue: Distogram,
     dgram_atom: Distogram,
 ) -> ModelSetup:
-    """Construct a ModelSetup with Adam optimizer, StepLR scheduler.
+    """Construct a ModelSetup with Adam optimizer, AlphaFold-style scheduler.
 
     Args:
         trunk: The MainTrunk to wrap.
@@ -123,10 +125,14 @@ def _make_model_params(
         Fully initialised ModelSetup.
     """
     optimizer = Adam(trunk.parameters(), lr=train_cfg.training.lr)
-    scheduler = StepLR(
+    scheduler = LambdaLR(
         optimizer,
-        step_size=train_cfg.training.lr_decay_steps,
-        gamma=train_cfg.training.lr_decay_factor,
+        lr_lambda=functools.partial(
+            alphafold_lr_lambda,
+            warmup_steps=train_cfg.training.lr_warmup_steps,
+            decay_steps=train_cfg.training.lr_decay_steps,
+            decay_factor=train_cfg.training.lr_decay_factor,
+        ),
     )
     return ModelSetup(
         model=trunk,
@@ -436,7 +442,8 @@ def model_params(
 
     Returns:
         ModelSetup wrapping the model fixture with an Adam optimizer and
-        StepLR scheduler configured from tcfg.
+        AlphaFold-style warmup/decay LambdaLR scheduler configured from
+        tcfg.
     """
     return _make_model_params(
         model,
@@ -1347,7 +1354,7 @@ def test_checkpoint_round_trip_preserves_optimizer_and_scheduler_state(
     model_params: ModelSetup,
     log: FilteringBoundLogger,
 ) -> None:
-    """save->load restores Adam moments and StepLR step count exactly.
+    """save->load restores Adam moments and scheduler step count exactly.
 
     Populates optimizer/scheduler state with a manual step, saves it,
     corrupts the in-memory state, then confirms load_checkpoint restores the
@@ -2010,6 +2017,191 @@ def test_train_config_accepts_any_positive_token_budget() -> None:
     """TrainConfig accepts any positive accumulated_token_budget."""
     cfg = TrainConfig(training=TrainingParams(accumulated_token_budget=1))
     assert cfg.training.accumulated_token_budget == 1
+
+
+def test_lr_warmup_steps_defaults_to_disabled() -> None:
+    """lr_warmup_steps defaults to 0, i.e. warmup disabled by default."""
+    assert TrainingParams().lr_warmup_steps == 0
+
+
+def test_lr_warmup_steps_rejects_negative() -> None:
+    """TrainingParams raises ValidationError for a negative warmup length."""
+    with pytest.raises(ValidationError):
+        _ = TrainingParams(lr_warmup_steps=-1)
+
+
+_ALPHAFOLD3_WARMUP_STEPS = 1_000
+
+
+def test_lr_warmup_steps_accepts_alphafold3_published_value() -> None:
+    """TrainConfig accepts AlphaFold 3's published 1,000-step warmup."""
+    cfg = TrainConfig(
+        training=TrainingParams(lr_warmup_steps=_ALPHAFOLD3_WARMUP_STEPS),
+    )
+    assert cfg.training.lr_warmup_steps == _ALPHAFOLD3_WARMUP_STEPS
+
+
+@dataclasses.dataclass
+class LRLambdaCase:
+    """One (inputs, expected multiplier) case for alphafold_lr_lambda.
+
+    Attributes:
+        step: Optimizer step passed to alphafold_lr_lambda.
+        warmup_steps: Warmup step count under test.
+        decay_steps: Post-warmup decay interval under test.
+        decay_factor: Multiplicative decay factor under test.
+        expected: Expected returned multiplier.
+    """
+
+    step: int
+    warmup_steps: int
+    decay_steps: int
+    decay_factor: float
+    expected: float
+
+
+@pytest.fixture
+def lr_lambda_case(
+    request: pytest.FixtureRequest,
+) -> LRLambdaCase:
+    """Build an LRLambdaCase from parametrize-supplied field values.
+
+    Args:
+        request: Pytest fixture request whose ``param`` is a
+            ``(step, warmup_steps, decay_steps, decay_factor, expected)``
+            tuple supplied via ``@pytest.mark.parametrize(..., indirect=True)``.
+
+    Returns:
+        The corresponding LRLambdaCase.
+    """
+    step, warmup_steps, decay_steps, decay_factor, expected = cast(
+        tuple[int, int, int, float, float],
+        request.param,
+    )
+    return LRLambdaCase(
+        step=step,
+        warmup_steps=warmup_steps,
+        decay_steps=decay_steps,
+        decay_factor=decay_factor,
+        expected=expected,
+    )
+
+
+@pytest.mark.parametrize(
+    "lr_lambda_case",
+    [
+        (0, 0, 100, 0.95, 1.0),
+        (100, 0, 100, 0.95, 0.95),
+        (0, 1_000, 50_000, 0.95, 1 / 1_000),
+        (499, 1_000, 50_000, 0.95, 500 / 1_000),
+        (999, 1_000, 50_000, 0.95, 1.0),
+        (1_000, 1_000, 50_000, 0.95, 1.0),
+        (51_000, 1_000, 50_000, 0.95, 0.95),
+        (75_000, 1_000, 50_000, 0.95, 0.95),
+        (101_000, 1_000, 50_000, 0.95, 0.95**2),
+    ],
+    ids=[
+        "warmup_disabled_step_zero_full_lr",
+        "warmup_disabled_first_decay_boundary",
+        "warmup_enabled_first_step_tiny_nonzero",
+        "warmup_enabled_midpoint_half_lr",
+        "warmup_enabled_last_warmup_step_reaches_peak",
+        "warmup_just_ended_no_decay_yet",
+        "first_post_warmup_decay_boundary",
+        "between_decay_boundaries_holds_steady",
+        "second_post_warmup_decay_boundary",
+    ],
+    indirect=True,
+)
+def _approx_rel(expected: float) -> object:
+    """pytest.approx with TOLERANCE as the relative tolerance.
+
+    Isolates the single reportUnknownMemberType suppression needed for
+    pytest.approx's partially-unknown return type behind one typed wrapper,
+    reused by every float-comparison test below.
+
+    Args:
+        expected: The value the actual result is compared against.
+
+    Returns:
+        An ApproxBase comparable via ``==`` against a float.
+    """
+    return pytest.approx(  # pyright: ignore[reportUnknownMemberType]
+        expected,
+        rel=TOLERANCE,
+    )
+
+
+def test_alphafold_lr_lambda_returns_expected_multiplier(
+    lr_lambda_case: LRLambdaCase,
+) -> None:
+    """alphafold_lr_lambda ramps linearly through warmup, then step-decays."""
+    multiplier = alphafold_lr_lambda(
+        lr_lambda_case.step,
+        warmup_steps=lr_lambda_case.warmup_steps,
+        decay_steps=lr_lambda_case.decay_steps,
+        decay_factor=lr_lambda_case.decay_factor,
+    )
+    assert multiplier == _approx_rel(lr_lambda_case.expected)
+
+
+_WARMUP_DECAY_BASE_LR = 2.0
+_WARMUP_DECAY_WARMUP_STEPS = 4
+_WARMUP_DECAY_DECAY_STEPS = 3
+_WARMUP_DECAY_DECAY_FACTOR = 0.5
+
+
+@pytest.fixture
+def warmup_decay_optimizer() -> Adam:
+    """Adam optimizer over a single dummy parameter at a fixed base LR."""
+    param = nn.Parameter(torch.zeros(1))
+    return Adam([param], lr=_WARMUP_DECAY_BASE_LR)
+
+
+@pytest.mark.parametrize(
+    "n_steps",
+    [0, 1, 3, 4, 5, 7, 10],
+    ids=[
+        "construction_only_first_warmup_value",
+        "one_step_into_warmup",
+        "last_warmup_step",
+        "warmup_just_ended_no_decay",
+        "one_step_past_warmup_before_decay_boundary",
+        "first_decay_boundary_reached",
+        "second_decay_boundary_reached",
+    ],
+)
+def test_lambda_lr_matches_alphafold_lr_lambda_through_real_scheduler(
+    warmup_decay_optimizer: Adam,
+    n_steps: int,
+) -> None:
+    """A real LambdaLR driven by alphafold_lr_lambda reproduces its outputs.
+
+    Steps a genuine torch.optim.lr_scheduler.LambdaLR n_steps times beyond
+    its construction-time initial value, then checks the optimizer's live
+    LR equals base_lr times alphafold_lr_lambda evaluated at the same step
+    count -- exercising the real PyTorch scheduler machinery end to end
+    rather than just the bare multiplier function in isolation.
+    """
+    scheduler = LambdaLR(
+        warmup_decay_optimizer,
+        lr_lambda=functools.partial(
+            alphafold_lr_lambda,
+            warmup_steps=_WARMUP_DECAY_WARMUP_STEPS,
+            decay_steps=_WARMUP_DECAY_DECAY_STEPS,
+            decay_factor=_WARMUP_DECAY_DECAY_FACTOR,
+        ),
+    )
+    for _ in range(n_steps):
+        scheduler.step()
+    expected = _WARMUP_DECAY_BASE_LR * alphafold_lr_lambda(
+        n_steps,
+        warmup_steps=_WARMUP_DECAY_WARMUP_STEPS,
+        decay_steps=_WARMUP_DECAY_DECAY_STEPS,
+        decay_factor=_WARMUP_DECAY_DECAY_FACTOR,
+    )
+    actual = cast(float, warmup_decay_optimizer.param_groups[0]["lr"])
+    assert actual == _approx_rel(expected)
 
 
 _N_RES_BUCKET = 42

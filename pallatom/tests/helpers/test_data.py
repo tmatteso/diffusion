@@ -8,6 +8,7 @@ length/indexing; and make_bucketed_data_loaders behaviour.
 """
 
 import dataclasses
+import functools
 import json
 import math
 import pathlib
@@ -44,7 +45,7 @@ from helpers.data import (
 from helpers.useful_objects import ModelSetup, manual_seed
 from jaxtyping import Bool, Float, TypeCheckError
 from torch.optim import Adam
-from torch.optim.lr_scheduler import StepLR
+from torch.optim.lr_scheduler import LambdaLR
 from train.train_config import (
     LoaderConfig as EvalLoaderConfig,
 )
@@ -53,6 +54,7 @@ from train.train_config import (
     TrainConfig,
     TrainLoaderConfig,
 )
+from train.train_loop import alphafold_lr_lambda
 
 # ---------------------------------------------------------------------------
 # test_batch_types block — FeaturizedItem and FeaturizedBatch shape contracts
@@ -905,10 +907,14 @@ def model_params(
         noise_params=tcfg.noise,
     ).eval()
     optimizer = Adam(trunk.parameters(), lr=tcfg.training.lr)
-    scheduler = StepLR(
+    scheduler = LambdaLR(
         optimizer,
-        step_size=tcfg.training.lr_decay_steps,
-        gamma=tcfg.training.lr_decay_factor,
+        lr_lambda=functools.partial(
+            alphafold_lr_lambda,
+            warmup_steps=tcfg.training.lr_warmup_steps,
+            decay_steps=tcfg.training.lr_decay_steps,
+            decay_factor=tcfg.training.lr_decay_factor,
+        ),
     )
     return ModelSetup(
         model=trunk,
