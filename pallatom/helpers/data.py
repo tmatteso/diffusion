@@ -33,18 +33,17 @@ from beartype import beartype
 from einops import rearrange, reduce, repeat
 from helpers.alignment import centre_random_augment, masked_com
 from helpers.atom_utils import (
-    ATOM5_CA,
-    ATOM5_ELEMENTS,
-    ATOM5_NAMES,
+    ATOM14_CA,
+    ATOMS_PER_RES,
     Protein,
-    atom5_to_atom37,
-    atom37_to_atom5,
+    atom14_to_cb,
+    atom37_to_atom14,
     atom37_to_cb,
     center_positions,
+    gather_ref_pos_and_element,
     make_fixed_size,
     make_np_example,
     restype_order,
-    rigid_group_atom_positions,
     truncate_to_length,
 )
 from helpers.context_managers import (
@@ -77,8 +76,8 @@ class FeaturizedItem:
     Attributes:
         r_gt: Ground-truth atom positions in flat (atom-indexed) layout.
         r_gt_noised: Noised atom positions in flat (atom-indexed) layout.
-        atom5_mask: Boolean mask indicating which of the 5 backbone+Cβ atoms
-            are present for each residue.
+        atom14_mask: Boolean mask indicating which of the up-to-14 heavy
+            atoms are present for each residue.
         f_pseudo_beta_mask: Boolean mask indicating residues that have a valid
             pseudo-β carbon, used to build the template Cβ distogram.
         gt_res_distogram_indices: Integer bin index per residue pair from
@@ -112,7 +111,7 @@ class FeaturizedItem:
 
     r_gt: Float[torch.Tensor, "N_atom 3"]
     r_gt_noised: Float[torch.Tensor, "N_atom 3"]
-    atom5_mask: Bool[torch.Tensor, "N_atom"]
+    atom14_mask: Bool[torch.Tensor, "N_atom"]
     f_pseudo_beta_mask: Int[torch.Tensor, "N_res"]
     gt_res_distogram_indices: Int[torch.Tensor, "N_res N_res"]
     noised_res_distogram: Float[torch.Tensor, "N_res N_res n_templ_bins"]
@@ -161,8 +160,8 @@ class FeaturizedBatch:
             prepended.
         r_gt_noised: Noisy version of ``r_gt`` at noise level ``t_hat``, used
             as the diffusion model input.
-        atom5_mask: Boolean mask for the five canonical backbone atoms per
-            residue after flattening.
+        atom14_mask: Boolean mask for the up-to-14 heavy atoms per residue
+            after flattening.
         aa_indices: Integer amino-acid class indices per residue (vocabulary
             size 20) with batch dimension prepended.
         t_hat: Per-item noise level sigma, one scalar per batch element.
@@ -188,7 +187,7 @@ class FeaturizedBatch:
     f_residue_idx: Int[torch.Tensor, "B N_res"]
     r_gt: Float[torch.Tensor, "B N_atom 3"]
     r_gt_noised: Float[torch.Tensor, "B N_atom 3"]
-    atom5_mask: Bool[torch.Tensor, "B N_atom"]
+    atom14_mask: Bool[torch.Tensor, "B N_atom"]
     aa_indices: Int[torch.Tensor, "B N_res"]
     t_hat: Float[torch.Tensor, "B"]
     t_normalized: Float[torch.Tensor, "B N_res N_res"]
@@ -240,7 +239,7 @@ class FeaturizedBatch:
             ),
             r_gt=self.r_gt.to(device, non_blocking=non_blocking),
             r_gt_noised=self.r_gt_noised.to(device, non_blocking=non_blocking),
-            atom5_mask=self.atom5_mask.to(device, non_blocking=non_blocking),
+            atom14_mask=self.atom14_mask.to(device, non_blocking=non_blocking),
             aa_indices=self.aa_indices.to(device, non_blocking=non_blocking),
             t_hat=self.t_hat.to(device, non_blocking=non_blocking),
             t_normalized=self.t_normalized.to(
@@ -282,7 +281,7 @@ class FeaturizedBatch:
             f_residue_idx=self.f_residue_idx.pin_memory(),
             r_gt=self.r_gt.pin_memory(),
             r_gt_noised=self.r_gt_noised.pin_memory(),
-            atom5_mask=self.atom5_mask.pin_memory(),
+            atom14_mask=self.atom14_mask.pin_memory(),
             aa_indices=self.aa_indices.pin_memory(),
             t_hat=self.t_hat.pin_memory(),
             t_normalized=self.t_normalized.pin_memory(),
@@ -307,7 +306,7 @@ class Distogram(nn.Module):
 
     - ``(..., N, 3)``    — single atom per residue (e.g. pseudo-Cβ),
       auto-expanded to ``(..., N, 1, 3)``
-    - ``(..., N, A, 3)`` — A atoms per residue (e.g. atom5, atom37)
+    - ``(..., N, A, 3)`` — A atoms per residue (e.g. atom14, atom37)
 
     Args:
         n_bins: Number of distance bins.
@@ -510,26 +509,6 @@ def sinusoidal_encoding(
 
 
 @jaxtyped(typechecker=beartype)
-def ref_pos_for_residue(resname: str) -> Float[torch.Tensor, "5 3"]:
-    """Return reference atom positions for the 5 ATOM5 atoms of a residue.
-
-    Args:
-        resname: Three-letter residue name (e.g. "ALA", "GLY").
-
-    Returns:
-        Tensor of shape (5, 3) with XYZ coordinates for each ATOM5 atom;
-        atoms absent from rigid_group_atom_positions default to (0, 0, 0).
-    """
-    pos_by_name = {
-        name: pos for name, _, pos in rigid_group_atom_positions[resname]
-    }
-    return torch.tensor(
-        [pos_by_name.get(name, (0.0, 0.0, 0.0)) for name in ATOM5_NAMES],
-        dtype=torch.float32,
-    )
-
-
-@jaxtyped(typechecker=beartype)
 def featurize_single_item(
     prot: Protein,
     template_distogram_fn: Distogram,
@@ -540,11 +519,11 @@ def featurize_single_item(
 ) -> FeaturizedItem:
     """Featurize one protein into model-ready tensors.
 
-    Converts atom37 coordinates to atom5, pads to max_seq_len_in_batch,
+    Converts atom37 coordinates to atom14, pads to max_seq_len_in_batch,
     computes ground-truth and self-conditioning Cβ distograms, builds the
-    sparse atom-pair distogram over the local residue window, tiles ALA
-    reference geometry across residues, and samples a diffusion noise level
-    from the lognormal schedule.
+    sparse atom-pair distogram over the local residue window, gathers each
+    residue's own true reference geometry, and samples a diffusion noise
+    level from the lognormal schedule.
 
     Args:
         prot: Protein with atom37 coordinates, mask, sequence,
@@ -565,9 +544,9 @@ def featurize_single_item(
     Returns:
         FeaturizedItem holding flat atom positions (ground-truth and noised),
         atom and residue masks, GT and noised Cβ distogram targets, sparse
-        atom-pair distogram targets, ALA reference geometry, sequence indices,
-        the sampled noise level ``t_hat``, and the uniform template weight
-        ``t_normalized``.
+        atom-pair distogram targets, per-residue reference geometry,
+        sequence indices, the sampled noise level ``t_hat``, and the uniform
+        template weight ``t_normalized``.
     """
     noise_params = tcfg.noise
     window_size = tcfg.model.window_size
@@ -582,7 +561,6 @@ def featurize_single_item(
     )
     # The pdb residue number for calculating relative positional embedding
     f_residue_idx: Int[torch.Tensor, "N_res"] = torch.tensor(prot.residue_index)
-    Natom: int = 5
     unpadded_N_res: int = atom37_positions.shape[0]
 
     pad = max_seq_len_in_batch - unpadded_N_res
@@ -599,8 +577,7 @@ def featurize_single_item(
     )
     aa_indices[:unpadded_N_res] = torch.tensor(prot.aatype, dtype=torch.long)
 
-    ala_ref_pos: Float[torch.Tensor, "5 3"] = ref_pos_for_residue("ALA")
-    ala_ref_elem: Float[torch.Tensor, "5 4"] = ATOM5_ELEMENTS.float()
+    ref_pos_per_res, ref_elem_per_res = gather_ref_pos_and_element(aa_indices)
     # Noise schedule lognormal. ln(sigma) ~ N(Pmean, Pstd**2),
     # Pmean = -1.2, Pstd = 1.5, sigma_data = 16,
     # ~ N(0, I) * Pstd + Pmean == ~ N(Pmean, Pstd**2).
@@ -618,19 +595,20 @@ def featurize_single_item(
         m=N_res,
     )
 
-    atom5_pos, atom5_mask = atom37_to_atom5(
+    atom14_pos, atom14_mask = atom37_to_atom14(
         rearrange(atom37_positions, "n a d -> 1 n a d"),
         rearrange(atom37_mask, "n a -> 1 n a"),
+        rearrange(aa_indices, "n -> 1 n"),
     )
-    atom5_pos = rearrange(atom5_pos, "1 n a d -> n a d")
-    atom5_mask = rearrange(atom5_mask, "1 n a -> n a")
-    residue_mask: Bool[torch.Tensor, "N_res"] = atom5_mask.any(dim=-1)
+    atom14_pos = rearrange(atom14_pos, "1 n a d -> n a d")
+    atom14_mask = rearrange(atom14_mask, "1 n a -> n a")
+    residue_mask: Bool[torch.Tensor, "N_res"] = atom14_mask.any(dim=-1)
     # f_pseudo_beta: Mask indicating if the Cβ atom has coordinates for the
     # template at this residue, where 1 indicates existing residues and 0 is
     # used for padding residues. f_pseudo_beta == residue_mask
 
     atom_mask_flat: Bool[torch.Tensor, "N_atom"] = rearrange(
-        atom5_mask.bool(),
+        atom14_mask.bool(),
         "n a -> (n a)",
     )
 
@@ -640,7 +618,7 @@ def featurize_single_item(
     # atom slots from biasing the centroid toward the origin.
     flat_pos: Float[torch.Tensor, "N_atom 3"] = rearrange(
         centre_random_augment(
-            rearrange(atom5_pos, "n a d -> 1 (n a) d"),
+            rearrange(atom14_pos, "n a d -> 1 (n a) d"),
             mask=rearrange(atom_mask_flat, "n -> 1 n"),
         ),
         "1 n d -> n d",
@@ -677,16 +655,12 @@ def featurize_single_item(
         )
     )
 
-    # Noised Cβ → self-conditioning template
-    atom37_noised, _ = atom5_to_atom37(
-        rearrange(r_gt_noised, "(n a) d -> 1 n a d", a=Natom),  # add B=1
-        rearrange(atom5_mask, "n a -> 1 n a"),  # add B=1
-    )
-    atom37_noised = rearrange(atom37_noised, "1 n a d -> n a d")  # strip B
-
-    c_beta_pos_noised, _ = atom37_to_cb(
-        rearrange(atom37_noised, "n a d -> 1 n a d"),
-        rearrange(atom37_mask, "n a -> 1 n a"),
+    # Noised Cβ → self-conditioning template. Backbone + Cβ occupy the same
+    # fixed slots in atom14 as in atom37, so this reads Cβ directly off the
+    # noised atom14 positions with no aatype and no atom37 round trip.
+    c_beta_pos_noised, _ = atom14_to_cb(
+        rearrange(r_gt_noised, "(n a) d -> 1 n a d", a=ATOMS_PER_RES),
+        rearrange(atom14_mask, "n a -> 1 n a"),
     )
     c_beta_pos_noised = rearrange(c_beta_pos_noised, "1 n d -> n d")
     noised_res_distogram, _ = template_distogram_fn(
@@ -695,27 +669,27 @@ def featurize_single_item(
     )
 
     ref_pos: Float[torch.Tensor, "N_atom 3"] = rearrange(
-        repeat(ala_ref_pos, "a d -> n a d", n=N_res),
+        ref_pos_per_res,
         "n a d -> (n a) d",
     )
     ref_elem: Float[torch.Tensor, "N_atom 4"] = rearrange(
-        repeat(ala_ref_elem, "a e -> n a e", n=N_res),
+        ref_elem_per_res,
         "n a e -> (n a) e",
     )
     # atom to residue map
     token_idx: Int[torch.Tensor, "N_atom"] = torch.arange(
         N_res,
-    ).repeat_interleave(Natom)
+    ).repeat_interleave(ATOMS_PER_RES)
     # center is alpha carbon for standard protein residues,
     # C1prime for nucleic acid residues.
     center_single: Int[torch.Tensor, "N_atom"] = (
-        torch.arange(N_res) * 5 + ATOM5_CA
-    ).repeat_interleave(Natom)
+        torch.arange(N_res) * ATOMS_PER_RES + ATOM14_CA
+    ).repeat_interleave(ATOMS_PER_RES)
     # ref_space_uid is the numerical encoding of the chain id and residue
     # index associated with this reference conformer. Each (chain id, residue
     # index) tuple is assigned an integer on first appearance.
     ref_space_uid: Int[torch.Tensor, "N_atom"] = (
-        f_residue_idx.repeat_interleave(Natom)
+        f_residue_idx.repeat_interleave(ATOMS_PER_RES)
     )
     # because we are only using one chain right now,
     # f_residue_idx == ref_space_uid.
@@ -766,7 +740,7 @@ def featurize_single_item(
     return FeaturizedItem(
         r_gt=flat_pos,
         r_gt_noised=r_gt_noised,
-        atom5_mask=atom_mask_flat,
+        atom14_mask=atom_mask_flat,
         f_pseudo_beta_mask=residue_mask.long(),
         gt_res_distogram_indices=gt_res_distogram_indices,
         noised_res_distogram=noised_res_distogram,
@@ -842,7 +816,7 @@ def featurize_batch(
         f_residue_idx=packed["f_residue_idx"],
         r_gt=packed["r_gt"],
         r_gt_noised=packed["r_gt_noised"],
-        atom5_mask=packed["atom5_mask"],
+        atom14_mask=packed["atom14_mask"],
         aa_indices=packed["aa_indices"],
         t_hat=packed["t_hat"],
         t_normalized=packed["t_normalized"],

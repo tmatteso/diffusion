@@ -324,7 +324,7 @@ def featurized_batch(  # noqa: PLR0913
         f_residue_idx=f_residue_idx,
         r_gt=torch.zeros_like(r_input),
         r_gt_noised=r_input,
-        atom5_mask=torch.ones(B, N_ATOM, dtype=torch.bool),
+        atom14_mask=torch.ones(B, N_ATOM, dtype=torch.bool),
         aa_indices=torch.zeros(B, N_RES, dtype=torch.long),
         t_hat=torch.rand(B) + 0.1,
         t_normalized=torch.randn(B, N_RES, N_RES),
@@ -745,7 +745,7 @@ def test_integration_gradient_flow_composite_loss(
     kabsch_loss = atom_loss(
         pred.r_denoised,
         featurized_batch.r_gt,
-        featurized_batch.atom5_mask.float(),
+        featurized_batch.atom14_mask.float(),
         aa_indices=featurized_batch.aa_indices,
         lambda_sigma_weight=torch.ones(B),
     ).mean()
@@ -753,7 +753,7 @@ def test_integration_gradient_flow_composite_loss(
     lddt = smooth_lddt_loss(
         pred.r_denoised,
         featurized_batch.r_gt,
-        featurized_batch.atom5_mask,
+        featurized_batch.atom14_mask,
         cutoff=15.0,
     )
     gt_res_bin_idx = featurized_batch.gt_res_distogram_indices.clamp(
@@ -784,7 +784,7 @@ def test_integration_gradient_flow_composite_loss(
         k_loss = atom_loss(
             inter_coords,
             featurized_batch.r_gt,
-            featurized_batch.atom5_mask.float(),
+            featurized_batch.atom14_mask.float(),
             aa_indices=featurized_batch.aa_indices,
             lambda_sigma_weight=torch.ones(B),
         ) + seq_ce_loss(inter_logits, featurized_batch.aa_indices)

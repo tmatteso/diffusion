@@ -223,7 +223,7 @@ def med_loss(
     if len(logits_aa_blocks) != K:
         raise BlockCountMismatchError(K, len(logits_aa_blocks))
 
-    atom5_mask_f: Float[torch.Tensor, "B N_atom"] = batch.atom5_mask.float()
+    atom14_mask_f: Float[torch.Tensor, "B N_atom"] = batch.atom14_mask.float()
     intermediate_loss: Float[torch.Tensor, "B"] = torch.zeros(
         lambda_sigma_weight.shape[0],
         device=r_denoised_blocks[0].device,
@@ -240,7 +240,7 @@ def med_loss(
         structure_loss: Float[torch.Tensor, "B"] = atom_loss(
             intermediate_denoised_coord,
             batch.r_gt,
-            atom5_mask_f,
+            atom14_mask_f,
             aa_indices=batch.aa_indices,
             lambda_sigma_weight=lambda_sigma_weight,
         )

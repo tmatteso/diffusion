@@ -321,7 +321,7 @@ class MainTrunk(nn.Module):
         noise_params: NoiseScheduleParams,
     ) -> None:
         super().__init__()
-        # 5 * (3+4) 4 because N C O UNK
+        # 14 * (3+4), 4 because N C O UNK
         self.f_ref_dim: int = model_params.f_ref_dim
         self.sigma_data: float = noise_params.sigma_data
         self.K_unit: int = model_params.K_unit

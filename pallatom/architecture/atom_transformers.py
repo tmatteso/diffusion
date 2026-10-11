@@ -667,8 +667,9 @@ class AtomFeatureEncoder(nn.Module):
 
         # ------------------------------------------------------------------
         # Build sparse pair index per batch item and stack into (B, N, K).
-        # Every sequence has 5 atoms per residue, so K is identical across
-        # batch items and torch.stack works without padding.
+        # Every sequence has the same fixed number of atom slots per residue,
+        # so K is identical across batch items and torch.stack works without
+        # padding.
         # ------------------------------------------------------------------
         per_batch_nidx: list[Int[torch.Tensor, "N_atom K"]] = []
         per_batch_wvalid: list[Bool[torch.Tensor, "N_atom K"]] = []
@@ -1008,7 +1009,8 @@ class AtomAttentionDecoder(nn.Module):
         N_atom = tok_idx.size(1)
 
         # Build sparse pair index per batch item and stack — K is identical
-        # across items since every residue has 5 atoms.
+        # across items since every residue has the same fixed number of
+        # atom slots.
         per_batch_nidx: list[Int[torch.Tensor, "N_atom K"]] = []
         per_batch_wvalid: list[Bool[torch.Tensor, "N_atom K"]] = []
         for b in range(B):
