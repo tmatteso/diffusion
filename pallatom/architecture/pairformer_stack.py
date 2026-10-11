@@ -31,14 +31,10 @@ from jaxtyping import Float, jaxtyped
 from torch.utils.checkpoint import checkpoint
 
 
-# ---------------------------------------------------------------------------
-# TriangleMultiplicationOutgoing  (Alg 17 step 2)
-# m_ij = gate(z_ij) · out(norm(Σ_k a_ik ⊙ b_kj))
-# ---------------------------------------------------------------------------
 class TriangleMultiplicationOutgoing(nn.Module):
     """Outgoing triangle multiplicative update on pair embeddings.
 
-    Implements Algorithm 17 step 2: for each (i, j) pair the output is
+    Implements AF3 Algorithm 12: for each (i, j) pair the output is
     ``gate(z_ij) · proj_out(norm(Σ_k a_ik ⊙ b_kj))``, where ``a`` and ``b``
     are gated projections of the layer-normalised pair embedding ``z``.
     """
@@ -98,16 +94,10 @@ class TriangleMultiplicationOutgoing(nn.Module):
         return g * self.proj_out(self.norm_out(m))
 
 
-# ---------------------------------------------------------------------------
-# TriangleMultiplicationIncoming  (Alg 17 step 3)
-# m_ij = gate(z_ij) · out(norm(Σ_k a_ki ⊙ b_jk))
-# ---------------------------------------------------------------------------
-
-
 class TriangleMultiplicationIncoming(nn.Module):
     """Incoming triangle multiplicative update on pair embeddings.
 
-    Implements Algorithm 17 step 3: for each (i, j) pair the output is
+    Implements AF3 Algorithm 13: for each (i, j) pair the output is
     ``gate(z_ij) · proj_out(norm(Σ_k a_ki ⊙ b_jk))``, where ``a`` and ``b``
     are gated projections of the layer-normalised pair embedding ``z``.
     """
@@ -234,7 +224,7 @@ class PairformerBlock(nn.Module):
                 c_res=c_res,
                 c_pair=c_pair,
                 n_heads=self.n_heads,
-            )  # n head = 16 as per AF3.
+            )
 
             self.transition2: Transition = Transition(c_res)
 

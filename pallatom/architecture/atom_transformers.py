@@ -257,11 +257,6 @@ class DiffusionTransformer(nn.Module):
         return a
 
 
-# ---------------------------------------------------------------------------
-# Sparse-pair index builder
-# ---------------------------------------------------------------------------
-
-
 def build_sparse_pairs(
     tok_idx: Int[torch.Tensor, "N"],
     window_size: int = WINDOW_SIZE,
@@ -316,11 +311,6 @@ def build_sparse_pairs(
     neighbor_idx = neighbor_idx.clamp(max=N - 1)
 
     return neighbor_idx, valid_mask
-
-
-# ---------------------------------------------------------------------------
-# compute_beta — Algorithm 7 line 1
-# ---------------------------------------------------------------------------
 
 
 @jaxtyped(typechecker=beartype)
@@ -402,13 +392,8 @@ def compute_beta(
     )
 
 
-# ---------------------------------------------------------------------------
-# AtomTransformer — stack of sparse blocks
-# ---------------------------------------------------------------------------
-
-
 class AtomTransformer(nn.Module):
-    """Implements Algorithm 7 (AtomTransformer).
+    """Implements Alphafold3 Algorithm 7 (AtomTransformer).
 
     Constructs the sequence-local β mask once — 0 for atom pairs that share a
     sliding window centre, -1e10 elsewhere — then runs n_blocks rounds of
@@ -515,11 +500,6 @@ class AtomTransformer(nn.Module):
         # Algorithm 7 line 2:
         # DiffusionTransformer — n_blocks rounds of attention + transition
         return self.blocks(q, c, p, beta, neighbor_idx=neighbor_idx)
-
-
-# ---------------------------------------------------------------------------
-# AtomFeatureEncoder — Algorithm 4
-# ---------------------------------------------------------------------------
 
 
 class AtomFeatureEncoder(nn.Module):
@@ -888,11 +868,6 @@ class AtomFeatureEncoder(nn.Module):
         return s_i, q_skip, c_skip, p_skip, c_l
 
 
-# ---------------------------------------------------------------------------
-# AtomAttentionDecoder — Algorithm 5
-# ---------------------------------------------------------------------------
-
-
 class AtomAttentionDecoder(nn.Module):
     """Decodes trunk embeddings back to per-atom position updates.
 
@@ -1088,7 +1063,7 @@ class AtomAttentionDecoder(nn.Module):
         # Step 3: p += MLP(p) residual; zero padding slots
         p = (p + self.mlp_p(p)) * rearrange(valid_mask, "b n k -> b n k 1")
 
-        # Step 4: AtomTransformer — 32-residue sparse window
+        # Step 4: AtomTransformer — sparse windowed attention
         q = self.transformer(
             q,
             c,

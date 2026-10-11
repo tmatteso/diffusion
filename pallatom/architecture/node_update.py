@@ -1,7 +1,8 @@
 """Node update modules for single-representation refinement.
 
 Contains AdaLN (adaptive layer normalisation), AttentionPairBias (pair-biased
-self-attention), and NodeUpdate (Algorithm 6 single-embedding update step).
+self-attention), and NodeUpdate (P(all-atom) Algorithm 6 single-embedding
+update step).
 """
 
 import math
@@ -27,7 +28,7 @@ class InvalidSingleHeadDimensionError(ValueError):
 
 
 class AdaLN(nn.Module):
-    """Adaptive LayerNorm — Algorithm 26.
+    """Adaptive LayerNorm — Alphafold3 Algorithm 26.
 
     Normalises a conditioned on s:
         norm_a(a) scaled and shifted by functions of norm_s(s).
@@ -35,7 +36,9 @@ class AdaLN(nn.Module):
 
     def __init__(self, c_a: int, c_s: int) -> None:
         super().__init__()
+        # elementwise_affine=False means it will not learn the scale and shift
         self.norm_a: LayerNorm = LayerNorm(c_a, elementwise_affine=False)
+        # elementwise_affine=False means it will not learn the shift
         self.norm_s: LayerNorm = LayerNorm(c_s, bias=False)
         self.to_scale: TypedLinear = TypedLinear(c_s, c_a)
         self.to_shift: LinearNoBias = LinearNoBias(c_s, c_a)
@@ -73,17 +76,6 @@ class AdaLN(nn.Module):
         a = self.norm_a(a)
         s = self.norm_s(s)
         return torch.sigmoid(self.to_scale(s)) * a + self.to_shift(s)
-
-
-# ---------------------------------------------------------------------------
-# AttentionPairBias
-# ---------------------------------------------------------------------------
-# Standard single-sequence self-attention where z_ij provides a per-head
-# additive bias on the attention logits, and t_i is injected as a bias on
-# the queries (time / noise-level conditioning).
-#
-# With β_ij = 0 the pair bias is purely additive (no learned gating).
-# ---------------------------------------------------------------------------
 
 
 class AttentionPairBias(nn.Module):
@@ -202,7 +194,7 @@ class AttentionPairBias(nn.Module):
                 n_heads=self.n_heads,
             ),
         )
-
+        # sparse path
         if neighbor_idx is not None:
             B = k.shape[0]
             batch_idx = torch.arange(B, device=k.device)[
@@ -255,19 +247,14 @@ class AttentionPairBias(nn.Module):
         return a
 
 
-# ---------------------------------------------------------------------------
-# NodeUpdate — Algorithm 6
-# ---------------------------------------------------------------------------
-
-
 class NodeUpdate(nn.Module):
     """Parameters
 
     ----------
     c       : single embedding dim
     c_pair  : pair   embedding dim
-    n_heads : attention heads       (default 8, per Algorithm 6)
-    dropout : rowwise dropout prob  (default 0.25, per Algorithm 6)
+    n_heads : attention heads       (default 8, per P(all-atom) Algorithm 6)
+    dropout : rowwise dropout prob  (default 0.25, per P(all-atom) Algorithm 6)
     """
 
     def __init__(

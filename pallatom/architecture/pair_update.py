@@ -1,4 +1,4 @@
-"""PairUpdate — based on Algorithm 7 from the AlphaFold 3 paper.
+"""PairUpdate — based on Algorithm 7 from the P(all-atom) paper.
 
 Replaces the simplified PairUpdate stub in main_trunk.py.
 
@@ -25,10 +25,6 @@ from beartype import beartype
 from einops import rearrange, reduce
 from jaxtyping import Float, jaxtyped
 from torch.nn.attention import SDPBackend, sdpa_kernel
-
-# ---------------------------------------------------------------------------
-# RBF transform  (Transform_RBF in step 2)
-# ---------------------------------------------------------------------------
 
 
 @dataclasses.dataclass(frozen=True)
@@ -99,13 +95,6 @@ class TransformRBF(nn.Module):
             * self.sigma**2,
         )
         return rbf
-
-
-# ---------------------------------------------------------------------------
-# TriangleAttentionStartingNode  (step 3)
-# "Starting node" = row-wise gated self-attention on z_ij,
-#  biased by b_ij (coordinate pair bias).
-# ---------------------------------------------------------------------------
 
 
 class TriangleAttentionStartingNodeWithBias(nn.Module):
@@ -224,13 +213,6 @@ class TriangleAttentionStartingNodeWithBias(nn.Module):
         return self.to_out(out)
 
 
-# ---------------------------------------------------------------------------
-# TriangleAttentionEndingNode  (step 4)
-# "Ending node" = column-wise gated self-attention on z_ij,
-#  biased by b_ij.
-# ---------------------------------------------------------------------------
-
-
 class TriangleAttentionEndingNodeWithBias(nn.Module):
     """Column-wise triangle attention over pair embeddings, biased by b_ij.
 
@@ -344,11 +326,6 @@ class TriangleAttentionEndingNodeWithBias(nn.Module):
         return self.to_out(out)
 
 
-# ---------------------------------------------------------------------------
-# Transition  (step 5)
-# ---------------------------------------------------------------------------
-
-
 class Transition(nn.Module):
     """Two-layer feed-forward transition block applied to pair embeddings.
 
@@ -397,11 +374,6 @@ class Transition(nn.Module):
         b = self.x_to_b(x)
         hidden = F.silu(a) * b
         return self.hidden_to_out(hidden)
-
-
-# ---------------------------------------------------------------------------
-# DropoutRowwise / DropoutColumnwise
-# ---------------------------------------------------------------------------
 
 
 class DropoutRowwise(nn.Module):
@@ -494,11 +466,6 @@ class DropoutColumnwise(nn.Module):
         return x * mask
 
 
-# ---------------------------------------------------------------------------
-# PairUpdate — Algorithm 7
-# ---------------------------------------------------------------------------
-
-
 class PairUpdate(nn.Module):
     """Parameters
 
@@ -558,7 +525,7 @@ class PairUpdate(nn.Module):
     ) -> Float[torch.Tensor, "B N_res N_res c_pair"]:
         """Update pair embeddings with triangle attention and RBF bias.
 
-        Implements Algorithm 7 from the AlphaFold 3 paper in five steps:
+        Implements Algorithm 7 from the P(all-atom) 3 paper in five steps:
         compute pairwise distances, project them through an RBF bias, apply
         rowwise triangle attention, apply columnwise triangle attention, and
         apply a feed-forward transition.
