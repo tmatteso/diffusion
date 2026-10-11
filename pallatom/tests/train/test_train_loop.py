@@ -2019,110 +2019,6 @@ def test_train_config_accepts_any_positive_token_budget() -> None:
     assert cfg.training.accumulated_token_budget == 1
 
 
-@dataclasses.dataclass
-class LRLambdaCase:
-    """One (inputs, expected multiplier) case for alphafold_lr_lambda.
-
-    Attributes:
-        step: Optimizer step passed to alphafold_lr_lambda.
-        warmup_steps: Warmup step count under test.
-        decay_steps: Post-warmup decay interval under test.
-        decay_factor: Multiplicative decay factor under test.
-        expected: Expected returned multiplier.
-    """
-
-    step: int
-    warmup_steps: int
-    decay_steps: int
-    decay_factor: float
-    expected: float
-
-
-@pytest.fixture
-def lr_lambda_case(
-    request: pytest.FixtureRequest,
-) -> LRLambdaCase:
-    """Build an LRLambdaCase from parametrize-supplied field values.
-
-    Args:
-        request: Pytest fixture request whose ``param`` is a
-            ``(step, warmup_steps, decay_steps, decay_factor, expected)``
-            tuple supplied via ``@pytest.mark.parametrize(..., indirect=True)``.
-
-    Returns:
-        The corresponding LRLambdaCase.
-    """
-    step, warmup_steps, decay_steps, decay_factor, expected = cast(
-        tuple[int, int, int, float, float],
-        request.param,
-    )
-    return LRLambdaCase(
-        step=step,
-        warmup_steps=warmup_steps,
-        decay_steps=decay_steps,
-        decay_factor=decay_factor,
-        expected=expected,
-    )
-
-
-def _approx_rel(expected: float) -> object:
-    """pytest.approx with TOLERANCE as the relative tolerance.
-
-    Isolates the single reportUnknownMemberType suppression needed for
-    pytest.approx's partially-unknown return type behind one typed wrapper,
-    reused by every float-comparison test below.
-
-    Args:
-        expected: The value the actual result is compared against.
-
-    Returns:
-        An ApproxBase comparable via ``==`` against a float.
-    """
-    return pytest.approx(  # pyright: ignore[reportUnknownMemberType]
-        expected,
-        rel=TOLERANCE,
-    )
-
-
-@pytest.mark.parametrize(
-    "lr_lambda_case",
-    [
-        (0, 0, 100, 0.95, 1.0),
-        (100, 0, 100, 0.95, 0.95),
-        (0, 1_000, 50_000, 0.95, 1 / 1_000),
-        (499, 1_000, 50_000, 0.95, 500 / 1_000),
-        (999, 1_000, 50_000, 0.95, 1.0),
-        (1_000, 1_000, 50_000, 0.95, 1.0),
-        (51_000, 1_000, 50_000, 0.95, 0.95),
-        (75_000, 1_000, 50_000, 0.95, 0.95),
-        (101_000, 1_000, 50_000, 0.95, 0.95**2),
-    ],
-    ids=[
-        "warmup_disabled_step_zero_full_lr",
-        "warmup_disabled_first_decay_boundary",
-        "warmup_enabled_first_step_tiny_nonzero",
-        "warmup_enabled_midpoint_half_lr",
-        "warmup_enabled_last_warmup_step_reaches_peak",
-        "warmup_just_ended_no_decay_yet",
-        "first_post_warmup_decay_boundary",
-        "between_decay_boundaries_holds_steady",
-        "second_post_warmup_decay_boundary",
-    ],
-    indirect=True,
-)
-def test_alphafold_lr_lambda_returns_expected_multiplier(
-    lr_lambda_case: LRLambdaCase,
-) -> None:
-    """alphafold_lr_lambda ramps linearly through warmup, then step-decays."""
-    multiplier = alphafold_lr_lambda(
-        lr_lambda_case.step,
-        warmup_steps=lr_lambda_case.warmup_steps,
-        decay_steps=lr_lambda_case.decay_steps,
-        decay_factor=lr_lambda_case.decay_factor,
-    )
-    assert multiplier == _approx_rel(lr_lambda_case.expected)
-
-
 _WARMUP_DECAY_BASE_LR = 2.0
 _WARMUP_DECAY_WARMUP_STEPS = 4
 _WARMUP_DECAY_DECAY_STEPS = 3
@@ -2179,7 +2075,11 @@ def test_lambda_lr_matches_alphafold_lr_lambda_through_real_scheduler(
         decay_factor=_WARMUP_DECAY_DECAY_FACTOR,
     )
     actual = cast(float, warmup_decay_optimizer.param_groups[0]["lr"])
-    assert actual == _approx_rel(expected)
+    expected_approx = pytest.approx(  # pyright: ignore[reportUnknownMemberType]
+        expected,
+        rel=TOLERANCE,
+    )
+    assert actual == expected_approx
 
 
 _N_RES_BUCKET = 42

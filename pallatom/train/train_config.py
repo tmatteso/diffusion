@@ -62,7 +62,7 @@ class TrainingParams(BaseModel):
             gradient-accumulation steps before a parameter update is applied.
         lr_warmup_steps: Number of initial optimizer steps over which the LR
             is linearly ramped up to the peak ``lr``, following AlphaFold 3's
-            published recipe (1,000 steps in the paper). ``0`` disables
+            published recipe (1,000 steps, the default here). ``0`` disables
             warmup, starting training at the full peak LR immediately.
         lr_decay_steps: Number of optimizer steps between each LR decay.
             Counted from the end of warmup, so the first decay lands
@@ -84,7 +84,7 @@ class TrainingParams(BaseModel):
     pretrained_weights: pathlib.Path | None = None
     resume_checkpoint: pathlib.Path | None = None
     accumulated_token_budget: int = Field(default=4096, gt=0)
-    lr_warmup_steps: int = Field(default=0, ge=0)
+    lr_warmup_steps: int = Field(default=1_000, ge=0)
     lr_decay_steps: int = Field(default=50_000, gt=0)
     lr_decay_factor: float = Field(default=0.95, gt=0, lt=1)
     ema_decay: float = Field(default=0.999, gt=0, lt=1)
