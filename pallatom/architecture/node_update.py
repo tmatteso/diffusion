@@ -194,8 +194,7 @@ class AttentionPairBias(nn.Module):
                 n_heads=self.n_heads,
             ),
         )
-
-        # dense path looks good, but I don't like this sparse path
+        # sparse path
         if neighbor_idx is not None:
             B = k.shape[0]
             batch_idx = torch.arange(B, device=k.device)[
