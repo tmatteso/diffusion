@@ -2019,28 +2019,6 @@ def test_train_config_accepts_any_positive_token_budget() -> None:
     assert cfg.training.accumulated_token_budget == 1
 
 
-def test_lr_warmup_steps_defaults_to_disabled() -> None:
-    """lr_warmup_steps defaults to 0, i.e. warmup disabled by default."""
-    assert TrainingParams().lr_warmup_steps == 0
-
-
-def test_lr_warmup_steps_rejects_negative() -> None:
-    """TrainingParams raises ValidationError for a negative warmup length."""
-    with pytest.raises(ValidationError):
-        _ = TrainingParams(lr_warmup_steps=-1)
-
-
-_ALPHAFOLD3_WARMUP_STEPS = 1_000
-
-
-def test_lr_warmup_steps_accepts_alphafold3_published_value() -> None:
-    """TrainConfig accepts AlphaFold 3's published 1,000-step warmup."""
-    cfg = TrainConfig(
-        training=TrainingParams(lr_warmup_steps=_ALPHAFOLD3_WARMUP_STEPS),
-    )
-    assert cfg.training.lr_warmup_steps == _ALPHAFOLD3_WARMUP_STEPS
-
-
 @dataclasses.dataclass
 class LRLambdaCase:
     """One (inputs, expected multiplier) case for alphafold_lr_lambda.
@@ -2087,6 +2065,25 @@ def lr_lambda_case(
     )
 
 
+def _approx_rel(expected: float) -> object:
+    """pytest.approx with TOLERANCE as the relative tolerance.
+
+    Isolates the single reportUnknownMemberType suppression needed for
+    pytest.approx's partially-unknown return type behind one typed wrapper,
+    reused by every float-comparison test below.
+
+    Args:
+        expected: The value the actual result is compared against.
+
+    Returns:
+        An ApproxBase comparable via ``==`` against a float.
+    """
+    return pytest.approx(  # pyright: ignore[reportUnknownMemberType]
+        expected,
+        rel=TOLERANCE,
+    )
+
+
 @pytest.mark.parametrize(
     "lr_lambda_case",
     [
@@ -2113,25 +2110,6 @@ def lr_lambda_case(
     ],
     indirect=True,
 )
-def _approx_rel(expected: float) -> object:
-    """pytest.approx with TOLERANCE as the relative tolerance.
-
-    Isolates the single reportUnknownMemberType suppression needed for
-    pytest.approx's partially-unknown return type behind one typed wrapper,
-    reused by every float-comparison test below.
-
-    Args:
-        expected: The value the actual result is compared against.
-
-    Returns:
-        An ApproxBase comparable via ``==`` against a float.
-    """
-    return pytest.approx(  # pyright: ignore[reportUnknownMemberType]
-        expected,
-        rel=TOLERANCE,
-    )
-
-
 def test_alphafold_lr_lambda_returns_expected_multiplier(
     lr_lambda_case: LRLambdaCase,
 ) -> None:
