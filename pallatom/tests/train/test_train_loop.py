@@ -10,8 +10,14 @@ import contextlib
 import dataclasses
 import functools
 import json
+import multiprocessing
+import os
 import pathlib
-from collections.abc import Generator
+import queue
+import socket
+from collections.abc import Generator, Sequence
+from datetime import timedelta
+from multiprocessing.process import BaseProcess
 from typing import cast
 
 import numpy as np
@@ -26,6 +32,7 @@ from helpers.atom_utils import RESTYPE_NUM, RESTYPE_NUM_NO_X, Protein
 from helpers.data import (
     Distogram,
     FeaturizedBatch,
+    build_distogram_module,
     featurize_batch,
     make_bucketed_data_loaders,
 )
@@ -59,6 +66,7 @@ from train.train_config import (
 )
 from train.train_loop import (
     alphafold_lr_lambda,
+    any_rank_true,
     component_grad_norms,
     evaluate,
     load_checkpoint,
@@ -103,6 +111,7 @@ EXPECTED_CHECKPOINT_KEYS = frozenset(
     {"model", "optimizer", "scheduler", "ema", "best_val_loss"},
 )
 _ADAM_EXP_AVG_KEY = "exp_avg"
+_ADAM_STEP_KEY = "step"
 
 
 def _make_model_params(
@@ -314,9 +323,8 @@ def distogram_atom() -> Distogram:
     ).eval()
 
 
-@pytest.fixture
-def model() -> MainTrunk:
-    """Provide a small MainTrunk instance for training loop tests.
+def _build_test_trunk() -> MainTrunk:
+    """Build the small MainTrunk shared by fixtures and DDP worker processes.
 
     Returns:
         MainTrunk built with reduced channel widths and block counts to keep
@@ -358,6 +366,16 @@ def model() -> MainTrunk:
             sigma_data=SIGMA_DATA,
         ),
     )
+
+
+@pytest.fixture
+def model() -> MainTrunk:
+    """Provide a small MainTrunk instance for training loop tests.
+
+    Returns:
+        MainTrunk built by ``_build_test_trunk``.
+    """
+    return _build_test_trunk()
 
 
 @pytest.fixture
@@ -1793,8 +1811,8 @@ def test_train_token_budget_preflush_fires_before_oversized_batch(
     - batch2: tokens+tokens > 7 → pre-flush batch1, then batch2 added
     - batch3: tokens+tokens > 7 → pre-flush batch2, then batch3 added
     - batch4: tokens+tokens > 7 → pre-flush batch3, then batch4 added
-    - epoch end: batch4 remains in buffer (no end-of-epoch flush)
-    Result: three optimizer windows each of size 1.
+    - epoch end: batch4 remains in buffer → end-of-epoch flush of batch4
+    Result: four optimizer windows each of size 1; no batch is dropped.
     """
     window_sizes: list[int] = []
     _real_process = process_accum_window
@@ -1883,7 +1901,7 @@ def test_train_token_budget_preflush_fires_before_oversized_batch(
         model_params=mp_b,
         log=log,
     )
-    assert window_sizes == [1, 1, 1]
+    assert window_sizes == [1, 1, 1, 1]
 
 
 def test_train_wandb_called_once_per_epoch_when_enabled(
@@ -2230,7 +2248,7 @@ def test_train_optimizer_state_non_zero_after_one_step(
     assert first_state[_ADAM_EXP_AVG_KEY].abs().max().item() > 0
 
 
-def test_train_scheduler_state_reflects_completed_epoch(
+def test_train_scheduler_state_matches_optimizer_step_count(
     model_params: ModelSetup,
     loaders: tuple[
         torch.utils.data.DataLoader[FeaturizedBatch],
@@ -2238,7 +2256,14 @@ def test_train_scheduler_state_reflects_completed_epoch(
     ],
     log: FilteringBoundLogger,
 ) -> None:
-    """Scheduler last_epoch in checkpoint equals number of epochs completed."""
+    """Checkpointed scheduler last_epoch equals the optimizer step count.
+
+    The LR schedule is per optimizer step (AlphaFold 3-style warmup), so
+    ``optimizer_step`` advances the scheduler once per optimizer step, not
+    once per epoch. Adam's per-parameter ``step`` counter records the same
+    number of optimizer steps, so the two must agree in the saved
+    checkpoint, and both must be positive after a training epoch.
+    """
     train_loader, test_loader = loaders
     train(
         best_val_loss=torch.tensor(float("inf")),
@@ -2254,9 +2279,13 @@ def test_train_scheduler_state_reflects_completed_epoch(
             weights_only=True,
         ),
     )
-    assert (
-        ckpt["scheduler"]["last_epoch"] == model_params.tcfg.training.num_epochs
+    opt_state = cast(
+        dict[int, dict[str, torch.Tensor]],
+        ckpt["optimizer"]["state"],
     )
+    adam_steps = int(next(iter(opt_state.values()))[_ADAM_STEP_KEY].item())
+    assert adam_steps > 0
+    assert ckpt["scheduler"]["last_epoch"] == adam_steps
 
 
 def test_train_wandb_epoch_increments_across_epochs(
@@ -2312,3 +2341,386 @@ def test_integration_gradient_flow_through_all_submodules(
             torch.isfinite(g).all().item() and g.abs().max().item() > 0
             for g in grads
         ), f"submodule '{prefix}' has no finite nonzero gradients"
+
+
+# ---------------------------------------------------------------------------
+# DDP: collective flush decision keeps ranks in lockstep
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def cpu_device() -> torch.device:
+    """Provide the CPU device used for gloo-backed collective tensors."""
+    return torch.device("cpu")
+
+
+@pytest.mark.parametrize("flag", [True, False], ids=["true", "false"])
+def test_any_rank_true_returns_flag_without_process_group(
+    flag: bool,  # noqa: FBT001
+    cpu_device: torch.device,
+) -> None:
+    """any_rank_true() returns the local flag unchanged on a single device.
+
+    Arrange: no distributed process group is initialised -- the state for
+    ordinary single-device training.
+    Act: call any_rank_true() with each boolean value.
+    Assert: the result equals the input, confirming single-device training
+    never attempts a collective call that would error without a group.
+    The multi-rank OR semantics are covered end to end by
+    test_train_ddp_uneven_protein_lengths_keeps_ranks_in_lockstep.
+    """
+    assert not dist.is_initialized()
+    assert any_rank_true(flag, cpu_device) is flag
+
+
+_DDP_WORLD_SIZE = 2
+_DDP_SHORT_RES = 2
+_DDP_LONG_RES = 6
+_DDP_BATCHES_PER_RANK = 2
+_DDP_ACCUMULATED_TOKEN_BUDGET_PER_BATCH_SLOT = 14
+_DDP_EXPECTED_OPTIMIZER_STEPS = 2
+_DDP_BATCH_SIZES = (1, 2, 4, 8, 16, 32)
+_DDP_COLLECTIVE_TIMEOUT = timedelta(seconds=60)
+_DDP_THREADS_PER_RANK = 4
+_DDP_RESULT_TIMEOUT_S = 240
+_DDP_POLL_INTERVAL_S = 1.0
+
+
+@dataclasses.dataclass(frozen=True)
+class _DDPWorkerSpec:
+    """Everything a spawned DDP training worker needs besides its rank.
+
+    Attributes:
+        world_size: Number of ranks in the gloo process group.
+        port: TCP port used for process-group rendezvous.
+        train_args: Dataset, splits, and log paths for the data loaders.
+        tcfg: Training configuration shared by every rank.
+    """
+
+    world_size: int
+    port: int
+    train_args: TrainArgs
+    tcfg: TrainConfig
+
+
+def _collect_ddp_results(
+    processes: Sequence[BaseProcess],
+    result_queue: "multiprocessing.Queue[tuple[int, int]]",
+) -> list[tuple[int, int]]:
+    """Gather one ``(rank, optimizer_steps)`` report per rank, failing fast.
+
+    Polls ``result_queue`` every ``_DDP_POLL_INTERVAL_S`` seconds. A
+    blocking ``get`` would wait out the full ``_DDP_RESULT_TIMEOUT_S`` even
+    after a rank has died (for example when gloo aborts a deadlocked
+    collective after ``_DDP_COLLECTIVE_TIMEOUT``), so after every empty
+    poll this checks each worker's exit code and fails as soon as any rank
+    exits non-zero. The poll budget (``_DDP_RESULT_TIMEOUT_S /
+    _DDP_POLL_INTERVAL_S`` empty polls) still bounds a rank that hangs
+    without exiting.
+
+    Args:
+        processes: The spawned rank processes.
+        result_queue: Queue the workers report ``(rank, optimizer_steps)``
+            on after a successful ``train()``.
+
+    Returns:
+        The reports sorted by rank.
+    """
+    results: list[tuple[int, int]] = []
+    for _ in range(int(_DDP_RESULT_TIMEOUT_S / _DDP_POLL_INTERVAL_S)):
+        with contextlib.suppress(queue.Empty):
+            results.append(result_queue.get(timeout=_DDP_POLL_INTERVAL_S))
+            if len(results) == len(processes):
+                return sorted(results)
+            continue
+        exit_codes = [p.exitcode for p in processes]
+        if any(code not in {None, 0} for code in exit_codes):
+            pytest.fail(f"DDP rank crashed: exit codes {exit_codes}")
+    pytest.fail(f"DDP ranks timed out; reports so far {results}")
+
+
+def _free_port() -> int:
+    """Return an OS-assigned free TCP port by briefly binding to it.
+
+    Returns:
+        A port number free at the moment of the call, for process-group
+        rendezvous in the multiprocess DDP test.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return cast(int, sock.getsockname()[1])
+
+
+@pytest.fixture
+def ddp_batch_size(request: pytest.FixtureRequest) -> int:
+    """Provide the DataLoader batch size for the uneven-length DDP test.
+
+    Factory fixture: the value comes from the test's
+    ``@pytest.mark.parametrize(..., indirect=True)`` over
+    ``_DDP_BATCH_SIZES``. ``uneven_ddp_train_args`` and ``ddp_tcfg`` both
+    scale with it (dataset size and token budget), so every batch size
+    reproduces the same per-batch flush pattern.
+
+    Args:
+        request: Pytest request carrying the parametrized batch size.
+
+    Returns:
+        Number of proteins per training batch on each rank.
+    """
+    return cast(int, request.param)
+
+
+@pytest.fixture
+def uneven_ddp_train_args(
+    tmp_path: pathlib.Path,
+    ddp_batch_size: int,
+) -> TrainArgs:
+    """Write a dataset whose proteins alternate short/long in file order.
+
+    ``DistributedSampler(shuffle=False)`` deals dataset indices round-robin,
+    so with two ranks every short protein (``_DDP_SHORT_RES`` residues) lands
+    on rank 0 and every long one (``_DDP_LONG_RES`` residues) on rank 1.
+    Each rank receives ``_DDP_BATCHES_PER_RANK * ddp_batch_size`` proteins,
+    i.e. exactly ``_DDP_BATCHES_PER_RANK`` full batches of uniform-length
+    proteins. Both ranks therefore get the same number of batches but very
+    different token counts per batch -- the condition under which a
+    per-rank flush decision gives the ranks different optimizer step
+    counts. Two validation and two test proteins keep the
+    ``drop_last=True`` eval samplers non-empty.
+
+    Args:
+        tmp_path: Pytest-provided temporary directory for data and logs.
+        ddp_batch_size: Proteins per training batch on each rank.
+
+    Returns:
+        TrainArgs pointing at the written JSONL and splits files, with
+        ``ddp=True``.
+    """
+    n_train = _DDP_WORLD_SIZE * _DDP_BATCHES_PER_RANK * ddp_batch_size
+    train_names = [f"t{i}.A" for i in range(n_train)]
+    val_names = ["v0.A", "v1.A"]
+    test_names = ["e0.A", "e1.A"]
+    lengths = [
+        _DDP_SHORT_RES if i % _DDP_WORLD_SIZE == 0 else _DDP_LONG_RES
+        for i in range(n_train)
+    ] + [_DDP_SHORT_RES] * (len(val_names) + len(test_names))
+    jsonl = tmp_path / "uneven.jsonl"
+    with jsonl.open("w") as f:
+        for name, n_res in zip(
+            train_names + val_names + test_names,
+            lengths,
+            strict=True,
+        ):
+            entry = {
+                "name": name,
+                "seq": "A" * n_res,
+                "coords": {
+                    atom: np.zeros((n_res, 3)).tolist()
+                    for atom in ("N", "CA", "C", "O")
+                },
+            }
+            _ = f.write(json.dumps(entry) + "\n")
+    splits = tmp_path / "uneven_splits.json"
+    _ = splits.write_text(
+        json.dumps(
+            {"train": train_names, "validation": val_names, "test": test_names},
+        ),
+    )
+    return TrainArgs(
+        dataset_jsonl=jsonl,
+        shard_dir=tmp_path / "shards",
+        keys_for_splits_json=splits,
+        config=tmp_path / "config.json",
+        structlog_jsonl=tmp_path / "structlog.jsonl",
+        ddp=True,
+        debug_run=False,
+    )
+
+
+@pytest.fixture
+def ddp_tcfg(
+    model_params: ModelSetup,
+    tmp_path: pathlib.Path,
+    ddp_batch_size: int,
+) -> TrainConfig:
+    """One-epoch config whose token budget scales with the batch size.
+
+    The accumulated budget is ``_DDP_ACCUMULATED_TOKEN_BUDGET_PER_BATCH_SLOT
+    * ddp_batch_size`` (14 tokens per batch slot), which two ranks split
+    into ``7 * ddp_batch_size`` tokens per rank. A batch of B uniform
+    proteins carries ``2 * B`` tokens on the short rank and ``6 * B`` on
+    the long rank, so the B factor cancels and every batch size sees the
+    same decisions as B = 1: before its second batch the long rank wants
+    to flush (6B + 6B > 7B) while the short rank does not (2B + 2B <= 7B).
+    Only the ratio of token counts to budget matters, which is why the
+    proteins can be tiny (2 and 6 residues) and keep the test fast.
+    ``max_seq_length`` is pinned to ``_DDP_LONG_RES`` because
+    ``ProteinDataset`` pads every protein to ``max_seq_length``; at the
+    default of 128 each tiny protein would cost as much as a 128-residue
+    one, and runtime would grow by roughly 9 s per protein per rank.
+
+    Args:
+        model_params: Fixture providing the shared small-model config.
+        tmp_path: Pytest-provided temporary directory for checkpoints.
+        ddp_batch_size: Proteins per batch for the train and eval loaders.
+
+    Returns:
+        TrainConfig for the two-rank uneven-length DDP test.
+    """
+    return TrainConfig(
+        training=TrainingParams(
+            num_epochs=1,
+            lr=LEARNING_RATE,
+            grad_clip=1.0,
+            accumulated_token_budget=(
+                _DDP_ACCUMULATED_TOKEN_BUDGET_PER_BATCH_SLOT * ddp_batch_size
+            ),
+        ),
+        model=model_params.tcfg.model,
+        distogram_template=TemplateDistogramParams(
+            n_bins=_N_BINS,
+            min_dist=3.25,
+            max_dist=50.75,
+        ),
+        distogram_residue=ResidueDistogramParams(
+            n_bins=_N_BINS,
+            min_dist=2.0,
+            max_dist=22.0,
+        ),
+        distogram_atom=AtomDistogramParams(
+            n_bins=_N_ATOM_BINS,
+            min_dist=0.0,
+            max_dist=10.0,
+        ),
+        checkpoint=CheckpointParams(
+            checkpoint_path=tmp_path / "ddp_best.pt",
+            save_every=100,
+        ),
+        logging=LoggingParams(use_wandb=False),
+        test_loader=LoaderConfig(
+            max_seq_length=_DDP_LONG_RES,
+            batch_size=ddp_batch_size,
+            num_workers=0,
+        ),
+    )
+
+
+def _uneven_ddp_train_worker(
+    rank: int,
+    spec: _DDPWorkerSpec,
+    result_queue: "multiprocessing.Queue[tuple[int, int]]",
+) -> None:
+    """Run one epoch of train() as one rank of a CPU gloo DDP group.
+
+    Builds the model, distogram modules, and DistributedSampler-backed
+    loaders exactly as ``main()`` does, runs ``train()``, and reports
+    ``(rank, optimizer_steps)`` to the parent. A rank that deadlocks in a
+    mismatched collective never reports; gloo raises after
+    ``_DDP_COLLECTIVE_TIMEOUT`` instead of hanging forever. Each rank is
+    capped at ``_DDP_THREADS_PER_RANK`` intra-op threads; by default every
+    spawned process claims all cores, and the ranks thrash each other.
+
+    Args:
+        rank: This process's rank.
+        spec: World size, rendezvous port, data paths, and config.
+        result_queue: Queue to report ``(rank, optimizer_steps)`` on success.
+    """
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(spec.port)
+    os.environ["LOCAL_RANK"] = str(rank)
+    torch.set_num_threads(_DDP_THREADS_PER_RANK)
+    dist.init_process_group(
+        backend="gloo",
+        rank=rank,
+        world_size=spec.world_size,
+        timeout=_DDP_COLLECTIVE_TIMEOUT,
+    )
+    model_setup = _make_model_params(
+        _build_test_trunk(),
+        spec.tcfg,
+        build_distogram_module(spec.tcfg.distogram_template),
+        build_distogram_module(spec.tcfg.distogram_residue),
+        build_distogram_module(spec.tcfg.distogram_atom),
+    )
+    train_loader, test_loader, _ = make_bucketed_data_loaders(
+        cfg=spec.tcfg,
+        extra_train_args=spec.train_args,
+    )
+    train(
+        best_val_loss=torch.tensor(float("inf")),
+        train_loader=train_loader,
+        test_loader=test_loader,
+        model_params=model_setup,
+        log=cast(FilteringBoundLogger, structlog.get_logger()),
+    )
+    result_queue.put((rank, model_setup.scheduler.last_epoch))
+    dist.destroy_process_group()
+
+
+@pytest.mark.parametrize(
+    "ddp_batch_size",
+    _DDP_BATCH_SIZES,
+    ids=[f"batch_size_{b}" for b in _DDP_BATCH_SIZES],
+    indirect=True,
+)
+def test_train_ddp_uneven_protein_lengths_keeps_ranks_in_lockstep(
+    uneven_ddp_train_args: TrainArgs,
+    ddp_tcfg: TrainConfig,
+) -> None:
+    """train() completes under DDP when ranks see different protein lengths.
+
+    Regression for an NCCL watchdog crash at the end of an epoch: with a
+    per-rank token-budget flush decision, a rank holding long proteins
+    took more optimizer steps than a rank holding short ones. The long
+    rank's extra DDP gradient all-reduces then had no partner, the short
+    rank moved on to the epoch-metric all-reduces, and both ranks
+    deadlocked until the collective timeout killed the job.
+
+    Arrange: two real OS processes in a CPU gloo group, each loading its
+    DistributedSampler shard of the alternating short/long dataset in
+    batches of ``ddp_batch_size`` (indirectly parametrized over 1, 2, 4,
+    8, 16, and 32). The dataset size and token budget both scale with the
+    batch size, so each case runs two batches per rank with the same
+    uneven flush pattern; the cases differ in batch shape (padding,
+    collation, per-batch token counts) rather than in the expected
+    schedule. Under the old per-rank logic this split gives rank 1 one
+    pre-flush and rank 0 none -- the smallest schedule that still
+    disagrees.
+    Act: each process runs one full epoch of train() (training, EMA
+    evaluation, metric all-reduce, logging) and reports its optimizer
+    step count.
+    Assert: both ranks finish and report the same step count: 1 collective
+    pre-flush (before batch 2, triggered by rank 1 alone) plus 1
+    end-of-epoch flush. A deadlock makes gloo abort the stuck collective
+    after ``_DDP_COLLECTIVE_TIMEOUT``; the crashed rank's non-zero exit
+    code then fails the test immediately (see ``_collect_ddp_results``)
+    rather than hanging the run.
+    """
+    ctx = multiprocessing.get_context("spawn")
+    result_queue: "multiprocessing.Queue[tuple[int, int]]" = ctx.Queue()
+    spec = _DDPWorkerSpec(
+        world_size=_DDP_WORLD_SIZE,
+        port=_free_port(),
+        train_args=uneven_ddp_train_args,
+        tcfg=ddp_tcfg,
+    )
+    processes = [
+        ctx.Process(
+            target=_uneven_ddp_train_worker,
+            args=(rank, spec, result_queue),
+        )
+        for rank in range(_DDP_WORLD_SIZE)
+    ]
+    for p in processes:
+        p.start()
+    try:
+        results = _collect_ddp_results(processes, result_queue)
+    finally:
+        for p in processes:
+            p.join(timeout=_DDP_RESULT_TIMEOUT_S)
+            if p.is_alive():
+                p.terminate()
+
+    assert results == [
+        (rank, _DDP_EXPECTED_OPTIMIZER_STEPS) for rank in range(_DDP_WORLD_SIZE)
+    ]
