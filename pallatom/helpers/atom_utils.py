@@ -54,7 +54,7 @@ ATOM14_N: int = 0
 ATOM14_CA: int = 1
 ATOM14_C: int = 2
 ATOM14_O: int = 3
-ATOM14_CB: int = 4  # absent (masked) only for Gly
+ATOM14_CB: int = 4  # Gly: virtual atom at C alpha
 ATOMS_PER_RES: int = 14
 
 # PDB constants
@@ -529,6 +529,47 @@ def _build_atom14_tables() -> tuple[
     ATOM14_REF_POS,
     ATOM14_ELEMENTS,
 ) = _build_atom14_tables()
+
+
+# ── sequence-independent atom14 reference template ──────────────────────────
+# The residue type is what is being generated, so every residue gets the same
+# reference conformer: Ala's ideal backbone + Cβ in slots 0-4, then slots 5-13
+# as UNK-element pseudo-sidechain atoms extending along the C alpha → Cβ bond.
+# Slots 5-13 need distinct positions: the atom encoder tells atoms within a
+# residue apart only through ref_pos differences, so coincident slots would
+# be indistinguishable.
+
+VIRTUAL_ATOM_SPACING: float = (
+    1.5  # Å between consecutive pseudo-sidechain slots
+)
+
+
+@jaxtyped(typechecker=beartype)
+def _build_generic_atom14_reference() -> tuple[
+    Float[torch.Tensor, "14 3"],
+    Float[torch.Tensor, "14 4"],
+]:
+    """Build the single atom14 reference conformer shared by every residue.
+
+    Returns:
+        Tuple of (ref_pos, ref_elem) with shapes (14, 3) and (14, 4).
+    """
+    ala = restype_order["A"]
+    ref_pos = ATOM14_REF_POS[ala].clone()
+    ref_elem = ATOM14_ELEMENTS[ala].clone()
+    ca = ref_pos[ATOM14_CA]
+    cb = ref_pos[ATOM14_CB]
+    bond = cb - ca
+    unit = bond / torch.sqrt(reduce(bond**2, "d -> ", "sum"))
+    for slot in range(ATOM14_CB + 1, ATOMS_PER_RES):
+        ref_pos[slot] = cb + (slot - ATOM14_CB) * VIRTUAL_ATOM_SPACING * unit
+        ref_elem[slot] = torch.tensor(_UNK_ONE_HOT)
+    return ref_pos, ref_elem
+
+
+GENERIC_ATOM14_REF_POS, GENERIC_ATOM14_ELEMENTS = (
+    _build_generic_atom14_reference()
+)
 
 
 def make_np_example(
@@ -1087,30 +1128,74 @@ def atom14_to_atom37(
 
 
 @jaxtyped(typechecker=beartype)
-def gather_ref_pos_and_element(
-    aatype: Int[torch.Tensor, "N_res"],
+def fill_atom14_virtual_atoms(
+    atom14_positions: Float[torch.Tensor, "B N_res 14 3"],
+    atom14_mask: Float[torch.Tensor, "B N_res 14"],
+    aatype: Int[torch.Tensor, "B N_res"],
+) -> tuple[
+    Float[torch.Tensor, "B N_res 14 3"],
+    Float[torch.Tensor, "B N_res 14"],
+]:
+    """Fill the slots a residue type lacks with virtual atoms at its C alpha.
+
+    After this, every residue with a resolved C alpha occupies all 14 slots, so
+    neither the positions' layout nor the mask reveals the residue type.
+    Slots the residue type does have keep their own mask, so unresolved
+    real atoms stay masked out rather than being pulled onto the C alpha.
+
+    Args:
+        atom14_positions: Atom14 coordinates (B, N_res, 14, 3).
+        atom14_mask: Atom14 presence mask (B, N_res, 14).
+        aatype: Residue type index per position (B, N_res); see
+            atom37_to_atom14 for how out-of-range values are handled.
+
+    Returns:
+        Tuple of (atom14_positions, atom14_mask) with virtual atoms filled
+        in, shapes (B, N_res, 14, 3) and (B, N_res, 14).
+    """
+    aatype_safe = aatype.clamp(min=0, max=RESTYPE_NUM - 1)
+    exists14: Bool[torch.Tensor, "B N_res 14"] = ATOM14_ATOM_EXISTS.to(
+        aatype_safe.device,
+    )[aatype_safe]
+    ca_pos = atom14_positions[:, :, ATOM14_CA : ATOM14_CA + 1, :]
+    ca_mask = atom14_mask[:, :, ATOM14_CA : ATOM14_CA + 1]
+    positions = torch.where(
+        rearrange(exists14, "b n a -> b n a 1"),
+        atom14_positions,
+        ca_pos,
+    )
+    mask = torch.where(exists14, atom14_mask, ca_mask)
+    return positions, mask
+
+
+@jaxtyped(typechecker=beartype)
+def generic_ref_pos_and_element(
+    n_res: int,
+    device: torch.device | str,
 ) -> tuple[
     Float[torch.Tensor, "N_res 14 3"],
     Float[torch.Tensor, "N_res 14 4"],
 ]:
-    """Per-residue-type reference conformer and element one-hot, by aatype.
-
-    Replaces tiling a single hardcoded residue's geometry across every
-    position: each residue gets its own idealized atom14 conformer and
-    element encoding, looked up from the vendored
-    rigid_group_atom_positions table.
+    """Tile the sequence-independent atom14 reference over every residue.
 
     Args:
-        aatype: Residue type index per position (N_res,); out-of-range
-            values (e.g. the -100 padding sentinel) are clamped before use.
+        n_res: Number of residues.
+        device: Device to place the outputs on.
 
     Returns:
-        Tuple of (ref_pos, ref_elem) with shapes (N_res, 14, 3) and
-        (N_res, 14, 4), on the same device as ``aatype``.
+        Tuple of (ref_pos, ref_elem) with shapes (n_res, 14, 3) and
+        (n_res, 14, 4).
     """
-    aatype_safe = aatype.clamp(min=0, max=RESTYPE_NUM - 1)
-    ref_pos = ATOM14_REF_POS.to(aatype_safe.device)[aatype_safe]
-    ref_elem = ATOM14_ELEMENTS.to(aatype_safe.device)[aatype_safe]
+    ref_pos = repeat(
+        GENERIC_ATOM14_REF_POS.to(device),
+        "a d -> n a d",
+        n=n_res,
+    )
+    ref_elem = repeat(
+        GENERIC_ATOM14_ELEMENTS.to(device),
+        "a e -> n a e",
+        n=n_res,
+    )
     return ref_pos, ref_elem
 
 

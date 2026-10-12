@@ -29,7 +29,8 @@ from helpers.atom_utils import (
     atom14_to_cb,
     atom37_to_atom14,
     atom37_to_cb,
-    gather_ref_pos_and_element,
+    fill_atom14_virtual_atoms,
+    generic_ref_pos_and_element,
     protein_from_pdb,
     to_pdb,
 )
@@ -143,6 +144,11 @@ def build_aa_context(
         rearrange(atom_37_mask, "n a -> 1 n a"),
         rearrange(aa_indices_i, "n -> 1 n"),
     )
+    atom14_pos, atom14_mask = fill_atom14_virtual_atoms(
+        atom14_pos,
+        atom14_mask,
+        rearrange(aa_indices_i, "n -> 1 n"),
+    )
     atom14_pos = rearrange(atom14_pos, "1 n a d -> n a d")  # (N_res_i, 14, 3)
     atom14_mask = rearrange(atom14_mask, "1 n a -> n a")  # (N_res_i, 14)
     residue_mask_i: Bool[torch.Tensor, "N_res"] = atom14_mask.any(dim=-1)
@@ -150,11 +156,8 @@ def build_aa_context(
         atom14_pos,
         "n a d -> (n a) d",
     )
-    # Real per-atom mask, not residue_mask_i broadcast uniformly: atom14
-    # occupancy is residue-type-dependent (e.g. Gly fills only 4/14 slots),
-    # unlike atom5 where every residue always filled all 5 slots — so
-    # broadcasting "this residue has any atom" to every slot would wrongly
-    # mark padding slots as present.
+    # Per-atom mask: virtual atoms fill every slot of a residue with a
+    # resolved C alpha, but unresolved real atoms stay masked out.
     packed_atom_mask_i: Bool[torch.Tensor, "N_atom"] = rearrange(
         atom14_mask.bool(),
         "n a -> (n a)",
@@ -378,14 +381,10 @@ def build_sampling_context(
             device=device,
         )
 
-    # ── Per-residue reference conformer, gathered by true residue type ───────
-    aatype_single: Int[torch.Tensor, "N_res"] = torch.tensor(
-        protein.aatype,
-        dtype=torch.long,
+    # ── Sequence-independent reference conformer, same as training ──────────
+    ref_pos_per_res, ref_elem_per_res = generic_ref_pos_and_element(
+        residue_number,
         device=device,
-    )
-    ref_pos_per_res, ref_elem_per_res = gather_ref_pos_and_element(
-        aatype_single,
     )
 
     ref_pos_single: Float[torch.Tensor, "N_atom 3"] = rearrange(
@@ -873,7 +872,8 @@ def main(args: SamplingArgs, scfg: SampleConfig, device: str) -> None:
             # Must use the model's own decoded sequence here, not a
             # placeholder: atom14 slot identity is residue-type-dependent,
             # so writing out the wrong aatype would silently misassign every
-            # generated sidechain atom in the output PDB.
+            # generated sidechain atom in the output PDB. The decoded type
+            # also drops that type's virtual-atom slots from the atom37 output.
             decoded_aatype: Int[torch.Tensor, "1 N_res"] = rearrange(
                 seqs_batch[b].cpu(),
                 "n -> 1 n",

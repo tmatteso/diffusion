@@ -2,8 +2,8 @@
 
 Covers FeaturizedItem and FeaturizedBatch shape contracts; Distogram shape,
 one-hot, masking, symmetry, and bin-assignment properties; featurize_batch
-output shapes and value contracts;
-sinusoidal_encoding and gather_ref_pos_and_element correctness; ProteinDataset
+output shapes and value contracts; sinusoidal_encoding correctness;
+sequence-independent reference features and masks; ProteinDataset
 length/indexing; and make_bucketed_data_loaders behaviour.
 """
 
@@ -28,7 +28,6 @@ from helpers.atom_utils import (
     ATOMS_PER_RES,
     RESTYPE_NUM_NO_X,
     Protein,
-    gather_ref_pos_and_element,
     restype_order,
 )
 from helpers.data import (
@@ -1191,7 +1190,7 @@ def test_featurize_collate_is_picklable(
 
 
 # ---------------------------------------------------------------------------
-# sinusoidal_encoding, gather_ref_pos_and_element, featurize_single_item
+# sinusoidal_encoding, featurize_single_item
 # ---------------------------------------------------------------------------
 
 
@@ -1203,42 +1202,50 @@ def test_sinusoidal_encoding_output_shape_and_shape() -> None:
     assert torch.isfinite(out).all()
 
 
-def test_gather_ref_pos_and_element_output_shape_and_finite() -> None:
-    """gather_ref_pos_and_element returns finite per-residue reference data.
-
-    Verifies the (N_res, 14, 3) reference position and (N_res, 14, 4)
-    element one-hot tensors for a short mixed-residue-type sequence.
-    """
-    aatype = torch.tensor(
-        [restype_order[c] for c in "AGWC"],
-        dtype=torch.long,
-    )
-    ref_pos, ref_elem = gather_ref_pos_and_element(aatype)
-    assert ref_pos.shape == (4, ATOMS_PER_RES, 3)
-    assert ref_elem.shape == (4, ATOMS_PER_RES, 4)
-    assert torch.isfinite(ref_pos).all()
-    assert torch.isfinite(ref_elem).all()
-
-
-def test_featurize_single_item_ref_pos_varies_by_true_residue_type(
+def test_featurize_single_item_ref_pos_is_sequence_independent(
     featurized_item: FeaturizedItem,
 ) -> None:
-    """featurize_single_item no longer tiles one residue's geometry for all.
+    """Every residue gets the same reference conformer and element encoding.
 
-    Regression test for the ALA-tiling bug: single_protein's sequence is
+    Regression test for sequence leakage: single_protein's sequence is
     AA_SEQ = "ACDEFGHIKLMN", so residue 0 (Ala) and residue 5 (Gly, the
-    one standard residue with no Cβ) must receive genuinely different
-    per-residue reference conformers in the real featurize_single_item
-    output, not a single hardcoded residue's geometry tiled across both.
+    one standard residue with no Cβ) differ in type, yet must receive
+    identical reference features, since the sequence is what the model is
+    asked to predict.
     """
     gly_residue_position = 5
-    ala_ref_pos = featurized_item.ref_pos[:ATOMS_PER_RES]
-    gly_ref_pos = featurized_item.ref_pos[
-        gly_residue_position
-        * ATOMS_PER_RES : (gly_residue_position + 1)
-        * ATOMS_PER_RES
-    ]
-    assert not torch.allclose(ala_ref_pos, gly_ref_pos)
+    gly_slice = slice(
+        gly_residue_position * ATOMS_PER_RES,
+        (gly_residue_position + 1) * ATOMS_PER_RES,
+    )
+    ala_slice = slice(0, ATOMS_PER_RES)
+    assert torch.equal(
+        featurized_item.ref_pos[ala_slice],
+        featurized_item.ref_pos[gly_slice],
+    )
+    assert torch.equal(
+        featurized_item.ref_element[ala_slice],
+        featurized_item.ref_element[gly_slice],
+    )
+
+
+def test_featurize_single_item_mask_is_sequence_independent(
+    featurized_item: FeaturizedItem,
+) -> None:
+    """Ala (5 real atoms) and Gly (4) both fill all 14 atom14 mask slots.
+
+    Slots a residue type lacks hold virtual atoms, so the mask doesn't
+    reveal the residue type.
+    """
+    gly_residue_position = 5
+    assert bool(featurized_item.atom14_mask[:ATOMS_PER_RES].all())
+    assert bool(
+        featurized_item.atom14_mask[
+            gly_residue_position
+            * ATOMS_PER_RES : (gly_residue_position + 1)
+            * ATOMS_PER_RES
+        ].all(),
+    )
 
 
 # ---------------------------------------------------------------------------

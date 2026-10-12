@@ -1,7 +1,8 @@
 """Tests for atom utility dataclasses and functions.
 
 Covers pseudo_cb, atom37_to_atom14, atom14_to_atom37, atom37_to_cb,
-atom14_to_cb, gather_ref_pos_and_element, the atom14 lookup tables, the
+atom14_to_cb, fill_atom14_virtual_atoms, generic_ref_pos_and_element, the
+atom14 lookup tables, the
 Protein dataclass, make_np_example, make_fixed_size, center_positions,
 chain_end, to_pdb, protein_from_pdb, truncate_to_length, and molecule-type
 constants.
@@ -16,6 +17,7 @@ import numpy as np
 import numpy.typing as npt
 import pytest
 import torch
+from einops import rearrange
 from helpers.atom_utils import (
     ATOM14_ATOM_EXISTS,
     ATOM14_C,
@@ -31,6 +33,8 @@ from helpers.atom_utils import (
     DNA_RESTYPE_3TO1,
     DNA_RESTYPE_ORDER,
     DNA_RESTYPES,
+    GENERIC_ATOM14_ELEMENTS,
+    GENERIC_ATOM14_REF_POS,
     MOL_TYPE_DNA,
     MOL_TYPE_PROTEIN,
     MOL_TYPE_RNA,
@@ -61,7 +65,8 @@ from helpers.atom_utils import (
     center_positions,
     chain_end,
     classify_mol_type,
-    gather_ref_pos_and_element,
+    fill_atom14_virtual_atoms,
+    generic_ref_pos_and_element,
     make_fixed_size,
     make_np_example,
     protein_from_pdb,
@@ -692,63 +697,128 @@ def test_atom14_to_cb_mixed_residues(
 
 
 # ---------------------------------------------------------------------------
-# gather_ref_pos_and_element
+# fill_atom14_virtual_atoms / generic_ref_pos_and_element
 # ---------------------------------------------------------------------------
 
 
-def test_gather_ref_pos_and_element_output_shapes() -> None:
-    """gather_ref_pos_and_element returns (N_res, 14, 3) and (N_res, 14, 4).
+def _ideal_atom14(
+    one_letter: str,
+) -> tuple[
+    Float[torch.Tensor, "1 1 14 3"],
+    Float[torch.Tensor, "1 1 14"],
+    Int[torch.Tensor, "1 1"],
+]:
+    """Return random atom14 coords, the type's real-atom mask, and aatype.
 
-    Verifies output shapes for a short mixed-residue-type sequence.
+    Args:
+        one_letter: One-letter residue code.
+
+    Returns:
+        Tuple of (positions, mask, aatype) for a single residue.
     """
-    aatype = torch.tensor(
-        [restype_order[c] for c in "AGWC"],
-        dtype=torch.long,
+    row = restype_order[one_letter]
+    positions = torch.randn(1, 1, ATOMS_PER_RES, 3)
+    mask = rearrange(ATOM14_ATOM_EXISTS[row].float(), "a -> 1 1 a")
+    aatype = torch.tensor([[row]], dtype=torch.long)
+    return positions, mask, aatype
+
+
+@pytest.mark.parametrize("one_letter", ["A", "C", "G", "F", "W"])
+def test_fill_atom14_virtual_atoms_mask_is_all_set(one_letter: str) -> None:
+    """Every slot of a fully resolved residue is present after filling.
+
+    This is what keeps the mask from revealing the residue type.
+
+    Args:
+        one_letter: One-letter residue code under test.
+    """
+    positions, mask, aatype = _ideal_atom14(one_letter)
+    _, filled_mask = fill_atom14_virtual_atoms(positions, mask, aatype)
+    assert bool((filled_mask == 1).all())
+
+
+@pytest.mark.parametrize("one_letter", ["A", "C", "G", "F", "W"])
+def test_fill_atom14_virtual_atoms_places_virtual_atoms_at_ca(
+    one_letter: str,
+) -> None:
+    """Slots the type lacks move to C alpha; real slots keep their coordinates.
+
+    Args:
+        one_letter: One-letter residue code under test.
+    """
+    positions, mask, aatype = _ideal_atom14(one_letter)
+    filled, _ = fill_atom14_virtual_atoms(positions, mask, aatype)
+    exists = ATOM14_ATOM_EXISTS[restype_order[one_letter]]
+    ca_pos = positions[0, 0, ATOM14_CA]
+    assert torch.equal(filled[0, 0, exists], positions[0, 0, exists])
+    assert bool((filled[0, 0, ~exists] == ca_pos).all())
+
+
+def test_fill_atom14_virtual_atoms_keeps_unresolved_real_atoms_masked() -> None:
+    """An unresolved real atom stays masked instead of becoming virtual."""
+    positions, mask, aatype = _ideal_atom14("F")
+    mask[0, 0, ATOM14_CB] = 0.0
+    filled, filled_mask = fill_atom14_virtual_atoms(positions, mask, aatype)
+    assert filled_mask[0, 0, ATOM14_CB] == 0
+    assert torch.equal(
+        filled[0, 0, ATOM14_CB],
+        positions[0, 0, ATOM14_CB],
     )
-    ref_pos, ref_elem = gather_ref_pos_and_element(aatype)
-    assert ref_pos.shape == (4, ATOMS_PER_RES, 3)
-    assert ref_elem.shape == (4, ATOMS_PER_RES, 4)
 
 
-def test_gather_ref_pos_and_element_varies_by_residue_type() -> None:
-    """Different residues in the same batch get genuinely different geometry.
+def test_fill_atom14_virtual_atoms_missing_ca_masks_virtual_atoms() -> None:
+    """Virtual atoms inherit the C alpha mask, so padding stays masked."""
+    positions, _, aatype = _ideal_atom14("A")
+    mask = torch.zeros(1, 1, ATOMS_PER_RES)
+    _, filled_mask = fill_atom14_virtual_atoms(positions, mask, aatype)
+    assert bool((filled_mask == 0).all())
 
-    This is the property that catches a regression back to tiling a single
-    hardcoded residue's geometry across every position: Ala, Gly, and Trp
-    must not all receive identical reference conformers.
+
+def test_generic_ref_pos_and_element_output_shapes() -> None:
+    """generic_ref_pos_and_element returns (N_res, 14, 3) and (N_res, 14, 4)."""
+    n_res = 4
+    ref_pos, ref_elem = generic_ref_pos_and_element(n_res, device="cpu")
+    assert ref_pos.shape == (n_res, ATOMS_PER_RES, 3)
+    assert ref_elem.shape == (n_res, ATOMS_PER_RES, 4)
+
+
+def test_generic_ref_pos_and_element_identical_for_every_residue() -> None:
+    """Every residue gets the same reference, so it carries no sequence."""
+    ref_pos, ref_elem = generic_ref_pos_and_element(3, device="cpu")
+    assert torch.equal(ref_pos[0], ref_pos[1])
+    assert torch.equal(ref_pos[0], ref_pos[2])
+    assert torch.equal(ref_elem[0], ref_elem[2])
+
+
+def test_generic_atom14_reference_slots_are_distinct() -> None:
+    """No two slots share a reference position.
+
+    The atom encoder distinguishes atoms within a residue only through
+    reference-position differences, so coincident slots would be
+    interchangeable.
     """
-    aatype = torch.tensor(
-        [restype_order[c] for c in "AGW"],
-        dtype=torch.long,
+    dist = torch.cdist(GENERIC_ATOM14_REF_POS, GENERIC_ATOM14_REF_POS)
+    off_diagonal = ~torch.eye(ATOMS_PER_RES, dtype=torch.bool)
+    assert bool((dist[off_diagonal] > 1.0).all())
+
+
+def test_generic_atom14_reference_backbone_matches_alanine() -> None:
+    """Slots 0-4 use Ala's ideal backbone + Cβ geometry and elements."""
+    ala = restype_order["A"]
+    assert torch.equal(
+        GENERIC_ATOM14_REF_POS[: ATOM14_CB + 1],
+        ATOM14_REF_POS[ala, : ATOM14_CB + 1],
     )
-    ref_pos, _ = gather_ref_pos_and_element(aatype)
-    assert not torch.allclose(ref_pos[0], ref_pos[1])
-    assert not torch.allclose(ref_pos[0], ref_pos[2])
+    assert torch.equal(
+        GENERIC_ATOM14_ELEMENTS[: ATOM14_CB + 1],
+        ATOM14_ELEMENTS[ala, : ATOM14_CB + 1],
+    )
 
 
-def test_gather_ref_pos_and_element_glycine_cb_slot_is_zero() -> None:
-    """Glycine's CB slot is zero in both the reference position and element.
-
-    Glycine has no Cβ, so its atom14 reference conformer must leave that
-    slot at the zero padding value rather than reusing another residue's
-    CB coordinate.
-    """
-    aatype = torch.tensor([restype_order["G"]], dtype=torch.long)
-    ref_pos, ref_elem = gather_ref_pos_and_element(aatype)
-    assert torch.equal(ref_pos[0, ATOM14_CB, :], torch.zeros(3))
-    assert torch.equal(ref_elem[0, ATOM14_CB, :], torch.zeros(4))
-
-
-def test_gather_ref_pos_and_element_sentinel_aatype_does_not_raise() -> None:
-    """The -100 padding sentinel is clamped rather than rejected.
-
-    Mirrors the equivalent atom37_to_atom14 contract: this function must not
-    raise on padded aatype positions, leaving masking to the caller.
-    """
-    aatype = torch.tensor([-100, restype_order["A"]], dtype=torch.long)
-    ref_pos, ref_elem = gather_ref_pos_and_element(aatype)
-    assert torch.isfinite(ref_pos).all()
-    assert torch.isfinite(ref_elem).all()
+def test_generic_atom14_reference_sidechain_slots_are_unk() -> None:
+    """Slots 5-13 are UNK so their element reveals nothing."""
+    unk = torch.tensor([0.0, 0.0, 0.0, 1.0])
+    assert bool((GENERIC_ATOM14_ELEMENTS[ATOM14_CB + 1 :] == unk).all())
 
 
 # ---------------------------------------------------------------------------

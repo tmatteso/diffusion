@@ -40,7 +40,8 @@ from helpers.atom_utils import (
     atom37_to_atom14,
     atom37_to_cb,
     center_positions,
-    gather_ref_pos_and_element,
+    fill_atom14_virtual_atoms,
+    generic_ref_pos_and_element,
     make_fixed_size,
     make_np_example,
     restype_order,
@@ -76,8 +77,9 @@ class FeaturizedItem:
     Attributes:
         r_gt: Ground-truth atom positions in flat (atom-indexed) layout.
         r_gt_noised: Noised atom positions in flat (atom-indexed) layout.
-        atom14_mask: Boolean mask indicating which of the up-to-14 heavy
-            atoms are present for each residue.
+        atom14_mask: Boolean mask over the 14 atom slots of each residue;
+            slots the residue type lacks hold virtual atoms and count as
+            present.
         f_pseudo_beta_mask: Boolean mask indicating residues that have a valid
             pseudo-β carbon, used to build the template Cβ distogram.
         gt_res_distogram_indices: Integer bin index per residue pair from
@@ -521,9 +523,9 @@ def featurize_single_item(
 
     Converts atom37 coordinates to atom14, pads to max_seq_len_in_batch,
     computes ground-truth and self-conditioning Cβ distograms, builds the
-    sparse atom-pair distogram over the local residue window, gathers each
-    residue's own true reference geometry, and samples a diffusion noise
-    level from the lognormal schedule.
+    sparse atom-pair distogram over the local residue window, tiles the
+    sequence-independent atom14 reference geometry across residues, and
+    samples a diffusion noise level from the lognormal schedule.
 
     Args:
         prot: Protein with atom37 coordinates, mask, sequence,
@@ -544,7 +546,7 @@ def featurize_single_item(
     Returns:
         FeaturizedItem holding flat atom positions (ground-truth and noised),
         atom and residue masks, GT and noised Cβ distogram targets, sparse
-        atom-pair distogram targets, per-residue reference geometry,
+        atom-pair distogram targets, the shared reference geometry,
         sequence indices, the sampled noise level ``t_hat``, and the uniform
         template weight ``t_normalized``.
     """
@@ -577,7 +579,12 @@ def featurize_single_item(
     )
     aa_indices[:unpadded_N_res] = torch.tensor(prot.aatype, dtype=torch.long)
 
-    ref_pos_per_res, ref_elem_per_res = gather_ref_pos_and_element(aa_indices)
+    # Same reference conformer for every residue: per-type geometry or
+    # element patterns would hand the model the sequence it must predict.
+    ref_pos_per_res, ref_elem_per_res = generic_ref_pos_and_element(
+        max_seq_len_in_batch,
+        device="cpu",
+    )
     # Noise schedule lognormal. ln(sigma) ~ N(Pmean, Pstd**2),
     # Pmean = -1.2, Pstd = 1.5, sigma_data = 16,
     # ~ N(0, I) * Pstd + Pmean == ~ N(Pmean, Pstd**2).
@@ -598,6 +605,13 @@ def featurize_single_item(
     atom14_pos, atom14_mask = atom37_to_atom14(
         rearrange(atom37_positions, "n a d -> 1 n a d"),
         rearrange(atom37_mask, "n a -> 1 n a"),
+        rearrange(aa_indices, "n -> 1 n"),
+    )
+    # Slots the residue type lacks become virtual atoms at C alpha, so every
+    # real residue fills all 14 slots and the mask is sequence-independent.
+    atom14_pos, atom14_mask = fill_atom14_virtual_atoms(
+        atom14_pos,
+        atom14_mask,
         rearrange(aa_indices, "n -> 1 n"),
     )
     atom14_pos = rearrange(atom14_pos, "1 n a d -> n a d")
