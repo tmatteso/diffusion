@@ -236,9 +236,12 @@ def identity_stoch_sampler_tmin_high(
 ) -> EDMSampler:
     """Stochastic EDMSampler, noise injection suppressed by a high S_tmin.
 
-    Sets ``S_churn=2.0`` (non-zero stochasticity) but ``S_tmin=SIGMA_MAX*10``,
-    so the injection gate ``S_tmin ≤ sigma_cur`` is never satisfied and no
-    extra noise is added.  Used to verify that the sampler degenerates to the
+    Sets ``S_churn=2.0`` (non-zero stochasticity) but ``S_tmin=SIGMA_MAX*10``.
+    The churn gate compares ``S_tmin`` with the schedule time
+    ``timestep / ddim_steps``, which never exceeds 1, so the gate
+    ``S_tmin ≤ timestep / ddim_steps`` is never satisfied and no extra noise
+    is added. Any ``S_tmin`` above 1 would do; this value is simply far
+    outside the window. Used to verify that the sampler degenerates to the
     deterministic trajectory when the window is empty.
     """
     return EDMSampler(
@@ -787,7 +790,12 @@ def sampler_trajectory(
 
     1. ``torch.rand`` is monkeypatched to return the scenario's jitter.
        The sampler draws ``torch.rand()`` only for the per-step time offset,
-       so the visited times are exactly ``k / T - jitter / T``.
+       so the visited times are exactly ``k / T - jitter / T``. Following
+       Pallatom, the real sampler draws a separate offset for the initial
+       noise and for every step, so neighbouring steps can disagree by up to
+       one interval. Pinning every draw to one value makes them agree, so
+       these tests check the schedule direction and step targets, not that
+       per-step independence.
     2. The zero denoiser stands in for the trunk. Its output is always
        zero, so each Euler step only rescales the input by
        ``1 + eta * (sigma_next - sigma) / sigma``. No real model's output
@@ -979,6 +987,11 @@ def test_edm_sampler_initial_noise_matches_first_step(
 ) -> None:
     """The starting coordinates are drawn at the first step's noise level.
 
+    With the per-step offset pinned (see ``sampler_trajectory``), the initial
+    noise and the first step share one offset, so this holds exactly. In
+    production they draw separate offsets, as in Pallatom, and share only
+    the top schedule interval.
+
     Regression: the initial noise level was evaluated at the wrong end of
     the schedule, so the first model call saw coordinates of about
     0.007 Å labelled as about 2,500 Å of noise.
@@ -1107,16 +1120,18 @@ def test_edm_sampler_sample_runs_without_error(edm_sampler: EDMSampler) -> None:
     assert torch.isfinite(seq_out).all()
 
 
-def test_edm_sampler_s_tmin_above_sigma_max_disables_injection(
+def test_edm_sampler_s_tmin_above_one_disables_injection(
     identity_det_sampler: EDMSampler,
     identity_stoch_sampler_tmin_high: EDMSampler,
 ) -> None:
-    """S_tmin above sigma_max disables stochastic noise injection entirely.
+    """S_tmin above 1 disables stochastic noise injection entirely.
 
-    When ``S_tmin > sigma_max``, the condition ``S_tmin ≤ sigma_cur`` is never
-    satisfied at any step of the schedule, so stochastic sampler degenerates
-    to the deterministic (``S_churn=0``) trajectory.  Both samplers are seeded
-    identically and their outputs are asserted to be numerically equal.
+    The churn gate compares ``S_tmin`` with the schedule time
+    ``timestep / ddim_steps``, which never exceeds 1. When ``S_tmin > 1``,
+    the condition ``S_tmin ≤ timestep / ddim_steps`` is never satisfied at
+    any step, so the stochastic sampler degenerates to the deterministic
+    (``S_churn=0``) trajectory. Both samplers are seeded identically and
+    their outputs are asserted to be numerically equal.
     """
     _ = manual_seed(5)
     out_det, seq_det = identity_det_sampler.sample((1, N_ATOM, 3))

@@ -26,8 +26,13 @@ class SamplerParams(BaseModel):
             values concentrate steps near low noise levels.
         S_churn: Amount of stochasticity injected at each step; 0 recovers
             deterministic DDIM.
-        S_tmin: Lower bound of the noise-level range in which churn is applied.
-        S_tmax: Upper bound of the noise-level range in which churn is applied.
+        S_tmin: Lower bound of the schedule-time window in which churn is
+            applied. Compared against ``timestep / ddim_steps``, which runs
+            from 1 (maximum noise) down to ``1 / ddim_steps``; it is a
+            fraction of schedule time, not a noise level in Å. Pallatom uses
+            0.01, which turns churn off on the final step at 200 steps.
+        S_tmax: Upper bound of the same schedule-time window. Pallatom uses
+            1.0, which keeps churn on from the first step.
         S_noise: Scale factor applied to injected Gaussian noise during churn.
         ddim_steps: Total number of denoising steps.
         eta_step_scale: Multiplicative scale for the effective step size used in

@@ -466,8 +466,9 @@ class EDMSampler:
     sigma_max : float  largest  noise level  (paper: 80.0)
     rho       : float  schedule exponent     (paper: 7.0)
     S_churn   : float  stochastic noise injected per step (0 = deterministic)
-    S_tmin    : float  only inject noise in [S_tmin, S_tmax]
-    S_tmax    : float
+    S_tmin    : float  only inject noise while S_tmin <= timestep / ddim_steps
+    S_tmax    : float  <= S_tmax; schedule time in [0, 1], 1 = maximum noise,
+                       not a noise level (Pallatom: 0.01 and 1.0)
     S_noise   : float  scaling of injected noise
     """
 
@@ -614,8 +615,11 @@ class EDMSampler:
         """
         delta_t: float = 1 / self.total_timesteps
         # from pallatom, c_T = NoiseSchedule(1 - uniform(0, 1) * delta_t).
-        # t = 1 is maximum noise, so this starts at the same noise level as
-        # the first loop step (timestep = total_timesteps).
+        # t = 1 is maximum noise, so this starts in the same schedule
+        # interval as the first loop step (timestep = total_timesteps). As in
+        # Pallatom, every step draws its own uniform offset, so the noise
+        # level here and at each step's Euler target can differ by up to one
+        # interval from the level the next step tells the model.
         c_T: Float[torch.Tensor, ""] = self.noise_schedule(
             1 - (torch.rand((), device=self.device)) * delta_t,
         )
