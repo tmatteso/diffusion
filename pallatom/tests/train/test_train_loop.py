@@ -27,6 +27,7 @@ import torch.nn as nn
 from architecture.main_trunk import EMA, MainTrunk
 from einops import reduce
 from helpers.atom_utils import RESTYPE_NUM, RESTYPE_NUM_NO_X, Protein
+from helpers.context_managers import UnevenRankBatchesError
 from helpers.data import (
     Distogram,
     FeaturizedBatch,
@@ -44,7 +45,7 @@ from helpers.useful_objects import (
 )
 from pydantic import ValidationError
 from structlog.typing import FilteringBoundLogger
-from torch.multiprocessing.spawn import spawn
+from torch.multiprocessing.spawn import ProcessRaisedException, spawn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import Adam
 from torch.optim.lr_scheduler import LambdaLR
@@ -71,6 +72,7 @@ from train.train_loop import (
     log_epoch,
     optimizer_step,
     process_accum_window,
+    require_equal_batch_counts,
     save_checkpoint,
     swapped_in_ema_weights,
     take_step,
@@ -2361,6 +2363,190 @@ def test_any_rank_true_returns_flag_without_process_group(
     assert any_rank_true(flag, cpu_device) is flag
 
 
+@pytest.mark.parametrize("n_batches", [0, 1, 7], ids=["zero", "one", "seven"])
+def test_require_equal_batch_counts_noop_without_process_group(
+    n_batches: int,
+    cpu_device: torch.device,
+) -> None:
+    """require_equal_batch_counts() never raises on a single device.
+
+    Arrange: no distributed process group is initialised -- the state for
+    ordinary single-device training.
+    Act: call require_equal_batch_counts() with an empty, a single, and a
+    multi-batch epoch.
+    Assert: no exception, confirming single-device training never attempts
+    the collective (which would error without a group) and never rejects
+    any batch count. The multi-rank comparison is covered by
+    test_require_equal_batch_counts_agrees_on_every_rank.
+    """
+    assert not dist.is_initialized()
+    require_equal_batch_counts(n_batches, cpu_device)
+
+
+class BatchCountScenario(enum.Enum):
+    """Per-rank batch counts and the verdict every rank must reach.
+
+    Each member's value is ``(batch_counts, expected_bounds)``:
+    ``batch_counts[r]`` is what rank ``r`` passes to
+    ``require_equal_batch_counts``, and ``expected_bounds`` is the
+    ``(min_batches, max_batches)`` every rank's ``UnevenRankBatchesError``
+    must carry, or ``None`` when no rank may raise. Members are read via
+    their properties rather than branched on.
+
+    Members:
+        equal: Both ranks yield three batches; nobody raises.
+        both_empty: Both ranks yield nothing; equal counts, nobody raises.
+        rank_1_extra: Rank 1 has one more batch -- the case that used to
+            hang mid-epoch.
+        rank_0_extra: Rank 0 has one more batch; guards against a check
+            that only compares against rank 0's count.
+        one_rank_empty: Rank 0 yields nothing while rank 1 yields one.
+    """
+
+    equal = ((3, 3), None)
+    both_empty = ((0, 0), None)
+    rank_1_extra = ((3, 4), (3, 4))
+    rank_0_extra = ((4, 3), (3, 4))
+    one_rank_empty = ((0, 1), (0, 1))
+
+    @property
+    def batch_counts(self) -> tuple[int, int]:
+        """Batches each rank reports, indexed by rank."""
+        return self.value[0]
+
+    @property
+    def expected_bounds(self) -> tuple[int, int] | None:
+        """``(min, max)`` every rank's error must carry, or ``None``."""
+        return self.value[1]
+
+
+@dataclasses.dataclass(frozen=True)
+class BatchCountCheck:
+    """A two-rank CPU gloo group in which each rank checks its batch count.
+
+    Built by the ``batch_count_check`` factory fixture and handed to
+    ``torch.multiprocessing.spawn``; ``check_rank`` is the per-process
+    entry point, which lives on this object because ``spawn`` needs a
+    picklable callable to run in the child and fixtures cannot run there.
+
+    Attributes:
+        batch_counts: Batches each rank reports, indexed by rank; its length
+            is the world size.
+        store_path: File backing the gloo rendezvous store.
+        collective_timeout: How long a rank waits in a collective before
+            gloo raises, so a hang fails the test instead of stalling it.
+    """
+
+    batch_counts: tuple[int, ...]
+    store_path: pathlib.Path
+    collective_timeout: timedelta
+
+    def check_rank(
+        self,
+        rank: int,
+        reports: SimpleQueue[tuple[int, tuple[int, int] | None]],
+    ) -> None:
+        """Run ``require_equal_batch_counts`` as one rank and report it.
+
+        Reports ``(rank, None)`` if the check passed, or
+        ``(rank, (min_batches, max_batches))`` from the raised
+        ``UnevenRankBatchesError``.
+
+        Args:
+            rank: This process's rank, supplied by ``spawn``.
+            reports: Queue receiving ``(rank, outcome)``.
+        """
+        dist.init_process_group(
+            backend="gloo",
+            init_method=self.store_path.as_uri(),
+            rank=rank,
+            world_size=len(self.batch_counts),
+            timeout=self.collective_timeout,
+        )
+        try:
+            require_equal_batch_counts(
+                self.batch_counts[rank],
+                torch.device("cpu"),
+            )
+        except UnevenRankBatchesError as err:
+            reports.put((rank, (err.min_batches, err.max_batches)))
+        else:
+            reports.put((rank, None))
+        finally:
+            dist.destroy_process_group()
+
+
+@pytest.fixture
+def batch_count_check(
+    request: pytest.FixtureRequest,
+    tmp_path: pathlib.Path,
+) -> BatchCountCheck:
+    """Build the two-rank batch-count check for one scenario.
+
+    Factory fixture: receives a ``BatchCountScenario`` through
+    ``@pytest.mark.parametrize(..., indirect=["batch_count_check"])``. No
+    model or data is involved, so each case costs only process startup.
+
+    Args:
+        request: Pytest request carrying the ``BatchCountScenario``.
+        tmp_path: Pytest-provided directory for the rendezvous store.
+
+    Returns:
+        BatchCountCheck ready to hand to ``torch.multiprocessing.spawn``.
+    """
+    scenario = cast(BatchCountScenario, request.param)
+    return BatchCountCheck(
+        batch_counts=scenario.batch_counts,
+        store_path=tmp_path / "gloo_store",
+        collective_timeout=timedelta(seconds=60),
+    )
+
+
+@pytest.mark.parametrize(
+    ("batch_count_check", "scenario"),
+    [pytest.param(s, s, id=s.name) for s in BatchCountScenario],
+    indirect=["batch_count_check"],
+)
+def test_require_equal_batch_counts_agrees_on_every_rank(
+    batch_count_check: BatchCountCheck,
+    scenario: BatchCountScenario,
+) -> None:
+    """Every rank reaches the same verdict on whether batch counts match.
+
+    The check exists so that uneven per-rank batch counts fail loudly
+    instead of deadlocking ``train()``'s per-batch flush vote. That only
+    works if *every* rank raises: a rank that passed the check would walk
+    into the training loop and hang waiting for the ranks that raised.
+
+    Arrange: ``batch_count_check`` assigns each rank its scenario count.
+    Act: ``torch.multiprocessing.spawn`` runs ``check_rank`` in two real OS
+    processes forming a CPU gloo group; each calls
+    ``require_equal_batch_counts`` and reports whether it raised, and with
+    which ``(min_batches, max_batches)``.
+    Assert: both ranks report, and every rank's outcome equals the
+    scenario's ``expected_bounds`` -- ``None`` everywhere for equal counts,
+    the same true bounds everywhere for uneven counts.
+
+    Args:
+        batch_count_check: Factory-fixture-built check for this scenario.
+        scenario: Per-rank counts and the expected shared verdict.
+    """
+    reports: SimpleQueue[tuple[int, tuple[int, int] | None]] = (
+        multiprocessing.get_context("spawn").SimpleQueue()
+    )
+    _ = spawn(
+        batch_count_check.check_rank,
+        args=(reports,),
+        nprocs=len(batch_count_check.batch_counts),
+    )
+    reported = [reports.get() for _ in batch_count_check.batch_counts]
+
+    assert {rank for rank, _ in reported} == set(
+        range(len(batch_count_check.batch_counts)),
+    )
+    assert {outcome for _, outcome in reported} == {scenario.expected_bounds}
+
+
 class DDPLockstepScenario(enum.Enum):
     """Per-batch-size expectations for the uneven-length two-rank DDP run.
 
@@ -2418,7 +2604,10 @@ class DDPLockstepRun:
     Attributes:
         model_params: Model, optimizer, scheduler, and the scenario's
             TrainConfig, copied into every rank.
-        train_args: Dataset, splits, and log paths for the data loaders.
+        train_args_by_rank: Dataset, splits, and log paths for each rank's
+            data loaders, indexed by rank. Ranks normally share one
+            ``TrainArgs``; giving one rank a larger split simulates a loader
+            whose per-rank batch counts differ.
         store_path: File backing the gloo rendezvous store; avoids having to
             reserve a free TCP port.
         world_size: Number of ranks.
@@ -2430,7 +2619,7 @@ class DDPLockstepRun:
     """
 
     model_params: ModelSetup
-    train_args: TrainArgs
+    train_args_by_rank: tuple[TrainArgs, ...]
     store_path: pathlib.Path
     world_size: int
     threads_per_rank: int
@@ -2461,7 +2650,7 @@ class DDPLockstepRun:
         )
         train_loader, test_loader, _ = make_bucketed_data_loaders(
             cfg=self.model_params.tcfg,
-            extra_train_args=self.train_args,
+            extra_train_args=self.train_args_by_rank[rank],
         )
         train(
             best_val_loss=torch.tensor(float("inf")),
@@ -2575,17 +2764,18 @@ def ddp_lockstep_run(
             ),
         },
     )
+    train_args = TrainArgs(
+        dataset_jsonl=jsonl,
+        shard_dir=tmp_path / "shards",
+        keys_for_splits_json=splits_json,
+        config=tmp_path / "config.json",
+        structlog_jsonl=tmp_path / "structlog.jsonl",
+        ddp=True,
+        debug_run=False,
+    )
     return DDPLockstepRun(
         model_params=dataclasses.replace(model_params, tcfg=run_cfg),
-        train_args=TrainArgs(
-            dataset_jsonl=jsonl,
-            shard_dir=tmp_path / "shards",
-            keys_for_splits_json=splits_json,
-            config=tmp_path / "config.json",
-            structlog_jsonl=tmp_path / "structlog.jsonl",
-            ddp=True,
-            debug_run=False,
-        ),
+        train_args_by_rank=(train_args,) * world_size,
         store_path=tmp_path / "gloo_store",
         world_size=world_size,
         threads_per_rank=4,
@@ -2643,3 +2833,91 @@ def test_train_ddp_uneven_protein_lengths_keeps_ranks_in_lockstep(
     assert {steps for _, steps in reported} == {
         scenario.expected_optimizer_steps,
     }
+
+
+@pytest.fixture
+def rank_1_extra_batch_run(
+    ddp_lockstep_run: DDPLockstepRun,
+    tmp_path: pathlib.Path,
+) -> DDPLockstepRun:
+    """Derive a lockstep run in which rank 1 yields one more batch.
+
+    Simulates a loader whose per-rank batch counts differ (as the
+    token-budget ``ShardDataLoader`` produces) using the same
+    ``DistributedSampler`` path as the lockstep test: rank 1's splits file
+    also lists the two validation proteins as training proteins, so its
+    sampler sees ``4 * batch_size + 2`` proteins instead of
+    ``4 * batch_size``. Each rank's sampler takes half of what it sees,
+    rounded up, so rank 0 yields two batches and rank 1 three, at every
+    batch size.
+
+    Args:
+        ddp_lockstep_run: Fixture providing the even two-rank run, which
+            supplies the dataset, config, and model.
+        tmp_path: Pytest-provided directory for rank 1's splits file.
+
+    Returns:
+        The same run with rank 1's ``TrainArgs`` pointing at the enlarged
+        split.
+    """
+    shared_args = ddp_lockstep_run.train_args_by_rank[0]
+    splits = cast(
+        dict[str, list[str]],
+        json.loads(shared_args.keys_for_splits_json.read_text()),
+    )
+    enlarged_json = tmp_path / "rank_1_extra_splits.json"
+    _ = enlarged_json.write_text(
+        json.dumps(
+            splits | {"train": splits["train"] + splits["validation"]},
+        ),
+    )
+    return dataclasses.replace(
+        ddp_lockstep_run,
+        train_args_by_rank=(
+            shared_args,
+            dataclasses.replace(
+                shared_args,
+                keys_for_splits_json=enlarged_json,
+            ),
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "ddp_lockstep_run",
+    [pytest.param(s, id=s.name) for s in DDPLockstepScenario],
+    indirect=True,
+)
+def test_train_ddp_uneven_batch_counts_raises_instead_of_hanging(
+    rank_1_extra_batch_run: DDPLockstepRun,
+) -> None:
+    """train() fails fast when DDP ranks would yield different batch counts.
+
+    ``train()`` votes on every batch, so with one extra batch on rank 1 the
+    old code had rank 1 wait forever in an ``all_reduce`` that rank 0 never
+    joined -- a mid-epoch hang with no indication of the cause. Now
+    ``require_equal_batch_counts`` compares the counts at the start of the
+    epoch and raises ``UnevenRankBatchesError`` before any batch is drawn.
+
+    Arrange: ``rank_1_extra_batch_run`` gives rank 1 one more batch than
+    rank 0, at each ``DDPLockstepScenario`` batch size.
+    Act: ``torch.multiprocessing.spawn`` runs ``train_rank`` on both ranks.
+    Assert: spawn raises ``ProcessRaisedException`` carrying
+    ``UnevenRankBatchesError``. Without the check, the extra batch's vote
+    would hang until gloo's collective timeout and surface as a gloo
+    error instead, so this fails. That every rank raises (rather than one
+    raising while the other hangs) is covered by
+    test_require_equal_batch_counts_agrees_on_every_rank.
+
+    Args:
+        rank_1_extra_batch_run: Lockstep run with an extra batch on rank 1.
+    """
+    reports: SimpleQueue[tuple[int, int]] = multiprocessing.get_context(
+        "spawn",
+    ).SimpleQueue()
+    with pytest.raises(ProcessRaisedException, match="UnevenRankBatchesError"):
+        _ = spawn(
+            rank_1_extra_batch_run.train_rank,
+            args=(reports,),
+            nprocs=rank_1_extra_batch_run.world_size,
+        )

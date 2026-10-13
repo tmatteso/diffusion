@@ -37,6 +37,29 @@ class DistributedPeerError(RuntimeError):
     """
 
 
+class UnevenRankBatchesError(RuntimeError):
+    """Raised on every DDP rank when ranks would yield different batch counts.
+
+    ``train()`` makes a collective flush decision on every batch, so a rank
+    with even one extra batch would wait forever in an ``all_reduce`` that no
+    other rank joins. ``require_equal_batch_counts`` raises this on all ranks
+    at the start of the epoch instead.
+
+    Args:
+        min_batches: Fewest batches any rank will yield this epoch.
+        max_batches: Most batches any rank will yield this epoch.
+    """
+
+    def __init__(self, min_batches: int, max_batches: int) -> None:
+        super().__init__(
+            f"DDP ranks yield between {min_batches} and {max_batches} "
+            + "batches this epoch; train() requires every rank to yield "
+            + "the same number (DistributedSampler guarantees this).",
+        )
+        self.min_batches: int = min_batches
+        self.max_batches: int = max_batches
+
+
 class DistProcessGroup:
     """Context manager that inits and tears down distributed process group.
 
