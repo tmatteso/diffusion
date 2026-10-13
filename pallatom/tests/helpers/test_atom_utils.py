@@ -21,7 +21,6 @@ import pytest
 import torch
 from einops import einsum, rearrange, reduce, repeat
 from helpers.atom_utils import (
-    ATOM14_ATOM_EXISTS,
     ATOM14_C,
     ATOM14_CA,
     ATOM14_CB,
@@ -55,6 +54,9 @@ from helpers.atom_utils import (
     RNA_RESTYPE_ORDER,
     RNA_RESTYPES,
     Protein,
+    _build_atom14_tables,  # pyright: ignore[reportPrivateUsage]
+    _build_generic_atom14_reference,  # pyright: ignore[reportPrivateUsage]
+    _cb_from_backbone,  # pyright: ignore[reportPrivateUsage]
     atom14_to_atom37,
     atom14_to_cb,
     atom37_to_atom14,
@@ -301,10 +303,10 @@ class SentinelResidue:
             where the atom is absent.
         expected_sentinel_values: Ascending sentinel values of every atom
             the residue type has, i.e. the values atom14 must gather.
-        atom14_reference: The residue type's row of ``ATOM14_REF_POS``
-            (1, 1, 14, 3).
-        atom14_reference_mask: The residue type's row of
-            ``ATOM14_ATOM_EXISTS`` as a float mask (1, 1, 14).
+        atom14_reference: The residue type's row of the reference-position
+            table from ``_build_atom14_tables`` (1, 1, 14, 3).
+        atom14_reference_mask: The residue type's row of the atom-exists
+            table from ``_build_atom14_tables``, as a float mask (1, 1, 14).
         expected_reference_atom37: Ideal coordinates of each atom straight
             from ``rigid_group_atom_positions``, laid out in atom37 slots
             and zero elsewhere (1, 1, 37, 3).
@@ -350,6 +352,7 @@ def sentinel_residue(request: pytest.FixtureRequest) -> SentinelResidue:
             [],
         )
     }
+    exists14, _, _, _, ref_pos14, _ = _build_atom14_tables()
     sentinel = torch.arange(1, len(atom_types) + 1, dtype=torch.float32)
     real_atoms37 = torch.tensor(
         [float(name in ideal_by_name) for name in atom_types],
@@ -374,11 +377,11 @@ def sentinel_residue(request: pytest.FixtureRequest) -> SentinelResidue:
             sorted(float(atom_order[name] + 1) for name in ideal_by_name),
         ).float(),
         atom14_reference=rearrange(
-            ATOM14_REF_POS[scenario.aatype],
+            ref_pos14[scenario.aatype],
             "a d -> 1 1 a d",
         ),
         atom14_reference_mask=rearrange(
-            ATOM14_ATOM_EXISTS[scenario.aatype].float(),
+            exists14[scenario.aatype].float(),
             "a -> 1 1 a",
         ),
         expected_reference_atom37=rearrange(
@@ -502,12 +505,13 @@ def test_atom14_to_atom37_round_trip_restores_atom37(
 def test_atom14_reference_tables_match_rigid_group_geometry(
     sentinel_residue: SentinelResidue,
 ) -> None:
-    """ATOM14_REF_POS places each atom's ideal coordinates in its own slot.
+    """_build_atom14_tables places each atom's ideal coordinates in its slot.
 
-    ``ATOM14_REF_POS`` and ``ATOM14_ATOM_EXISTS`` are built at import time
-    from ``rigid_group_atom_positions``; the generic reference conformer
-    takes its backbone from them, so a slot mix-up would silently corrupt
-    every residue's reference features.
+    ``_build_atom14_tables`` builds ``ATOM14_REF_POS`` and
+    ``ATOM14_ATOM_EXISTS`` at import time from
+    ``rigid_group_atom_positions``; the generic reference conformer takes
+    its backbone from them, so a slot mix-up would silently corrupt every
+    residue's reference features.
 
     Arrange: ``sentinel_residue`` with the residue type's table rows and
     the ideal coordinates read by atom name from the rigid-group data.
@@ -787,6 +791,42 @@ def test_atom37_to_cb_uses_real_cb_else_pseudo_cb(
     assert torch.equal(cb_present, backbone_with_cb.expected_cb_present)
 
 
+@pytest.mark.parametrize(
+    "backbone_with_cb",
+    [pytest.param(s, id=s.name) for s in CbScenario],
+    indirect=True,
+)
+def test_cb_from_backbone_selects_per_residue(
+    backbone_with_cb: BackboneWithCb,
+) -> None:
+    """_cb_from_backbone picks real or pseudo-Cβ from an explicit presence.
+
+    The shared core of ``atom14_to_cb`` and ``atom37_to_cb``: given the
+    backbone, a candidate Cβ, and a presence mask, it must return the
+    candidate where present and the backbone's pseudo-Cβ elsewhere, and
+    pass the presence mask through unchanged.
+
+    Arrange: ``backbone_with_cb`` chain; its atom14 head slots supply N,
+    CA, C, and the candidate Cβ, and its expected presence is the mask.
+    Act: call ``_cb_from_backbone`` directly.
+    Assert: the same expectations as the atom14 and atom37 tests.
+
+    Args:
+        backbone_with_cb: Factory-fixture-built chain for this scenario.
+    """
+    head = backbone_with_cb.atom14_positions
+    cb, cb_present = _cb_from_backbone(
+        head[:, :, ATOM14_N],
+        head[:, :, ATOM14_CA],
+        head[:, :, ATOM14_C],
+        head[:, :, ATOM14_CB],
+        backbone_with_cb.expected_cb_present,
+    )
+
+    assert torch.allclose(cb, backbone_with_cb.expected_cb)
+    assert torch.equal(cb_present, backbone_with_cb.expected_cb_present)
+
+
 # ---------------------------------------------------------------------------
 # fill_atom14_virtual_atoms
 # ---------------------------------------------------------------------------
@@ -1001,11 +1041,12 @@ def reference_slots(request: pytest.FixtureRequest) -> ReferenceSlots:
     Factory fixture: receives a ``ReferenceSlotGroup`` through
     ``@pytest.mark.parametrize(..., indirect=["reference_slots"])``.
 
-    The expectation is assembled from the specification rather than from
-    ``GENERIC_ATOM14_*``: alanine's ideal head from ``ATOM14_REF_POS`` /
-    ``ATOM14_ELEMENTS`` (themselves checked against the rigid-group data
-    above), then nine UNK pseudo-atoms at ``CB + k * 1.5 Å * unit(CB -
-    CA)`` for ``k = 1..9``.
+    The actual slots come from ``_build_generic_atom14_reference`` (which
+    builds ``GENERIC_ATOM14_*`` at import time); the expectation is
+    assembled from the specification instead: alanine's ideal head from
+    ``ATOM14_REF_POS`` / ``ATOM14_ELEMENTS`` (themselves checked against
+    the rigid-group data above), then nine UNK pseudo-atoms at
+    ``CB + k * 1.5 Å * unit(CB - CA)`` for ``k = 1..9``.
 
     Args:
         request: Pytest request carrying the ``ReferenceSlotGroup``.
@@ -1029,10 +1070,10 @@ def reference_slots(request: pytest.FixtureRequest) -> ReferenceSlots:
             repeat(torch.tensor([0.0, 0.0, 0.0, 1.0]), "e -> k e", k=n_pseudo),
         ],
     )
-    ref_pos, ref_elem = generic_ref_pos_and_element(1, device="cpu")
+    ref_pos, ref_elem = _build_generic_atom14_reference()
     return ReferenceSlots(
-        ref_pos=ref_pos[0, group.slots],
-        ref_elem=ref_elem[0, group.slots],
+        ref_pos=ref_pos[group.slots],
+        ref_elem=ref_elem[group.slots],
         expected_ref_pos=expected_pos[group.slots],
         expected_ref_elem=expected_elem[group.slots],
     )
