@@ -583,8 +583,16 @@ def test_edm_sampler_identity_denoiser_produces_finite_centred_output(
        contain no NaN or Inf values, and the coordinate tensor has the
        expected shape ``(1, N_ATOM, 3)``.
     2. **Centre-of-mass at origin** — the mean position across all atoms must
-       be zero for every batch element (up to ``atol=1e-5``), confirming that
-       the sampler zero-centres its output.
+       be zero for every batch element, confirming that the sampler
+       zero-centres its output. The tolerance is ``1e-6`` times the largest
+       coordinate magnitude, not a fixed absolute value. The identity
+       denoiser leaves the coordinates at the starting noise scale
+       (``sigma_data * sigma_max``, about 1,280 Å here), where float32
+       rounding alone moves the centre of mass by around 1e-5 Å. Without
+       the final centring step the output keeps the random translation
+       (about 1 Å) that ``centre_random_augment`` adds each step: about
+       0.6 Å with this seed, several hundred times the tolerance (about
+       1.3e-3 Å), so the check still catches a missing centring step.
     """
     sampler = EDMSampler(
         identity_denoiser_mock,
@@ -599,7 +607,11 @@ def test_edm_sampler_identity_denoiser_produces_finite_centred_output(
     assert torch.isfinite(z).all()
     assert torch.isfinite(seq).all()
     com: Float[torch.Tensor, "1 3"] = reduce(z, "b n_atom d -> b d", "mean")
-    assert torch.allclose(com, torch.zeros_like(com), atol=1e-5)
+    assert torch.allclose(
+        com,
+        torch.zeros_like(com),
+        atol=1e-6 * float(z.abs().max()),
+    )
 
 
 def test_edm_sampler_zero_denoiser_output_is_zero(
