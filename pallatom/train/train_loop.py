@@ -38,6 +38,7 @@ from helpers.context_managers import (
     FatalOnError,
     StepContext,
     StructlogConfig,
+    UnevenRankBatchesError,
 )
 from helpers.data import (
     FeaturizedBatch,
@@ -59,6 +60,8 @@ from torch.optim import Adam
 from torch.optim.lr_scheduler import LambdaLR
 from tqdm import tqdm
 from train.train_config import TrainArgs, TrainConfig
+
+_CUDA_DEVICE_TYPE = "cuda"
 
 
 @dataclasses.dataclass
@@ -697,6 +700,66 @@ def flush_micro_buffer(
     return dataclasses.replace(step, global_step=new_global_step)
 
 
+def any_rank_true(flag: bool, device: torch.device) -> bool:  # noqa: FBT001
+    """Return ``True`` on every rank if ``flag`` is ``True`` on any rank.
+
+    Makes a per-rank decision collective so every rank takes the same branch.
+    Must be called by every rank at the same point; a no-op returning
+    ``flag`` unchanged when no distributed process group is initialised.
+
+    Args:
+        flag: This rank's local decision.
+        device: Device for the one-element reduction tensor (must match the
+            process-group backend: CUDA for NCCL, CPU for gloo).
+
+    Returns:
+        The logical OR of ``flag`` across all ranks.
+    """
+    if not dist.is_initialized():
+        return flag
+    flag_tensor: Int[torch.Tensor, ""] = torch.tensor(int(flag), device=device)
+    _ = dist.all_reduce(  # pyright: ignore[reportUnknownMemberType]
+        flag_tensor,
+        op=dist.ReduceOp.MAX,
+    )
+    return bool(flag_tensor.item())
+
+
+def require_equal_batch_counts(n_batches: int, device: torch.device) -> None:
+    """Raise on every rank unless all ranks will yield ``n_batches`` batches.
+
+    ``train()`` votes on every batch via ``any_rank_true``, so a rank with
+    even one extra batch would wait forever in an ``all_reduce`` that no
+    other rank joins. A single ``all_reduce`` of ``[n, -n]`` with ``MAX``
+    gives every rank both the largest and the smallest count, so every rank
+    reaches the same verdict and they all raise together rather than some
+    raising while the rest hang. Must be called by every rank at the same
+    point; a no-op when no distributed process group is initialised.
+
+    Args:
+        n_batches: Number of batches this rank will yield this epoch.
+        device: Device for the reduction tensor (must match the
+            process-group backend: CUDA for NCCL, CPU for gloo).
+
+    Raises:
+        UnevenRankBatchesError: If any two ranks' counts differ.
+    """
+    if not dist.is_initialized():
+        return
+    bounds: Int[torch.Tensor, "2"] = torch.tensor(
+        [n_batches, -n_batches],
+        device=device,
+    )
+    _ = dist.all_reduce(  # pyright: ignore[reportUnknownMemberType]
+        bounds,
+        op=dist.ReduceOp.MAX,
+    )
+    max_batches = int(bounds[0].item())
+    min_batches = -int(bounds[1].item())
+    if min_batches != max_batches:
+        raise UnevenRankBatchesError(min_batches, max_batches)
+
+
 def collect_distributed_vars() -> tuple[int, int, int]:
     """Return (rank, world_size, local_rank) for the current DDP context."""
     if not dist.is_initialized():
@@ -797,6 +860,24 @@ def train(
     ``tcfg.training.accumulated_token_budget`` is divided by ``world_size`` to
     get the per-rank token threshold; micro-batches accumulate until their
     combined token count hits that threshold before each optimizer step.
+    The flush decision is made collectively via ``any_rank_true``: when any
+    rank's next batch would exceed its threshold, every rank flushes. This
+    keeps every rank on the same number of optimizer steps (and hence DDP
+    gradient all-reduces); deciding per rank lets ranks with differently
+    sized proteins drift apart and deadlock at the epoch-end collectives.
+    Any micro-batches left in the buffer at epoch end are flushed as a final
+    (partial) window rather than dropped. That window, like a window cut
+    short because another rank voted to flush, can hold far fewer tokens
+    than the budget -- as little as one micro-batch -- yet still takes a
+    full optimizer step at the scheduled learning rate, because
+    ``process_accum_window`` averages the loss per protein rather than
+    scaling it by window size. Such steps are noisier than full-budget
+    ones; this is accepted over discarding the leftover proteins. Every
+    rank must yield the same number of batches per
+    epoch, as ``DistributedSampler`` guarantees; ``require_equal_batch_counts``
+    checks this at the start of each epoch and raises
+    ``UnevenRankBatchesError`` on every rank instead of letting the per-batch
+    vote deadlock.
 
     Per-epoch validation runs against the EMA shadow weights rather than
     the raw trained weights (matching AlphaFold2's checkpoint-selection
@@ -825,7 +906,11 @@ def train(
     if dist.is_initialized():
         ddp_wrapped: DDP = DDP(
             model_params.model,
-            device_ids=[local_rank],
+            device_ids=(
+                [local_rank]
+                if model_params.device.type == _CUDA_DEVICE_TYPE
+                else None
+            ),
             find_unused_parameters=False,
             gradient_as_bucket_view=True,
         )
@@ -865,6 +950,7 @@ def train(
         train_iter: Iterator[FeaturizedBatch] = iter(
             cast(Iterable[FeaturizedBatch], train_loader),
         )
+        require_equal_batch_counts(len(train_loader), model_params.device)
         estimated_steps: int = math.ceil(len(train_loader))
         pbar: tqdm[NoReturn] = tqdm(  # pylint: disable=unsubscriptable-object
             desc=f"Epoch {epoch:03d}/{tp.num_epochs}",
@@ -888,10 +974,13 @@ def train(
             n_proteins: int = int(batch.r_gt.shape[0])
             n_all_tokens: int = int(batch.f_pseudo_beta_mask.sum().item())
 
-            # if adding this batch would push tokens over the budget, flush.
-            if (
-                micro_buffer
-                and accum_tokens + n_all_tokens > per_rank_token_budget
+            # if adding this batch would push tokens over the budget on any
+            # rank, every rank flushes, so all ranks take the same number of
+            # optimizer steps (and DDP gradient all-reduces) per epoch.
+            if any_rank_true(
+                bool(micro_buffer)
+                and accum_tokens + n_all_tokens > per_rank_token_budget,
+                model_params.device,
             ):
                 step = flush_micro_buffer(
                     micro_buffer,
@@ -906,6 +995,16 @@ def train(
             n_proteins_buffer.append(n_proteins)
             accum_tokens += n_all_tokens
             step.pbar.update(1)  # pyright: ignore[reportUnusedCallResult]
+
+        # flush the remaining micro-batches; ranks flush in lockstep, so the
+        # buffer is non-empty on every rank or on none.
+        if micro_buffer:
+            step = flush_micro_buffer(
+                micro_buffer,
+                n_proteins_buffer,
+                model_params,
+                step,
+            )
 
         with swapped_in_ema_weights(model_params):
             epoch_val_metrics, _ = evaluate(
