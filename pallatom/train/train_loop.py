@@ -866,7 +866,14 @@ def train(
     gradient all-reduces); deciding per rank lets ranks with differently
     sized proteins drift apart and deadlock at the epoch-end collectives.
     Any micro-batches left in the buffer at epoch end are flushed as a final
-    (partial) window. Every rank must yield the same number of batches per
+    (partial) window rather than dropped. That window, like a window cut
+    short because another rank voted to flush, can hold far fewer tokens
+    than the budget -- as little as one micro-batch -- yet still takes a
+    full optimizer step at the scheduled learning rate, because
+    ``process_accum_window`` averages the loss per protein rather than
+    scaling it by window size. Such steps are noisier than full-budget
+    ones; this is accepted over discarding the leftover proteins. Every
+    rank must yield the same number of batches per
     epoch, as ``DistributedSampler`` guarantees; ``require_equal_batch_counts``
     checks this at the start of each epoch and raises
     ``UnevenRankBatchesError`` on every rank instead of letting the per-batch

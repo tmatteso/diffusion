@@ -2356,11 +2356,166 @@ def test_any_rank_true_returns_flag_without_process_group(
     Act: call any_rank_true() with each boolean value.
     Assert: the result equals the input, confirming single-device training
     never attempts a collective call that would error without a group.
-    The multi-rank OR semantics are covered end to end by
-    test_train_ddp_uneven_protein_lengths_keeps_ranks_in_lockstep.
+    The multi-rank OR semantics are covered by
+    test_any_rank_true_ors_flags_across_ranks.
     """
     assert not dist.is_initialized()
     assert any_rank_true(flag, cpu_device) is flag
+
+
+class VoteScenario(enum.Enum):
+    """Per-rank flags for ``any_rank_true`` and the OR every rank must get.
+
+    Each member's value is ``(flags, expected)``: ``flags[r]`` is rank
+    ``r``'s local decision, so the tuple's length is the world size, and
+    ``expected`` is the logical OR that every rank must get back. Members
+    are read via their properties rather than branched on.
+
+    Members:
+        only_rank_0: Only rank 0 votes True; catches a vote that only
+            listens to the last rank.
+        only_rank_1: Only rank 1 votes True; catches a vote that only
+            listens to rank 0 (e.g. a broadcast from rank 0).
+        neither: No rank votes True; catches a vote that returns True when
+            nobody asked.
+        both: Every rank votes True; the result must still be True when
+            the votes coincide.
+        middle_of_three: Three ranks, and only the middle one votes True;
+            catches a vote that only consults the first and last ranks.
+    """
+
+    only_rank_0 = ((True, False), True)
+    only_rank_1 = ((False, True), True)
+    neither = ((False, False), False)
+    both = ((True, True), True)
+    middle_of_three = ((False, True, False), True)
+
+    @property
+    def flags(self) -> tuple[bool, ...]:
+        """Each rank's local decision, indexed by rank."""
+        return self.value[0]
+
+    @property
+    def expected(self) -> bool:
+        """The OR every rank must get back."""
+        return self.value[1]
+
+
+@dataclasses.dataclass(frozen=True)
+class VoteCheck:
+    """A CPU gloo group in which each rank votes through ``any_rank_true``.
+
+    Built by the ``vote_check`` factory fixture and handed to
+    ``torch.multiprocessing.spawn``; ``vote_rank`` is the per-process entry
+    point, which lives on this object because ``spawn`` needs a picklable
+    callable to run in the child and fixtures cannot run there.
+
+    Attributes:
+        flags: Each rank's local decision, indexed by rank; its length is
+            the world size.
+        store_path: File backing the gloo rendezvous store.
+        collective_timeout: How long a rank waits in a collective before
+            gloo raises, so a hang fails the test instead of stalling it.
+    """
+
+    flags: tuple[bool, ...]
+    store_path: pathlib.Path
+    collective_timeout: timedelta
+
+    def vote_rank(
+        self,
+        rank: int,
+        reports: SimpleQueue[tuple[int, bool]],
+    ) -> None:
+        """Vote this rank's flag through ``any_rank_true`` and report it.
+
+        Args:
+            rank: This process's rank, supplied by ``spawn``.
+            reports: Queue receiving ``(rank, result)``.
+        """
+        dist.init_process_group(
+            backend="gloo",
+            init_method=self.store_path.as_uri(),
+            rank=rank,
+            world_size=len(self.flags),
+            timeout=self.collective_timeout,
+        )
+        try:
+            reports.put(
+                (rank, any_rank_true(self.flags[rank], torch.device("cpu"))),
+            )
+        finally:
+            dist.destroy_process_group()
+
+
+@pytest.fixture
+def vote_check(
+    request: pytest.FixtureRequest,
+    tmp_path: pathlib.Path,
+) -> VoteCheck:
+    """Build the multi-rank ``any_rank_true`` vote for one scenario.
+
+    Factory fixture: receives a ``VoteScenario`` through
+    ``@pytest.mark.parametrize(..., indirect=["vote_check"])``. No model or
+    data is involved, so each case costs only process startup.
+
+    Args:
+        request: Pytest request carrying the ``VoteScenario``.
+        tmp_path: Pytest-provided directory for the rendezvous store.
+
+    Returns:
+        VoteCheck ready to hand to ``torch.multiprocessing.spawn``.
+    """
+    scenario = cast(VoteScenario, request.param)
+    return VoteCheck(
+        flags=scenario.flags,
+        store_path=tmp_path / "gloo_store",
+        collective_timeout=timedelta(seconds=60),
+    )
+
+
+@pytest.mark.parametrize(
+    ("vote_check", "scenario"),
+    [pytest.param(s, s, id=s.name) for s in VoteScenario],
+    indirect=["vote_check"],
+)
+def test_any_rank_true_ors_flags_across_ranks(
+    vote_check: VoteCheck,
+    scenario: VoteScenario,
+) -> None:
+    """any_rank_true() returns the OR of every rank's flag on every rank.
+
+    ``train()`` relies on this for its flush decision: if any rank gets a
+    different answer, that rank flushes when the others do not, and the
+    ranks' gradient all-reduces stop lining up. This tests the vote
+    directly, so a wrong reduction fails here with the offending flag
+    combination rather than as a step-count mismatch deep inside
+    ``train()``.
+
+    Arrange: ``vote_check`` assigns each rank its scenario flag, over two
+    or three ranks.
+    Act: ``torch.multiprocessing.spawn`` runs ``vote_rank`` in one real OS
+    process per rank, forming a CPU gloo group; each calls
+    ``any_rank_true`` and reports the result.
+    Assert: every rank reports, and every rank's result equals the
+    scenario's expected OR.
+
+    Args:
+        vote_check: Factory-fixture-built vote for this scenario.
+        scenario: Per-rank flags and the expected OR.
+    """
+    reports: SimpleQueue[tuple[int, bool]] = multiprocessing.get_context(
+        "spawn",
+    ).SimpleQueue()
+    _ = spawn(
+        vote_check.vote_rank,
+        args=(reports,),
+        nprocs=len(vote_check.flags),
+    )
+    reported = [reports.get() for _ in vote_check.flags]
+
+    assert {rank for rank, _ in reported} == set(range(len(vote_check.flags)))
+    assert {result for _, result in reported} == {scenario.expected}
 
 
 @pytest.mark.parametrize("n_batches", [0, 1, 7], ids=["zero", "one", "seven"])
