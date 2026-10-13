@@ -1,9 +1,7 @@
 """Tests for the conditional sampling loop."""
 
 import dataclasses
-import itertools
-import math
-from enum import Flag, auto
+from enum import Enum, Flag, auto
 from typing import cast
 from unittest.mock import MagicMock
 
@@ -11,11 +9,13 @@ import numpy as np
 import pytest
 import torch
 from architecture.main_trunk import PredictedOutputs
+from beartype import beartype
 from einops import rearrange, reduce
+from helpers.alignment import masked_com
 from helpers.atom_utils import RESTYPE_NUM_NO_X, Protein, restype_order
 from helpers.data import Distogram, FeaturizedBatch
 from helpers.useful_objects import manual_seed
-from jaxtyping import Float, TypeCheckError
+from jaxtyping import Bool, Float, TypeCheckError, jaxtyped
 from sample.sample_config import SamplerParams
 from sample.sampling import (
     NATOM,
@@ -39,15 +39,6 @@ SIGMA_MAX = 80.0
 N_ATOM_BINS = 22
 T_HAT_INIT = 1.0
 T_NORM_INIT = 0.5
-SCHEDULE_REL_TOL = 1e-5
-# Loose bounds: an RMS over N_ATOM * 3 Gaussian draws is noisy, but a start
-# at the wrong end of the schedule is off by orders of magnitude.
-INIT_RMS_RATIO_MIN = 0.5
-INIT_RMS_RATIO_MAX = 2.0
-RECORDED_STEPS = 10
-# Just above the SamplerParams minimum of 1, so each zero-denoiser Euler step
-# rescales the input by roughly c_next / c_T and never overshoots past zero.
-ETA_NEAR_ONE = 1.01
 
 # ---------------------------------------------------------------------------
 # Mock factories
@@ -222,22 +213,6 @@ def half_denoiser_mock() -> MagicMock:
 
 
 @pytest.fixture
-def bare_sampler(
-    zero_denoiser_mock: MagicMock,
-    context: FeaturizedBatch,
-    templ_disto: Distogram,
-) -> EDMSampler:
-    """EDMSampler with a zero denoiser; used for _sigma_schedule tests only."""
-    return EDMSampler(
-        zero_denoiser_mock,
-        context,
-        templ_disto,
-        SamplerParams(rho=7.0),
-        NoiseScheduleParams(sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX),
-    )
-
-
-@pytest.fixture
 def identity_det_sampler(
     identity_denoiser_mock: MagicMock,
     context: FeaturizedBatch,
@@ -396,41 +371,163 @@ def test_build_sampling_context_bin_count_propagation(
 # ---------------------------------------------------------------------------
 
 
-def test_noise_schedule_boundary_and_properties(
-    bare_sampler: EDMSampler,
-) -> None:
-    """Verify properties of an EDM Noise Schedule.
+class NoiseScheduleScenario(Enum):
+    """Noise schedule configurations whose time axis must run min to max.
 
-    Checks four properties of the noise schedule in a single pass:
+    Each member is a ``(sigma_data, sigma_min, sigma_max, rho)`` tuple read
+    through properties. The ``noise_schedule_curve`` factory fixture builds an
+    ``EDMSampler`` from those values; the expected endpoints are the same
+    values multiplied out, so they do not reimplement the schedule formula.
+    Members are read via their properties rather than branched on.
 
-    1. **Boundaries** — ``noise_schedule(1)`` equals ``sigma_data * sigma_max``
-       and ``noise_schedule(0)`` equals ``sigma_data * sigma_min`` (within
-       ``rel_tol=1e-5``).
-    2. **Midpoint in open interval** — ``noise_schedule(0.5)`` lies strictly
-       between the two boundary values, confirming the schedule does not
-       collapse to either extreme.
-    3. **Monotone increase** — values sampled at 20 evenly-spaced points from
-       0 to 1 are non-decreasing.
-    4. **Strict positivity** — every sampled value is greater than zero.
+    Members:
+        pallatom_default: The training defaults (sigma_data 16, sigma_min
+            4e-4, sigma_max 160, rho 7), i.e. the schedule production
+            sampling uses.
+        unit_sigma_data: sigma_data of 1, so the endpoints are the raw
+            sigma_min and sigma_max; catches a missing or doubled
+            sigma_data factor that the default scale would hide.
+        low_rho: rho of 3. The interior of the curve changes with rho but
+            the endpoints must not.
     """
-    lo = bare_sampler.sigma_data * bare_sampler.sigma_min
-    hi = bare_sampler.sigma_data * bare_sampler.sigma_max
-    assert math.isclose(
-        bare_sampler.noise_schedule(torch.tensor(1.0)).item(),
-        hi,
-        rel_tol=1e-5,
+
+    pallatom_default = (16.0, 4e-4, 160.0, 7.0)
+    unit_sigma_data = (1.0, 0.002, 80.0, 7.0)
+    low_rho = (16.0, 4e-4, 160.0, 3.0)
+
+    @property
+    def sigma_data(self) -> float:
+        """Data standard deviation scaling every noise level."""
+        return self.value[0]
+
+    @property
+    def sigma_min(self) -> float:
+        """Smallest unscaled noise level."""
+        return self.value[1]
+
+    @property
+    def sigma_max(self) -> float:
+        """Largest unscaled noise level."""
+        return self.value[2]
+
+    @property
+    def rho(self) -> float:
+        """Schedule exponent."""
+        return self.value[3]
+
+    @property
+    def expected_sigma_at_zero(self) -> float:
+        """Noise level the schedule must give at t = 0 (minimum noise)."""
+        return self.sigma_data * self.sigma_min
+
+    @property
+    def expected_sigma_at_one(self) -> float:
+        """Noise level the schedule must give at t = 1 (maximum noise)."""
+        return self.sigma_data * self.sigma_max
+
+
+@pytest.fixture
+def noise_schedule_curve(
+    request: pytest.FixtureRequest,
+    zero_denoiser_mock: MagicMock,
+    context: FeaturizedBatch,
+    templ_disto: Distogram,
+) -> Float[torch.Tensor, "n_t"]:
+    """Evaluate one scenario's noise schedule on an even grid over [0, 1].
+
+    Factory fixture: receives a ``NoiseScheduleScenario`` through
+    ``@pytest.mark.parametrize(..., indirect=["noise_schedule_curve"])``.
+    The grid has 21 points, so it includes both endpoints exactly and
+    steps of 0.05 between them. The zero denoiser is never called;
+    ``noise_schedule`` only reads the sampler's schedule parameters.
+
+    Args:
+        request: Pytest request carrying the ``NoiseScheduleScenario``.
+        zero_denoiser_mock: Trunk stand-in required to construct the sampler.
+        context: Unconditional sampling context required by the sampler.
+        templ_disto: Template distogram module required by the sampler.
+
+    Returns:
+        Noise levels at ``t = 0, 0.05, ..., 1``, in grid order.
+    """
+    scenario = cast(NoiseScheduleScenario, request.param)
+    n_grid_points = 21
+    sampler = EDMSampler(
+        zero_denoiser_mock,
+        context,
+        templ_disto,
+        SamplerParams(rho=scenario.rho),
+        NoiseScheduleParams(
+            sigma_data=scenario.sigma_data,
+            sigma_min=scenario.sigma_min,
+            sigma_max=scenario.sigma_max,
+        ),
     )
-    assert math.isclose(
-        bare_sampler.noise_schedule(torch.tensor(0.0)).item(),
-        lo,
-        rel_tol=1e-5,
+    times = torch.linspace(0.0, 1.0, n_grid_points)
+    return torch.stack([sampler.noise_schedule(t) for t in times])
+
+
+@pytest.mark.parametrize(
+    ("noise_schedule_curve", "scenario"),
+    [pytest.param(s, s, id=s.name) for s in NoiseScheduleScenario],
+    indirect=["noise_schedule_curve"],
+)
+def test_noise_schedule_runs_from_sigma_min_at_zero_to_sigma_max_at_one(
+    noise_schedule_curve: Float[torch.Tensor, "n_t"],
+    scenario: NoiseScheduleScenario,
+) -> None:
+    """noise_schedule maps t = 0 to minimum noise and t = 1 to maximum noise.
+
+    Regression for a sampler that mixed two time conventions: the schedule
+    put maximum noise at t = 0 (AF3) while the initial noise level and the
+    Euler target assumed maximum noise at t = 1 (Pallatom), so sampling
+    started from the bottom of the schedule.
+
+    Arrange: ``noise_schedule_curve`` evaluates the scenario's schedule on
+    an even grid from t = 0 to t = 1.
+    Act: read the first and last grid values.
+    Assert: the first equals ``sigma_data * sigma_min`` and the last equals
+    ``sigma_data * sigma_max``, to float32 precision.
+
+    Args:
+        noise_schedule_curve: Noise levels on the grid for this scenario.
+        scenario: Schedule parameters and expected endpoint values.
+    """
+    torch.testing.assert_close(
+        float(noise_schedule_curve[0]),
+        scenario.expected_sigma_at_zero,
+        rtol=1e-5,
+        atol=0.0,
     )
-    mid = bare_sampler.noise_schedule(torch.tensor(0.5))
-    assert lo < mid.item() < hi
-    ts = torch.linspace(0.0, 1.0, 20)
-    vals = torch.stack([bare_sampler.noise_schedule(t) for t in ts])
-    assert (vals[1:] - vals[:-1] >= 0).all()
-    assert (vals > 0).all()
+    torch.testing.assert_close(
+        float(noise_schedule_curve[-1]),
+        scenario.expected_sigma_at_one,
+        rtol=1e-5,
+        atol=0.0,
+    )
+
+
+@pytest.mark.parametrize(
+    "noise_schedule_curve",
+    [pytest.param(s, id=s.name) for s in NoiseScheduleScenario],
+    indirect=True,
+)
+def test_noise_schedule_strictly_increases_with_time(
+    noise_schedule_curve: Float[torch.Tensor, "n_t"],
+) -> None:
+    """Noise levels strictly increase from t = 0 to t = 1.
+
+    Arrange: ``noise_schedule_curve`` evaluates the scenario's schedule on
+    an even grid from t = 0 to t = 1.
+    Act: compare each grid value with the one after it.
+    Assert: every later value is larger. Together with the endpoint test,
+    this pins the direction of the time axis: counting t down from 1 to 0
+    visits noise levels from maximum to minimum, never revisiting one.
+
+    Args:
+        noise_schedule_curve: Noise levels on the grid for this scenario.
+    """
+    assert bool((noise_schedule_curve[1:] > noise_schedule_curve[:-1]).all())
 
 
 def test_noise_schedule_different_rho_gives_different_intermediate_values(
@@ -582,135 +679,354 @@ def test_edm_sampler_s_churn_produces_different_result_than_deterministic(
     assert torch.isfinite(seq_stoch).all()
 
 
-def test_edm_sampler_denoiser_called_twice_per_step(
+class SamplerTrajectoryScenario(Enum):
+    """Sampler settings whose recorded trajectory must follow the schedule.
+
+    Each member is a ``(ddim_steps, jitter, eta_step_scale)`` tuple read
+    through properties. ``jitter`` replaces the ``torch.rand()`` draw that
+    offsets every step's time, so the visited noise levels are known
+    exactly. Members are read via their properties rather than branched on.
+
+    Members:
+        two_steps: The smallest step count ``SamplerParams`` allows; the
+            first step is also the second-to-last.
+        ten_steps: A coarse grid with no jitter, so every step lands on a
+            grid point ``t = k / 10``.
+        ten_steps_half_jitter: The same grid with every time shifted down by
+            half a step, as the sampler's random offset would.
+        ten_steps_gentle_step_scale: A smaller Euler step scale, so the
+            per-step rescale differs from the default.
+        pallatom_default: The production defaults (200 steps, step scale
+            2.25) with half-step jitter.
+
+    Every member runs with churn off (``S_churn = 0``), so both model calls
+    in a step see the same noise level and the same noisy input.
+    """
+
+    two_steps = (2, 0.0, 2.25)
+    ten_steps = (10, 0.0, 2.25)
+    ten_steps_half_jitter = (10, 0.5, 2.25)
+    ten_steps_gentle_step_scale = (10, 0.5, 1.5)
+    pallatom_default = (200, 0.5, 2.25)
+
+    @property
+    def ddim_steps(self) -> int:
+        """Number of sampling steps."""
+        return self.value[0]
+
+    @property
+    def jitter(self) -> float:
+        """Value returned in place of each ``torch.rand()`` draw."""
+        return self.value[1]
+
+    @property
+    def eta_step_scale(self) -> float:
+        """Multiplier on each Euler step."""
+        return self.value[2]
+
+    @property
+    def expected_model_calls(self) -> int:
+        """Model calls a full run must make: two per step."""
+        return 2 * self.ddim_steps
+
+
+@jaxtyped(typechecker=beartype)
+@dataclasses.dataclass(frozen=True)
+class SamplerTrajectory:
+    """What the model saw during one sampling run, with exact expectations.
+
+    Built by the ``sampler_trajectory`` factory fixture. "Centred RMS" is
+    the RMS of a step's noisy input about its centroid, which measures how
+    much noise the input carries. Recorded and expected sequences use
+    separate dimension names on purpose: a sampler that runs the wrong
+    number of steps must reach the test and fail its comparison there,
+    not fail jaxtyping while the fixture is being built.
+
+    Attributes:
+        model_calls: Number of model calls the run made.
+        step_sigmas: Noise level passed to the model at each step, in loop
+            order.
+        expected_step_sigmas: ``noise_schedule(k / T - jitter / T)`` for
+            ``k = T, ..., 1``.
+        initial_centred_rms: Centred RMS of the first step's input.
+        expected_initial_centred_rms: Centred RMS of the seeded initial
+            draw, scaled by the noise level the first model call was told.
+            Taken from the recorded call rather than from
+            ``noise_schedule``, so a schedule evaluated at the wrong end
+            cannot make the expectation agree with the bug.
+        step_rms_ratios: Centred RMS of each step's input divided by the
+            previous step's.
+        expected_step_rms_ratios: ``|1 + eta * (sigma_next / sigma - 1)|``
+            for each step but the last, where ``sigma_next`` is the
+            schedule one step further toward t = 0.
+    """
+
+    model_calls: int
+    step_sigmas: Float[torch.Tensor, "n_recorded_steps"]
+    expected_step_sigmas: Float[torch.Tensor, "n_expected_steps"]
+    initial_centred_rms: Float[torch.Tensor, ""]
+    expected_initial_centred_rms: Float[torch.Tensor, ""]
+    step_rms_ratios: Float[torch.Tensor, "n_recorded_gaps"]
+    expected_step_rms_ratios: Float[torch.Tensor, "n_expected_gaps"]
+
+
+@pytest.fixture
+def sampler_trajectory(
+    request: pytest.FixtureRequest,
     zero_denoiser_mock: MagicMock,
     context: FeaturizedBatch,
     templ_disto: Distogram,
-) -> None:
-    """Each loop step must call denoise twice per iteration.
+    monkeypatch: pytest.MonkeyPatch,
+) -> SamplerTrajectory:
+    """Run the sampler for one scenario and record every model input.
 
-    The loop runs over ``range(ddim_steps, 0, -1)`` (``ddim_steps``
-    iterations). Each iteration calls denoise once for self-conditioning and
-    once for the update, giving a total of ``2 * ddim_steps`` calls.
+    Factory fixture: receives a ``SamplerTrajectoryScenario`` through
+    ``@pytest.mark.parametrize(..., indirect=["sampler_trajectory"])``.
+
+    Four choices make every expectation exact rather than statistical:
+
+    1. ``torch.rand`` is monkeypatched to return the scenario's jitter.
+       The sampler draws ``torch.rand()`` only for the per-step time offset,
+       so the visited times are exactly ``k / T - jitter / T``.
+    2. The zero denoiser stands in for the trunk. Its output is always
+       zero, so each Euler step only rescales the input by
+       ``1 + eta * (sigma_next - sigma) / sigma``. No real model's output
+       could be predicted this way.
+    3. The global seed is set to 0 twice: once to draw the initial noise
+       here, and again just before ``sample()``. With ``torch.rand``
+       patched, the sampler's first random draw is that same initial
+       ``torch.randn``, so the fixture knows the starting coordinates.
+    4. ``centre_random_augment`` is replaced with plain centring. Its random
+       rotation and translation do not affect which noise levels are
+       visited, but the fresh ~1 Å translation it adds every step would
+       swamp the input in float32: with a zero denoiser and 200 steps the
+       input shrinks to about 1e-10 Å, far below float32 resolution at
+       1 Å.
+
+    The last step's Euler update is discarded (``sample()`` returns the
+    denoised prediction), so ratios cover every step but the last.
+
+    Args:
+        request: Pytest request carrying the ``SamplerTrajectoryScenario``.
+        zero_denoiser_mock: Trunk stand-in that always predicts zeros and
+            records every call.
+        context: Unconditional sampling context.
+        templ_disto: Template distogram module for self-conditioning.
+        monkeypatch: Pytest monkeypatch used to pin ``torch.rand`` and to
+            replace ``centre_random_augment``.
+
+    Returns:
+        SamplerTrajectory with the recorded trajectory and its expectations.
     """
-    ddim_steps = 5
+    scenario = cast(SamplerTrajectoryScenario, request.param)
+    seed = 0
+    shape = (1, context.r_gt.shape[1], 3)
+    delta_t = 1 / scenario.ddim_steps
     sampler = EDMSampler(
         zero_denoiser_mock,
         context,
         templ_disto,
-        SamplerParams(S_churn=0.0, ddim_steps=ddim_steps),
-        NoiseScheduleParams(sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX),
-    )
-    _ = sampler.sample((1, N_ATOM, 3))
-    assert zero_denoiser_mock.call_count == 2 * ddim_steps
-
-
-def _record_steps(
-    denoiser: MagicMock,
-    sampling_context: FeaturizedBatch,
-    template_distogram: Distogram,
-) -> tuple[EDMSampler, list[FeaturizedBatch]]:
-    """Run a churn-free sampler and return the batch seen at each step.
-
-    With churn off, both model calls in a step share one noise level and
-    noisy input, so every other recorded call gives one batch per step. The
-    step scale is set just above 1 so that a coarse grid cannot overshoot.
-
-    Args:
-        denoiser: Mock trunk whose calls are recorded.
-        sampling_context: Static sampling context.
-        template_distogram: Template distogram module.
-
-    Returns:
-        The sampler (for evaluating its schedule) and one model input batch
-        per sampling step, in loop order.
-    """
-    sampler = EDMSampler(
-        denoiser,
-        sampling_context,
-        template_distogram,
         SamplerParams(
             S_churn=0.0,
-            ddim_steps=RECORDED_STEPS,
-            eta_step_scale=ETA_NEAR_ONE,
+            ddim_steps=scenario.ddim_steps,
+            eta_step_scale=scenario.eta_step_scale,
         ),
-        NoiseScheduleParams(sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX),
+        NoiseScheduleParams(),
     )
-    _ = sampler.sample((1, N_ATOM, 3))
-    batches: list[FeaturizedBatch] = [
-        cast(FeaturizedBatch, call.args[0]) for call in denoiser.call_args_list
-    ]
-    return sampler, batches[::2]
+
+    def fixed_jitter(
+        size: tuple[int, ...],
+        device: torch.device,
+    ) -> Float[torch.Tensor, "..."]:
+        """Stand in for ``torch.rand``, returning the scenario's jitter.
+
+        Args:
+            size: Requested output shape.
+            device: Requested output device.
+
+        Returns:
+            Tensor of ``size`` filled with the scenario's jitter.
+        """
+        return torch.full(size, scenario.jitter, device=device)
+
+    def centre_only(
+        coords: Float[torch.Tensor, "B N_atom 3"],
+        mask: Bool[torch.Tensor, "B N_atom"],
+    ) -> Float[torch.Tensor, "B N_atom 3"]:
+        """Stand in for ``centre_random_augment``: centre with no rotation.
+
+        Args:
+            coords: Batched atom coordinates.
+            mask: Valid-atom mask used for the centroid.
+
+        Returns:
+            ``coords`` shifted so their masked centroid is at the origin.
+        """
+        return coords - masked_com(coords, mask=mask)
+
+    def centred_rms(
+        coords: Float[torch.Tensor, "B N_atom 3"],
+    ) -> Float[torch.Tensor, ""]:
+        """RMS of ``coords`` about their centroid.
+
+        Args:
+            coords: Batched atom coordinates.
+
+        Returns:
+            Scalar RMS distance from the centroid.
+        """
+        centred = coords - reduce(coords, "b n d -> b 1 d", "mean")
+        return torch.sqrt(reduce(centred**2, "b n d -> ", "mean"))
+
+    monkeypatch.setattr(torch, "rand", fixed_jitter)
+    monkeypatch.setattr("sample.sampling.centre_random_augment", centre_only)
+    _ = manual_seed(seed)
+    initial_draw = torch.randn(shape)
+    _ = manual_seed(seed)
+    _ = sampler.sample(shape)
+
+    step_batches = [
+        cast(FeaturizedBatch, call.args[0])
+        for call in zero_denoiser_mock.call_args_list
+    ][::2]
+    step_sigmas = torch.stack([batch.t_hat[0] for batch in step_batches])
+    step_rms = torch.stack(
+        [centred_rms(batch.r_gt_noised) for batch in step_batches],
+    )
+    times = (
+        torch.arange(scenario.ddim_steps, 0, -1) * delta_t
+        - scenario.jitter * delta_t
+    )
+    expected_sigmas = torch.stack([sampler.noise_schedule(t) for t in times])
+    next_sigmas = torch.stack(
+        [sampler.noise_schedule((t - delta_t).clamp(min=0.0)) for t in times],
+    )
+    return SamplerTrajectory(
+        model_calls=zero_denoiser_mock.call_count,
+        step_sigmas=step_sigmas,
+        expected_step_sigmas=expected_sigmas,
+        initial_centred_rms=step_rms[0],
+        expected_initial_centred_rms=centred_rms(
+            step_sigmas[0] * centre_only(initial_draw, context.atom5_mask),
+        ),
+        step_rms_ratios=step_rms[1:] / step_rms[:-1],
+        expected_step_rms_ratios=torch.abs(
+            1 + scenario.eta_step_scale * (next_sigmas / expected_sigmas - 1),
+        )[:-1],
+    )
 
 
-def _sigma_at(sampler: EDMSampler, t: float) -> float:
-    """Evaluate the sampler's noise schedule at time ``t``."""
-    return float(sampler.noise_schedule(torch.tensor(t)).item())
-
-
-def _centred_rms(batch: FeaturizedBatch) -> float:
-    """RMS of the noisy input about its centroid.
-
-    Centring removes the ~1 Å random translation that
-    ``centre_random_augment`` adds each step, which would otherwise dominate
-    the RMS at low noise levels.
-    """
-    r = batch.r_gt_noised
-    centred = r - reduce(r, "b n d -> b 1 d", "mean")
-    return float(torch.sqrt(reduce(centred**2, "... -> ", "mean")))
-
-
-def test_edm_sampler_visits_noise_levels_from_high_to_low(
-    zero_denoiser_mock: MagicMock,
-    context: FeaturizedBatch,
-    templ_disto: Distogram,
+@pytest.mark.parametrize(
+    ("sampler_trajectory", "scenario"),
+    [pytest.param(s, s, id=s.name) for s in SamplerTrajectoryScenario],
+    indirect=["sampler_trajectory"],
+)
+def test_edm_sampler_calls_model_twice_per_step(
+    sampler_trajectory: SamplerTrajectory,
+    scenario: SamplerTrajectoryScenario,
 ) -> None:
-    """Noise levels must strictly decrease, from the top interval to the bottom.
+    """sample() runs every one of its ddim_steps, with two model calls each.
 
-    The first step's ``t_hat`` must lie in the highest schedule interval and
-    the last step's in the lowest.
+    Each step calls the model once to build the self-conditioning template
+    and once more with that template to take the Euler step. The loop
+    previously ran ``ddim_steps - 2`` steps and never reached the lowest
+    noise levels.
+
+    Arrange: ``sampler_trajectory`` runs the sampler for the scenario.
+    Act: count the recorded model calls.
+    Assert: the count is ``2 * ddim_steps``.
+
+    Args:
+        sampler_trajectory: Recorded run for this scenario.
+        scenario: Step count and expected number of model calls.
     """
-    sampler, steps = _record_steps(zero_denoiser_mock, context, templ_disto)
-    sigmas = [float(batch.t_hat[0].item()) for batch in steps]
-    assert len(sigmas) == RECORDED_STEPS
-    assert all(a > b for a, b in itertools.pairwise(sigmas))
-    top_lo = _sigma_at(sampler, (RECORDED_STEPS - 1) / RECORDED_STEPS)
-    top_hi = _sigma_at(sampler, 1.0) * (1 + SCHEDULE_REL_TOL)
-    assert top_lo <= sigmas[0] <= top_hi
-    bottom_lo = _sigma_at(sampler, 0.0) * (1 - SCHEDULE_REL_TOL)
-    assert bottom_lo <= sigmas[-1] <= _sigma_at(sampler, 1 / RECORDED_STEPS)
+    assert sampler_trajectory.model_calls == scenario.expected_model_calls
 
 
+@pytest.mark.parametrize(
+    "sampler_trajectory",
+    [pytest.param(s, id=s.name) for s in SamplerTrajectoryScenario],
+    indirect=True,
+)
+def test_edm_sampler_visits_noise_levels_from_max_to_min(
+    sampler_trajectory: SamplerTrajectory,
+) -> None:
+    """The model sees noise_schedule(k / T - jitter / T) for k = T down to 1.
+
+    Arrange: ``sampler_trajectory`` pins the per-step jitter and records
+    the noise level passed to the model at each step.
+    Act: compare the recorded noise levels with the schedule evaluated at
+    the expected times.
+    Assert: they match exactly (to float32 precision), so the loop counts
+    down from maximum noise at t near 1 to minimum noise at t near 0.
+
+    Args:
+        sampler_trajectory: Recorded run and expected noise levels.
+    """
+    torch.testing.assert_close(
+        sampler_trajectory.step_sigmas,
+        sampler_trajectory.expected_step_sigmas,
+    )
+
+
+@pytest.mark.parametrize(
+    "sampler_trajectory",
+    [pytest.param(s, id=s.name) for s in SamplerTrajectoryScenario],
+    indirect=True,
+)
 def test_edm_sampler_initial_noise_matches_first_step(
-    zero_denoiser_mock: MagicMock,
-    context: FeaturizedBatch,
-    templ_disto: Distogram,
+    sampler_trajectory: SamplerTrajectory,
 ) -> None:
-    """Initial coordinates must be drawn at the first step's noise level.
+    """The starting coordinates are drawn at the first step's noise level.
 
-    Guards against initialising from the bottom of the schedule, which would
-    hand the first step a near-zero input labelled with maximum noise.
+    Regression: the initial noise level was evaluated at the wrong end of
+    the schedule, so the first model call saw coordinates of about
+    0.007 Å labelled as about 2,500 Å of noise.
+
+    Arrange: ``sampler_trajectory`` seeds the initial draw and records the
+    first model call's input and noise level.
+    Act: compare that input's centred RMS with the seeded draw's centred
+    RMS scaled by the noise level the first call was told.
+    Assert: they match exactly (to float32 precision), so the input really
+    carries the amount of noise the model is told it has.
+
+    Args:
+        sampler_trajectory: Recorded run and expected initial spread.
     """
-    _, steps = _record_steps(zero_denoiser_mock, context, templ_disto)
-    first = steps[0]
-    ratio = _centred_rms(first) / float(first.t_hat[0].item())
-    assert INIT_RMS_RATIO_MIN < ratio < INIT_RMS_RATIO_MAX
+    torch.testing.assert_close(
+        sampler_trajectory.initial_centred_rms,
+        sampler_trajectory.expected_initial_centred_rms,
+    )
 
 
-def test_edm_sampler_euler_step_lowers_noise(
-    zero_denoiser_mock: MagicMock,
-    context: FeaturizedBatch,
-    templ_disto: Distogram,
+@pytest.mark.parametrize(
+    "sampler_trajectory",
+    [pytest.param(s, id=s.name) for s in SamplerTrajectoryScenario],
+    indirect=True,
+)
+def test_edm_sampler_euler_steps_target_next_lower_noise_level(
+    sampler_trajectory: SamplerTrajectory,
 ) -> None:
-    """Each Euler step must target a lower noise level than the current one.
+    """Each Euler step targets the next, lower noise level in the schedule.
 
-    With a zero denoiser the update only rescales the input, by about
-    ``c_next / c_T`` at a step scale near 1, so the input's centred RMS must
-    shrink from one step to the next.
+    Regression: the Euler target was the schedule one step toward higher
+    noise, so steps removed too little noise and late in sampling the
+    residual noise drifted above the schedule.
+
+    Arrange: ``sampler_trajectory`` runs with a zero denoiser and churn
+    off, so each step only rescales the input by
+    ``1 + eta * (sigma_next - sigma) / sigma``.
+    Act: divide each step's input centred RMS by the previous step's.
+    Assert: each ratio equals the magnitude of that rescale, with
+    ``sigma_next`` taken one step further toward t = 0.
+
+    Args:
+        sampler_trajectory: Recorded run and expected per-step rescales.
     """
-    _, steps = _record_steps(zero_denoiser_mock, context, templ_disto)
-    rms = [_centred_rms(batch) for batch in steps]
-    assert all(a > b for a, b in itertools.pairwise(rms))
+    torch.testing.assert_close(
+        sampler_trajectory.step_rms_ratios,
+        sampler_trajectory.expected_step_rms_ratios,
+    )
 
 
 # ---------------------------------------------------------------------------
