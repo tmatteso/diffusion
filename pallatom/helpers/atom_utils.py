@@ -1,7 +1,7 @@
 """Utility dataclasses and functions for atom-level coordinate data.
 
 Provides the Protein dataclass, atom-type constants, residue-type mappings,
-PDB I/O helpers, and tensor utilities for converting between atom37, atom5,
+PDB I/O helpers, and tensor utilities for converting between atom37, atom14,
 and Cβ coordinate representations.
 """
 
@@ -15,7 +15,7 @@ import numpy as np
 import numpy.typing as npt
 import torch
 from beartype import beartype
-from einops import rearrange, reduce
+from einops import rearrange, reduce, repeat
 from helpers.errors import (
     InvalidAAtypesError,
     NoAtomRecordsError,
@@ -35,46 +35,27 @@ PDB_REC_MODEL = "MODEL"
 PDB_REC_ENDMDL = "ENDMDL"
 PDB_REC_END = "END"
 
-# atom5 slot order: N=0, CA=1, C=2, O=3, CB=4
-ATOM5_NAMES: list[str] = ["N", "CA", "C", "O", "CB"]
-ATOMS_PER_RES: int = 5  # MANY, MANY THINGS SHOULD DEPEND ON THIS NUMBER
-
-# Element encoding: N=0, C=1, O=2, UNK=3 (side-chain placeholder)
-# Backbone slots:
-ATOM5_ELEMENTS = torch.tensor(
-    [
-        [1, 0, 0, 0],  # N
-        [0, 1, 0, 0],  # CA (Carbon)
-        [0, 1, 0, 0],  # C
-        [0, 0, 1, 0],  # O
-        [0, 0, 0, 1],  # CB → UNK class
-    ],
-    dtype=torch.long,
-)  # (5, 4)
-
 # ── atom37 index constants (standard residue_constants ordering) ──────────────
-# Matches OpenFold / AlphaFold2 residue_constants.atom_order
+# Matches OpenFold / AlphaFold2 residue_constants.atom_order, and must match
+# atom_types below (CB before O) — this is also what _parse_pdb_atoms uses
+# to place real atoms when reading a PDB file.
 ATOM37_N: int = 0
 ATOM37_CA: int = 1
 ATOM37_C: int = 2
-ATOM37_CB: int = 4
-ATOM37_O: int = 3
+ATOM37_CB: int = 3
+ATOM37_O: int = 4
 
-# atom5 slot indices
-ATOM5_N: int = 0
-ATOM5_CA: int = 1
-ATOM5_C: int = 2
-ATOM5_CB: int = 4
-ATOM5_O: int = 3
-
-# atom5 slot → atom37 index mapping (N=0, CA=1, C=2, O=3, CB=4)
-ATOM5_TO_ATOM37: list[int] = [
-    ATOM37_N,
-    ATOM37_CA,
-    ATOM37_C,
-    ATOM37_O,
-    ATOM37_CB,
-]
+# atom14 canonical slot layout: slots 0-3 are always N, CA, C, O; slot 4 is
+# CB when the residue type has one (every standard residue except Gly).
+# Slot identity from 5 onward is residue-type-dependent — unlike atom37 and
+# these first 5 slots, there is no single fixed meaning for slot 5+; see the
+# aatype-indexed lookup tables built below from rigid_group_atom_positions.
+ATOM14_N: int = 0
+ATOM14_CA: int = 1
+ATOM14_C: int = 2
+ATOM14_O: int = 3
+ATOM14_CB: int = 4  # Gly: virtual atom at C alpha
+ATOMS_PER_RES: int = 14
 
 # PDB constants
 PDB_ATOM_NAME_CUTOFF_LEN: int = 4
@@ -419,6 +400,176 @@ rigid_group_atom_positions = {
         ("CG2", 4, (0.533, -0.776, -1.203)),
     ],
 }
+
+
+# ── atom14 per-residue-type lookup tables ──────────────────────────────────
+# Atom14's slot *identity* depends on residue type (unlike atom37, whose
+# slot order is fixed everywhere). Built once at import time from the
+# vendored rigid_group_atom_positions geometry above — no new data needed.
+
+atom_order: dict[str, int] = {name: i for i, name in enumerate(atom_types)}
+
+_ELEMENT_NITROGEN: str = "N"
+_ELEMENT_CARBON: str = "C"
+_ELEMENT_OXYGEN: str = "O"
+_EMPTY_SLOT: str = ""
+_CB_NAME: str = "CB"
+_BACKBONE_NAMES: tuple[str, str, str, str] = ("N", "CA", "C", "O")
+_BACKBONE_AND_CB_NAMES: frozenset[str] = frozenset(
+    (*_BACKBONE_NAMES, _CB_NAME),
+)
+
+_ELEMENT_ONE_HOT: dict[str, list[float]] = {
+    _ELEMENT_NITROGEN: [1.0, 0.0, 0.0, 0.0],
+    _ELEMENT_CARBON: [0.0, 1.0, 0.0, 0.0],
+    _ELEMENT_OXYGEN: [0.0, 0.0, 1.0, 0.0],
+}
+_UNK_ONE_HOT: list[float] = [0.0, 0.0, 0.0, 1.0]
+
+
+def _build_atom14_names_for_residue(resname: str) -> list[str]:
+    """Build the 14-slot atom14 name list for one residue type.
+
+    Slots 0-3 are always N, CA, C, O. Slot 4 is CB if the residue type has
+    one (every standard residue except Gly). Remaining sidechain atoms
+    follow in their rigid_group_atom_positions order, starting at slot 5,
+    padded with "" for unused trailing slots.
+
+    Args:
+        resname: Three-letter residue name (e.g. "ALA"); unknown names
+            (including "" for the "X" mask token) produce an all-empty row.
+
+    Returns:
+        A list of length ATOMS_PER_RES of atom names ("" for empty slots).
+    """
+    if resname not in rigid_group_atom_positions:
+        return [_EMPTY_SLOT] * ATOMS_PER_RES
+    entry_names = [name for name, _, _ in rigid_group_atom_positions[resname]]
+    backbone_and_cb = [
+        *_BACKBONE_NAMES,
+        _CB_NAME if _CB_NAME in entry_names else _EMPTY_SLOT,
+    ]
+    sidechain = [
+        name for name in entry_names if name not in _BACKBONE_AND_CB_NAMES
+    ]
+    slots = (backbone_and_cb + sidechain)[:ATOMS_PER_RES]
+    return slots + [_EMPTY_SLOT] * (ATOMS_PER_RES - len(slots))
+
+
+RESTYPE_ATOM14_NAMES: dict[str, list[str]] = {
+    one_letter: _build_atom14_names_for_residue(
+        restype_1to3.get(one_letter, ""),
+    )
+    for one_letter in RESTYPES
+}
+
+
+@jaxtyped(typechecker=beartype)
+def _build_atom14_tables() -> tuple[
+    Bool[torch.Tensor, "21 14"],
+    Int[torch.Tensor, "21 14"],
+    Int[torch.Tensor, "21 37"],
+    Bool[torch.Tensor, "21 37"],
+    Float[torch.Tensor, "21 14 3"],
+    Float[torch.Tensor, "21 14 4"],
+]:
+    """Build the aatype-indexed atom14/atom37 lookup tensors.
+
+    Each row is indexed by restype_order[one_letter]. Sentinel 0 is used
+    for atom14<->atom37 index entries where no atom exists at that slot;
+    the paired "exists" tensor is what actually masks those entries out,
+    the sentinel index itself is never meaningful on its own.
+
+    Returns:
+        Tuple of (atom14_exists, residx_atom14_to_atom37,
+        residx_atom37_to_atom14, atom37_exists, atom14_ref_pos,
+        atom14_elements).
+    """
+    exists14 = torch.zeros((RESTYPE_NUM, ATOMS_PER_RES), dtype=torch.bool)
+    idx14_to_37 = torch.zeros(
+        (RESTYPE_NUM, ATOMS_PER_RES),
+        dtype=torch.long,
+    )
+    idx37_to_14 = torch.zeros(
+        (RESTYPE_NUM, len(atom_types)),
+        dtype=torch.long,
+    )
+    exists37 = torch.zeros((RESTYPE_NUM, len(atom_types)), dtype=torch.bool)
+    ref_pos = torch.zeros((RESTYPE_NUM, ATOMS_PER_RES, 3))
+    elements = torch.zeros((RESTYPE_NUM, ATOMS_PER_RES, 4))
+
+    for one_letter in RESTYPES:
+        row = restype_order[one_letter]
+        resname = restype_1to3.get(one_letter, "")
+        pos_by_name = {
+            name: pos
+            for name, _, pos in rigid_group_atom_positions.get(resname, [])
+        }
+        for slot, name in enumerate(RESTYPE_ATOM14_NAMES[one_letter]):
+            if name == _EMPTY_SLOT:
+                continue
+            atom37_idx = atom_order[name]
+            exists14[row, slot] = True
+            idx14_to_37[row, slot] = atom37_idx
+            idx37_to_14[row, atom37_idx] = slot
+            exists37[row, atom37_idx] = True
+            ref_pos[row, slot] = torch.tensor(pos_by_name[name])
+            elements[row, slot] = torch.tensor(
+                _ELEMENT_ONE_HOT.get(name[0], _UNK_ONE_HOT),
+            )
+
+    return exists14, idx14_to_37, idx37_to_14, exists37, ref_pos, elements
+
+
+(
+    ATOM14_ATOM_EXISTS,
+    RESIDX_ATOM14_TO_ATOM37,
+    RESIDX_ATOM37_TO_ATOM14,
+    ATOM37_ATOM_EXISTS,
+    ATOM14_REF_POS,
+    ATOM14_ELEMENTS,
+) = _build_atom14_tables()
+
+
+# ── sequence-independent atom14 reference template ──────────────────────────
+# The residue type is what is being generated, so every residue gets the same
+# reference conformer: Ala's ideal backbone + Cβ in slots 0-4, then slots 5-13
+# as UNK-element pseudo-sidechain atoms extending along the C alpha → Cβ bond.
+# Slots 5-13 need distinct positions: the atom encoder tells atoms within a
+# residue apart only through ref_pos differences, so coincident slots would
+# be indistinguishable.
+
+VIRTUAL_ATOM_SPACING: float = (
+    1.5  # Å between consecutive pseudo-sidechain slots
+)
+
+
+@jaxtyped(typechecker=beartype)
+def _build_generic_atom14_reference() -> tuple[
+    Float[torch.Tensor, "14 3"],
+    Float[torch.Tensor, "14 4"],
+]:
+    """Build the single atom14 reference conformer shared by every residue.
+
+    Returns:
+        Tuple of (ref_pos, ref_elem) with shapes (14, 3) and (14, 4).
+    """
+    ala = restype_order["A"]
+    ref_pos = ATOM14_REF_POS[ala].clone()
+    ref_elem = ATOM14_ELEMENTS[ala].clone()
+    ca = ref_pos[ATOM14_CA]
+    cb = ref_pos[ATOM14_CB]
+    bond = cb - ca
+    unit = bond / torch.sqrt(reduce(bond**2, "d -> ", "sum"))
+    for slot in range(ATOM14_CB + 1, ATOMS_PER_RES):
+        ref_pos[slot] = cb + (slot - ATOM14_CB) * VIRTUAL_ATOM_SPACING * unit
+        ref_elem[slot] = torch.tensor(_UNK_ONE_HOT)
+    return ref_pos, ref_elem
+
+
+GENERIC_ATOM14_REF_POS, GENERIC_ATOM14_ELEMENTS = (
+    _build_generic_atom14_reference()
+)
 
 
 def make_np_example(
@@ -895,68 +1046,157 @@ def to_pdb(prot: Protein) -> str:
 
 
 @jaxtyped(typechecker=beartype)
-def atom37_to_atom5(
+def atom37_to_atom14(
     atom37_positions: Float[torch.Tensor, "B N_res 37 3"],
     atom37_mask: Float[torch.Tensor, "B N_res 37"],
+    aatype: Int[torch.Tensor, "B N_res"],
 ) -> tuple[
-    Float[torch.Tensor, "B N_res 5 3"],
-    Float[torch.Tensor, "B N_res 5"],
+    Float[torch.Tensor, "B N_res 14 3"],
+    Float[torch.Tensor, "B N_res 14"],
 ]:
-    """Extract the 5 backbone+Cβ atoms from atom37 representation.
+    """Extract each residue's up-to-14 heavy atoms from atom37.
+
+    Unlike atom37's own fixed slot order, atom14 slot identity depends on
+    residue type (e.g. slot 5 is CG for one amino acid and OG1 for
+    another), so this gather is driven by ``aatype``.
 
     Args:
         atom37_positions: Full atom37 coordinates (B, N_res, 37, 3).
         atom37_mask: Atom37 presence mask (B, N_res, 37).
+        aatype: Residue type index per position (B, N_res); values outside
+            [0, RESTYPE_NUM) (e.g. the -100 padding sentinel) are clamped
+            before use — the caller's own residue mask is what zeroes out
+            the resulting garbage downstream, not this function.
 
     Returns:
-        Tuple of (atom5_positions, atom5_mask) with shapes (B, N_res, 5, 3)
-        and (B, N_res, 5).
+        Tuple of (atom14_positions, atom14_mask) with shapes
+        (B, N_res, 14, 3) and (B, N_res, 14).
     """
-    select = [ATOM37_N, ATOM37_CA, ATOM37_C, ATOM37_O, ATOM37_CB]
+    aatype_safe = aatype.clamp(min=0, max=RESTYPE_NUM - 1)
+    idx14_to_37: Int[torch.Tensor, "B N_res 14"] = RESIDX_ATOM14_TO_ATOM37.to(
+        aatype_safe.device,
+    )[aatype_safe]
+    exists14: Float[torch.Tensor, "B N_res 14"] = ATOM14_ATOM_EXISTS.to(
+        aatype_safe.device,
+    )[aatype_safe].float()
 
-    atom5_positions = atom37_positions[:, :, select, :]
-    atom5_mask = atom37_mask[:, :, select]
+    atom14_positions = atom37_positions.gather(
+        2,
+        repeat(idx14_to_37, "b n a -> b n a d", d=3),
+    )
+    atom14_mask = atom37_mask.gather(2, idx14_to_37) * exists14
 
-    return atom5_positions, atom5_mask
+    return atom14_positions, atom14_mask
 
 
 @jaxtyped(typechecker=beartype)
-def atom5_to_atom37(
-    coords_5: Float[torch.Tensor, "B N_res 5 3"],
-    mask_5: Float[torch.Tensor, "B N_res 5"] | None = None,
+def atom14_to_atom37(
+    coords_14: Float[torch.Tensor, "B N_res 14 3"],
+    mask_14: Float[torch.Tensor, "B N_res 14"],
+    aatype: Int[torch.Tensor, "B N_res"],
 ) -> tuple[
     Float[torch.Tensor, "B N_res 37 3"],
     Float[torch.Tensor, "B N_res 37"],
 ]:
-    """Map atom5 coordinates back into the full atom37 layout.
+    """Scatter atom14 coordinates back into the full atom37 layout.
 
     Args:
-        coords_5: Atom5 coordinates (B, N_res, 5, 3).
-        mask_5: Atom5 presence mask (B, N_res, 5); when None all slots are
-            marked present.
+        coords_14: Atom14 coordinates (B, N_res, 14, 3).
+        mask_14: Atom14 presence mask (B, N_res, 14).
+        aatype: Residue type index per position (B, N_res); see
+            atom37_to_atom14 for how out-of-range values are handled.
 
     Returns:
         Tuple of (x_37, mask_37) with shapes (B, N_res, 37, 3) and
         (B, N_res, 37).
     """
-    B: int = coords_5.shape[0]
-    N_res: int = coords_5.shape[1]
-    x_37: Float[torch.Tensor, "B N_res 37 3"] = torch.zeros(
-        (B, N_res, 37, 3),
-        dtype=coords_5.dtype,
-        device=coords_5.device,
+    aatype_safe = aatype.clamp(min=0, max=RESTYPE_NUM - 1)
+    idx37_to_14: Int[torch.Tensor, "B N_res 37"] = RESIDX_ATOM37_TO_ATOM14.to(
+        aatype_safe.device,
+    )[aatype_safe]
+    exists37: Float[torch.Tensor, "B N_res 37"] = ATOM37_ATOM_EXISTS.to(
+        aatype_safe.device,
+    )[aatype_safe].float()
+
+    x_37 = coords_14.gather(
+        2,
+        repeat(idx37_to_14, "b n a -> b n a d", d=3),
     )
-    mask_37: Float[torch.Tensor, "B N_res 37"] = torch.zeros(
-        (B, N_res, 37),
-        dtype=coords_5.dtype,
-        device=coords_5.device,
-    )
-    for atom5_slot, atom37_idx in enumerate(ATOM5_TO_ATOM37):
-        x_37[:, :, atom37_idx, :] = coords_5[:, :, atom5_slot, :]
-        mask_37[:, :, atom37_idx] = (
-            mask_5[:, :, atom5_slot] if mask_5 is not None else 1.0
-        )
+    mask_37 = mask_14.gather(2, idx37_to_14) * exists37
+
     return x_37, mask_37
+
+
+@jaxtyped(typechecker=beartype)
+def fill_atom14_virtual_atoms(
+    atom14_positions: Float[torch.Tensor, "B N_res 14 3"],
+    atom14_mask: Float[torch.Tensor, "B N_res 14"],
+    aatype: Int[torch.Tensor, "B N_res"],
+) -> tuple[
+    Float[torch.Tensor, "B N_res 14 3"],
+    Float[torch.Tensor, "B N_res 14"],
+]:
+    """Fill the slots a residue type lacks with virtual atoms at its C alpha.
+
+    After this, every residue with a resolved C alpha occupies all 14 slots, so
+    neither the positions' layout nor the mask reveals the residue type.
+    Slots the residue type does have keep their own mask, so unresolved
+    real atoms stay masked out rather than being pulled onto the C alpha.
+
+    Args:
+        atom14_positions: Atom14 coordinates (B, N_res, 14, 3).
+        atom14_mask: Atom14 presence mask (B, N_res, 14).
+        aatype: Residue type index per position (B, N_res); see
+            atom37_to_atom14 for how out-of-range values are handled.
+
+    Returns:
+        Tuple of (atom14_positions, atom14_mask) with virtual atoms filled
+        in, shapes (B, N_res, 14, 3) and (B, N_res, 14).
+    """
+    aatype_safe = aatype.clamp(min=0, max=RESTYPE_NUM - 1)
+    exists14: Bool[torch.Tensor, "B N_res 14"] = ATOM14_ATOM_EXISTS.to(
+        aatype_safe.device,
+    )[aatype_safe]
+    ca_pos = atom14_positions[:, :, ATOM14_CA : ATOM14_CA + 1, :]
+    ca_mask = atom14_mask[:, :, ATOM14_CA : ATOM14_CA + 1]
+    positions = torch.where(
+        rearrange(exists14, "b n a -> b n a 1"),
+        atom14_positions,
+        ca_pos,
+    )
+    mask = torch.where(exists14, atom14_mask, ca_mask)
+    return positions, mask
+
+
+@jaxtyped(typechecker=beartype)
+def generic_ref_pos_and_element(
+    n_res: int,
+    device: torch.device | str,
+) -> tuple[
+    Float[torch.Tensor, "N_res 14 3"],
+    Float[torch.Tensor, "N_res 14 4"],
+]:
+    """Tile the sequence-independent atom14 reference over every residue.
+
+    Args:
+        n_res: Number of residues.
+        device: Device to place the outputs on.
+
+    Returns:
+        Tuple of (ref_pos, ref_elem) with shapes (n_res, 14, 3) and
+        (n_res, 14, 4).
+    """
+    ref_pos = repeat(
+        GENERIC_ATOM14_REF_POS.to(device),
+        "a d -> n a d",
+        n=n_res,
+    )
+    ref_elem = repeat(
+        GENERIC_ATOM14_ELEMENTS.to(device),
+        "a e -> n a e",
+        n=n_res,
+    )
+    return ref_pos, ref_elem
 
 
 @jaxtyped(typechecker=beartype)
@@ -997,34 +1237,20 @@ def pseudo_cb(
 
 
 @jaxtyped(typechecker=beartype)
-def get_cb_coords(
-    atom5_positions: Float[torch.Tensor, "B N_res 5 3"],
-    atom5_mask: Float[torch.Tensor, "B N_res 5"],
+def _cb_from_backbone(
+    n: Float[torch.Tensor, "B N_res 3"],
+    ca: Float[torch.Tensor, "B N_res 3"],
+    c: Float[torch.Tensor, "B N_res 3"],
+    cb: Float[torch.Tensor, "B N_res 3"],
+    cb_present: Bool[torch.Tensor, "B N_res"],
 ) -> tuple[Float[torch.Tensor, "B N_res 3"], Bool[torch.Tensor, "B N_res"]]:
-    """Extract beta carbon from atom5, replace missing beta carbon for Gly.
-
-    Args:
-        atom5_positions: Atom5 coordinates (B, N_res, 5, 3).
-        atom5_mask: Atom5 presence mask (B, N_res, 5); 1 where atom is present.
-
-    Returns:
-        Tuple of (cb, pseudo_beta_mask): cb is (B, N_res, 3) with real Cβ
-        where available and pseudo-Cβ otherwise; pseudo_beta_mask is
-        (B, N_res) True where real Cβ was present.
-    """
-    n = atom5_positions[:, :, ATOM5_N, :]  # (B, N_res, 3)
-    ca = atom5_positions[:, :, ATOM5_CA, :]
-    c = atom5_positions[:, :, ATOM5_C, :]
-    cb = atom5_positions[:, :, ATOM5_CB, :]  # zero / garbage where missing
-    # compute pseudo-Cβ wherever Cβ is absent
-    cb_present = atom5_mask[:, :, ATOM5_CB].bool()  # (B, N_res)
-    p_cb = pseudo_cb(n, ca, c)  # (B, N_res, 3)
-    cb = torch.where(rearrange(cb_present, "b n -> b n 1"), cb, p_cb)
-
-    return cb, cb_present
+    """Return the real Cβ where present, else the Gly-safe pseudo-Cβ."""
+    p_cb = pseudo_cb(n, ca, c)
+    cb_out = torch.where(rearrange(cb_present, "b n -> b n 1"), cb, p_cb)
+    return cb_out, cb_present
 
 
-# ── convenience wrapper ─────────────────────────────────────────────────────
+# ── convenience wrappers ────────────────────────────────────────────────────
 
 
 @jaxtyped(typechecker=beartype)
@@ -1032,7 +1258,7 @@ def atom37_to_cb(
     atom37_positions: Float[torch.Tensor, "B N_res 37 3"],
     atom37_mask: Float[torch.Tensor, "B N_res 37"],
 ) -> tuple[Float[torch.Tensor, "B N_res 3"], Bool[torch.Tensor, "B N_res"]]:
-    """Full pipeline: atom37 → atom5 → Cβ / pseudo-Cβ.
+    """Extract Cβ directly from atom37, falling back to pseudo-Cβ for Gly.
 
     Args:
         atom37_positions: Full atom37 coordinates (B, N_res, 37, 3).
@@ -1043,5 +1269,36 @@ def atom37_to_cb(
         where available and pseudo-Cβ otherwise; pseudo_beta_mask is
         (B, N_res) True where real Cβ was present.
     """
-    atom5_pos, atom5_mask = atom37_to_atom5(atom37_positions, atom37_mask)
-    return get_cb_coords(atom5_pos, atom5_mask)
+    n = atom37_positions[:, :, ATOM37_N, :]
+    ca = atom37_positions[:, :, ATOM37_CA, :]
+    c = atom37_positions[:, :, ATOM37_C, :]
+    cb = atom37_positions[:, :, ATOM37_CB, :]
+    cb_present = atom37_mask[:, :, ATOM37_CB].bool()
+    return _cb_from_backbone(n, ca, c, cb, cb_present)
+
+
+@jaxtyped(typechecker=beartype)
+def atom14_to_cb(
+    atom14_positions: Float[torch.Tensor, "B N_res 14 3"],
+    atom14_mask: Float[torch.Tensor, "B N_res 14"],
+) -> tuple[Float[torch.Tensor, "B N_res 3"], Bool[torch.Tensor, "B N_res"]]:
+    """Extract Cβ directly from atom14, falling back to pseudo-Cβ for Gly.
+
+    Backbone + Cβ occupy the same fixed slots (0-4) in atom14 as in
+    atom37, so this needs no aatype and no round trip through atom37.
+
+    Args:
+        atom14_positions: Atom14 coordinates (B, N_res, 14, 3).
+        atom14_mask: Atom14 presence mask (B, N_res, 14).
+
+    Returns:
+        Tuple of (cb, pseudo_beta_mask): cb is (B, N_res, 3) with real Cβ
+        where available and pseudo-Cβ otherwise; pseudo_beta_mask is
+        (B, N_res) True where real Cβ was present.
+    """
+    n = atom14_positions[:, :, ATOM14_N, :]
+    ca = atom14_positions[:, :, ATOM14_CA, :]
+    c = atom14_positions[:, :, ATOM14_C, :]
+    cb = atom14_positions[:, :, ATOM14_CB, :]
+    cb_present = atom14_mask[:, :, ATOM14_CB].bool()
+    return _cb_from_backbone(n, ca, c, cb, cb_present)

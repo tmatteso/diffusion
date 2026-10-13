@@ -224,7 +224,7 @@ def take_step(
 
     b_size, n_res = cpu_batch.f_residue_idx.shape
     actual_residues: int = int(cpu_batch.f_pseudo_beta_mask.sum().item())
-    actual_atoms: int = int(cpu_batch.atom5_mask.sum().item())
+    actual_atoms: int = int(cpu_batch.atom14_mask.sum().item())
 
     featurized_batch: FeaturizedBatch = cpu_batch.to(
         model_params.device,
@@ -242,8 +242,8 @@ def take_step(
             model_params.model(featurized_batch),
         )
 
-        atom5_mask_f: Float[torch.Tensor, "B N_atom"] = (
-            featurized_batch.atom5_mask.float()
+        atom14_mask_f: Float[torch.Tensor, "B N_atom"] = (
+            featurized_batch.atom14_mask.float()
         )
         pseudo_beta_mask_f: Float[torch.Tensor, "B N_res"] = (
             featurized_batch.f_pseudo_beta_mask.float()
@@ -252,7 +252,7 @@ def take_step(
         Kabsch_aligned_MSE_loss: Float[torch.Tensor, ""] = atom_loss(
             pred_outputs.r_denoised,
             featurized_batch.r_gt,
-            atom5_mask_f,
+            atom14_mask_f,
             aa_indices=featurized_batch.aa_indices,
             lambda_sigma_weight=lambda_sigma_loss_weight,
         ).mean()
@@ -290,7 +290,7 @@ def take_step(
         lddt_loss: Float[torch.Tensor, ""] = smooth_lddt_loss(
             pred_outputs.r_denoised,
             featurized_batch.r_gt,
-            featurized_batch.atom5_mask,
+            featurized_batch.atom14_mask,
             cutoff=float(lp.smooth_lddt_cutoff),
         )
         CE_loss: Float[torch.Tensor, ""] = seq_ce_loss(
@@ -318,7 +318,7 @@ def take_step(
         (r_aligned,) = kabsch_align(  # pylint: disable=unpacking-non-sequence
             featurized_batch.r_gt,
             r_denoised_for_rmsd,
-            weights=atom5_mask_f,
+            weights=atom14_mask_f,
             return_transform=False,
         )
 
@@ -327,7 +327,7 @@ def take_step(
         )
         sq: Float[torch.Tensor, "B N_atom"] = (diff * diff).sum(dim=-1)
         rmsd: Float[torch.Tensor, ""] = (
-            (sq * atom5_mask_f).sum() / atom5_mask_f.sum().clamp(min=1)
+            (sq * atom14_mask_f).sum() / atom14_mask_f.sum().clamp(min=1)
         ).sqrt()
 
     t1 = time.perf_counter()

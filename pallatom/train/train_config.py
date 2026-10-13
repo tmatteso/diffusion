@@ -98,7 +98,7 @@ class ModelParams(BaseModel):
         window_size: Residue-level neighbour window used by the atom transformer
             to build sparse pairs (default 32).
         f_ref_dim: Dimensionality of the reference atom feature vector
-            (5 atoms by 7 features = 35).
+            (14 atoms by 7 features = 98).
         c_atom: Hidden dimension for atom-level single embeddings.
         c_pair: Hidden dimension for trunk residue-pair embeddings.
         c_res: Hidden dimension for residue-level single embeddings.
@@ -119,7 +119,7 @@ class ModelParams(BaseModel):
     model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True)
 
     window_size: int = Field(default=32, gt=0)
-    f_ref_dim: int = Field(default=35, gt=0)  # 5 atoms by 7 features
+    f_ref_dim: int = Field(default=98, gt=0)  # 14 atoms by 7 features
     c_atom: int = Field(default=128, gt=0)  # paper was 128
     c_pair: int = Field(default=128, gt=0)  # paper was 128
     c_res: int = Field(default=256, gt=0)  # paper was 256

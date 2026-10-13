@@ -2,12 +2,13 @@
 
 Covers FeaturizedItem and FeaturizedBatch shape contracts; Distogram shape,
 one-hot, masking, symmetry, and bin-assignment properties; featurize_batch
-output shapes and value contracts;
-sinusoidal_encoding and ref_pos_for_residue correctness; ProteinDataset
+output shapes and value contracts; sinusoidal_encoding correctness;
+sequence-independent reference features and masks; ProteinDataset
 length/indexing; and make_bucketed_data_loaders behaviour.
 """
 
 import dataclasses
+import enum
 import functools
 import json
 import math
@@ -23,7 +24,15 @@ import torch
 import torch.nn as nn
 from architecture.main_trunk import EMA, MainTrunk
 from einops import rearrange, reduce, repeat
-from helpers.atom_utils import RESTYPE_NUM_NO_X, Protein, restype_order
+from helpers.atom_utils import (
+    ATOM14_CA,
+    ATOMS_PER_RES,
+    GENERIC_ATOM14_ELEMENTS,
+    GENERIC_ATOM14_REF_POS,
+    RESTYPE_NUM_NO_X,
+    Protein,
+    restype_order,
+)
 from helpers.data import (
     DatasetSplitsManifest,
     Distogram,
@@ -39,11 +48,10 @@ from helpers.data import (
     featurize_batch,
     featurize_single_item,
     make_bucketed_data_loaders,
-    ref_pos_for_residue,
     sinusoidal_encoding,
 )
 from helpers.useful_objects import ModelSetup, manual_seed
-from jaxtyping import Bool, Float, TypeCheckError
+from jaxtyping import Bool, Float, Shaped, TypeCheckError
 from torch.optim import Adam
 from torch.optim.lr_scheduler import LambdaLR
 from train.train_config import (
@@ -62,7 +70,7 @@ from train.train_loop import alphafold_lr_lambda
 
 BT_B = 2
 BT_N_RES = 8
-BT_N_ATOM = BT_N_RES * 5
+BT_N_ATOM = BT_N_RES * ATOMS_PER_RES
 BT_N_TEMPL_BINS = 38
 BT_C_RES = 32
 BT_K = 16
@@ -175,7 +183,7 @@ def test_protein_rejects_mismatched_atom_count() -> None:
 
 @pytest.fixture
 def featurized_item_raw() -> FeaturizedItem:
-    """Provide a valid FeaturizedItem with BT_N_RES=8, BT_N_ATOM=40.
+    """Provide a valid FeaturizedItem with BT_N_RES=8, BT_N_ATOM=112.
 
     Returns:
         A fully-constructed FeaturizedItem using tensors of the correct shapes.
@@ -183,7 +191,7 @@ def featurized_item_raw() -> FeaturizedItem:
     return FeaturizedItem(
         r_gt=torch.randn(BT_N_ATOM, 3),
         r_gt_noised=torch.randn(BT_N_ATOM, 3),
-        atom5_mask=torch.ones(BT_N_ATOM, dtype=torch.bool),
+        atom14_mask=torch.ones(BT_N_ATOM, dtype=torch.bool),
         f_pseudo_beta_mask=torch.zeros(BT_N_RES, dtype=torch.long),
         gt_res_distogram_indices=torch.zeros(
             BT_N_RES,
@@ -204,11 +212,13 @@ def featurized_item_raw() -> FeaturizedItem:
         ref_space_uid=torch.arange(
             BT_N_RES,
             dtype=torch.long,
-        ).repeat_interleave(5),
-        tok_idx=torch.arange(BT_N_RES, dtype=torch.long).repeat_interleave(5),
+        ).repeat_interleave(ATOMS_PER_RES),
+        tok_idx=torch.arange(BT_N_RES, dtype=torch.long).repeat_interleave(
+            ATOMS_PER_RES,
+        ),
         center_uid=(
-            torch.arange(BT_N_RES, dtype=torch.long) * 5 + 1
-        ).repeat_interleave(5),
+            torch.arange(BT_N_RES, dtype=torch.long) * ATOMS_PER_RES + 1
+        ).repeat_interleave(ATOMS_PER_RES),
         gt_atom_distogram_sparse=torch.zeros(BT_N_ATOM, BT_K, dtype=torch.long),
         gt_atom_distogram_mask_sparse=torch.ones(
             BT_N_ATOM,
@@ -229,14 +239,14 @@ def test_featurized_item_constructs(
     """FeaturizedItem constructed successfully with correct types and shapes.
 
     Verifies that the fixture produces a FeaturizedItem instance and that key
-    tensors retain expected shapes: r_gt (BT_N_ATOM, 3), atom5_mask
+    tensors retain expected shapes: r_gt (BT_N_ATOM, 3), atom14_mask
     (BT_N_ATOM,), gt_res_distogram_indices (BT_N_RES, BT_N_RES),
     ref_pos (BT_N_ATOM, 3), ref_element (BT_N_ATOM, 4), and f_residue_idx
     (BT_N_RES,).
     """
     assert isinstance(featurized_item_raw, FeaturizedItem)
     assert featurized_item_raw.r_gt.shape == (BT_N_ATOM, 3)
-    assert featurized_item_raw.atom5_mask.shape == (BT_N_ATOM,)
+    assert featurized_item_raw.atom14_mask.shape == (BT_N_ATOM,)
     assert featurized_item_raw.gt_res_distogram_indices.shape == (
         BT_N_RES,
         BT_N_RES,
@@ -261,7 +271,7 @@ def test_featurized_item_rejects_1d_r_gt() -> None:
         _ = FeaturizedItem(
             r_gt=torch.randn(BT_N_ATOM),
             r_gt_noised=torch.randn(BT_N_ATOM, 3),
-            atom5_mask=torch.ones(BT_N_ATOM, dtype=torch.bool),
+            atom14_mask=torch.ones(BT_N_ATOM, dtype=torch.bool),
             f_pseudo_beta_mask=torch.zeros(BT_N_RES, dtype=torch.long),
             gt_res_distogram_indices=torch.zeros(
                 BT_N_RES,
@@ -306,7 +316,7 @@ def test_featurized_item_rejects_wrong_ref_element_dim() -> None:
         _ = FeaturizedItem(
             r_gt=torch.randn(BT_N_ATOM, 3),
             r_gt_noised=torch.randn(BT_N_ATOM, 3),
-            atom5_mask=torch.ones(BT_N_ATOM, dtype=torch.bool),
+            atom14_mask=torch.ones(BT_N_ATOM, dtype=torch.bool),
             f_pseudo_beta_mask=torch.zeros(BT_N_RES, dtype=torch.long),
             gt_res_distogram_indices=torch.zeros(
                 BT_N_RES,
@@ -347,7 +357,7 @@ def test_featurized_item_rejects_wrong_ref_element_dim() -> None:
 
 @pytest.fixture
 def featurized_batch_raw() -> FeaturizedBatch:
-    """Provide a valid FeaturizedBatch with BT_B=2, BT_N_RES=8, BT_N_ATOM=40.
+    """Provide a valid FeaturizedBatch with BT_B=2, BT_N_RES=8, BT_N_ATOM=112.
 
     Returns:
         A fully-constructed FeaturizedBatch using tensors of the correct shapes.
@@ -376,7 +386,7 @@ def featurized_batch_raw() -> FeaturizedBatch:
         ),
         r_gt=torch.randn(BT_B, BT_N_ATOM, 3),
         r_gt_noised=torch.randn(BT_B, BT_N_ATOM, 3),
-        atom5_mask=torch.ones(BT_B, BT_N_ATOM, dtype=torch.bool),
+        atom14_mask=torch.ones(BT_B, BT_N_ATOM, dtype=torch.bool),
         aa_indices=torch.zeros(BT_B, BT_N_RES, dtype=torch.long),
         t_hat=torch.randn(BT_B),
         t_normalized=torch.rand(BT_B, BT_N_RES, BT_N_RES),
@@ -421,7 +431,7 @@ def test_featurized_batch_valid_construction(
         BT_N_RES,
     )
     assert featurized_batch_raw.f_residue_idx.shape == (BT_B, BT_N_RES)
-    assert featurized_batch_raw.atom5_mask.shape == (BT_B, BT_N_ATOM)
+    assert featurized_batch_raw.atom14_mask.shape == (BT_B, BT_N_ATOM)
     assert featurized_batch_raw.gt_atom_distogram_sparse.shape == (
         BT_B,
         BT_N_ATOM,
@@ -464,7 +474,7 @@ def test_featurized_batch_rejects_unbatched_ref_pos() -> None:
             f_residue_idx=torch.randn(BT_B, BT_N_RES, BT_C_RES),
             r_gt=torch.randn(BT_B, BT_N_ATOM, 3),
             r_gt_noised=torch.randn(BT_B, BT_N_ATOM, 3),
-            atom5_mask=torch.ones(BT_B, BT_N_ATOM, dtype=torch.bool),
+            atom14_mask=torch.ones(BT_B, BT_N_ATOM, dtype=torch.bool),
             aa_indices=torch.zeros(BT_B, BT_N_RES, dtype=torch.long),
             t_hat=torch.randn(BT_B),
             t_normalized=torch.randn(BT_B, BT_N_RES, BT_N_RES),
@@ -512,7 +522,7 @@ def test_featurized_batch_rejects_wrong_coords_dim() -> None:
             f_residue_idx=torch.randn(BT_B, BT_N_RES, BT_C_RES),
             r_gt=torch.randn(BT_B, BT_N_ATOM, 4),
             r_gt_noised=torch.randn(BT_B, BT_N_ATOM, 3),
-            atom5_mask=torch.ones(BT_B, BT_N_ATOM, dtype=torch.bool),
+            atom14_mask=torch.ones(BT_B, BT_N_ATOM, dtype=torch.bool),
             aa_indices=torch.zeros(BT_B, BT_N_RES, dtype=torch.long),
             t_hat=torch.randn(BT_B),
             t_normalized=torch.randn(BT_B, BT_N_RES, BT_N_RES),
@@ -981,7 +991,7 @@ def featurized_batch(
 # (FZ_B, N_ATOM, *)
 # ---------------------------------------------------------------------------
 
-N_ATOM = N_RES * 5  # 5 atoms per residue, no separators
+N_ATOM = N_RES * ATOMS_PER_RES  # up to 14 atoms per residue, no separators
 
 
 def test_featurize_batch_output_shapes(
@@ -1025,15 +1035,17 @@ def test_featurize_batch_output_shapes(
 
     expected_res_idx = repeat(
         torch.arange(N_RES),
-        "r -> b (r five)",
+        "r -> b (r a)",
         b=FZ_B,
-        five=5,
+        a=ATOMS_PER_RES,
     )
     assert torch.equal(featurized_batch.ref_space_uid, expected_res_idx)
     assert torch.equal(featurized_batch.tok_idx, expected_res_idx)
 
     expected_ca = repeat(
-        (torch.arange(N_RES) * 5 + 1).repeat_interleave(5),
+        (torch.arange(N_RES) * ATOMS_PER_RES + ATOM14_CA).repeat_interleave(
+            ATOMS_PER_RES,
+        ),
         "a -> b a",
         b=FZ_B,
     )
@@ -1084,11 +1096,13 @@ def test_featurize_single_item_output_shapes(
         ],
     )
 
-    expected_res_idx = torch.arange(N_RES).repeat_interleave(5)
+    expected_res_idx = torch.arange(N_RES).repeat_interleave(ATOMS_PER_RES)
     assert torch.equal(featurized_item.ref_space_uid, expected_res_idx)
     assert torch.equal(featurized_item.tok_idx, expected_res_idx)
 
-    expected_ca = (torch.arange(N_RES) * 5 + 1).repeat_interleave(5)
+    expected_ca = (
+        torch.arange(N_RES) * ATOMS_PER_RES + ATOM14_CA
+    ).repeat_interleave(ATOMS_PER_RES)
     assert torch.equal(featurized_item.center_uid, expected_ca)
 
 
@@ -1179,7 +1193,7 @@ def test_featurize_collate_is_picklable(
 
 
 # ---------------------------------------------------------------------------
-# sinusoidal_encoding, ref_pos_for_residue, featurize_single_item
+# sinusoidal_encoding, featurize_single_item sequence independence
 # ---------------------------------------------------------------------------
 
 
@@ -1191,11 +1205,186 @@ def test_sinusoidal_encoding_output_shape_and_shape() -> None:
     assert torch.isfinite(out).all()
 
 
-def test_ref_pos_for_residue_output_shape_and_finite() -> None:
-    """ref_pos_for_residue returns finite (5, 3) reference position tensor."""
-    pos = ref_pos_for_residue("ALA")
-    assert pos.shape == (5, 3)
-    assert torch.isfinite(pos).all()
+class ProteinSequence(enum.Enum):
+    """Sequences featurized on the same coordinates as ``single_protein``.
+
+    Each member's value is an ``N_RES``-long sequence. Together they span
+    the whole range of atom14 occupancy, so any per-type leak in the
+    features shows up as a difference from the shared expectation.
+
+    Members:
+        mixed: ``AA_SEQ``, twelve different residue types.
+        all_glycine: Fewest real atoms (4 of 14 slots, no Cβ).
+        all_tryptophan: Most real atoms (all 14 slots).
+    """
+
+    mixed = AA_SEQ
+    all_glycine = "G" * N_RES
+    all_tryptophan = "W" * N_RES
+
+    @property
+    def sequence(self) -> str:
+        """One-letter sequence of length ``N_RES``."""
+        return self.value
+
+
+@pytest.fixture
+def sequence_featurized_item(
+    request: pytest.FixtureRequest,
+    single_protein: Protein,
+    tcfg: TrainConfig,
+    template_distogram_fn: Distogram,
+    residue_distogram_fn: Distogram,
+    atom_distogram_fn: Distogram,
+) -> FeaturizedItem:
+    """Featurize ``single_protein``'s coordinates under another sequence.
+
+    Factory fixture: receives a ``ProteinSequence`` through
+    ``@pytest.mark.parametrize(..., indirect=["sequence_featurized_item"])``.
+    Only ``aatype`` changes; coordinates and the all-ones atom37 mask are
+    ``single_protein``'s, so the residue types' own atom sets decide which
+    atom14 slots are real.
+
+    Args:
+        request: Pytest request carrying the ``ProteinSequence``.
+        single_protein: Protein providing coordinates and masks.
+        tcfg: Training config passed to featurize_single_item.
+        template_distogram_fn: Self-conditioning template distogram.
+        residue_distogram_fn: Ground-truth residue distogram.
+        atom_distogram_fn: Ground-truth atom distogram.
+
+    Returns:
+        FeaturizedItem for the scenario's sequence.
+    """
+    sequence = cast(ProteinSequence, request.param).sequence
+    _ = manual_seed(1)
+    return featurize_single_item(
+        prot=dataclasses.replace(
+            single_protein,
+            aatype=np.array(
+                [restype_order[aa] for aa in sequence],
+                dtype=np.intp,
+            ),
+        ),
+        template_distogram_fn=template_distogram_fn,
+        residue_distogram_fn=residue_distogram_fn,
+        atom_distogram_fn=atom_distogram_fn,
+        tcfg=tcfg,
+        max_seq_len_in_batch=N_RES,
+    )
+
+
+class SequenceBlindFeature(enum.Enum):
+    """Per-atom FeaturizedItem fields that must not depend on the sequence.
+
+    Each member's value is ``(field_name, per_residue_value)``: the field
+    must equal ``per_residue_value`` repeated once per residue.
+
+    Members:
+        ref_pos: The shared generic reference conformer.
+        ref_element: The shared generic element one-hots.
+        atom14_mask: All 14 slots present, real or virtual.
+    """
+
+    ref_pos = ("ref_pos", GENERIC_ATOM14_REF_POS)
+    ref_element = ("ref_element", GENERIC_ATOM14_ELEMENTS)
+    atom14_mask = (
+        "atom14_mask",
+        torch.ones(ATOMS_PER_RES, dtype=torch.bool),
+    )
+
+    @property
+    def field_name(self) -> str:
+        """FeaturizedItem attribute holding the feature."""
+        return self.value[0]
+
+    @property
+    def per_residue_value(self) -> Shaped[torch.Tensor, "14 ..."]:
+        """Value every residue must have."""
+        return self.value[1]
+
+
+@dataclasses.dataclass(frozen=True)
+class SequenceBlindExpectation:
+    """A feature's FeaturizedItem field and its expected flat value.
+
+    Attributes:
+        field_name: FeaturizedItem attribute holding the feature.
+        expected: ``per_residue_value`` repeated over ``N_RES`` residues
+            and flattened to the per-atom layout.
+    """
+
+    field_name: str
+    expected: Shaped[torch.Tensor, "N_atom ..."]
+
+
+@pytest.fixture
+def sequence_blind_expectation(
+    request: pytest.FixtureRequest,
+) -> SequenceBlindExpectation:
+    """Build the expected flat value of one ``SequenceBlindFeature``.
+
+    Factory fixture: receives a ``SequenceBlindFeature`` through
+    ``@pytest.mark.parametrize(..., indirect=[...])``.
+
+    Args:
+        request: Pytest request carrying the ``SequenceBlindFeature``.
+
+    Returns:
+        SequenceBlindExpectation for the feature.
+    """
+    feature = cast(SequenceBlindFeature, request.param)
+    return SequenceBlindExpectation(
+        field_name=feature.field_name,
+        expected=repeat(
+            feature.per_residue_value,
+            "a ... -> (n a) ...",
+            n=N_RES,
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "sequence_featurized_item",
+    [pytest.param(s, id=s.name) for s in ProteinSequence],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "sequence_blind_expectation",
+    [pytest.param(f, id=f.name) for f in SequenceBlindFeature],
+    indirect=True,
+)
+def test_featurize_single_item_atom_features_ignore_sequence(
+    sequence_featurized_item: FeaturizedItem,
+    sequence_blind_expectation: SequenceBlindExpectation,
+) -> None:
+    """Reference features and the atom mask reveal nothing about sequence.
+
+    Regression test for sequence leakage after the atom5 -> atom14 move:
+    per-type reference conformers and element patterns, or an atom14 mask
+    with residue-type-dependent occupancy (glycine 4 slots, tryptophan
+    14), would hand the model the sequence it is asked to generate.
+
+    Arrange: ``sequence_featurized_item`` featurizes identical coordinates
+    under a mixed, an all-glycine, and an all-tryptophan sequence;
+    ``sequence_blind_expectation`` gives the feature's sequence-free value.
+    Act: read the feature from the FeaturizedItem.
+    Assert: it equals the shared value repeated for every residue, for
+    every sequence -- so the three sequences are indistinguishable.
+
+    Args:
+        sequence_featurized_item: Factory-fixture-built item.
+        sequence_blind_expectation: Factory-fixture-built expectation.
+    """
+    feature = cast(
+        Shaped[torch.Tensor, "N_atom ..."],
+        getattr(
+            sequence_featurized_item,
+            sequence_blind_expectation.field_name,
+        ),
+    )
+
+    assert torch.equal(feature, sequence_blind_expectation.expected)
 
 
 # ---------------------------------------------------------------------------
@@ -2139,11 +2328,6 @@ def test_distogram_is_importable_from_data() -> None:
 def test_sinusoidal_encoding_is_importable_from_data() -> None:
     """sinusoidal_encoding is callable and importable from helpers.data."""
     assert callable(sinusoidal_encoding)
-
-
-def test_ref_pos_for_residue_is_importable_from_data() -> None:
-    """ref_pos_for_residue is callable and importable from helpers.data."""
-    assert callable(ref_pos_for_residue)
 
 
 def test_featurize_single_item_is_importable_from_data() -> None:

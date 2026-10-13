@@ -1,6 +1,7 @@
 """Tests for the conditional sampling loop."""
 
 import dataclasses
+import enum
 from enum import Enum, Flag, auto
 from typing import cast
 from unittest.mock import MagicMock
@@ -12,13 +13,18 @@ from architecture.main_trunk import PredictedOutputs
 from beartype import beartype
 from einops import rearrange, reduce
 from helpers.alignment import masked_com
-from helpers.atom_utils import RESTYPE_NUM_NO_X, Protein, restype_order
+from helpers.atom_utils import (
+    ATOM14_CA,
+    ATOMS_PER_RES,
+    RESTYPE_NUM_NO_X,
+    Protein,
+    restype_order,
+)
 from helpers.data import Distogram, FeaturizedBatch
 from helpers.useful_objects import manual_seed
 from jaxtyping import Bool, Float, TypeCheckError, jaxtyped
 from sample.sample_config import SamplerParams
 from sample.sampling import (
-    NATOM,
     AllAtomContext,
     EDMSampler,
     TemplateContext,
@@ -33,7 +39,7 @@ _ = manual_seed(0)
 CPU_DEVICE_TYPE = "cpu"
 B = 2
 N_RES = 4
-N_ATOM = N_RES * NATOM  # 20
+N_ATOM = N_RES * ATOMS_PER_RES  # 56
 SIGMA_MIN = 0.002
 SIGMA_MAX = 80.0
 N_ATOM_BINS = 22
@@ -291,12 +297,15 @@ def test_build_sampling_context(context: FeaturizedBatch) -> None:
             ).all(), f"non-finite in field '{field_name}'"
 
     row_sums = reduce(context.ref_element, "b n_atom e -> b n_atom", "sum")
-    expected_uid = torch.arange(N_RES).repeat_interleave(NATOM)
-    expected_ca = torch.arange(N_RES).repeat_interleave(NATOM) * NATOM + 1
+    expected_uid = torch.arange(N_RES).repeat_interleave(ATOMS_PER_RES)
+    expected_ca = (
+        torch.arange(N_RES).repeat_interleave(ATOMS_PER_RES) * ATOMS_PER_RES
+        + ATOM14_CA
+    )
     value_checks: list[tuple[bool, str]] = [
         (
-            bool(torch.allclose(row_sums, torch.ones(1, N_ATOM))),
-            "ref_element rows sum to 1",
+            bool(torch.allclose(row_sums, torch.ones_like(row_sums))),
+            "ref_element is a one-hot in every slot, virtual ones included",
         ),
         (
             bool(torch.equal(context.ref_space_uid[0], expected_uid)),
@@ -318,7 +327,10 @@ def test_build_sampling_context(context: FeaturizedBatch) -> None:
             bool((context.f_pseudo_beta_mask == 1).all()),
             "f_pseudo_beta_mask all ones",
         ),
-        (bool(context.atom5_mask.all()), "atom5_mask all set"),
+        (
+            bool(context.atom14_mask.all()),
+            "atom14_mask fills all 14 slots (virtual atoms included)",
+        ),
         (bool((context.t_hat == T_HAT_INIT).all()), "t_hat equals T_HAT_INIT"),
         (
             bool((context.t_normalized == T_NORM_INIT).all()),
@@ -582,17 +594,20 @@ def test_edm_sampler_identity_denoiser_produces_finite_centred_output(
     1. **Finiteness** — both the coordinate tensor and the sequence logits
        contain no NaN or Inf values, and the coordinate tensor has the
        expected shape ``(1, N_ATOM, 3)``.
-    2. **Centre-of-mass at origin** — the mean position across all atoms must
-       be zero for every batch element, confirming that the sampler
-       zero-centres its output. The tolerance is ``1e-6`` times the largest
-       coordinate magnitude, not a fixed absolute value. The identity
-       denoiser leaves the coordinates at the starting noise scale
-       (``sigma_data * sigma_max``, about 1,280 Å here), where float32
-       rounding alone moves the centre of mass by around 1e-5 Å. Without
-       the final centring step the output keeps the random translation
-       (about 1 Å) that ``centre_random_augment`` adds each step: about
-       0.6 Å with this seed, several hundred times the tolerance (about
-       1.3e-3 Å), so the check still catches a missing centring step.
+    2. **Centre-of-mass at origin** — the mean position over
+       ``context.atom14_mask`` must be zero for every batch element,
+       confirming that the sampler zero-centres its output over the atoms it
+       denoises. In the unconditional context every residue fills all 14
+       slots (real or virtual), so this is the mean over every atom. The
+       tolerance is ``1e-6`` times the largest coordinate magnitude, not a
+       fixed absolute value. The identity denoiser leaves the coordinates at
+       the starting noise scale (``sigma_data * sigma_max``, about 1,280 Å
+       here), where float32 rounding alone moves the centre of mass by
+       around 1e-5 Å. Without the final centring step the output keeps the
+       random translation (about 1 Å) that ``centre_random_augment`` adds
+       each step: about 0.75 Å with this seed, several hundred times
+       the tolerance (about 1.7e-3 Å), so the check still catches a
+       missing centring step.
     """
     sampler = EDMSampler(
         identity_denoiser_mock,
@@ -606,7 +621,10 @@ def test_edm_sampler_identity_denoiser_produces_finite_centred_output(
     assert z.shape == (1, N_ATOM, 3)
     assert torch.isfinite(z).all()
     assert torch.isfinite(seq).all()
-    com: Float[torch.Tensor, "1 3"] = reduce(z, "b n_atom d -> b d", "mean")
+    com: Float[torch.Tensor, "1 1 3"] = masked_com(
+        z,
+        mask=context.atom14_mask,
+    )
     assert torch.allclose(
         com,
         torch.zeros_like(com),
@@ -927,7 +945,7 @@ def sampler_trajectory(
         expected_step_sigmas=expected_sigmas,
         initial_centred_rms=step_rms[0],
         expected_initial_centred_rms=centred_rms(
-            step_sigmas[0] * centre_only(initial_draw, context.atom5_mask),
+            step_sigmas[0] * centre_only(initial_draw, context.atom14_mask),
         ),
         step_rms_ratios=step_rms[1:] / step_rms[:-1],
         expected_step_rms_ratios=torch.abs(
@@ -1101,19 +1119,31 @@ def test_edm_sampler_step_count_changes_output_for_nontrivial_denoiser(
 def test_build_sampling_context_additional_fields(
     context: FeaturizedBatch,
 ) -> None:
-    """Verify additional fields of an unconditional sampling context.
-
-    Checks that ``aa_indices`` are all alanine (0), that ``r_gt`` is all
-    zeros, that the sparse atom distogram is finite with its mask fully set
-    and the expected atom/bin dimensions, and that ``ref_pos``, ``tok_idx``,
-    and ``r_gt`` are all placed on CPU.
-    """
+    """``aa_indices`` are all alanine (0) and ``r_gt`` is all zeros."""
     assert (context.aa_indices == 0).all()
     assert (context.r_gt == 0).all()
+
+
+def test_build_sampling_context_sparse_atom_distogram(
+    context: FeaturizedBatch,
+) -> None:
+    """Sparse atom distogram is finite, in range, and fully unmasked.
+
+    Every slot of every residue holds a real or virtual atom, so every
+    atom pair in the sparse window is valid and the sparse mask must be
+    fully set -- a masked-out slot here would mean the virtual atoms the
+    sampler denoises get no atom-distogram signal.
+    """
     assert torch.isfinite(context.gt_atom_distogram_sparse.float()).all()
     assert context.gt_atom_distogram_mask_sparse.all()
     assert context.gt_atom_distogram_sparse.shape[1] == N_ATOM
     assert int(context.gt_atom_distogram_sparse.max().item()) < N_ATOM_BINS
+
+
+def test_build_sampling_context_fields_on_cpu(
+    context: FeaturizedBatch,
+) -> None:
+    """``ref_pos``, ``tok_idx``, and ``r_gt`` are all placed on CPU."""
     assert context.ref_pos.device.type == CPU_DEVICE_TYPE
     assert context.tok_idx.device.type == CPU_DEVICE_TYPE
     assert context.r_gt.device.type == CPU_DEVICE_TYPE
@@ -1160,7 +1190,7 @@ def test_edm_sampler_s_tmin_above_one_disables_injection(
 # ---------------------------------------------------------------------------
 
 N_RES_AA = 6
-N_ATOM_AA = N_RES_AA * NATOM  # 30
+N_ATOM_AA = N_RES_AA * ATOMS_PER_RES  # 84
 AA_SEQ_AA = "ACDEFG"  # len == N_RES_AA
 
 
@@ -1239,7 +1269,7 @@ class ExtraChecks(Flag):
     ("attr", "expected", "checks"),
     [
         ("r_gt", (2, N_ATOM_AA, 3), ExtraChecks.BATCH_EQUAL),
-        ("atom5_mask", (2, N_ATOM_AA), ExtraChecks.ALL_SET),
+        ("atom14_mask", (2, N_ATOM_AA), ExtraChecks.ALL_SET),
         ("residue_mask", (2, N_RES_AA), ExtraChecks.ALL_SET),
         (
             "aa_indices",
@@ -1279,9 +1309,10 @@ def test_build_aa_context_field_shape(
 
     ``ExtraChecks`` flags:
 
-    - ``ALL_SET``: asserts ``tensor.all()`` — used for the boolean masks
-      ``atom5_mask`` and ``residue_mask``, which must be fully ones when
-      every atom / residue is present.
+    - ``ALL_SET``: asserts ``tensor.all()`` — used for ``atom14_mask``
+      and ``residue_mask``, which must be fully ones: every atom37 slot is
+      resolved, and the atom14 slots a residue type lacks hold virtual
+      atoms (see ``test_build_aa_context_virtual_atoms_hide_sequence``).
     - ``BATCH_EQUAL``: asserts ``tensor[0] == tensor[1]`` — used for
       ``r_gt`` and ``aa_indices``, which are tiled from the same protein so
       every batch item must be identical.
@@ -1313,6 +1344,144 @@ def test_build_aa_context_field_shape(
                 dtype=torch.long,
             ),
         )
+
+
+class AaContextSequence(enum.Enum):
+    """Sequences to build an all-atom context for, on the same coordinates.
+
+    Each member's value is ``(sequence, real_slots_per_residue)``: an
+    ``N_RES_AA``-long sequence and, per residue, how many leading atom14
+    slots its type really has (hand-counted heavy atoms). Every later slot
+    must hold a virtual atom at C alpha.
+
+    Members:
+        all_alanine: 5 real slots per residue.
+        all_glycine: 4 real slots per residue; the Cβ slot is virtual.
+        all_tryptophan: All 14 slots real; nothing is virtual.
+        mixed: ``AA_SEQ_AA`` ("ACDEFG"), a different count per residue.
+    """
+
+    all_alanine = ("A" * N_RES_AA, (5,) * N_RES_AA)
+    all_glycine = ("G" * N_RES_AA, (4,) * N_RES_AA)
+    all_tryptophan = ("W" * N_RES_AA, (14,) * N_RES_AA)
+    mixed = (AA_SEQ_AA, (5, 6, 8, 9, 11, 4))
+
+    @property
+    def sequence(self) -> str:
+        """One-letter sequence of length ``N_RES_AA``."""
+        return self.value[0]
+
+    @property
+    def real_slots_per_residue(self) -> tuple[int, ...]:
+        """Number of real atom14 slots of each residue."""
+        return self.value[1]
+
+
+@dataclasses.dataclass(frozen=True)
+class SequenceAaContext:
+    """An AllAtomContext and which of its atom14 slots are virtual.
+
+    Attributes:
+        context: build_aa_context output for the scenario's sequence.
+        virtual_slots: True at every (residue, slot) the residue type
+            lacks (N_RES_AA, 14).
+    """
+
+    context: AllAtomContext
+    virtual_slots: Bool[torch.Tensor, "N_res 14"]
+
+
+@pytest.fixture
+def sequence_aa_ctx(
+    request: pytest.FixtureRequest,
+    atom37_pos: Float[torch.Tensor, "N_RES_AA 37 3"],
+    atom37_mask_all: Float[torch.Tensor, "N_RES_AA 37"],
+    residue_idx_aa: Float[torch.Tensor, "N_RES_AA"],
+    atom_disto_fn: Distogram,
+) -> SequenceAaContext:
+    """Build the all-atom context for one ``AaContextSequence``.
+
+    Factory fixture: receives an ``AaContextSequence`` through
+    ``@pytest.mark.parametrize(..., indirect=["sequence_aa_ctx"])``.
+    Coordinates, the all-ones atom37 mask, and residue indices are the
+    shared ``aa_ctx`` inputs; only the sequence changes.
+
+    Args:
+        request: Pytest request carrying the ``AaContextSequence``.
+        atom37_pos: Random atom37 coordinates.
+        atom37_mask_all: All-ones atom37 mask.
+        residue_idx_aa: Sequential residue indices.
+        atom_disto_fn: Atom distogram for the sparse targets.
+
+    Returns:
+        SequenceAaContext with the context and its virtual slots.
+    """
+    scenario = cast(AaContextSequence, request.param)
+    prot = Protein(
+        atom_positions=np.array(atom37_pos, dtype=np.float64),
+        atom_mask=np.array(atom37_mask_all, dtype=np.float64),
+        residue_index=np.array(residue_idx_aa, dtype=np.intp),
+        aatype=np.array(
+            [restype_order[c] for c in scenario.sequence],
+            dtype=np.intp,
+        ),
+        chain_index=np.zeros(N_RES_AA, dtype=np.intp),
+        b_factors=np.zeros((N_RES_AA, 37), dtype=np.float64),
+    )
+    with torch.no_grad():
+        aa_context = build_aa_context(
+            prot,
+            atom_disto_fn,
+            batch_size=1,
+            device="cpu",
+        )
+    return SequenceAaContext(
+        context=aa_context,
+        virtual_slots=rearrange(torch.arange(ATOMS_PER_RES), "a -> 1 a")
+        >= rearrange(
+            torch.tensor(scenario.real_slots_per_residue),
+            "n -> n 1",
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "sequence_aa_ctx",
+    [pytest.param(s, id=s.name) for s in AaContextSequence],
+    indirect=True,
+)
+def test_build_aa_context_virtual_atoms_hide_sequence(
+    sequence_aa_ctx: SequenceAaContext,
+) -> None:
+    """Every atom14 slot is present, and the ones a type lacks sit at C alpha.
+
+    The sampler conditions on this context, so a residue-type-dependent
+    mask would leak the sequence the model is asked to design, and must
+    match training's ``featurize_single_item`` (tested in test_data.py).
+
+    Arrange: ``sequence_aa_ctx`` built for the scenario's sequence on
+    shared random coordinates, with the slots its residue types lack.
+    Act: unpack ``r_gt`` to (residue, slot) and measure every slot's
+    offset from its residue's C alpha.
+    Assert: ``atom14_mask`` is all set and every atom has at least one
+    valid sparse distogram neighbour, whatever the sequence; every
+    virtual slot is exactly at C alpha; and every real slot other than
+    C alpha is not (the random coordinates are distinct).
+
+    Args:
+        sequence_aa_ctx: Factory-fixture-built context for this scenario.
+    """
+    aa_context = sequence_aa_ctx.context
+    slots = rearrange(aa_context.r_gt[0], "(n a) d -> n a d", a=ATOMS_PER_RES)
+    offset_from_ca = slots - slots[:, ATOM14_CA : ATOM14_CA + 1]
+    is_at_ca = (offset_from_ca == 0).all(dim=-1)
+    real_not_ca = ~sequence_aa_ctx.virtual_slots
+    real_not_ca[:, ATOM14_CA] = False
+
+    assert bool(aa_context.atom14_mask.all())
+    assert bool(aa_context.gt_atom_distogram_mask_sparse.any(dim=-1).all())
+    assert bool(is_at_ca[sequence_aa_ctx.virtual_slots].all())
+    assert not bool(is_at_ca[real_not_ca].any())
 
 
 def test_build_aa_context_batch_size_controls_leading_dim(
@@ -1516,13 +1685,14 @@ def test_unconditional(unconditional_ctx: FeaturizedBatch) -> None:
     """Verify unconditional (all-alanine, zero-coordinate) context.
 
     Checks that the distogram peaks at bin 0, the pseudo-β mask is fully set,
-    ``aa_indices`` are all alanine (0), every atom5 entry is unmasked, and the
-    ground-truth coordinates are zero.
+    ``aa_indices`` are all alanine (0), all 14 atom14 slots are unmasked
+    (alanine's missing slots hold virtual atoms, so the sampler denoises
+    every slot it later decodes), and the ground-truth coordinates are zero.
     """
     assert (unconditional_ctx.noised_res_distogram.argmax(dim=-1) == 0).all()
     assert (unconditional_ctx.f_pseudo_beta_mask == 1).all()
     assert (unconditional_ctx.aa_indices == 0).all()
-    assert unconditional_ctx.atom5_mask.all()
+    assert bool(unconditional_ctx.atom14_mask.all())
     assert (unconditional_ctx.r_gt == 0).all()
 
 
@@ -1586,7 +1756,7 @@ def test_all_atom_context_wrong_shape() -> None:
     with pytest.raises(TypeCheckError):
         _ = AllAtomContext(
             r_gt=torch.zeros(b_local, n_atom_local),  # must be 3-D "B N_atom 3"
-            atom5_mask=torch.zeros(b_local, n_atom_local, dtype=torch.bool),
+            atom14_mask=torch.zeros(b_local, n_atom_local, dtype=torch.bool),
             residue_mask=torch.zeros(b_local, n_res_local, dtype=torch.bool),
             gt_atom_distogram_sparse=torch.zeros(
                 b_local,
