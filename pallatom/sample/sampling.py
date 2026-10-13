@@ -553,7 +553,7 @@ class EDMSampler:
             f_template_distogram: Optional template pairwise distance
                 distribution to inject into the batch; pass None to keep the
                 distogram already stored in the context.
-            normalized_timestep: Diffusion time in [0, 1) as a scalar tensor
+            normalized_timestep: Diffusion time in (0, 1] as a scalar tensor
                 (1 is maximum noise), broadcast to a (B, N_res, N_res) pair
                 field.
             t_hat: Current noise level sigma as a scalar tensor.
