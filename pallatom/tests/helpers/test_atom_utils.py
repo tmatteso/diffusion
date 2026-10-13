@@ -2,14 +2,16 @@
 
 Covers pseudo_cb, atom37_to_atom14, atom14_to_atom37, atom37_to_cb,
 atom14_to_cb, fill_atom14_virtual_atoms, generic_ref_pos_and_element, the
-atom14 lookup tables, the
-Protein dataclass, make_np_example, make_fixed_size, center_positions,
-chain_end, to_pdb, protein_from_pdb, truncate_to_length, and molecule-type
-constants.
+atom14 lookup tables, the Protein dataclass, make_np_example,
+make_fixed_size, center_positions, chain_end, to_pdb, protein_from_pdb,
+truncate_to_length, and molecule-type constants.
 """
 
+import dataclasses
+import enum
+import functools
 import pathlib
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from types import MappingProxyType
 from typing import cast
 
@@ -17,7 +19,7 @@ import numpy as np
 import numpy.typing as npt
 import pytest
 import torch
-from einops import rearrange
+from einops import einsum, rearrange, reduce, repeat
 from helpers.atom_utils import (
     ATOM14_ATOM_EXISTS,
     ATOM14_C,
@@ -25,10 +27,12 @@ from helpers.atom_utils import (
     ATOM14_CB,
     ATOM14_ELEMENTS,
     ATOM14_N,
-    ATOM14_O,
     ATOM14_REF_POS,
-    ATOM37_ATOM_EXISTS,
+    ATOM37_C,
+    ATOM37_CA,
     ATOM37_CB,
+    ATOM37_N,
+    ATOM37_O,
     ATOMS_PER_RES,
     DNA_RESTYPE_3TO1,
     DNA_RESTYPE_ORDER,
@@ -45,17 +49,12 @@ from helpers.atom_utils import (
     PDB_REC_ENDMDL,
     PDB_REC_MODEL,
     PDB_REC_TER,
-    RESIDX_ATOM14_TO_ATOM37,
-    RESIDX_ATOM37_TO_ATOM14,
     RESTYPE_NUM,
     RESTYPE_NUM_NO_X,
-    RESTYPES,
     RNA_RESTYPE_3TO1,
     RNA_RESTYPE_ORDER,
     RNA_RESTYPES,
     Protein,
-    _build_atom14_tables,  # pyright: ignore[reportPrivateUsage]
-    _cb_from_backbone,  # pyright: ignore[reportPrivateUsage]
     atom14_to_atom37,
     atom14_to_cb,
     atom37_to_atom14,
@@ -79,7 +78,7 @@ from helpers.atom_utils import (
 )
 from helpers.errors import InvalidAAtypesError
 from helpers.useful_objects import manual_seed
-from jaxtyping import Float, Int, TypeCheckError
+from jaxtyping import Bool, Float, Int, TypeCheckError
 
 _ = manual_seed(42)
 
@@ -88,7 +87,6 @@ N_RES = 10
 PDB_ATOM_NAME_CUTOFF = 4
 PDB_LINE_LEN = 80
 PROT_LEN = 3
-_CB_ATOM_NAME = "CB"
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -112,40 +110,6 @@ def atom37_mask() -> Float[torch.Tensor, "B N_res 37"]:
         A ones tensor of shape (B, N_RES, 37) indicating all atoms present.
     """
     return torch.ones(B, N_RES, 37)
-
-
-@pytest.fixture
-def atom14_positions() -> Float[torch.Tensor, "B N_res 14 3"]:
-    """Provide random atom14 coordinate tensor (B, N_RES, 14, 3).
-
-    Returns:
-        A randomly initialised float tensor of shape (B, N_RES, 14, 3).
-    """
-    return torch.randn(B, N_RES, ATOMS_PER_RES, 3)
-
-
-@pytest.fixture
-def atom14_mask() -> Float[torch.Tensor, "B N_res 14"]:
-    """Provide all-ones atom14 mask (B, N_RES, 14).
-
-    Returns:
-        A ones tensor of shape (B, N_RES, 14) indicating all 14 slots present.
-    """
-    return torch.ones(B, N_RES, ATOMS_PER_RES)
-
-
-@pytest.fixture
-def ala_aatype() -> Int[torch.Tensor, "B N_res"]:
-    """Provide an all-alanine aatype tensor (B, N_RES).
-
-    Used by tests that only need a valid, arbitrary residue type (e.g.
-    shape/finiteness checks) rather than exercising residue-type-dependent
-    behavior.
-
-    Returns:
-        An integer tensor of shape (B, N_RES) filled with restype_order["A"].
-    """
-    return torch.full((B, N_RES), restype_order["A"], dtype=torch.long)
 
 
 @pytest.fixture
@@ -257,635 +221,986 @@ def test_pseudo_cb_collinear_backbone_finite() -> None:
 
 
 # ---------------------------------------------------------------------------
-# atom37_to_atom14
+# atom37_to_atom14 / atom14_to_atom37 — every residue type
 # ---------------------------------------------------------------------------
 
 
-def _real_atom_names(one_letter: str) -> frozenset[str]:
-    """Independently derive a residue type's true atom37 names.
+class ResidueScenario(enum.Enum):
+    """One single-residue conversion case per residue type.
 
-    Reads directly from rigid_group_atom_positions (not from any atom14
-    lookup table), so tests built on this oracle stay independent of the
-    atom37_to_atom14/atom14_to_atom37 gather implementation under test.
+    Each member's value is ``(aatype, resname, n_heavy_atoms)``. ``resname``
+    is the three-letter key into ``rigid_group_atom_positions``, which the
+    ``sentinel_residue`` fixture reads as an oracle independent of the
+    atom14 lookup tables under test. ``n_heavy_atoms`` is a hand-counted
+    second oracle: the number of heavy atoms the residue type has, which is
+    also the number of atom14 slots it really occupies. Members are read
+    via their properties rather than branched on.
+
+    Members cover all 20 standard amino acids, including the edge cases
+    glycine (4 atoms, the one residue without a Cβ) and tryptophan
+    (14 atoms, exactly filling every slot), plus ``unknown`` (the "X"
+    token, which has no geometry and so no atoms). The -100 padding index
+    is covered by ``VirtualAtomScenario.padding_sentinel``.
+    """
+
+    alanine = (restype_order["A"], "ALA", 5)
+    arginine = (restype_order["R"], "ARG", 11)
+    asparagine = (restype_order["N"], "ASN", 8)
+    aspartate = (restype_order["D"], "ASP", 8)
+    cysteine = (restype_order["C"], "CYS", 6)
+    glutamine = (restype_order["Q"], "GLN", 9)
+    glutamate = (restype_order["E"], "GLU", 9)
+    glycine = (restype_order["G"], "GLY", 4)
+    histidine = (restype_order["H"], "HIS", 10)
+    isoleucine = (restype_order["I"], "ILE", 8)
+    leucine = (restype_order["L"], "LEU", 8)
+    lysine = (restype_order["K"], "LYS", 9)
+    methionine = (restype_order["M"], "MET", 8)
+    phenylalanine = (restype_order["F"], "PHE", 11)
+    proline = (restype_order["P"], "PRO", 7)
+    serine = (restype_order["S"], "SER", 6)
+    threonine = (restype_order["T"], "THR", 7)
+    tryptophan = (restype_order["W"], "TRP", 14)
+    tyrosine = (restype_order["Y"], "TYR", 12)
+    valine = (restype_order["V"], "VAL", 7)
+    unknown = (restype_order["X"], "UNK", 0)
+
+    @property
+    def aatype(self) -> int:
+        """Residue type index passed to the conversions."""
+        return self.value[0]
+
+    @property
+    def resname(self) -> str:
+        """Three-letter name keying ``rigid_group_atom_positions``."""
+        return self.value[1]
+
+    @property
+    def n_heavy_atoms(self) -> int:
+        """Hand-counted number of heavy atoms this residue type has."""
+        return self.value[2]
+
+
+@dataclasses.dataclass(frozen=True)
+class SentinelResidue:
+    """A single residue whose atom37 coordinates encode their own slot.
+
+    Every atom37 slot ``i`` holds coordinate value ``i + 1`` on all three
+    axes, so a gathered value names the atom37 slot it came from without
+    the test needing to know atom14's residue-specific sidechain order.
+
+    Attributes:
+        atom37_positions: Sentinel atom37 coordinates (1, 1, 37, 3).
+        atom37_mask: 1 exactly at the atom37 slots this residue type has.
+        aatype: Residue type index (1, 1).
+        expected_atom_count: Hand-counted number of atom14 slots the
+            residue type really occupies.
+        expected_head_mask: Expected atom14 mask of the fixed slots 0-4
+            (N, CA, C, O, CB): 1 where the residue type has that atom.
+        expected_head_values: Expected sentinel value in slots 0-4, zero
+            where the atom is absent.
+        expected_sentinel_values: Ascending sentinel values of every atom
+            the residue type has, i.e. the values atom14 must gather.
+        atom14_reference: The residue type's row of ``ATOM14_REF_POS``
+            (1, 1, 14, 3).
+        atom14_reference_mask: The residue type's row of
+            ``ATOM14_ATOM_EXISTS`` as a float mask (1, 1, 14).
+        expected_reference_atom37: Ideal coordinates of each atom straight
+            from ``rigid_group_atom_positions``, laid out in atom37 slots
+            and zero elsewhere (1, 1, 37, 3).
+    """
+
+    atom37_positions: Float[torch.Tensor, "1 1 37 3"]
+    atom37_mask: Float[torch.Tensor, "1 1 37"]
+    aatype: Int[torch.Tensor, "1 1"]
+    expected_atom_count: int
+    expected_head_mask: Float[torch.Tensor, "5"]
+    expected_head_values: Float[torch.Tensor, "5"]
+    expected_sentinel_values: Float[torch.Tensor, "n_atoms"]
+    atom14_reference: Float[torch.Tensor, "1 1 14 3"]
+    atom14_reference_mask: Float[torch.Tensor, "1 1 14"]
+    expected_reference_atom37: Float[torch.Tensor, "1 1 37 3"]
+
+
+@pytest.fixture
+def sentinel_residue(request: pytest.FixtureRequest) -> SentinelResidue:
+    """Build the sentinel-coordinate residue for one ``ResidueScenario``.
+
+    Factory fixture: receives a ``ResidueScenario`` through
+    ``@pytest.mark.parametrize(..., indirect=["sentinel_residue"])``.
+
+    The atom set comes from ``rigid_group_atom_positions`` (the geometry
+    the atom14 tables are built from, but read here by atom name), so the
+    expectations do not depend on the gather tables under test. The fixed
+    head slots 0-4 are N, CA, C, O, CB for every residue type, which is
+    the one part of atom14's layout that can be written down by name.
 
     Args:
-        one_letter: Single-letter residue code, e.g. "A"; "X" has no entry
-            and produces an empty set.
+        request: Pytest request carrying the ``ResidueScenario``.
 
     Returns:
-        The frozenset of atom37 atom names this residue type has.
+        SentinelResidue with inputs and expectations for the scenario.
     """
-    resname = restype_1to3.get(one_letter, "")
-    return frozenset(
-        name for name, _, _ in rigid_group_atom_positions.get(resname, [])
-    )
-
-
-def _sentinel_atom37(
-    one_letter: str,
-) -> tuple[Float[torch.Tensor, "1 1 37 3"], Float[torch.Tensor, "1 1 37"]]:
-    """Build single-residue atom37 tensors with per-atom sentinel coords.
-
-    Every atom37 slot gets coordinate value (atom37_idx + 1), and the mask
-    is 1 only at slots this residue type actually has — so later gather
-    results can be checked by value without needing to know atom14's exact
-    slot ordering.
-
-    Args:
-        one_letter: Single-letter residue code to build the mask for.
-
-    Returns:
-        Tuple of (atom37_positions, atom37_mask), each with a leading
-        (1, 1, ...) batch/residue shape.
-    """
-    real_names = _real_atom_names(one_letter)
-    positions = torch.zeros(1, 1, len(atom_types), 3)
-    mask = torch.zeros(1, 1, len(atom_types))
-    for name, idx in atom_order.items():
-        positions[:, :, idx, :] = float(idx + 1)
-        if name in real_names:
-            mask[:, :, idx] = 1.0
-    return positions, mask
-
-
-def _aatype_row(one_letter: str) -> Int[torch.Tensor, "1 1"]:
-    """Build a single-residue aatype tensor for one_letter's restype row."""
-    return torch.full((1, 1), restype_order[one_letter], dtype=torch.long)
-
-
-def test_atom37_to_atom14_output_shapes(
-    atom37_positions: Float[torch.Tensor, "B N_res 37 3"],
-    atom37_mask: Float[torch.Tensor, "B N_res 37"],
-    ala_aatype: Int[torch.Tensor, "B N_res"],
-) -> None:
-    """atom37_to_atom14 returns position and mask tensors with correct shapes.
-
-    Verifies that the output position tensor is (B, N_RES, 14, 3) and the
-    mask tensor is (B, N_RES, 14).
-    """
-    pos14, mask14 = atom37_to_atom14(atom37_positions, atom37_mask, ala_aatype)
-    assert pos14.shape == (B, N_RES, ATOMS_PER_RES, 3)
-    assert mask14.shape == (B, N_RES, ATOMS_PER_RES)
-
-
-def test_atom37_to_atom14_output_finite(
-    atom37_positions: Float[torch.Tensor, "B N_res 37 3"],
-    atom37_mask: Float[torch.Tensor, "B N_res 37"],
-    ala_aatype: Int[torch.Tensor, "B N_res"],
-) -> None:
-    """atom37_to_atom14 produces finite position, mask values for random input.
-
-    Verifies that no NaN or Inf values appear in the position or mask outputs.
-    """
-    pos14, mask14 = atom37_to_atom14(atom37_positions, atom37_mask, ala_aatype)
-    assert torch.isfinite(pos14).all()
-    assert torch.isfinite(mask14).all()
-
-
-@pytest.mark.parametrize("one_letter", RESTYPES, ids=RESTYPES)
-def test_atom37_to_atom14_canonical_backbone_slots(one_letter: str) -> None:
-    """Slots 0-3 are always N, CA, C, O; slot 4 is CB iff the residue has one.
-
-    This is the one part of atom14's slot layout that is NOT residue-type
-    dependent, so it is checked directly by name rather than through the
-    gather's own lookup tables.
-    """
-    positions, mask = _sentinel_atom37(one_letter)
-    aatype = _aatype_row(one_letter)
-    pos14, mask14 = atom37_to_atom14(positions, mask, aatype)
-    real_names = _real_atom_names(one_letter)
-
-    for slot, name in zip(
-        (ATOM14_N, ATOM14_CA, ATOM14_C, ATOM14_O),
-        ("N", "CA", "C", "O"),
-        strict=True,
-    ):
-        if name in real_names:
-            assert mask14[0, 0, slot] == 1.0
-            assert pos14[0, 0, slot, 0] == float(atom_order[name] + 1)
-        else:
-            assert mask14[0, 0, slot] == 0.0
-
-    cb_present = _CB_ATOM_NAME in real_names
-    assert mask14[0, 0, ATOM14_CB] == (1.0 if cb_present else 0.0)
-    if cb_present:
-        assert pos14[0, 0, ATOM14_CB, 0] == float(
-            atom_order[_CB_ATOM_NAME] + 1,
+    scenario = cast(ResidueScenario, request.param)
+    head_names = ("N", "CA", "C", "O", "CB")
+    ideal_by_name = {
+        name: pos
+        for name, _, pos in rigid_group_atom_positions.get(
+            scenario.resname,
+            [],
         )
-
-
-@pytest.mark.parametrize("one_letter", RESTYPES, ids=RESTYPES)
-def test_atom37_to_atom14_recovers_exact_atom_set(one_letter: str) -> None:
-    """atom14's masked-in values are exactly this residue type's atom set.
-
-    Verifies, for every residue type (including the empty "X" row), that the
-    number of masked-in atom14 slots equals the residue's true atom count
-    and that the set of masked-in sentinel values matches the independently
-    derived oracle — without assuming any particular sidechain slot order.
-    """
-    positions, mask = _sentinel_atom37(one_letter)
-    aatype = _aatype_row(one_letter)
-    pos14, mask14 = atom37_to_atom14(positions, mask, aatype)
-    real_names = _real_atom_names(one_letter)
-
-    present = mask14[0, 0, :].bool()
-    assert int(present.sum()) == len(real_names)
-    got_values = {float(v.item()) for v in pos14[0, 0, present, 0]}
-    expected_values = {float(atom_order[name] + 1) for name in real_names}
-    assert got_values == expected_values
-
-
-def test_atom37_to_atom14_gly_has_only_backbone() -> None:
-    """Glycine's atom14 row has exactly 4 real atoms and no CB.
-
-    Mandatory edge case: the one standard residue with no Cβ.
-    """
-    gly_atom_count = 4  # N, CA, C, O — Gly is the one residue with no CB
-    assert int(ATOM14_ATOM_EXISTS[restype_order["G"]].sum()) == gly_atom_count
-    assert not ATOM14_ATOM_EXISTS[restype_order["G"], ATOM14_CB]
-
-
-def test_atom37_to_atom14_trp_fills_all_slots() -> None:
-    """Tryptophan's atom14 row uses all 14 slots.
-
-    Mandatory edge case: the largest standard residue, which exactly
-    saturates the 14-slot budget with no padding left over.
-    """
-    assert int(ATOM14_ATOM_EXISTS[restype_order["W"]].sum()) == ATOMS_PER_RES
-
-
-def test_atom37_to_atom14_unknown_x_has_no_atoms() -> None:
-    """The "X" mask token has no entry in rigid_group_atom_positions.
-
-    Its atom14 row must be entirely empty rather than falling back to some
-    other residue's geometry.
-    """
-    assert int(ATOM14_ATOM_EXISTS[restype_order["X"]].sum()) == 0
-
-
-def test_atom37_to_atom14_sentinel_aatype_does_not_raise(
-    atom37_positions: Float[torch.Tensor, "B N_res 37 3"],
-    atom37_mask: Float[torch.Tensor, "B N_res 37"],
-) -> None:
-    """The -100 padding sentinel used by data.py is clamped, not rejected.
-
-    Verifies atom37_to_atom14 does not raise and produces finite output when
-    aatype contains the padding sentinel; it is the caller's own residue
-    mask, not this function, that is responsible for zeroing the result at
-    padded positions.
-    """
-    aatype = torch.full((B, N_RES), -100, dtype=torch.long)
-    pos14, mask14 = atom37_to_atom14(atom37_positions, atom37_mask, aatype)
-    assert torch.isfinite(pos14).all()
-    assert torch.isfinite(mask14).all()
-
-
-# ---------------------------------------------------------------------------
-# atom14_to_atom37 — round trip, mask handling, and residue-type coverage
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize("one_letter", RESTYPES, ids=RESTYPES)
-def test_atom14_to_atom37_roundtrip_recovers_real_atoms(
-    one_letter: str,
-) -> None:
-    """atom37 -> atom14 -> atom37 recovers every real atom's coordinates.
-
-    Covers all 21 residue types (20 standard + "X"), including the Gly
-    (no CB) and Trp (all 14 slots used) edge cases, without assuming any
-    particular atom14 slot ordering: only the recovered-value set at the
-    residue's true atom37 indices is checked.
-    """
-    positions, mask = _sentinel_atom37(one_letter)
-    aatype = _aatype_row(one_letter)
-    real_names = _real_atom_names(one_letter)
-
-    pos14, mask14 = atom37_to_atom14(positions, mask, aatype)
-    roundtrip_pos, roundtrip_mask = atom14_to_atom37(pos14, mask14, aatype)
-
-    for name in real_names:
-        idx = atom_order[name]
-        assert roundtrip_mask[0, 0, idx] == 1.0
-        assert roundtrip_pos[0, 0, idx, 0] == float(idx + 1)
-
-    absent_indices = [
-        idx for name, idx in atom_order.items() if name not in real_names
-    ]
-    assert torch.allclose(
-        roundtrip_mask[0, 0, absent_indices],
-        torch.zeros(len(absent_indices)),
+    }
+    sentinel = torch.arange(1, len(atom_types) + 1, dtype=torch.float32)
+    real_atoms37 = torch.tensor(
+        [float(name in ideal_by_name) for name in atom_types],
+    )
+    expected_reference = torch.tensor(
+        [ideal_by_name.get(name, [0.0, 0.0, 0.0]) for name in atom_types],
+    )
+    head_mask = torch.tensor(
+        [float(name in ideal_by_name) for name in head_names],
+    )
+    head_sentinels = torch.tensor(
+        [float(atom_order[name] + 1) for name in head_names],
+    )
+    return SentinelResidue(
+        atom37_positions=repeat(sentinel, "a -> 1 1 a d", d=3),
+        atom37_mask=rearrange(real_atoms37, "a -> 1 1 a"),
+        aatype=torch.full((1, 1), scenario.aatype, dtype=torch.long),
+        expected_atom_count=scenario.n_heavy_atoms,
+        expected_head_mask=head_mask,
+        expected_head_values=head_mask * head_sentinels,
+        expected_sentinel_values=torch.tensor(
+            sorted(float(atom_order[name] + 1) for name in ideal_by_name),
+        ).float(),
+        atom14_reference=rearrange(
+            ATOM14_REF_POS[scenario.aatype],
+            "a d -> 1 1 a d",
+        ),
+        atom14_reference_mask=rearrange(
+            ATOM14_ATOM_EXISTS[scenario.aatype].float(),
+            "a -> 1 1 a",
+        ),
+        expected_reference_atom37=rearrange(
+            expected_reference,
+            "a d -> 1 1 a d",
+        ),
     )
 
 
-def test_atom14_to_atom37_output_shapes(
-    atom14_positions: Float[torch.Tensor, "B N_res 14 3"],
-    atom14_mask: Float[torch.Tensor, "B N_res 14"],
-    ala_aatype: Int[torch.Tensor, "B N_res"],
+@pytest.mark.parametrize(
+    "sentinel_residue",
+    [pytest.param(s, id=s.name) for s in ResidueScenario],
+    indirect=True,
+)
+def test_atom37_to_atom14_gathers_exactly_the_residue_atoms(
+    sentinel_residue: SentinelResidue,
 ) -> None:
-    """atom14_to_atom37 returns position and mask tensors with correct shapes.
+    """atom37_to_atom14 keeps every atom the residue type has, and no other.
 
-    Verifies that the output position tensor is (B, N_RES, 37, 3) and the
-    mask tensor is (B, N_RES, 37).
-    """
-    x_37, mask_37 = atom14_to_atom37(
-        atom14_positions,
-        atom14_mask,
-        ala_aatype,
-    )
-    assert x_37.shape == (B, N_RES, 37, 3)
-    assert mask_37.shape == (B, N_RES, 37)
-
-
-def test_atom14_to_atom37_single_residue() -> None:
-    """atom14_to_atom37 handles single-residue input without error."""
-    coords_14 = torch.randn(1, 1, ATOMS_PER_RES, 3)
-    mask_14 = torch.ones(1, 1, ATOMS_PER_RES)
-    aatype = _aatype_row("A")
-    x_37, mask_37 = atom14_to_atom37(coords_14, mask_14, aatype)
-    assert x_37.shape == (1, 1, 37, 3)
-    assert mask_37.shape == (1, 1, 37)
-
-
-# ---------------------------------------------------------------------------
-# atom37_to_atom14 / atom14_to_atom37 — type enforcement
-# ---------------------------------------------------------------------------
-
-
-def test_atom37_to_atom14_rejects_wrong_third_dimension(
-    ala_aatype: Int[torch.Tensor, "B N_res"],
-) -> None:
-    """A jaxtyping TypeCheckError raised when atom37_positions' last dim≠3."""
-    with pytest.raises(TypeCheckError):
-        _ = atom37_to_atom14(
-            torch.zeros((B, N_RES, 37, 4), dtype=torch.float64),
-            torch.ones((B, N_RES, 37), dtype=torch.float64),
-            ala_aatype,
-        )  # 4 ≠ 3
-
-
-def test_atom14_to_atom37_rejects_wrong_third_dimension(
-    ala_aatype: Int[torch.Tensor, "B N_res"],
-) -> None:
-    """A jaxtyping TypeCheckError raised when coords_14's third dim ≠ 14."""
-    with pytest.raises(TypeCheckError):
-        _ = atom14_to_atom37(
-            torch.zeros((B, N_RES, 4, 3), dtype=torch.float64),
-            torch.ones((B, N_RES, 4), dtype=torch.float64),
-            ala_aatype,
-        )  # 4 ≠ 14
-
-
-# ---------------------------------------------------------------------------
-# atom37_to_cb
-# ---------------------------------------------------------------------------
-
-
-def test_atom37_to_cb_output_shapes(
-    atom37_positions: Float[torch.Tensor, "B N_res 37 3"],
-    atom37_mask: Float[torch.Tensor, "B N_res 37"],
-) -> None:
-    """atom37_to_cb returns Cβ positions (B, N_RES, 3) and bool presence mask.
-
-    Verifies that both the coordinate tensor and the presence mask have the
-    expected shapes and that the mask dtype is torch.bool.
-    """
-    cb, cb_present = atom37_to_cb(atom37_positions, atom37_mask)
-    assert cb.shape == (B, N_RES, 3)
-    assert cb_present.shape == (B, N_RES)
-    assert cb_present.dtype == torch.bool
-
-
-def test_atom37_to_cb_output_finite(
-    atom37_positions: Float[torch.Tensor, "B N_res 37 3"],
-    atom37_mask: Float[torch.Tensor, "B N_res 37"],
-) -> None:
-    """atom37_to_cb produces finite Cβ coordinates from random backbone atoms.
-
-    Verifies that no NaN or Inf values appear in returned Cβ position tensor.
-    """
-    cb, _ = atom37_to_cb(atom37_positions, atom37_mask)
-    assert torch.isfinite(cb).all()
-
-
-def test_atom37_to_cb_all_cb_present(
-    atom37_positions: Float[torch.Tensor, "B N_res 37 3"],
-    atom37_mask: Float[torch.Tensor, "B N_res 37"],
-) -> None:
-    """atom37_to_cb marks all residues as CB-present when CB is set in mask.
-
-    Verifies that the presence mask is all-True when the input atom37 mask has
-    the CB slot set to 1.0 for every residue.
-    """
-    _, cb_present = atom37_to_cb(atom37_positions, atom37_mask)
-    assert cb_present.all()
-
-
-def test_atom37_to_cb_glycine_gets_pseudo_cb(
-    atom37_positions: Float[torch.Tensor, "B N_res 37 3"],
-) -> None:
-    """atom37_to_cb falls back to pseudo-Cβ for glycine-like residues.
-
-    Verifies that when CB is absent from the atom37 mask the presence mask is
-    all-False and the returned positions remain finite.
-    """
-    mask = torch.ones(B, N_RES, 37)
-    mask[:, :, ATOM37_CB] = 0.0
-    cb, cb_present = atom37_to_cb(atom37_positions, mask)
-    assert not cb_present.any()
-    assert torch.isfinite(cb).all()
-
-
-def test_atom37_to_cb_agrees_with_atom14_to_cb(
-    atom37_positions: Float[torch.Tensor, "B N_res 37 3"],
-    atom37_mask: Float[torch.Tensor, "B N_res 37"],
-    ala_aatype: Int[torch.Tensor, "B N_res"],
-) -> None:
-    """atom37_to_cb and atom14_to_cb agree on the same underlying structure.
-
-    Converts the same atom37 structure through atom37_to_atom14 and checks
-    that extracting Cβ directly from atom37 matches extracting it from the
-    derived atom14 representation.
-    """
-    cb_from_37, mask_from_37 = atom37_to_cb(atom37_positions, atom37_mask)
-    pos14, mask14 = atom37_to_atom14(
-        atom37_positions,
-        atom37_mask,
-        ala_aatype,
-    )
-    cb_from_14, mask_from_14 = atom14_to_cb(pos14, mask14)
-    assert torch.equal(mask_from_37, mask_from_14)
-    assert torch.equal(cb_from_37, cb_from_14)
-
-
-# ---------------------------------------------------------------------------
-# atom14_to_cb
-# ---------------------------------------------------------------------------
-
-
-def test_atom14_to_cb_output_shapes(
-    atom14_positions: Float[torch.Tensor, "B N_res 14 3"],
-    atom14_mask: Float[torch.Tensor, "B N_res 14"],
-) -> None:
-    """atom14_to_cb returns Cβ positions (B, N_RES, 3) and bool presence mask.
-
-    Verifies that both the coordinate tensor and the presence mask have the
-    expected shapes and that the mask dtype is torch.bool.
-    """
-    cb, cb_present = atom14_to_cb(atom14_positions, atom14_mask)
-    assert cb.shape == (B, N_RES, 3)
-    assert cb_present.shape == (B, N_RES)
-    assert cb_present.dtype == torch.bool
-
-
-def test_atom14_to_cb_output_finite(
-    atom14_positions: Float[torch.Tensor, "B N_res 14 3"],
-    atom14_mask: Float[torch.Tensor, "B N_res 14"],
-) -> None:
-    """atom14_to_cb produces finite Cβ coordinates from random backbone atoms.
-
-    Verifies that no NaN or Inf values appear in the returned Cβ position
-    tensor.
-    """
-    cb, _ = atom14_to_cb(atom14_positions, atom14_mask)
-    assert torch.isfinite(cb).all()
-
-
-def test_atom14_to_cb_real_cb_used_when_present(
-    atom14_positions: Float[torch.Tensor, "B N_res 14 3"],
-    atom14_mask: Float[torch.Tensor, "B N_res 14"],
-) -> None:
-    """atom14_to_cb returns the real atom14 CB slot when CB is present.
-
-    Verifies that the returned coordinates equal the atom14 CB channel and
-    that the presence mask is all-True when all residues have CB.
-    """
-    cb, cb_present = atom14_to_cb(atom14_positions, atom14_mask)
-    assert torch.allclose(cb, atom14_positions[:, :, ATOM14_CB, :])
-    assert cb_present.all()
-
-
-def test_atom14_to_cb_glycine_gets_pseudo_cb(
-    atom14_positions: Float[torch.Tensor, "B N_res 14 3"],
-) -> None:
-    """atom14_to_cb falls back to pseudo-Cβ when CB is absent (Gly-like).
-
-    Verifies that the presence mask is all-False, the fallback coordinates
-    are finite, and they differ from the raw CB slot values.
-    """
-    mask = torch.ones(B, N_RES, ATOMS_PER_RES)
-    mask[:, :, ATOM14_CB] = 0.0
-    cb, cb_present = atom14_to_cb(atom14_positions, mask)
-    assert not cb_present.any()
-    assert torch.isfinite(cb).all()
-    assert not torch.allclose(cb, atom14_positions[:, :, ATOM14_CB, :])
-
-
-def test_atom14_to_cb_mixed_residues(
-    atom14_positions: Float[torch.Tensor, "B N_res 14 3"],
-) -> None:
-    """atom14_to_cb gets pseudo-Cβ for residue 0 only, real CB for the rest.
-
-    Verifies per-residue branching when only the first residue is missing
-    its CB atom.
-    """
-    mask = torch.ones(B, N_RES, ATOMS_PER_RES)
-    mask[:, 0, ATOM14_CB] = 0.0  # residue 0 has no CB (Gly-like)
-    cb, cb_present = atom14_to_cb(atom14_positions, mask)
-    assert not cb_present[:, 0].any()
-    assert cb_present[:, 1:].all()
-    assert torch.allclose(cb[:, 1:, :], atom14_positions[:, 1:, ATOM14_CB, :])
-
-
-# ---------------------------------------------------------------------------
-# fill_atom14_virtual_atoms / generic_ref_pos_and_element
-# ---------------------------------------------------------------------------
-
-
-def _ideal_atom14(
-    one_letter: str,
-) -> tuple[
-    Float[torch.Tensor, "1 1 14 3"],
-    Float[torch.Tensor, "1 1 14"],
-    Int[torch.Tensor, "1 1"],
-]:
-    """Return random atom14 coords, the type's real-atom mask, and aatype.
+    Arrange: ``sentinel_residue`` marks every atom37 slot with its own
+    index and masks in exactly this residue type's atoms.
+    Act: convert to atom14.
+    Assert: the number of masked-in atom14 slots equals the hand-counted
+    ``n_heavy_atoms`` (4 for glycine, 14 for tryptophan, 0 for "X" and
+    the masked-in sentinel values are exactly
+    the residue type's atoms -- checked as a set, so no particular
+    sidechain slot order is assumed.
 
     Args:
-        one_letter: One-letter residue code.
+        sentinel_residue: Factory-fixture-built residue for this scenario.
+    """
+    pos14, mask14 = atom37_to_atom14(
+        sentinel_residue.atom37_positions,
+        sentinel_residue.atom37_mask,
+        sentinel_residue.aatype,
+    )
+    present = mask14[0, 0].bool()
+
+    assert int(present.sum()) == sentinel_residue.expected_atom_count
+    assert torch.equal(
+        pos14[0, 0, present, 0].sort().values,
+        sentinel_residue.expected_sentinel_values,
+    )
+
+
+@pytest.mark.parametrize(
+    "sentinel_residue",
+    [pytest.param(s, id=s.name) for s in ResidueScenario],
+    indirect=True,
+)
+def test_atom37_to_atom14_fixed_backbone_and_cb_slots(
+    sentinel_residue: SentinelResidue,
+) -> None:
+    """Slots 0-4 hold N, CA, C, O, CB for every residue type that has them.
+
+    This fixed head is what lets ``atom14_to_cb`` and ``ATOM14_CA`` work
+    without an aatype, so it is checked by atom name for every type.
+
+    Arrange: ``sentinel_residue`` with the expected head mask and values.
+    Act: convert to atom14.
+    Assert: the head mask matches (glycine's CB slot is empty, "X" and
+    the padding sentinel have no atoms), and each present head slot holds
+    the sentinel value of the atom37 slot with that atom's name.
+
+    Args:
+        sentinel_residue: Factory-fixture-built residue for this scenario.
+    """
+    pos14, mask14 = atom37_to_atom14(
+        sentinel_residue.atom37_positions,
+        sentinel_residue.atom37_mask,
+        sentinel_residue.aatype,
+    )
+    head_mask = mask14[0, 0, : ATOM14_CB + 1]
+
+    assert torch.equal(head_mask, sentinel_residue.expected_head_mask)
+    assert torch.equal(
+        pos14[0, 0, : ATOM14_CB + 1, 0] * head_mask,
+        sentinel_residue.expected_head_values,
+    )
+
+
+@pytest.mark.parametrize(
+    "sentinel_residue",
+    [pytest.param(s, id=s.name) for s in ResidueScenario],
+    indirect=True,
+)
+def test_atom14_to_atom37_round_trip_restores_atom37(
+    sentinel_residue: SentinelResidue,
+) -> None:
+    """atom37 -> atom14 -> atom37 restores every real atom and its mask.
+
+    Arrange: ``sentinel_residue`` whose atom37 mask covers exactly the
+    residue type's atoms.
+    Act: convert to atom14 and back.
+    Assert: the restored mask equals the input mask, and the restored
+    coordinates equal the input coordinates at every masked-in slot.
+
+    Args:
+        sentinel_residue: Factory-fixture-built residue for this scenario.
+    """
+    pos14, mask14 = atom37_to_atom14(
+        sentinel_residue.atom37_positions,
+        sentinel_residue.atom37_mask,
+        sentinel_residue.aatype,
+    )
+    pos37, mask37 = atom14_to_atom37(pos14, mask14, sentinel_residue.aatype)
+    keep = rearrange(sentinel_residue.atom37_mask, "b n a -> b n a 1")
+
+    assert torch.equal(mask37, sentinel_residue.atom37_mask)
+    assert torch.equal(
+        pos37 * keep,
+        sentinel_residue.atom37_positions * keep,
+    )
+
+
+@pytest.mark.parametrize(
+    "sentinel_residue",
+    [pytest.param(s, id=s.name) for s in ResidueScenario],
+    indirect=True,
+)
+def test_atom14_reference_tables_match_rigid_group_geometry(
+    sentinel_residue: SentinelResidue,
+) -> None:
+    """ATOM14_REF_POS places each atom's ideal coordinates in its own slot.
+
+    ``ATOM14_REF_POS`` and ``ATOM14_ATOM_EXISTS`` are built at import time
+    from ``rigid_group_atom_positions``; the generic reference conformer
+    takes its backbone from them, so a slot mix-up would silently corrupt
+    every residue's reference features.
+
+    Arrange: ``sentinel_residue`` with the residue type's table rows and
+    the ideal coordinates read by atom name from the rigid-group data.
+    Act: scatter the table row into atom37 with ``atom14_to_atom37``.
+    Assert: the result equals the rigid-group coordinates at every atom
+    the residue type has, and is zero everywhere else.
+
+    Args:
+        sentinel_residue: Factory-fixture-built residue for this scenario.
+    """
+    pos37, mask37 = atom14_to_atom37(
+        sentinel_residue.atom14_reference,
+        sentinel_residue.atom14_reference_mask,
+        sentinel_residue.aatype,
+    )
+
+    assert torch.equal(
+        pos37 * rearrange(mask37, "b n a -> b n a 1"),
+        sentinel_residue.expected_reference_atom37,
+    )
+
+
+class MalformedConversion(enum.Enum):
+    """Shape-contract violations the atom37 <-> atom14 conversions reject.
+
+    Each member's value is ``(conversion, positions_shape, mask_shape)``;
+    the ``malformed_conversion_call`` fixture builds zero-filled inputs of
+    those shapes with a matching (1, 1) aatype.
+
+    Members:
+        atom37_coords_not_xyz: atom37 coordinates with 4 components.
+        atom14_slots_not_fourteen: atom14 input with 4 slots instead of 14.
+    """
+
+    atom37_coords_not_xyz = (atom37_to_atom14, (1, 1, 37, 4), (1, 1, 37))
+    atom14_slots_not_fourteen = (atom14_to_atom37, (1, 1, 4, 3), (1, 1, 4))
+
+    @property
+    def conversion(self) -> Callable[..., object]:
+        """Conversion function under test."""
+        return self.value[0]
+
+    @property
+    def positions_shape(self) -> tuple[int, ...]:
+        """Shape of the malformed positions argument."""
+        return self.value[1]
+
+    @property
+    def mask_shape(self) -> tuple[int, ...]:
+        """Shape of the mask argument."""
+        return self.value[2]
+
+
+@pytest.fixture
+def malformed_conversion_call(
+    request: pytest.FixtureRequest,
+) -> Callable[[], object]:
+    """Bind a conversion to inputs that violate its shape contract.
+
+    Factory fixture: receives a ``MalformedConversion`` through
+    ``@pytest.mark.parametrize(..., indirect=[...])``.
+
+    Args:
+        request: Pytest request carrying the ``MalformedConversion``.
 
     Returns:
-        Tuple of (positions, mask, aatype) for a single residue.
+        Zero-argument callable that invokes the conversion.
     """
-    row = restype_order[one_letter]
-    positions = torch.randn(1, 1, ATOMS_PER_RES, 3)
-    mask = rearrange(ATOM14_ATOM_EXISTS[row].float(), "a -> 1 1 a")
-    aatype = torch.tensor([[row]], dtype=torch.long)
-    return positions, mask, aatype
+    scenario = cast(MalformedConversion, request.param)
+    return functools.partial(
+        scenario.conversion,
+        torch.zeros(scenario.positions_shape),
+        torch.ones(scenario.mask_shape),
+        torch.zeros((1, 1), dtype=torch.long),
+    )
 
 
-@pytest.mark.parametrize("one_letter", ["A", "C", "G", "F", "W"])
-def test_fill_atom14_virtual_atoms_mask_is_all_set(one_letter: str) -> None:
-    """Every slot of a fully resolved residue is present after filling.
-
-    This is what keeps the mask from revealing the residue type.
-
-    Args:
-        one_letter: One-letter residue code under test.
-    """
-    positions, mask, aatype = _ideal_atom14(one_letter)
-    _, filled_mask = fill_atom14_virtual_atoms(positions, mask, aatype)
-    assert bool((filled_mask == 1).all())
-
-
-@pytest.mark.parametrize("one_letter", ["A", "C", "G", "F", "W"])
-def test_fill_atom14_virtual_atoms_places_virtual_atoms_at_ca(
-    one_letter: str,
+@pytest.mark.parametrize(
+    "malformed_conversion_call",
+    [pytest.param(s, id=s.name) for s in MalformedConversion],
+    indirect=True,
+)
+def test_atom_conversions_reject_malformed_shapes(
+    malformed_conversion_call: Callable[[], object],
 ) -> None:
-    """Slots the type lacks move to C alpha; real slots keep their coordinates.
+    """The jaxtyping shape contract rejects malformed conversion inputs.
+
+    Arrange: ``malformed_conversion_call`` binds the conversion to inputs
+    whose coordinate or slot dimension is wrong.
+    Act: call it.
+    Assert: jaxtyping raises ``TypeCheckError`` instead of gathering
+    garbage.
 
     Args:
-        one_letter: One-letter residue code under test.
+        malformed_conversion_call: Factory-fixture-built bound call.
     """
-    positions, mask, aatype = _ideal_atom14(one_letter)
-    filled, _ = fill_atom14_virtual_atoms(positions, mask, aatype)
-    exists = ATOM14_ATOM_EXISTS[restype_order[one_letter]]
-    ca_pos = positions[0, 0, ATOM14_CA]
-    assert torch.equal(filled[0, 0, exists], positions[0, 0, exists])
-    assert bool((filled[0, 0, ~exists] == ca_pos).all())
+    with pytest.raises(TypeCheckError):
+        _ = malformed_conversion_call()
 
 
-def test_fill_atom14_virtual_atoms_keeps_unresolved_real_atoms_masked() -> None:
-    """An unresolved real atom stays masked instead of becoming virtual."""
-    positions, mask, aatype = _ideal_atom14("F")
-    mask[0, 0, ATOM14_CB] = 0.0
-    filled, filled_mask = fill_atom14_virtual_atoms(positions, mask, aatype)
-    assert filled_mask[0, 0, ATOM14_CB] == 0
-    assert torch.equal(
-        filled[0, 0, ATOM14_CB],
-        positions[0, 0, ATOM14_CB],
+# ---------------------------------------------------------------------------
+# atom14_to_cb / atom37_to_cb — real Cβ where present, pseudo-Cβ otherwise
+# ---------------------------------------------------------------------------
+
+
+class CbScenario(enum.Enum):
+    """Which residues of a three-residue chain have a resolved Cβ.
+
+    Each member's value is the per-residue Cβ presence. The
+    ``backbone_with_cb`` fixture builds the same chain in atom14 and atom37
+    and expects the real Cβ where present and the pseudo-Cβ from the
+    backbone where absent.
+
+    Members:
+        all_present: Every residue has a Cβ; no fallback.
+        all_absent: No residue has a Cβ (glycine-like); all fallback.
+        first_absent: Only residue 0 lacks a Cβ, so the per-residue choice
+            must not leak across residues.
+    """
+
+    all_present = (True, True, True)
+    all_absent = (False, False, False)
+    first_absent = (False, True, True)
+
+    @property
+    def cb_present(self) -> tuple[bool, ...]:
+        """Whether each residue has a resolved Cβ."""
+        return self.value
+
+
+@dataclasses.dataclass(frozen=True)
+class BackboneWithCb:
+    """A three-residue chain in both atom layouts, with its expected Cβ.
+
+    Attributes:
+        atom14_positions: Chain in atom14 layout (1, 3, 14, 3).
+        atom14_mask: atom14 mask; backbone present, CB per scenario.
+        atom37_positions: The same chain in atom37 layout (1, 3, 37, 3).
+        atom37_mask: atom37 mask; backbone present, CB per scenario.
+        expected_cb: Real Cβ where present, pseudo-Cβ otherwise (1, 3, 3).
+        expected_cb_present: Per-residue Cβ presence (1, 3).
+    """
+
+    atom14_positions: Float[torch.Tensor, "1 3 14 3"]
+    atom14_mask: Float[torch.Tensor, "1 3 14"]
+    atom37_positions: Float[torch.Tensor, "1 3 37 3"]
+    atom37_mask: Float[torch.Tensor, "1 3 37"]
+    expected_cb: Float[torch.Tensor, "1 3 3"]
+    expected_cb_present: Bool[torch.Tensor, "1 3"]
+
+
+@pytest.fixture
+def backbone_with_cb(request: pytest.FixtureRequest) -> BackboneWithCb:
+    """Build the three-residue chain for one ``CbScenario``.
+
+    Factory fixture: receives a ``CbScenario`` through
+    ``@pytest.mark.parametrize(..., indirect=["backbone_with_cb"])``.
+
+    Every residue has N (1, 0, 0), CA at the origin, C (0, 1, 0),
+    O (1, 1, 0) and a real CB at (0, 0, 1) -- far from the pseudo-Cβ that
+    backbone implies -- shifted by 10 Å along x per residue so a residue
+    mix-up shows. The expected fallback is ``pseudo_cb`` of that backbone,
+    which is tested on its own above.
+
+    Args:
+        request: Pytest request carrying the ``CbScenario``.
+
+    Returns:
+        BackboneWithCb with both layouts and the expected Cβ.
+    """
+    scenario = cast(CbScenario, request.param)
+    n_res = len(scenario.cb_present)
+    head = torch.tensor(
+        [
+            [1.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+    )
+    shift = repeat(
+        torch.arange(n_res, dtype=torch.float32) * 10.0,
+        "n -> n 1 1",
+    ) * torch.tensor([1.0, 0.0, 0.0])
+    chain_head = repeat(head, "a d -> n a d", n=n_res)
+    chain_head = chain_head + shift
+    cb_present = torch.tensor(scenario.cb_present)
+    head_mask = torch.ones(n_res, ATOM14_CB + 1)
+    head_mask[:, ATOM14_CB] = cb_present.float()
+
+    positions14 = torch.zeros(n_res, ATOMS_PER_RES, 3)
+    positions14[:, : ATOM14_CB + 1] = chain_head
+    mask14 = torch.zeros(n_res, ATOMS_PER_RES)
+    mask14[:, : ATOM14_CB + 1] = head_mask
+
+    atom37_slots = [ATOM37_N, ATOM37_CA, ATOM37_C, ATOM37_O, ATOM37_CB]
+    positions37 = torch.zeros(n_res, len(atom_types), 3)
+    positions37[:, atom37_slots] = chain_head
+    mask37 = torch.zeros(n_res, len(atom_types))
+    mask37[:, atom37_slots] = head_mask
+
+    fallback = pseudo_cb(
+        chain_head[:, ATOM14_N],
+        chain_head[:, ATOM14_CA],
+        chain_head[:, ATOM14_C],
+    )
+    expected_cb = torch.where(
+        rearrange(cb_present, "n -> n 1"),
+        chain_head[:, ATOM14_CB],
+        fallback,
+    )
+    return BackboneWithCb(
+        atom14_positions=rearrange(positions14, "n a d -> 1 n a d"),
+        atom14_mask=rearrange(mask14, "n a -> 1 n a"),
+        atom37_positions=rearrange(positions37, "n a d -> 1 n a d"),
+        atom37_mask=rearrange(mask37, "n a -> 1 n a"),
+        expected_cb=rearrange(expected_cb, "n d -> 1 n d"),
+        expected_cb_present=rearrange(cb_present, "n -> 1 n"),
     )
 
 
-def test_fill_atom14_virtual_atoms_missing_ca_masks_virtual_atoms() -> None:
-    """Virtual atoms inherit the C alpha mask, so padding stays masked."""
-    positions, _, aatype = _ideal_atom14("A")
-    mask = torch.zeros(1, 1, ATOMS_PER_RES)
-    _, filled_mask = fill_atom14_virtual_atoms(positions, mask, aatype)
-    assert bool((filled_mask == 0).all())
+@pytest.mark.parametrize(
+    "backbone_with_cb",
+    [pytest.param(s, id=s.name) for s in CbScenario],
+    indirect=True,
+)
+def test_atom14_to_cb_uses_real_cb_else_pseudo_cb(
+    backbone_with_cb: BackboneWithCb,
+) -> None:
+    """atom14_to_cb reads slot 4 where CB is present, else the pseudo-Cβ.
 
+    Arrange: ``backbone_with_cb`` chain in atom14 layout.
+    Act: extract the Cβ.
+    Assert: positions equal the real CB where present and the backbone's
+    pseudo-Cβ elsewhere, residue by residue, and the presence mask is the
+    scenario's (as a bool tensor).
 
-def test_generic_ref_pos_and_element_output_shapes() -> None:
-    """generic_ref_pos_and_element returns (N_res, 14, 3) and (N_res, 14, 4)."""
-    n_res = 4
-    ref_pos, ref_elem = generic_ref_pos_and_element(n_res, device="cpu")
-    assert ref_pos.shape == (n_res, ATOMS_PER_RES, 3)
-    assert ref_elem.shape == (n_res, ATOMS_PER_RES, 4)
-
-
-def test_generic_ref_pos_and_element_identical_for_every_residue() -> None:
-    """Every residue gets the same reference, so it carries no sequence."""
-    ref_pos, ref_elem = generic_ref_pos_and_element(3, device="cpu")
-    assert torch.equal(ref_pos[0], ref_pos[1])
-    assert torch.equal(ref_pos[0], ref_pos[2])
-    assert torch.equal(ref_elem[0], ref_elem[2])
-
-
-def test_generic_atom14_reference_slots_are_distinct() -> None:
-    """No two slots share a reference position.
-
-    The atom encoder distinguishes atoms within a residue only through
-    reference-position differences, so coincident slots would be
-    interchangeable.
+    Args:
+        backbone_with_cb: Factory-fixture-built chain for this scenario.
     """
-    dist = torch.cdist(GENERIC_ATOM14_REF_POS, GENERIC_ATOM14_REF_POS)
-    off_diagonal = ~torch.eye(ATOMS_PER_RES, dtype=torch.bool)
-    assert bool((dist[off_diagonal] > 1.0).all())
+    cb, cb_present = atom14_to_cb(
+        backbone_with_cb.atom14_positions,
+        backbone_with_cb.atom14_mask,
+    )
+
+    assert torch.allclose(cb, backbone_with_cb.expected_cb)
+    assert torch.equal(cb_present, backbone_with_cb.expected_cb_present)
 
 
-def test_generic_atom14_reference_backbone_matches_alanine() -> None:
-    """Slots 0-4 use Ala's ideal backbone + Cβ geometry and elements."""
+@pytest.mark.parametrize(
+    "backbone_with_cb",
+    [pytest.param(s, id=s.name) for s in CbScenario],
+    indirect=True,
+)
+def test_atom37_to_cb_uses_real_cb_else_pseudo_cb(
+    backbone_with_cb: BackboneWithCb,
+) -> None:
+    """atom37_to_cb gives the same Cβ as atom14_to_cb on the same chain.
+
+    ``data.py`` takes the ground-truth distogram's Cβ from atom37 and the
+    self-conditioning template's Cβ from atom14, so the two must agree.
+
+    Arrange: ``backbone_with_cb`` chain in atom37 layout.
+    Act: extract the Cβ.
+    Assert: the same expectations as the atom14 test.
+
+    Args:
+        backbone_with_cb: Factory-fixture-built chain for this scenario.
+    """
+    cb, cb_present = atom37_to_cb(
+        backbone_with_cb.atom37_positions,
+        backbone_with_cb.atom37_mask,
+    )
+
+    assert torch.allclose(cb, backbone_with_cb.expected_cb)
+    assert torch.equal(cb_present, backbone_with_cb.expected_cb_present)
+
+
+# ---------------------------------------------------------------------------
+# fill_atom14_virtual_atoms
+# ---------------------------------------------------------------------------
+
+
+class VirtualAtomScenario(enum.Enum):
+    """Single-residue cases for filling missing atom14 slots at C alpha.
+
+    Each member's value is ``(aatype, unresolved_slots, n_real_slots,
+    expected_mask)``. A residue type's real atoms always occupy its first
+    ``n_real_slots`` atom14 slots; every later slot is one the type lacks
+    and must become a virtual atom at C alpha. ``unresolved_slots`` are
+    real slots masked out of the input, as for atoms missing from an
+    experimental structure. ``expected_mask`` is the full 14-slot output
+    mask, written out so a failure shows exactly which slot is wrong.
+
+    Members:
+        alanine_resolved: Slots 5-13 become virtual; all 14 present.
+        glycine_resolved: Slots 4-13, including the Cβ slot, become
+            virtual; all 14 present.
+        tryptophan_resolved: All 14 slots are real; nothing changes.
+        phenylalanine_missing_cb: An unresolved real atom stays masked out
+            and keeps its coordinates instead of being pulled onto C alpha.
+        alanine_missing_ca: Virtual atoms take the C alpha mask, so with
+            C alpha unresolved they are masked out too.
+        unknown_residue: "X" has no real atoms and no C alpha, so every
+            slot moves onto the (masked) C alpha slot and stays masked.
+        padding_sentinel: The -100 index ``data.py`` writes into padded
+            positions is clamped onto row 0 (alanine). A padded position
+            has nothing resolved, so alanine's 5 real slots keep their
+            coordinates, the rest move onto C alpha, and nothing is
+            present.
+    """
+
+    alanine_resolved = (restype_order["A"], (), 5, (1,) * 14)
+    glycine_resolved = (restype_order["G"], (), 4, (1,) * 14)
+    tryptophan_resolved = (restype_order["W"], (), 14, (1,) * 14)
+    phenylalanine_missing_cb = (
+        restype_order["F"],
+        (ATOM14_CB,),
+        11,
+        (1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1),
+    )
+    alanine_missing_ca = (
+        restype_order["A"],
+        (ATOM14_CA,),
+        5,
+        (1, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+    )
+    unknown_residue = (restype_order["X"], (), 0, (0,) * 14)
+    padding_sentinel = (-100, (0, 1, 2, 3, 4), 5, (0,) * 14)
+
+    @property
+    def aatype(self) -> int:
+        """Residue type index passed to fill_atom14_virtual_atoms."""
+        return self.value[0]
+
+    @property
+    def unresolved_slots(self) -> tuple[int, ...]:
+        """Real slots masked out of the input."""
+        return self.value[1]
+
+    @property
+    def n_real_slots(self) -> int:
+        """Number of leading slots the residue type really has."""
+        return self.value[2]
+
+    @property
+    def expected_mask(self) -> tuple[int, ...]:
+        """Expected 14-slot output mask."""
+        return self.value[3]
+
+
+@dataclasses.dataclass(frozen=True)
+class VirtualAtomFill:
+    """Input to and expected output of fill_atom14_virtual_atoms.
+
+    Attributes:
+        positions: Input atom14 coordinates (1, 1, 14, 3).
+        mask: Input atom14 mask (1, 1, 14).
+        aatype: Residue type index (1, 1).
+        expected_positions: Expected output coordinates (1, 1, 14, 3).
+        expected_mask: Expected output mask (1, 1, 14).
+    """
+
+    positions: Float[torch.Tensor, "1 1 14 3"]
+    mask: Float[torch.Tensor, "1 1 14"]
+    aatype: Int[torch.Tensor, "1 1"]
+    expected_positions: Float[torch.Tensor, "1 1 14 3"]
+    expected_mask: Float[torch.Tensor, "1 1 14"]
+
+
+@pytest.fixture
+def virtual_atom_fill(request: pytest.FixtureRequest) -> VirtualAtomFill:
+    """Build the fill input and expectation for one ``VirtualAtomScenario``.
+
+    Factory fixture: receives a ``VirtualAtomScenario`` through
+    ``@pytest.mark.parametrize(..., indirect=["virtual_atom_fill"])``.
+
+    Slot ``s`` starts at coordinate ``s + 1`` on all three axes, so C alpha
+    (slot 1) sits at 2. The expected output keeps ``s + 1`` in the residue
+    type's real slots -- resolved or not -- and has 2 (C alpha) in every
+    slot the type lacks.
+
+    Args:
+        request: Pytest request carrying the ``VirtualAtomScenario``.
+
+    Returns:
+        VirtualAtomFill with inputs and expectations for the scenario.
+    """
+    scenario = cast(VirtualAtomScenario, request.param)
+    slot_values = torch.arange(1, ATOMS_PER_RES + 1, dtype=torch.float32)
+    is_real = torch.arange(ATOMS_PER_RES) < scenario.n_real_slots
+    mask = is_real.float()
+    mask[list(scenario.unresolved_slots)] = 0.0
+    expected_values = torch.where(
+        is_real,
+        slot_values,
+        slot_values[ATOM14_CA],
+    )
+    return VirtualAtomFill(
+        positions=repeat(slot_values, "a -> 1 1 a d", d=3),
+        mask=rearrange(mask, "a -> 1 1 a"),
+        aatype=torch.full((1, 1), scenario.aatype, dtype=torch.long),
+        expected_positions=repeat(expected_values, "a -> 1 1 a d", d=3),
+        expected_mask=rearrange(
+            torch.tensor(scenario.expected_mask, dtype=torch.float32),
+            "a -> 1 1 a",
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "virtual_atom_fill",
+    [pytest.param(s, id=s.name) for s in VirtualAtomScenario],
+    indirect=True,
+)
+def test_fill_atom14_virtual_atoms(virtual_atom_fill: VirtualAtomFill) -> None:
+    """Missing slots become virtual atoms at C alpha with C alpha's mask.
+
+    This is what keeps the atom14 mask from revealing the residue type
+    the model is asked to generate: every resolved residue fills all 14
+    slots, whatever its type.
+
+    Arrange: ``virtual_atom_fill`` with slot-numbered coordinates, the
+    scenario's input mask, and the expected output.
+    Act: fill the virtual atoms.
+    Assert: coordinates and mask equal the expectation exactly -- real
+    slots untouched (even when unresolved), lacking slots at C alpha, and
+    the mask all-set only when C alpha is resolved.
+
+    Args:
+        virtual_atom_fill: Factory-fixture-built case for this scenario.
+    """
+    positions, mask = fill_atom14_virtual_atoms(
+        virtual_atom_fill.positions,
+        virtual_atom_fill.mask,
+        virtual_atom_fill.aatype,
+    )
+
+    assert torch.equal(positions, virtual_atom_fill.expected_positions)
+    assert torch.equal(mask, virtual_atom_fill.expected_mask)
+
+
+# ---------------------------------------------------------------------------
+# generic_ref_pos_and_element — the sequence-independent reference
+# ---------------------------------------------------------------------------
+
+
+class ReferenceSlotGroup(enum.Enum):
+    """Slot ranges of the generic atom14 reference with distinct origins.
+
+    Each member's value is the ``(start, stop)`` slot range.
+
+    Members:
+        backbone_and_cb: Slots 0-4 copy alanine's ideal N, CA, C, O, CB
+            coordinates and C/N/O element one-hots.
+        pseudo_sidechain: Slots 5-13 are UNK-element pseudo-atoms spaced
+            1.5 Å apart, continuing the C alpha -> Cβ bond past Cβ.
+    """
+
+    backbone_and_cb = (0, ATOM14_CB + 1)
+    pseudo_sidechain = (ATOM14_CB + 1, ATOMS_PER_RES)
+
+    @property
+    def slots(self) -> slice:
+        """Slice selecting this group's slots."""
+        return slice(*self.value)
+
+
+@dataclasses.dataclass(frozen=True)
+class ReferenceSlots:
+    """One slot group of the generic reference, actual and expected.
+
+    Attributes:
+        ref_pos: Generic reference coordinates in the group's slots.
+        ref_elem: Generic reference element one-hots in the group's slots.
+        expected_ref_pos: Expected coordinates.
+        expected_ref_elem: Expected element one-hots.
+    """
+
+    ref_pos: Float[torch.Tensor, "S 3"]
+    ref_elem: Float[torch.Tensor, "S 4"]
+    expected_ref_pos: Float[torch.Tensor, "S 3"]
+    expected_ref_elem: Float[torch.Tensor, "S 4"]
+
+
+@pytest.fixture
+def reference_slots(request: pytest.FixtureRequest) -> ReferenceSlots:
+    """Slice the generic reference and its expectation for one slot group.
+
+    Factory fixture: receives a ``ReferenceSlotGroup`` through
+    ``@pytest.mark.parametrize(..., indirect=["reference_slots"])``.
+
+    The expectation is assembled from the specification rather than from
+    ``GENERIC_ATOM14_*``: alanine's ideal head from ``ATOM14_REF_POS`` /
+    ``ATOM14_ELEMENTS`` (themselves checked against the rigid-group data
+    above), then nine UNK pseudo-atoms at ``CB + k * 1.5 Å * unit(CB -
+    CA)`` for ``k = 1..9``.
+
+    Args:
+        request: Pytest request carrying the ``ReferenceSlotGroup``.
+
+    Returns:
+        ReferenceSlots for the group.
+    """
+    group = cast(ReferenceSlotGroup, request.param)
+    spacing = 1.5
+    n_pseudo = ATOMS_PER_RES - (ATOM14_CB + 1)
     ala = restype_order["A"]
-    assert torch.equal(
-        GENERIC_ATOM14_REF_POS[: ATOM14_CB + 1],
-        ATOM14_REF_POS[ala, : ATOM14_CB + 1],
+    head_pos = ATOM14_REF_POS[ala, : ATOM14_CB + 1]
+    bond = head_pos[ATOM14_CB] - head_pos[ATOM14_CA]
+    unit = bond / torch.sqrt(reduce(bond**2, "d -> ", "sum"))
+    steps = torch.arange(1, n_pseudo + 1, dtype=torch.float32) * spacing
+    pseudo_pos = head_pos[ATOM14_CB] + einsum(steps, unit, "k, d -> k d")
+    expected_pos = torch.cat([head_pos, pseudo_pos])
+    expected_elem = torch.cat(
+        [
+            ATOM14_ELEMENTS[ala, : ATOM14_CB + 1],
+            repeat(torch.tensor([0.0, 0.0, 0.0, 1.0]), "e -> k e", k=n_pseudo),
+        ],
     )
-    assert torch.equal(
-        GENERIC_ATOM14_ELEMENTS[: ATOM14_CB + 1],
-        ATOM14_ELEMENTS[ala, : ATOM14_CB + 1],
+    ref_pos, ref_elem = generic_ref_pos_and_element(1, device="cpu")
+    return ReferenceSlots(
+        ref_pos=ref_pos[0, group.slots],
+        ref_elem=ref_elem[0, group.slots],
+        expected_ref_pos=expected_pos[group.slots],
+        expected_ref_elem=expected_elem[group.slots],
     )
 
 
-def test_generic_atom14_reference_sidechain_slots_are_unk() -> None:
-    """Slots 5-13 are UNK so their element reveals nothing."""
-    unk = torch.tensor([0.0, 0.0, 0.0, 1.0])
-    assert bool((GENERIC_ATOM14_ELEMENTS[ATOM14_CB + 1 :] == unk).all())
+@pytest.mark.parametrize(
+    "reference_slots",
+    [pytest.param(g, id=g.name) for g in ReferenceSlotGroup],
+    indirect=True,
+)
+def test_generic_atom14_reference_slot_layout(
+    reference_slots: ReferenceSlots,
+) -> None:
+    """The generic reference has alanine's head and an UNK pseudo-sidechain.
 
+    Arrange: ``reference_slots`` for one slot group.
+    Act: (the reference is built at import time; the fixture reads it.)
+    Assert: coordinates match the specification to float tolerance and
+    element one-hots match exactly.
 
-# ---------------------------------------------------------------------------
-# _build_atom14_tables / _cb_from_backbone — private helpers, direct tests
-# ---------------------------------------------------------------------------
-
-
-def test_build_atom14_tables_is_deterministic() -> None:
-    """_build_atom14_tables returns identical tensors on every call.
-
-    The module-level constants (ATOM14_ATOM_EXISTS, etc.) are built by
-    calling this function once at import time; calling it again directly
-    must reproduce exactly the same tables, since the construction depends
-    only on the fixed rigid_group_atom_positions data.
+    Args:
+        reference_slots: Factory-fixture-built slot group.
     """
-    rebuilt = _build_atom14_tables()
-    originals = (
-        ATOM14_ATOM_EXISTS,
-        RESIDX_ATOM14_TO_ATOM37,
-        RESIDX_ATOM37_TO_ATOM14,
-        ATOM37_ATOM_EXISTS,
-        ATOM14_REF_POS,
-        ATOM14_ELEMENTS,
+    assert torch.allclose(
+        reference_slots.ref_pos,
+        reference_slots.expected_ref_pos,
+        atol=1e-6,
     )
-    for rebuilt_tensor, original_tensor in zip(
-        rebuilt,
-        originals,
-        strict=True,
-    ):
-        assert torch.equal(rebuilt_tensor, original_tensor)
-
-
-def test_cb_from_backbone_real_cb_used_when_present() -> None:
-    """_cb_from_backbone returns the real CB coordinate when present."""
-    n_backbone = torch.zeros(1, 1, 3)
-    ca_backbone = torch.ones(1, 1, 3)
-    c_backbone = torch.full((1, 1, 3), 2.0)
-    cb = torch.full((1, 1, 3), 9.0)
-    cb_present = torch.ones(1, 1, dtype=torch.bool)
-    cb_out, mask_out = _cb_from_backbone(
-        n_backbone,
-        ca_backbone,
-        c_backbone,
-        cb,
-        cb_present,
+    assert torch.equal(
+        reference_slots.ref_elem,
+        reference_slots.expected_ref_elem,
     )
-    assert torch.equal(cb_out, cb)
-    assert torch.equal(mask_out, cb_present)
 
 
-def test_cb_from_backbone_pseudo_when_cb_absent() -> None:
-    """_cb_from_backbone falls back to the Gly-safe pseudo-Cβ when absent."""
-    n_backbone = torch.zeros(1, 1, 3)
-    ca_backbone = torch.ones(1, 1, 3)
-    c_backbone = torch.full((1, 1, 3), 2.0)
-    cb = torch.full((1, 1, 3), 9.0)
-    cb_present = torch.zeros(1, 1, dtype=torch.bool)
-    cb_out, mask_out = _cb_from_backbone(
-        n_backbone,
-        ca_backbone,
-        c_backbone,
-        cb,
-        cb_present,
+@dataclasses.dataclass(frozen=True)
+class TiledReference:
+    """generic_ref_pos_and_element output with its expected tiling.
+
+    Attributes:
+        ref_pos: Output coordinates (N_res, 14, 3).
+        ref_elem: Output element one-hots (N_res, 14, 4).
+        expected_ref_pos: ``GENERIC_ATOM14_REF_POS`` repeated per residue.
+        expected_ref_elem: ``GENERIC_ATOM14_ELEMENTS`` repeated per residue.
+    """
+
+    ref_pos: Float[torch.Tensor, "N_res 14 3"]
+    ref_elem: Float[torch.Tensor, "N_res 14 4"]
+    expected_ref_pos: Float[torch.Tensor, "N_res 14 3"]
+    expected_ref_elem: Float[torch.Tensor, "N_res 14 4"]
+
+
+class ReferenceTiling(enum.Enum):
+    """Chain lengths to tile the generic reference over.
+
+    Each member's value is the residue count.
+
+    Members:
+        single_residue: The smallest chain.
+        short_chain: A few residues, enough to compare rows.
+        max_residues: The default ``max_residues`` (128) of ModelParams.
+    """
+
+    single_residue = 1
+    short_chain = 3
+    max_residues = 128
+
+    @property
+    def n_res(self) -> int:
+        """Number of residues."""
+        return self.value
+
+
+@pytest.fixture
+def tiled_reference(request: pytest.FixtureRequest) -> TiledReference:
+    """Call generic_ref_pos_and_element for one ``ReferenceTiling``.
+
+    Factory fixture: receives a ``ReferenceTiling`` through
+    ``@pytest.mark.parametrize(..., indirect=["tiled_reference"])``.
+
+    Args:
+        request: Pytest request carrying the ``ReferenceTiling``.
+
+    Returns:
+        TiledReference with the output and its expected tiling.
+    """
+    n_res = cast(ReferenceTiling, request.param).n_res
+    ref_pos, ref_elem = generic_ref_pos_and_element(n_res, device="cpu")
+    return TiledReference(
+        ref_pos=ref_pos,
+        ref_elem=ref_elem,
+        expected_ref_pos=repeat(
+            GENERIC_ATOM14_REF_POS,
+            "a d -> n a d",
+            n=n_res,
+        ),
+        expected_ref_elem=repeat(
+            GENERIC_ATOM14_ELEMENTS,
+            "a e -> n a e",
+            n=n_res,
+        ),
     )
-    assert not mask_out.any()
-    assert torch.isfinite(cb_out).all()
-    assert not torch.allclose(cb_out, cb)
+
+
+@pytest.mark.parametrize(
+    "tiled_reference",
+    [pytest.param(t, id=t.name) for t in ReferenceTiling],
+    indirect=True,
+)
+def test_generic_ref_pos_and_element_tiles_one_reference(
+    tiled_reference: TiledReference,
+) -> None:
+    """Every residue gets the identical reference, so it carries no sequence.
+
+    Arrange: ``tiled_reference`` for a single residue, a short chain, and
+    the default ``max_residues`` (128).
+    Act: (the fixture calls generic_ref_pos_and_element.)
+    Assert: both outputs equal the shared reference repeated once per
+    residue -- which also pins their shapes.
+
+    Args:
+        tiled_reference: Factory-fixture-built output for the count.
+    """
+    assert torch.equal(
+        tiled_reference.ref_pos,
+        tiled_reference.expected_ref_pos,
+    )
+    assert torch.equal(
+        tiled_reference.ref_elem,
+        tiled_reference.expected_ref_elem,
+    )
+
+
+@pytest.fixture
+def generic_reference_pairwise_distances() -> Float[torch.Tensor, "14 14"]:
+    """Pairwise distances between the 14 generic reference slots.
+
+    Not a factory: there is exactly one generic reference, so there is
+    nothing to parametrize.
+
+    Returns:
+        Symmetric (14, 14) distance matrix with a zero diagonal.
+    """
+    return torch.cdist(GENERIC_ATOM14_REF_POS, GENERIC_ATOM14_REF_POS)
+
+
+def test_generic_atom14_reference_slots_are_distinct(
+    generic_reference_pairwise_distances: Float[torch.Tensor, "14 14"],
+) -> None:
+    """No two reference slots are within 1 Å of each other.
+
+    The atom encoder tells atoms within a residue apart only through
+    reference-position differences, so two coincident slots would be
+    interchangeable to the model. The shortest real bond in the head is
+    C=O at about 1.23 Å, so 1 Å is a safe floor. Not parametrized: this
+    is a property of the one shared reference.
+
+    Arrange: ``generic_reference_pairwise_distances``.
+    Act: take the off-diagonal entries.
+    Assert: all exceed 1 Å.
+
+    Args:
+        generic_reference_pairwise_distances: Slot-to-slot distances.
+    """
+    off_diagonal = ~torch.eye(ATOMS_PER_RES, dtype=torch.bool)
+
+    assert bool(
+        (generic_reference_pairwise_distances[off_diagonal] > 1.0).all(),
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -8,6 +8,7 @@ length/indexing; and make_bucketed_data_loaders behaviour.
 """
 
 import dataclasses
+import enum
 import functools
 import json
 import math
@@ -26,6 +27,8 @@ from einops import rearrange, reduce, repeat
 from helpers.atom_utils import (
     ATOM14_CA,
     ATOMS_PER_RES,
+    GENERIC_ATOM14_ELEMENTS,
+    GENERIC_ATOM14_REF_POS,
     RESTYPE_NUM_NO_X,
     Protein,
     restype_order,
@@ -48,7 +51,7 @@ from helpers.data import (
     sinusoidal_encoding,
 )
 from helpers.useful_objects import ModelSetup, manual_seed
-from jaxtyping import Bool, Float, TypeCheckError
+from jaxtyping import Bool, Float, Shaped, TypeCheckError
 from torch.optim import Adam
 from torch.optim.lr_scheduler import LambdaLR
 from train.train_config import (
@@ -1190,7 +1193,7 @@ def test_featurize_collate_is_picklable(
 
 
 # ---------------------------------------------------------------------------
-# sinusoidal_encoding, featurize_single_item
+# sinusoidal_encoding, featurize_single_item sequence independence
 # ---------------------------------------------------------------------------
 
 
@@ -1202,50 +1205,186 @@ def test_sinusoidal_encoding_output_shape_and_shape() -> None:
     assert torch.isfinite(out).all()
 
 
-def test_featurize_single_item_ref_pos_is_sequence_independent(
-    featurized_item: FeaturizedItem,
-) -> None:
-    """Every residue gets the same reference conformer and element encoding.
+class ProteinSequence(enum.Enum):
+    """Sequences featurized on the same coordinates as ``single_protein``.
 
-    Regression test for sequence leakage: single_protein's sequence is
-    AA_SEQ = "ACDEFGHIKLMN", so residue 0 (Ala) and residue 5 (Gly, the
-    one standard residue with no Cβ) differ in type, yet must receive
-    identical reference features, since the sequence is what the model is
-    asked to predict.
+    Each member's value is an ``N_RES``-long sequence. Together they span
+    the whole range of atom14 occupancy, so any per-type leak in the
+    features shows up as a difference from the shared expectation.
+
+    Members:
+        mixed: ``AA_SEQ``, twelve different residue types.
+        all_glycine: Fewest real atoms (4 of 14 slots, no Cβ).
+        all_tryptophan: Most real atoms (all 14 slots).
     """
-    gly_residue_position = 5
-    gly_slice = slice(
-        gly_residue_position * ATOMS_PER_RES,
-        (gly_residue_position + 1) * ATOMS_PER_RES,
-    )
-    ala_slice = slice(0, ATOMS_PER_RES)
-    assert torch.equal(
-        featurized_item.ref_pos[ala_slice],
-        featurized_item.ref_pos[gly_slice],
-    )
-    assert torch.equal(
-        featurized_item.ref_element[ala_slice],
-        featurized_item.ref_element[gly_slice],
-    )
+
+    mixed = AA_SEQ
+    all_glycine = "G" * N_RES
+    all_tryptophan = "W" * N_RES
+
+    @property
+    def sequence(self) -> str:
+        """One-letter sequence of length ``N_RES``."""
+        return self.value
 
 
-def test_featurize_single_item_mask_is_sequence_independent(
-    featurized_item: FeaturizedItem,
-) -> None:
-    """Ala (5 real atoms) and Gly (4) both fill all 14 atom14 mask slots.
+@pytest.fixture
+def sequence_featurized_item(
+    request: pytest.FixtureRequest,
+    single_protein: Protein,
+    tcfg: TrainConfig,
+    template_distogram_fn: Distogram,
+    residue_distogram_fn: Distogram,
+    atom_distogram_fn: Distogram,
+) -> FeaturizedItem:
+    """Featurize ``single_protein``'s coordinates under another sequence.
 
-    Slots a residue type lacks hold virtual atoms, so the mask doesn't
-    reveal the residue type.
+    Factory fixture: receives a ``ProteinSequence`` through
+    ``@pytest.mark.parametrize(..., indirect=["sequence_featurized_item"])``.
+    Only ``aatype`` changes; coordinates and the all-ones atom37 mask are
+    ``single_protein``'s, so the residue types' own atom sets decide which
+    atom14 slots are real.
+
+    Args:
+        request: Pytest request carrying the ``ProteinSequence``.
+        single_protein: Protein providing coordinates and masks.
+        tcfg: Training config passed to featurize_single_item.
+        template_distogram_fn: Self-conditioning template distogram.
+        residue_distogram_fn: Ground-truth residue distogram.
+        atom_distogram_fn: Ground-truth atom distogram.
+
+    Returns:
+        FeaturizedItem for the scenario's sequence.
     """
-    gly_residue_position = 5
-    assert bool(featurized_item.atom14_mask[:ATOMS_PER_RES].all())
-    assert bool(
-        featurized_item.atom14_mask[
-            gly_residue_position
-            * ATOMS_PER_RES : (gly_residue_position + 1)
-            * ATOMS_PER_RES
-        ].all(),
+    sequence = cast(ProteinSequence, request.param).sequence
+    _ = manual_seed(1)
+    return featurize_single_item(
+        prot=dataclasses.replace(
+            single_protein,
+            aatype=np.array(
+                [restype_order[aa] for aa in sequence],
+                dtype=np.intp,
+            ),
+        ),
+        template_distogram_fn=template_distogram_fn,
+        residue_distogram_fn=residue_distogram_fn,
+        atom_distogram_fn=atom_distogram_fn,
+        tcfg=tcfg,
+        max_seq_len_in_batch=N_RES,
     )
+
+
+class SequenceBlindFeature(enum.Enum):
+    """Per-atom FeaturizedItem fields that must not depend on the sequence.
+
+    Each member's value is ``(field_name, per_residue_value)``: the field
+    must equal ``per_residue_value`` repeated once per residue.
+
+    Members:
+        ref_pos: The shared generic reference conformer.
+        ref_element: The shared generic element one-hots.
+        atom14_mask: All 14 slots present, real or virtual.
+    """
+
+    ref_pos = ("ref_pos", GENERIC_ATOM14_REF_POS)
+    ref_element = ("ref_element", GENERIC_ATOM14_ELEMENTS)
+    atom14_mask = (
+        "atom14_mask",
+        torch.ones(ATOMS_PER_RES, dtype=torch.bool),
+    )
+
+    @property
+    def field_name(self) -> str:
+        """FeaturizedItem attribute holding the feature."""
+        return self.value[0]
+
+    @property
+    def per_residue_value(self) -> Shaped[torch.Tensor, "14 ..."]:
+        """Value every residue must have."""
+        return self.value[1]
+
+
+@dataclasses.dataclass(frozen=True)
+class SequenceBlindExpectation:
+    """A feature's FeaturizedItem field and its expected flat value.
+
+    Attributes:
+        field_name: FeaturizedItem attribute holding the feature.
+        expected: ``per_residue_value`` repeated over ``N_RES`` residues
+            and flattened to the per-atom layout.
+    """
+
+    field_name: str
+    expected: Shaped[torch.Tensor, "N_atom ..."]
+
+
+@pytest.fixture
+def sequence_blind_expectation(
+    request: pytest.FixtureRequest,
+) -> SequenceBlindExpectation:
+    """Build the expected flat value of one ``SequenceBlindFeature``.
+
+    Factory fixture: receives a ``SequenceBlindFeature`` through
+    ``@pytest.mark.parametrize(..., indirect=[...])``.
+
+    Args:
+        request: Pytest request carrying the ``SequenceBlindFeature``.
+
+    Returns:
+        SequenceBlindExpectation for the feature.
+    """
+    feature = cast(SequenceBlindFeature, request.param)
+    return SequenceBlindExpectation(
+        field_name=feature.field_name,
+        expected=repeat(
+            feature.per_residue_value,
+            "a ... -> (n a) ...",
+            n=N_RES,
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "sequence_featurized_item",
+    [pytest.param(s, id=s.name) for s in ProteinSequence],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "sequence_blind_expectation",
+    [pytest.param(f, id=f.name) for f in SequenceBlindFeature],
+    indirect=True,
+)
+def test_featurize_single_item_atom_features_ignore_sequence(
+    sequence_featurized_item: FeaturizedItem,
+    sequence_blind_expectation: SequenceBlindExpectation,
+) -> None:
+    """Reference features and the atom mask reveal nothing about sequence.
+
+    Regression test for sequence leakage after the atom5 -> atom14 move:
+    per-type reference conformers and element patterns, or an atom14 mask
+    with residue-type-dependent occupancy (glycine 4 slots, tryptophan
+    14), would hand the model the sequence it is asked to generate.
+
+    Arrange: ``sequence_featurized_item`` featurizes identical coordinates
+    under a mixed, an all-glycine, and an all-tryptophan sequence;
+    ``sequence_blind_expectation`` gives the feature's sequence-free value.
+    Act: read the feature from the FeaturizedItem.
+    Assert: it equals the shared value repeated for every residue, for
+    every sequence -- so the three sequences are indistinguishable.
+
+    Args:
+        sequence_featurized_item: Factory-fixture-built item.
+        sequence_blind_expectation: Factory-fixture-built expectation.
+    """
+    feature = cast(
+        Shaped[torch.Tensor, "N_atom ..."],
+        getattr(
+            sequence_featurized_item,
+            sequence_blind_expectation.field_name,
+        ),
+    )
+
+    assert torch.equal(feature, sequence_blind_expectation.expected)
 
 
 # ---------------------------------------------------------------------------
