@@ -1,6 +1,7 @@
 """Tests for the conditional sampling loop."""
 
 import dataclasses
+import itertools
 import math
 from enum import Flag, auto
 from typing import cast
@@ -38,6 +39,15 @@ SIGMA_MAX = 80.0
 N_ATOM_BINS = 22
 T_HAT_INIT = 1.0
 T_NORM_INIT = 0.5
+SCHEDULE_REL_TOL = 1e-5
+# Loose bounds: an RMS over N_ATOM * 3 Gaussian draws is noisy, but a start
+# at the wrong end of the schedule is off by orders of magnitude.
+INIT_RMS_RATIO_MIN = 0.5
+INIT_RMS_RATIO_MAX = 2.0
+RECORDED_STEPS = 10
+# Just above the SamplerParams minimum of 1, so each zero-denoiser Euler step
+# rescales the input by roughly c_next / c_T and never overshoots past zero.
+ETA_NEAR_ONE = 1.01
 
 # ---------------------------------------------------------------------------
 # Mock factories
@@ -393,25 +403,25 @@ def test_noise_schedule_boundary_and_properties(
 
     Checks four properties of the noise schedule in a single pass:
 
-    1. **Boundaries** — ``noise_schedule(0)`` equals ``sigma_data * sigma_max``
-       and ``noise_schedule(1)`` equals ``sigma_data * sigma_min`` (within
+    1. **Boundaries** — ``noise_schedule(1)`` equals ``sigma_data * sigma_max``
+       and ``noise_schedule(0)`` equals ``sigma_data * sigma_min`` (within
        ``rel_tol=1e-5``).
     2. **Midpoint in open interval** — ``noise_schedule(0.5)`` lies strictly
        between the two boundary values, confirming the schedule does not
        collapse to either extreme.
-    3. **Monotone decrease** — values sampled at 20 evenly-spaced points from
-       0 to 1 are non-increasing.
+    3. **Monotone increase** — values sampled at 20 evenly-spaced points from
+       0 to 1 are non-decreasing.
     4. **Strict positivity** — every sampled value is greater than zero.
     """
     lo = bare_sampler.sigma_data * bare_sampler.sigma_min
     hi = bare_sampler.sigma_data * bare_sampler.sigma_max
     assert math.isclose(
-        bare_sampler.noise_schedule(torch.tensor(0.0)).item(),
+        bare_sampler.noise_schedule(torch.tensor(1.0)).item(),
         hi,
         rel_tol=1e-5,
     )
     assert math.isclose(
-        bare_sampler.noise_schedule(torch.tensor(1.0)).item(),
+        bare_sampler.noise_schedule(torch.tensor(0.0)).item(),
         lo,
         rel_tol=1e-5,
     )
@@ -419,7 +429,7 @@ def test_noise_schedule_boundary_and_properties(
     assert lo < mid.item() < hi
     ts = torch.linspace(0.0, 1.0, 20)
     vals = torch.stack([bare_sampler.noise_schedule(t) for t in ts])
-    assert (vals[1:] - vals[:-1] <= 0).all()
+    assert (vals[1:] - vals[:-1] >= 0).all()
     assert (vals > 0).all()
 
 
@@ -430,9 +440,9 @@ def test_noise_schedule_different_rho_gives_different_intermediate_values(
 ) -> None:
     """Changing rho must alter intermediate noise levels.
 
-    The boundary values (``sigma_max`` at step 0 and ``sigma_min`` at the
-    last step) must be identical across schedules; only the intermediate
-    levels may differ.
+    The boundary values (``sigma_max`` at t = 1 and ``sigma_min`` at t = 0)
+    must be identical across schedules; only the intermediate levels may
+    differ.
     """
     noise = NoiseScheduleParams(sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX)
     s1 = EDMSampler(
@@ -579,9 +589,9 @@ def test_edm_sampler_denoiser_called_twice_per_step(
 ) -> None:
     """Each loop step must call denoise twice per iteration.
 
-    The loop runs over ``range(1, ddim_steps - 1)`` (``ddim_steps - 2``
+    The loop runs over ``range(ddim_steps, 0, -1)`` (``ddim_steps``
     iterations). Each iteration calls denoise once for self-conditioning and
-    once for the update, giving a total of ``2 * (ddim_steps - 2)`` calls.
+    once for the update, giving a total of ``2 * ddim_steps`` calls.
     """
     ddim_steps = 5
     sampler = EDMSampler(
@@ -592,7 +602,115 @@ def test_edm_sampler_denoiser_called_twice_per_step(
         NoiseScheduleParams(sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX),
     )
     _ = sampler.sample((1, N_ATOM, 3))
-    assert zero_denoiser_mock.call_count == 2 * (ddim_steps - 2)
+    assert zero_denoiser_mock.call_count == 2 * ddim_steps
+
+
+def _record_steps(
+    denoiser: MagicMock,
+    sampling_context: FeaturizedBatch,
+    template_distogram: Distogram,
+) -> tuple[EDMSampler, list[FeaturizedBatch]]:
+    """Run a churn-free sampler and return the batch seen at each step.
+
+    With churn off, both model calls in a step share one noise level and
+    noisy input, so every other recorded call gives one batch per step. The
+    step scale is set just above 1 so that a coarse grid cannot overshoot.
+
+    Args:
+        denoiser: Mock trunk whose calls are recorded.
+        sampling_context: Static sampling context.
+        template_distogram: Template distogram module.
+
+    Returns:
+        The sampler (for evaluating its schedule) and one model input batch
+        per sampling step, in loop order.
+    """
+    sampler = EDMSampler(
+        denoiser,
+        sampling_context,
+        template_distogram,
+        SamplerParams(
+            S_churn=0.0,
+            ddim_steps=RECORDED_STEPS,
+            eta_step_scale=ETA_NEAR_ONE,
+        ),
+        NoiseScheduleParams(sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX),
+    )
+    _ = sampler.sample((1, N_ATOM, 3))
+    batches: list[FeaturizedBatch] = [
+        cast(FeaturizedBatch, call.args[0]) for call in denoiser.call_args_list
+    ]
+    return sampler, batches[::2]
+
+
+def _sigma_at(sampler: EDMSampler, t: float) -> float:
+    """Evaluate the sampler's noise schedule at time ``t``."""
+    return float(sampler.noise_schedule(torch.tensor(t)).item())
+
+
+def _centred_rms(batch: FeaturizedBatch) -> float:
+    """RMS of the noisy input about its centroid.
+
+    Centring removes the ~1 Å random translation that
+    ``centre_random_augment`` adds each step, which would otherwise dominate
+    the RMS at low noise levels.
+    """
+    r = batch.r_gt_noised
+    centred = r - reduce(r, "b n d -> b 1 d", "mean")
+    return float(torch.sqrt(reduce(centred**2, "... -> ", "mean")))
+
+
+def test_edm_sampler_visits_noise_levels_from_high_to_low(
+    zero_denoiser_mock: MagicMock,
+    context: FeaturizedBatch,
+    templ_disto: Distogram,
+) -> None:
+    """Noise levels must strictly decrease, from the top interval to the bottom.
+
+    The first step's ``t_hat`` must lie in the highest schedule interval and
+    the last step's in the lowest.
+    """
+    sampler, steps = _record_steps(zero_denoiser_mock, context, templ_disto)
+    sigmas = [float(batch.t_hat[0].item()) for batch in steps]
+    assert len(sigmas) == RECORDED_STEPS
+    assert all(a > b for a, b in itertools.pairwise(sigmas))
+    top_lo = _sigma_at(sampler, (RECORDED_STEPS - 1) / RECORDED_STEPS)
+    top_hi = _sigma_at(sampler, 1.0) * (1 + SCHEDULE_REL_TOL)
+    assert top_lo <= sigmas[0] <= top_hi
+    bottom_lo = _sigma_at(sampler, 0.0) * (1 - SCHEDULE_REL_TOL)
+    assert bottom_lo <= sigmas[-1] <= _sigma_at(sampler, 1 / RECORDED_STEPS)
+
+
+def test_edm_sampler_initial_noise_matches_first_step(
+    zero_denoiser_mock: MagicMock,
+    context: FeaturizedBatch,
+    templ_disto: Distogram,
+) -> None:
+    """Initial coordinates must be drawn at the first step's noise level.
+
+    Guards against initialising from the bottom of the schedule, which would
+    hand the first step a near-zero input labelled with maximum noise.
+    """
+    _, steps = _record_steps(zero_denoiser_mock, context, templ_disto)
+    first = steps[0]
+    ratio = _centred_rms(first) / float(first.t_hat[0].item())
+    assert INIT_RMS_RATIO_MIN < ratio < INIT_RMS_RATIO_MAX
+
+
+def test_edm_sampler_euler_step_lowers_noise(
+    zero_denoiser_mock: MagicMock,
+    context: FeaturizedBatch,
+    templ_disto: Distogram,
+) -> None:
+    """Each Euler step must target a lower noise level than the current one.
+
+    With a zero denoiser the update only rescales the input, by about
+    ``c_next / c_T`` at a step scale near 1, so the input's centred RMS must
+    shrink from one step to the next.
+    """
+    _, steps = _record_steps(zero_denoiser_mock, context, templ_disto)
+    rms = [_centred_rms(batch) for batch in steps]
+    assert all(a > b for a, b in itertools.pairwise(rms))
 
 
 # ---------------------------------------------------------------------------

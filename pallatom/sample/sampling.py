@@ -500,22 +500,24 @@ class EDMSampler:
         self,
         timestep: Float[torch.Tensor, ""],
     ) -> Float[torch.Tensor, ""]:
-        """AF3 noise schedule following closed-form noise level sequence.
+        """Pallatom noise schedule; t = 1 is maximum noise, t = 0 is minimum.
 
-        The formula is:
+        This is the AF3 closed-form schedule with time reversed, matching the
+        Pallatom sampler's convention: sampling starts near t = 1 and steps
+        toward t = 0. The formula is:
 
-        t_hat = sigma_data * (sigma_max^(1/rho) + t * (sigma_min^(1/rho) -
-        sigma_max^(1/rho)))^rho
+        t_hat = sigma_data * (sigma_min^(1/rho) + t * (sigma_max^(1/rho) -
+        sigma_min^(1/rho)))^rho
         """
         t_hat: Float[torch.Tensor, ""] = cast(
             'Float[torch.Tensor, ""]',
             self.sigma_data
             * (
-                self.sigma_max ** (1 / self.rho)
+                self.sigma_min ** (1 / self.rho)
                 + timestep
                 * (
-                    self.sigma_min ** (1 / self.rho)
-                    - self.sigma_max ** (1 / self.rho)
+                    self.sigma_max ** (1 / self.rho)
+                    - self.sigma_min ** (1 / self.rho)
                 )
             )
             ** self.rho,
@@ -550,8 +552,9 @@ class EDMSampler:
             f_template_distogram: Optional template pairwise distance
                 distribution to inject into the batch; pass None to keep the
                 distogram already stored in the context.
-            normalized_timestep: Diffusion time in [0, 1) as a scalar tensor,
-                broadcast to a (B, N_res, N_res) pair field.
+            normalized_timestep: Diffusion time in [0, 1) as a scalar tensor
+                (1 is maximum noise), broadcast to a (B, N_res, N_res) pair
+                field.
             t_hat: Current noise level sigma as a scalar tensor.
 
         Returns:
@@ -610,7 +613,9 @@ class EDMSampler:
             indices decoded via low-temperature softmax.
         """
         delta_t: float = 1 / self.total_timesteps
-        # from pallatom, c_T = NoiseSchedule(1 - uniform(0, 1) * delta_t)
+        # from pallatom, c_T = NoiseSchedule(1 - uniform(0, 1) * delta_t).
+        # t = 1 is maximum noise, so this starts at the same noise level as
+        # the first loop step (timestep = total_timesteps).
         c_T: Float[torch.Tensor, ""] = self.noise_schedule(
             1 - (torch.rand((), device=self.device)) * delta_t,
         )
@@ -629,14 +634,17 @@ class EDMSampler:
             (shape[0], self.context.aa_indices.shape[1], 20),
             device=self.device,
         )
-        for timestep in range(1, self.total_timesteps - 1):
+        # Count down from maximum noise (t = 1) to minimum noise (t = 0).
+        for timestep in range(self.total_timesteps, 0, -1):
             t_p: Float[torch.Tensor, ""] = (
                 timestep / self.total_timesteps
                 - (torch.rand((), device=self.device)) * delta_t
             )
             c_T = self.noise_schedule(t_p)
+            # Clamp keeps the final step's target inside the schedule; that
+            # step's Euler update is discarded since r_denoised is returned.
             c_T_minus_one: Float[torch.Tensor, ""] = self.noise_schedule(
-                t_p - delta_t,
+                (t_p - delta_t).clamp(min=0.0),
             )
             r_l = centre_random_augment(
                 coords=r_l,
