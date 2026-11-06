@@ -33,6 +33,8 @@ mirror for a tool that is already a dev dependency.
 | `pre-commit` | **enforce-einops** | Bans raw tensor ops (see below) |
 | `pre-commit` | **enforce-jaxtyping** | Bans bare `torch.Tensor` / `Tensor` annotations (see below) |
 | `pre-commit` | **pydoclint** | Google-style docstring linting |
+| `pre-commit` | **enforce-test-fixtures** | No test may add to its file's count of fixtureless tests (see below) |
+| `pre-commit` | **enforce-test-determinism** | No test file may add to its count of `torch.rand*` calls (see below) |
 | CI (`push`/`pull_request`) | **ARM64 CI** / **CUDA CI** | Rebuild the devcontainer, run the pre-commit hooks above inside it (`basedpyright` only on CUDA), then run `pytest pallatom` — see below |
 
 ---
@@ -169,6 +171,20 @@ def foo(x: Float[torch.Tensor, "N 3"]) -> Float[torch.Tensor, "N 3"]: ...
 ```
 
 Valid wrappers: `Bool`, `Complex`, `Float`, `Inexact`, `Int`, `Integer`, `Num`, `Shaped`.
+
+---
+
+### enforce-test-fixtures / enforce-test-determinism (`scripts/check_test_quality.py`)
+
+These enforce two rules from `pallatom/tests/CLAUDE.md` as a ratchet.
+`scripts/test_quality_baseline.json` holds a violation ceiling per test file:
+
+- A count **above** its ceiling fails, so new code can't add violations.
+- A count **below** its ceiling also fails until you run
+  `python scripts/check_test_quality.py --write-baseline`, so fixes stay fixed.
+
+Don't raise a ceiling to get a commit through unless the test truly needs it, such
+as a test of random sampling itself, and say why in the PR.
 
 ---
 

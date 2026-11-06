@@ -1,0 +1,31 @@
+{
+  "fixtures": {
+    "pallatom/tests/architecture/test_atom_transformers.py": 12,
+    "pallatom/tests/architecture/test_losses.py": 20,
+    "pallatom/tests/architecture/test_main_trunk.py": 8,
+    "pallatom/tests/architecture/test_node_update.py": 2,
+    "pallatom/tests/architecture/test_pair_update.py": 2,
+    "pallatom/tests/architecture/test_pairformer_stack.py": 3,
+    "pallatom/tests/architecture/test_template_embedder.py": 3,
+    "pallatom/tests/helpers/test_alignment.py": 9,
+    "pallatom/tests/helpers/test_atom_utils.py": 22,
+    "pallatom/tests/helpers/test_data.py": 22,
+    "pallatom/tests/helpers/test_useful_objects.py": 5,
+    "pallatom/tests/sample/test_sampling.py": 2,
+    "pallatom/tests/test_jaxtyped_coverage.py": 1,
+    "pallatom/tests/train/test_train_loop.py": 2
+  },
+  "random": {
+    "pallatom/tests/architecture/test_atom_transformers.py": 50,
+    "pallatom/tests/architecture/test_losses.py": 49,
+    "pallatom/tests/architecture/test_main_trunk.py": 9,
+    "pallatom/tests/architecture/test_node_update.py": 13,
+    "pallatom/tests/architecture/test_pair_update.py": 15,
+    "pallatom/tests/architecture/test_pairformer_stack.py": 15,
+    "pallatom/tests/architecture/test_template_embedder.py": 10,
+    "pallatom/tests/helpers/test_alignment.py": 15,
+    "pallatom/tests/helpers/test_atom_utils.py": 12,
+    "pallatom/tests/helpers/test_data.py": 34,
+    "pallatom/tests/sample/test_sampling.py": 2
+  }
+}
