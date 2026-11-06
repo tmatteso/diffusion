@@ -74,6 +74,7 @@ jobs:
           runCmd: |
             set -e
             export PYTHONDONTWRITEBYTECODE=1
+            git config --global --add safe.directory "$PWD"
             ${{ inputs.build-run-cmd }}
             ${{ inputs.static-checks-cmd }}
 
