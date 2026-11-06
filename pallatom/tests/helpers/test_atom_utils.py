@@ -10,7 +10,7 @@ import pathlib
 from collections.abc import Callable, Mapping
 from dataclasses import replace
 from types import MappingProxyType
-from typing import cast
+from typing import cast, override
 
 import einops
 import numpy as np
@@ -107,72 +107,159 @@ class TensorCase(enum.Enum):
     collinear = "collinear"
 
 
-class BetaCarbonExpectation(enum.Enum):
-    """Per-scenario expected behavior of ``atom37_to_cb``.
+class AtomTensorScenario(enum.Enum):
+    """Base for per-test scenarios built by the atom tensor factory.
 
-    Each member bundles the two facts that vary across
-    ``test_atom37_to_cb`` cases: where CB presence turns on, and whether the
-    pseudo-Cβ fallback is expected to be a distinct point from CB and CA.
-    Members are read via their properties rather than branched on, so adding
-    a case never adds a decision point to the test body.
-
-    Members:
-        present: All residues have CB present; the pseudo-Cβ fallback path
-            is never exercised, so distinctness is not checked.
-        absent: No residues have CB present; the fallback must produce a
-            finite pseudo-Cβ distinct from both CB and CA.
-        half_present: The first half of residues are CB-absent and the
-            second half CB-present. The fixture backbone for this case is
-            all zeros, so the fallback pseudo-Cβ coincides with CB/CA by
-            construction — distinctness is not checked here.
+    Subclass members are one-line tuples that start with the tensor content,
+    batch size, and residue count; anything after that is the expectation
+    for that test, exposed through a property on the subclass. Tensors are
+    atom37 unless a subclass overrides ``representation``.
     """
 
-    present = (0, False)
-    absent = (N_RES, True)
-    half_present = (N_RES // 2, False)
+    @property
+    def tensor_content(self) -> TensorCase:
+        """Structural configuration of the tensors to build."""
+        return cast(TensorCase, self.value[0])
+
+    @property
+    def batch_size(self) -> int:
+        """Batch dimension of the tensors to build."""
+        return cast(int, self.value[1])
+
+    @property
+    def residue_number(self) -> int:
+        """Residue dimension of the tensors to build."""
+        return cast(int, self.value[2])
+
+    @property
+    def representation(self) -> ResidueRepresentation:
+        """Atom layout of the tensors built for this scenario."""
+        return ResidueRepresentation.atom37
+
+
+class Atom37ToAtom5Scenario(AtomTensorScenario):
+    """Scenarios for ``test_atom37_to_atom5``; the last value is the shape.
+
+    Members:
+        batched_standard: Well-formed backbone across a batch of two.
+        single_batch_zeros: All-zero coordinates in a batch of one.
+        batched_missing_cb: CB masked out for every residue.
+        batched_half_mask: First half of the residues masked out.
+    """
+
+    batched_standard = (TensorCase.standard, 2, 10, (2, 10, 5, 3))
+    single_batch_zeros = (TensorCase.all_zeros, 1, 10, (1, 10, 5, 3))
+    batched_missing_cb = (TensorCase.no_beta_carbon, 2, 10, (2, 10, 5, 3))
+    batched_half_mask = (TensorCase.half_mask, 2, 10, (2, 10, 5, 3))
+
+    @property
+    def expected_pos_shape(self) -> tuple[int, ...]:
+        """Expected positions shape; the mask shape drops the last axis."""
+        return self.value[3]
+
+
+class Atom5ToAtom37Scenario(AtomTensorScenario):
+    """Scenarios for ``test_atom5_to_atom37``; the last value is provide_mask.
+
+    Members:
+        batched_standard: Well-formed backbone with its mask passed through.
+        batched_missing_cb: CB masked out for every residue.
+        batched_half_mask: First half of the residues masked out.
+        single_batch: Well-formed backbone in a batch of one.
+        mask_defaults_to_all_present: Mask omitted, so it must be synthesized
+            as all ones.
+    """
+
+    batched_standard = (TensorCase.standard, 2, 10, True)
+    batched_missing_cb = (TensorCase.no_beta_carbon, 2, 10, True)
+    batched_half_mask = (TensorCase.half_mask, 2, 10, True)
+    single_batch = (TensorCase.standard, 1, 10, True)
+    mask_defaults_to_all_present = (TensorCase.standard, 2, 10, False)
+
+    @property
+    @override
+    def representation(self) -> ResidueRepresentation:
+        """Atom layout of the tensors built for this scenario."""
+        return ResidueRepresentation.atom5
+
+    @property
+    def provide_mask(self) -> bool:
+        """Whether to pass the mask or omit it to exercise the default."""
+        return self.value[3]
+
+
+class Atom37ToCbScenario(AtomTensorScenario):
+    """Scenarios for ``test_atom37_to_cb``.
+
+    The last two values are where CB presence turns on and whether the
+    pseudo-Cβ fallback must be a distinct point from CB and CA. Members are
+    read via their properties rather than branched on, so adding a case
+    never adds a decision point to the test body.
+
+    Members:
+        standard_all_cb_present: All residues have CB present; the pseudo-Cβ
+            fallback path is never exercised.
+        no_beta_carbon_pseudo_cb: No residues have CB present; the fallback
+            must produce a finite pseudo-Cβ distinct from both CB and CA.
+        collinear_pseudo_cb_finite: No residues have CB present and N, CA, C
+            are collinear; the fallback must stay finite.
+        half_mask_mixed_cb: The first half of residues are CB-absent and the
+            second half CB-present. The backbone for this case is all zeros,
+            so the fallback pseudo-Cβ coincides with CB/CA by construction
+            and distinctness is not checked.
+    """
+
+    standard_all_cb_present = (TensorCase.standard, 2, 10, 0, False)
+    no_beta_carbon_pseudo_cb = (TensorCase.no_beta_carbon, 2, 10, N_RES, True)
+    collinear_pseudo_cb_finite = (TensorCase.collinear, 2, 10, N_RES, True)
+    half_mask_mixed_cb = (TensorCase.half_mask, 2, 10, N_RES // 2, False)
 
     @property
     def present_from(self) -> int:
         """Residue index at which CB presence turns on."""
-        return self.value[0]
+        return self.value[3]
 
     @property
     def expect_distinct_pseudo_cb(self) -> bool:
         """Whether the fallback pseudo-Cβ must differ from CB and CA."""
-        return self.value[1]
+        return self.value[4]
+
+
+@pytest.fixture
+def atom_scenario(request: pytest.FixtureRequest) -> AtomTensorScenario:
+    """Expose the indirect scenario to both the factory and the test.
+
+    Args:
+        request: Pytest fixture request whose ``.param`` attribute is an
+            AtomTensorScenario member.
+
+    Returns:
+        The scenario member for the current test case.
+    """
+    return cast(AtomTensorScenario, request.param)
 
 
 @pytest.fixture
 def atom_position_and_mask_factory(
-    request: pytest.FixtureRequest,
+    atom_scenario: AtomTensorScenario,
 ) -> tuple[
     Float[torch.Tensor, "B N_res atom_rep 3"],
     Float[torch.Tensor, "B N_res atom_rep"],
 ]:
-    """Construct atom position and mask tensors from indirect parametrize args.
-
-    Receives a 4-tuple via ``request.param`` when used with
-    ``indirect=["atom_position_and_mask_factory"]``.
+    """Construct atom position and mask tensors for a test scenario.
 
     Args:
-        request: Pytest fixture request whose ``.param`` attribute is a
-            4-tuple of (residue_representation_type, tensor_content,
-            batch_size, residue_number).
+        atom_scenario: Scenario naming the atom layout, tensor content,
+            batch size, and residue count to build.
 
     Returns:
         Tuple of (atom_positions, atom_mask) with shapes
         ``(B, N_res, atom_rep, 3)`` and ``(B, N_res, atom_rep)``.
     """
-    (
-        residue_representation_type,
-        tensor_content,
-        batch_size,
-        residue_number,
-    ) = cast(
-        tuple[ResidueRepresentation, TensorCase, int, int],
-        request.param,
-    )
-    n_atoms_per_residue: int = residue_representation_type.value
+    tensor_content = atom_scenario.tensor_content
+    batch_size = atom_scenario.batch_size
+    residue_number = atom_scenario.residue_number
+    n_atoms_per_residue: int = atom_scenario.representation.value
     per_residue = torch.zeros(n_atoms_per_residue, 3)
 
     if tensor_content in (
@@ -210,37 +297,17 @@ def atom_position_and_mask_factory(
 
 
 @pytest.mark.parametrize(
-    ("atom_position_and_mask_factory", "expected_pos_shape"),
-    [
-        pytest.param(
-            (ResidueRepresentation.atom37, TensorCase.standard, 2, 10),
-            (2, 10, 5, 3),
-            id="batched-standard",
-        ),
-        pytest.param(
-            (ResidueRepresentation.atom37, TensorCase.all_zeros, 1, 10),
-            (1, 10, 5, 3),
-            id="single-batch-zeros",
-        ),
-        pytest.param(
-            (ResidueRepresentation.atom37, TensorCase.no_beta_carbon, 2, 10),
-            (2, 10, 5, 3),
-            id="batched-missing-cb",
-        ),
-        pytest.param(
-            (ResidueRepresentation.atom37, TensorCase.half_mask, 2, 10),
-            (2, 10, 5, 3),
-            id="batched-half-mask",
-        ),
-    ],
-    indirect=["atom_position_and_mask_factory"],
+    "atom_scenario",
+    list(Atom37ToAtom5Scenario),
+    ids=[case.name for case in Atom37ToAtom5Scenario],
+    indirect=True,
 )
 def test_atom37_to_atom5(
     atom_position_and_mask_factory: tuple[
         Float[torch.Tensor, "B N_res 37 3"],
         Float[torch.Tensor, "B N_res 37"],
     ],
-    expected_pos_shape: tuple[int, ...],
+    atom_scenario: Atom37ToAtom5Scenario,
 ) -> None:
     """Verify atom37_to_atom5 behavior.
 
@@ -252,12 +319,13 @@ def test_atom37_to_atom5(
 
     Args:
         atom_position_and_mask_factory: Fixture-produced (atom37_positions,
-            atom37_mask) pair parametrized via indirect.
-        expected_pos_shape: The expected shape returned by atom37_to_atom5()
-            for the appropriate input. The expected shape of the mask is
-            the same except for lacking the final dimension.
+            atom37_mask) pair built from atom_scenario.
+        atom_scenario: Scenario supplying the expected shape returned by
+            atom37_to_atom5(). The expected shape of the mask is the same
+            except for lacking the final dimension.
     """
     atom37_positions, atom37_mask = atom_position_and_mask_factory
+    expected_pos_shape = atom_scenario.expected_pos_shape
 
     atom5_positions, atom5_mask = atom37_to_atom5(
         atom37_positions,
@@ -286,7 +354,7 @@ def test_atom37_to_atom5(
             atom37_positions[:, :, a37, :],
         )
 
-    # 3 & 4. Mask propagation; the batched-missing-cb case exercises that
+    # 3 & 4. Mask propagation; the batched_missing_cb case exercises that
     # atom5_mask[:, :, ATOM5_CB] is all-zero when atom37 CB slot is zero.
     for a5, a37 in zip(atom5_indices, atom37_backbone_indices, strict=True):
         assert torch.equal(
@@ -296,43 +364,17 @@ def test_atom37_to_atom5(
 
 
 @pytest.mark.parametrize(
-    ("atom_position_and_mask_factory", "provide_mask"),
-    [
-        pytest.param(
-            (ResidueRepresentation.atom5, TensorCase.standard, 2, 10),
-            True,
-            id="batched-standard",
-        ),
-        pytest.param(
-            (ResidueRepresentation.atom5, TensorCase.no_beta_carbon, 2, 10),
-            True,
-            id="batched-missing-cb",
-        ),
-        pytest.param(
-            (ResidueRepresentation.atom5, TensorCase.half_mask, 2, 10),
-            True,
-            id="batched-half-mask",
-        ),
-        pytest.param(
-            (ResidueRepresentation.atom5, TensorCase.standard, 1, 10),
-            True,
-            id="single-batch",
-        ),
-        pytest.param(
-            (ResidueRepresentation.atom5, TensorCase.standard, 2, 10),
-            False,
-            id="mask-defaults-to-all-present",
-        ),
-    ],
-    indirect=["atom_position_and_mask_factory"],
+    "atom_scenario",
+    list(Atom5ToAtom37Scenario),
+    ids=[case.name for case in Atom5ToAtom37Scenario],
+    indirect=True,
 )
 def test_atom5_to_atom37(
     atom_position_and_mask_factory: tuple[
         Float[torch.Tensor, "B N_res 5 3"],
         Float[torch.Tensor, "B N_res 5"],
     ],
-    *,
-    provide_mask: bool,
+    atom_scenario: Atom5ToAtom37Scenario,
 ) -> None:
     """Verify atom5_to_atom37 behavior.
 
@@ -346,16 +388,16 @@ def test_atom5_to_atom37(
 
     Args:
         atom_position_and_mask_factory: Fixture-produced (atom5_positions,
-            atom5_mask) pair parametrized via indirect.
-        provide_mask: Whether to pass the fixture mask through to
-            atom5_to_atom37 or omit it (None) to exercise the
+            atom5_mask) pair built from atom_scenario.
+        atom_scenario: Scenario saying whether to pass the fixture mask
+            through to atom5_to_atom37 or omit it (None) to exercise the
             all-slots-present default.
     """
     # Arrange
     atom5_positions, atom5_mask = atom_position_and_mask_factory
     mask_arg, expected_backbone_mask = (
         (atom5_mask, atom5_mask)
-        if provide_mask
+        if atom_scenario.provide_mask
         else (None, torch.ones_like(atom5_mask))
     )
     batch_size, residue_number = atom5_positions.shape[:2]
@@ -407,37 +449,17 @@ def test_atom5_to_atom37(
 
 
 @pytest.mark.parametrize(
-    ("atom_position_and_mask_factory", "expectation"),
-    [
-        pytest.param(
-            (ResidueRepresentation.atom37, TensorCase.standard, 2, 10),
-            BetaCarbonExpectation.present,
-            id="standard-all-cb-present",
-        ),
-        pytest.param(
-            (ResidueRepresentation.atom37, TensorCase.no_beta_carbon, 2, 10),
-            BetaCarbonExpectation.absent,
-            id="no-beta-carbon-pseudo-cb",
-        ),
-        pytest.param(
-            (ResidueRepresentation.atom37, TensorCase.collinear, 2, 10),
-            BetaCarbonExpectation.absent,
-            id="collinear-no-cb-pseudo-cb-finite",
-        ),
-        pytest.param(
-            (ResidueRepresentation.atom37, TensorCase.half_mask, 2, 10),
-            BetaCarbonExpectation.half_present,
-            id="half-mask-mixed-cb-presence",
-        ),
-    ],
-    indirect=["atom_position_and_mask_factory"],
+    "atom_scenario",
+    list(Atom37ToCbScenario),
+    ids=[case.name for case in Atom37ToCbScenario],
+    indirect=True,
 )
 def test_atom37_to_cb(
     atom_position_and_mask_factory: tuple[
         Float[torch.Tensor, "B N_res 37 3"],
         Float[torch.Tensor, "B N_res 37"],
     ],
-    expectation: BetaCarbonExpectation,
+    atom_scenario: Atom37ToCbScenario,
 ) -> None:
     """Verify atom37_to_cb output shapes, CB presence, and pseudo-CB fallback.
 
@@ -456,8 +478,8 @@ def test_atom37_to_cb(
 
     Args:
         atom_position_and_mask_factory: Fixture-produced (atom37_positions,
-            atom37_mask) pair parametrized via indirect.
-        expectation: Bundles where CB presence turns on and whether the
+            atom37_mask) pair built from atom_scenario.
+        atom_scenario: Bundles where CB presence turns on and whether the
             pseudo-Cβ fallback must be distinct from CB/CA for this case.
     """
     atom37_positions, atom37_mask = atom_position_and_mask_factory
@@ -468,7 +490,7 @@ def test_atom37_to_cb(
     assert cb_present.dtype == torch.bool
 
     expected_cb_present = torch.zeros(B, N_RES, dtype=torch.bool)
-    expected_cb_present[:, expectation.present_from :] = True
+    expected_cb_present[:, atom_scenario.present_from :] = True
     assert torch.equal(cb_present, expected_cb_present)
 
     reference_cb = atom37_positions[:, :, ATOM37_CB, :]
@@ -479,7 +501,7 @@ def test_atom37_to_cb(
     assert torch.allclose(cb[present], reference_cb[present])
     assert torch.isfinite(cb[absent]).all()
 
-    if expectation.expect_distinct_pseudo_cb:
+    if atom_scenario.expect_distinct_pseudo_cb:
         assert not torch.allclose(cb[absent], reference_cb[absent])
         assert not torch.allclose(cb[absent], reference_ca[absent])
 
