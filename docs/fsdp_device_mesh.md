@@ -234,7 +234,7 @@ NCCL_HOSTID=fakenode1 NCCL_SOCKET_IFNAME=lo torchrun --nnodes=2 --node_rank=1 \
 
 These are unrelated to FSDP and are not fixed here.
 
-- `scripts/run_ddp_train.sh` line 45: `timeout 30 NCCL_P2P_DISABLE=1 "$TORCHRUN"`
+- `scripts/run_ddp_train.sh` line 43: `timeout 30 NCCL_P2P_DISABLE=1 "$TORCHRUN"`
   can never run, because `timeout` treats the assignment as the command. The SHM
   tier is always skipped. It needs `timeout 30 env NCCL_P2P_DISABLE=1 ...`.
 - `EMA` is built before `DDP` broadcasts weights, so with no seed each rank's
