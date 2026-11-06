@@ -8,7 +8,7 @@ to_pdb, protein_from_pdb, truncate_to_length, and molecule-type constants.
 import enum
 import pathlib
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from types import MappingProxyType
 from typing import cast
 
@@ -491,17 +491,47 @@ def test_atom37_to_cb(
 N_ATOM_TYPE = len(atom_types)  # 37
 
 
-@dataclass(frozen=True)
-class ProteinFieldOverride:
-    """Describes a single Protein constructor field to break for negative tests.
+class InvalidProteinShape(enum.Enum):
+    """Named Protein shape violations, each breaking one constructor field.
 
-    Attributes:
-        field_name: Name of the Protein constructor keyword to override.
-        shape: The deliberately wrong shape to allocate for that field.
+    Each member bundles the field to break and the deliberately wrong shape
+    to allocate for it, and mirrors a plausible bug in ``protein_from_pdb``'s
+    array-assembly loop. The member name is the pytest id.
+
+    Members:
+        positions_no_coord_axis: ``atom_positions`` lost its coordinate axis.
+        positions_extra_coord: ``atom_positions`` gained a stray fourth
+            coordinate component.
+        positions_res_drift: ``atom_positions`` residue count drifted, as
+            from insertion-code or altloc handling.
+        positions_atom_drift: ``atom_positions`` atom table grew out of sync
+            with a hardcoded dimension.
+        mask_no_atom_axis: ``atom_mask`` lost its atom axis.
+        mask_atom_drift: ``atom_mask`` atom table drifted independently of
+            ``atom_positions``.
+        aatype_column_vector: ``aatype`` became a column vector.
+        residue_index_drift: ``residue_index`` residue count drifted
+            independently of ``aatype``.
     """
 
-    field_name: str
-    shape: tuple[int, ...]
+    positions_no_coord_axis = ("atom_positions", (N_RES, N_ATOM_TYPE))
+    positions_extra_coord = ("atom_positions", (N_RES, N_ATOM_TYPE, 4))
+    positions_res_drift = ("atom_positions", (N_RES + 1, N_ATOM_TYPE, 3))
+    positions_atom_drift = ("atom_positions", (N_RES, N_ATOM_TYPE + 1, 3))
+    mask_no_atom_axis = ("atom_mask", (N_RES,))
+    mask_atom_drift = ("atom_mask", (N_RES, N_ATOM_TYPE + 1))
+    aatype_column_vector = ("aatype", (N_RES, 1))
+    residue_index_drift = ("residue_index", (N_RES + 1,))
+
+    @property
+    def field_name(self) -> str:
+        """Name of the Protein constructor keyword to break."""
+        return self.value[0]
+
+    @property
+    def shape(self) -> tuple[int, ...]:
+        """The deliberately wrong shape to allocate for that field."""
+        return self.value[1]
 
 
 @pytest.fixture
@@ -510,20 +540,20 @@ def invalid_protein_factory(
 ) -> Callable[[], Protein]:
     """Build a thunk that constructs a Protein with one field shape broken.
 
-    Receives a ProteinFieldOverride via ``request.param`` when used with
-    ``indirect=["invalid_protein_factory"]``.
+    Receives an InvalidProteinShape via ``request.param`` when used with
+    ``indirect=True``.
 
     Args:
         request: Pytest fixture request whose ``.param`` attribute is a
-            ProteinFieldOverride naming the field and shape to break.
+            InvalidProteinShape naming the field and shape to break.
 
     Returns:
-        A zero-argument callable that constructs a Protein using the
-        override; invoking it raises TypeCheckError.
+        A zero-argument callable that constructs a Protein with that
+        field broken; invoking it raises TypeCheckError.
     """
-    override = cast(ProteinFieldOverride, request.param)
+    invalid_shape = cast(InvalidProteinShape, request.param)
     int_fields = frozenset({"aatype", "residue_index", "chain_index"})
-    dtype = np.intp if override.field_name in int_fields else np.float64
+    dtype = np.intp if invalid_shape.field_name in int_fields else np.float64
     base = Protein(
         atom_positions=np.zeros((N_RES, N_ATOM_TYPE, 3), dtype=np.float64),
         aatype=np.zeros(N_RES, dtype=np.intp),
@@ -532,53 +562,15 @@ def invalid_protein_factory(
         chain_index=np.zeros(N_RES, dtype=np.intp),
         b_factors=np.zeros((N_RES, N_ATOM_TYPE), dtype=np.float64),
     )
-    broken = np.zeros(override.shape, dtype=dtype)
-    return lambda: replace(base, **{override.field_name: broken})
+    broken = np.zeros(invalid_shape.shape, dtype=dtype)
+    return lambda: replace(base, **{invalid_shape.field_name: broken})
 
 
 @pytest.mark.parametrize(
     "invalid_protein_factory",
-    [
-        pytest.param(
-            ProteinFieldOverride("atom_positions", (N_RES, N_ATOM_TYPE)),
-            id="atom_positions_missing_coord_axis",
-        ),
-        pytest.param(
-            ProteinFieldOverride("atom_positions", (N_RES, N_ATOM_TYPE, 4)),
-            id="atom_positions_extra_coord_component",
-        ),
-        pytest.param(
-            ProteinFieldOverride(
-                "atom_positions",
-                (N_RES + 1, N_ATOM_TYPE, 3),
-            ),
-            id="atom_positions_residue_count_drift",
-        ),
-        pytest.param(
-            ProteinFieldOverride(
-                "atom_positions",
-                (N_RES, N_ATOM_TYPE + 1, 3),
-            ),
-            id="atom_positions_atom_table_drift",
-        ),
-        pytest.param(
-            ProteinFieldOverride("atom_mask", (N_RES,)),
-            id="atom_mask_missing_atom_axis",
-        ),
-        pytest.param(
-            ProteinFieldOverride("atom_mask", (N_RES, N_ATOM_TYPE + 1)),
-            id="atom_mask_atom_table_drift_independent_of_positions",
-        ),
-        pytest.param(
-            ProteinFieldOverride("aatype", (N_RES, 1)),
-            id="aatype_column_vector_bug",
-        ),
-        pytest.param(
-            ProteinFieldOverride("residue_index", (N_RES + 1,)),
-            id="residue_index_count_drift_independent_of_aatype",
-        ),
-    ],
-    indirect=["invalid_protein_factory"],
+    list(InvalidProteinShape),
+    ids=[case.name for case in InvalidProteinShape],
+    indirect=True,
 )
 def test_protein_rejects_invalid_shapes(
     invalid_protein_factory: Callable[[], Protein],
