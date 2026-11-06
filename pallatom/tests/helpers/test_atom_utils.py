@@ -1,6 +1,6 @@
 """Tests for atom utility dataclasses and functions.
 
-Covers pseudo_cb, atom37_to_atom5, atom37_to_cb, get_cb_coords, the Protein
+Covers atom37_to_atom5, atom5_to_atom37, atom37_to_cb, the Protein
 dataclass, make_np_example, make_fixed_size, center_positions, chain_end,
 to_pdb, protein_from_pdb, truncate_to_length, and molecule-type constants.
 """
@@ -166,6 +166,7 @@ class Atom5ToAtom37Scenario(AtomTensorScenario):
         batched_missing_cb: CB masked out for every residue.
         batched_half_mask: First half of the residues masked out.
         single_batch: Well-formed backbone in a batch of one.
+        single_residue: One residue in a batch of one, the smallest input.
         mask_defaults_to_all_present: Mask omitted, so it must be synthesized
             as all ones.
     """
@@ -174,6 +175,7 @@ class Atom5ToAtom37Scenario(AtomTensorScenario):
     batched_missing_cb = (TensorCase.no_beta_carbon, 2, 10, True)
     batched_half_mask = (TensorCase.half_mask, 2, 10, True)
     single_batch = (TensorCase.standard, 1, 10, True)
+    single_residue = (TensorCase.standard, 1, 1, True)
     mask_defaults_to_all_present = (TensorCase.standard, 2, 10, False)
 
     @property
@@ -1093,12 +1095,84 @@ def test_to_pdb_protein_from_pdb_roundtrip(
 # ---------------------------------------------------------------------------
 
 
-def test_atom37_to_cb_wrong_shape() -> None:
-    """Wrong last dim on atom37_positions triggers TypeCheckError."""
-    positions_bad = torch.zeros(B, N_RES, 37, 4)  # last dim must be 3
-    mask = torch.ones(B, N_RES, 37)
+class WrongAtomShape(enum.Enum):
+    """Atom conversions paired with positions of a deliberately wrong shape.
+
+    Each member holds the conversion, the invalid positions shape, and a
+    valid mask shape, so the positions are the only contract violation.
+
+    Members:
+        atom37_coord_width: ``atom37_to_atom5`` given 4-component coordinates.
+        atom5_atom_count: ``atom5_to_atom37`` given 4 atoms instead of 5.
+        cb_coord_width: ``atom37_to_cb`` given 4-component coordinates.
+    """
+
+    atom37_coord_width = (atom37_to_atom5, (B, N_RES, 37, 4), (B, N_RES, 37))
+    atom5_atom_count = (atom5_to_atom37, (B, N_RES, 4, 3), (B, N_RES, 5))
+    cb_coord_width = (atom37_to_cb, (B, N_RES, 37, 4), (B, N_RES, 37))
+
+    @property
+    def convert(
+        self,
+    ) -> Callable[
+        [Float[torch.Tensor, "..."], Float[torch.Tensor, "..."]],
+        object,
+    ]:
+        """Conversion function under test."""
+        return self.value[0]
+
+    @property
+    def positions_shape(self) -> tuple[int, ...]:
+        """Invalid shape to allocate for the positions argument."""
+        return self.value[1]
+
+    @property
+    def mask_shape(self) -> tuple[int, ...]:
+        """Valid shape to allocate for the mask argument."""
+        return self.value[2]
+
+
+@pytest.fixture
+def wrong_shape_conversion(
+    request: pytest.FixtureRequest,
+) -> Callable[[], object]:
+    """Build a thunk that calls a conversion with wrongly shaped positions.
+
+    Args:
+        request: Pytest fixture request whose ``.param`` attribute is a
+            WrongAtomShape member.
+
+    Returns:
+        A zero-argument callable that runs the conversion; invoking it
+        raises TypeCheckError.
+    """
+    case = cast(WrongAtomShape, request.param)
+    positions = torch.zeros(case.positions_shape)
+    mask = torch.ones(case.mask_shape)
+    return lambda: case.convert(positions, mask)
+
+
+@pytest.mark.parametrize(
+    "wrong_shape_conversion",
+    list(WrongAtomShape),
+    ids=[case.name for case in WrongAtomShape],
+    indirect=True,
+)
+def test_atom_conversions_reject_wrong_shapes(
+    wrong_shape_conversion: Callable[[], object],
+) -> None:
+    """Atom conversions raise TypeCheckError for shape-contract violations.
+
+    These cases are what would fail if ``@jaxtyped`` were removed from a
+    conversion; ``test_jaxtyped_coverage`` would not notice, because it only
+    checks that decorated names appear in the test file.
+
+    Args:
+        wrong_shape_conversion: Fixture-produced thunk parametrized via
+            indirect to run one conversion on wrongly shaped positions.
+    """
     with pytest.raises(TypeCheckError):
-        _ = atom37_to_cb(positions_bad, mask)
+        _ = wrong_shape_conversion()
 
 
 # ---------------------------------------------------------------------------
