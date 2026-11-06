@@ -7,11 +7,16 @@ accumulation and W&B logging.
 """
 
 import contextlib
+import copy
 import dataclasses
 import functools
+import hashlib
 import json
+import multiprocessing
 import pathlib
 from collections.abc import Generator
+from datetime import timedelta
+from multiprocessing.queues import SimpleQueue
 from typing import cast
 
 import numpy as np
@@ -40,6 +45,7 @@ from helpers.useful_objects import (
 )
 from pydantic import ValidationError
 from structlog.typing import FilteringBoundLogger
+from torch.multiprocessing.spawn import spawn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import Adam
 from torch.optim.lr_scheduler import LambdaLR
@@ -1793,8 +1799,8 @@ def test_train_token_budget_preflush_fires_before_oversized_batch(
     - batch2: tokens+tokens > 7 → pre-flush batch1, then batch2 added
     - batch3: tokens+tokens > 7 → pre-flush batch2, then batch3 added
     - batch4: tokens+tokens > 7 → pre-flush batch3, then batch4 added
-    - epoch end: batch4 remains in buffer (no end-of-epoch flush)
-    Result: three optimizer windows each of size 1.
+    - epoch end: batch4 remains in buffer → end-of-epoch flush of batch4
+    Result: four optimizer windows each of size 1; no batch is dropped.
     """
     window_sizes: list[int] = []
     _real_process = process_accum_window
@@ -1883,7 +1889,7 @@ def test_train_token_budget_preflush_fires_before_oversized_batch(
         model_params=mp_b,
         log=log,
     )
-    assert window_sizes == [1, 1, 1]
+    assert window_sizes == [1, 1, 1, 1]
 
 
 def test_train_wandb_called_once_per_epoch_when_enabled(
@@ -2230,7 +2236,7 @@ def test_train_optimizer_state_non_zero_after_one_step(
     assert first_state[_ADAM_EXP_AVG_KEY].abs().max().item() > 0
 
 
-def test_train_scheduler_state_reflects_completed_epoch(
+def test_train_scheduler_state_matches_optimizer_step_count(
     model_params: ModelSetup,
     loaders: tuple[
         torch.utils.data.DataLoader[FeaturizedBatch],
@@ -2238,7 +2244,7 @@ def test_train_scheduler_state_reflects_completed_epoch(
     ],
     log: FilteringBoundLogger,
 ) -> None:
-    """Scheduler last_epoch in checkpoint equals number of epochs completed."""
+    """Checkpointed scheduler last_epoch equals the optimizer step count."""
     train_loader, test_loader = loaders
     train(
         best_val_loss=torch.tensor(float("inf")),
@@ -2254,9 +2260,13 @@ def test_train_scheduler_state_reflects_completed_epoch(
             weights_only=True,
         ),
     )
-    assert (
-        ckpt["scheduler"]["last_epoch"] == model_params.tcfg.training.num_epochs
+    opt_state = cast(
+        dict[int, dict[str, torch.Tensor]],
+        ckpt["optimizer"]["state"],
     )
+    adam_steps = int(next(iter(opt_state.values()))["step"].item())
+    assert adam_steps > 0
+    assert ckpt["scheduler"]["last_epoch"] == adam_steps
 
 
 def test_train_wandb_epoch_increments_across_epochs(
@@ -2312,3 +2322,125 @@ def test_integration_gradient_flow_through_all_submodules(
             torch.isfinite(g).all().item() and g.abs().max().item() > 0
             for g in grads
         ), f"submodule '{prefix}' has no finite nonzero gradients"
+
+
+# ---------------------------------------------------------------------------
+# DDP: collective flush decision keeps ranks in lockstep
+# ---------------------------------------------------------------------------
+
+
+def _featurized_protein(n_res: int, setup: ModelSetup) -> FeaturizedBatch:
+    """Featurize a one-protein batch of ``n_res`` residues."""
+    rng = np.random.default_rng(n_res)
+    protein = Protein(
+        atom_positions=rng.standard_normal((n_res, 37, 3)),
+        atom_mask=np.ones((n_res, 37)),
+        residue_index=np.arange(n_res, dtype=np.intp),
+        aatype=rng.integers(low=0, high=RESTYPE_NUM, size=(n_res,)),
+        chain_index=np.zeros(n_res, dtype=np.intp),
+        b_factors=np.zeros((n_res, 37)),
+    )
+    return featurize_batch(
+        [protein],
+        setup.tcfg,
+        setup.distogram_template,
+        setup.distogram_residue,
+        setup.distogram_atom,
+    )
+
+
+def _train_rank(
+    rank: int,
+    base_setup: ModelSetup,
+    batches_by_rank: tuple[list[FeaturizedBatch], ...],
+    store: pathlib.Path,
+    reports: SimpleQueue[tuple[int, str]],
+) -> None:
+    """Train as one rank of a CPU gloo group; report steps and a weight hash.
+
+    Args:
+        rank: This process's rank, supplied by ``spawn``.
+        base_setup: Model setup; deep-copied because ``spawn`` hands every
+            rank the same shared-memory tensors, which would make the weights
+            match trivially.
+        batches_by_rank: Training batches for each rank.
+        store: File backing the gloo rendezvous store.
+        reports: Queue receiving ``(optimizer_steps, weight_hash)``.
+    """
+    torch.set_num_threads(2)
+    dist.init_process_group(
+        backend="gloo",
+        init_method=store.as_uri(),
+        rank=rank,
+        world_size=len(batches_by_rank),
+        timeout=timedelta(seconds=60),
+    )
+    setup = copy.deepcopy(base_setup)
+    loader: torch.utils.data.DataLoader[FeaturizedBatch] = (
+        torch.utils.data.DataLoader(
+            cast(
+                torch.utils.data.Dataset[FeaturizedBatch],
+                cast(object, batches_by_rank[rank]),
+            ),
+            batch_size=None,
+        )
+    )
+    train(
+        best_val_loss=torch.tensor(float("inf")),
+        train_loader=loader,
+        test_loader=loader,
+        model_params=setup,
+        log=cast(FilteringBoundLogger, structlog.get_logger()),
+    )
+    weights = hashlib.sha256()
+    for param in setup.model.parameters():
+        weights.update(param.detach().numpy().tobytes())
+    reports.put((setup.scheduler.last_epoch, weights.hexdigest()))
+    dist.destroy_process_group()
+
+
+def test_train_ddp_uneven_protein_lengths_keeps_ranks_in_lockstep(
+    model_params: ModelSetup,
+    tmp_path: pathlib.Path,
+) -> None:
+    """Ranks with different token counts step together and end up identical.
+
+    Rank 1's proteins are twice as long, so only rank 1 hits the token budget
+    before its second batch. That must flush both ranks once, and the epoch
+    end must flush both again. Deciding per rank gives rank 1 an extra
+    gradient all-reduce with no partner, and the group deadlocks until gloo's
+    timeout kills it.
+    """
+    short, long = _N_KEEP // 2, _N_KEEP
+    budget_per_rank = short + long
+    world_size = 2
+    base = model_params.tcfg
+    setup = dataclasses.replace(
+        model_params,
+        tcfg=base.model_copy(
+            update={
+                "training": base.training.model_copy(
+                    update={
+                        "accumulated_token_budget": budget_per_rank
+                        * world_size,
+                    },
+                ),
+            },
+        ),
+    )
+    batches_by_rank = tuple(
+        [_featurized_protein(n_res, setup)] * 2 for n_res in (short, long)
+    )
+    reports: SimpleQueue[tuple[int, str]] = multiprocessing.get_context(
+        "spawn",
+    ).SimpleQueue()
+
+    _ = spawn(
+        _train_rank,
+        args=(setup, batches_by_rank, tmp_path / "gloo_store", reports),
+        nprocs=world_size,
+    )
+
+    (steps_0, weights_0), (steps_1, weights_1) = reports.get(), reports.get()
+    assert steps_0 == steps_1 == world_size
+    assert weights_0 == weights_1
