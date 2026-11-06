@@ -203,7 +203,7 @@ devcontainer from scratch and reruns the full check suite inside it.
 
 | Workflow | Trigger | What it does |
 |----------|---------|---------------|
-| `.github/workflows/arm64.yml` (**ARM64 CI**) | every `push` to `main` and every `pull_request` | Calls the reusable workflow below on `ubuntu-latest` with `pre-commit run --all-files` as its static checks, so every hook runs here once |
+| `.github/workflows/arm64.yml` (**ARM64 CI**) | every `push` to `main` and every `pull_request` | Calls the reusable workflow below on `ubuntu-24.04-arm`, a native aarch64 hosted runner, with `pre-commit run --all-files` as its static checks, so every hook runs here once |
 | `.github/workflows/cuda.yml` (**CUDA CI**) | every `push` to `main` and every `pull_request` | Calls the same reusable workflow on the self-hosted GPU runner, asserts `torch.cuda.is_available()`, and runs only `basedpyright` as its static check, because torch resolves differently in this environment |
 | `.github/workflows/devcontainer-checks.yml` (reusable, called by both above) | — | Inside the devcontainer: a `static-checks` job runs the caller's command, then a `test` job that depends on it runs `pytest pallatom` |
 

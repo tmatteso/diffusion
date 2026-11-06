@@ -9,7 +9,7 @@ on:
   workflow_call:
     inputs:
       runs-on:
-        description: "JSON array of runner labels, e.g. '[\"ubuntu-latest\"]'"
+        description: "JSON array of runner labels, e.g. '[\"ubuntu-24.04-arm\"]'"
         required: true
         type: string
       devcontainer-config:
