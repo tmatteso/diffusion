@@ -821,58 +821,133 @@ def test_make_fixed_size_padded_values_are_zero(
 # ---------------------------------------------------------------------------
 
 
-@pytest.fixture
-def full_mask_np_example() -> Mapping[str, npt.NDArray[np.float64]]:
-    """Provide a numpy example with 8 residues and all atoms unmasked."""
-    rng = np.random.default_rng(1)
-    return {
-        "atom_positions": rng.standard_normal((8, 37, 3)),
-        "atom_mask": np.ones((8, 37)),
-    }
+class CenterPositionsScenario(enum.Enum):
+    """Scenarios for ``test_center_positions``.
+
+    Positions count up from zero across residue, atom, and xyz axes, so a
+    residue's CA coordinates are ``111 * res + (3, 4, 5)``. Averaging that
+    over residues gives each member's hand-derived CA center.
+
+    Members:
+        full_mask: Eight residues with every atom present.
+        ca_only: Five residues with only CA present, so every other slot
+            must end up at zero.
+    """
+
+    full_mask = (8, tuple(range(N_ATOM_TYPE)), (391.5, 392.5, 393.5))
+    ca_only = (5, (ATOM37_CA,), (225.0, 226.0, 227.0))
+
+    @property
+    def num_res(self) -> int:
+        """Number of residues to build."""
+        return self.value[0]
+
+    @property
+    def present_atoms(self) -> tuple[int, ...]:
+        """Atom37 slots marked present in the mask."""
+        return self.value[1]
+
+    @property
+    def ca_center(self) -> tuple[float, float, float]:
+        """Expected masked mean of the CA positions before centering."""
+        return self.value[2]
 
 
 @pytest.fixture
-def ca_only_np_example() -> Mapping[str, npt.NDArray[np.float64]]:
-    """Provide numpy example with 5 residues where only CA atom is unmasked."""
-    rng = np.random.default_rng(2)
-    mask = np.zeros((5, 37))
-    mask[:, 1] = 1.0
-    return {
-        "atom_positions": rng.standard_normal((5, 37, 3)),
-        "atom_mask": mask,
-    }
+def center_scenario(request: pytest.FixtureRequest) -> CenterPositionsScenario:
+    """Expose the indirect scenario to the input and expected fixtures.
+
+    Args:
+        request: Pytest fixture request whose ``.param`` attribute is a
+            CenterPositionsScenario member.
+
+    Returns:
+        The scenario member for the current test case.
+    """
+    return cast(CenterPositionsScenario, request.param)
 
 
-def test_center_positions_ca_center_at_origin(
-    full_mask_np_example: Mapping[str, npt.NDArray[np.float64]],
-) -> None:
-    """center_positions translates structure so mean CA position at origin."""
-    center_positions(full_mask_np_example)
-    ca_center = cast(
+@pytest.fixture
+def np_example_to_center(
+    center_scenario: CenterPositionsScenario,
+) -> dict[str, npt.NDArray[np.float64]]:
+    """Build the input mapping for a center_positions scenario.
+
+    Returns a dict rather than a dataclass because center_positions takes a
+    mapping and writes its result back to the ``atom_positions`` key.
+
+    Args:
+        center_scenario: Scenario naming the residue count and present atoms.
+
+    Returns:
+        A dict with deterministic "atom_positions" and "atom_mask" arrays.
+    """
+    num_res = center_scenario.num_res
+    atom_mask = np.zeros((num_res, N_ATOM_TYPE), dtype=np.float64)
+    atom_mask[:, list(center_scenario.present_atoms)] = 1.0
+    atom_positions = cast(
         npt.NDArray[np.float64],
-        full_mask_np_example["atom_positions"][:, 1, :].mean(axis=0),
+        einops.rearrange(
+            np.arange(num_res * N_ATOM_TYPE * 3, dtype=np.float64),
+            "(res atom xyz) -> res atom xyz",
+            atom=N_ATOM_TYPE,
+            xyz=3,
+        ),
     )
-    np.testing.assert_allclose(ca_center, np.zeros(3), atol=1e-6)
+    return {"atom_positions": atom_positions, "atom_mask": atom_mask}
 
 
-def test_center_positions_masked_atoms_remain_zero(
-    ca_only_np_example: Mapping[str, npt.NDArray[np.float64]],
-) -> None:
-    """center_positions leaves zero-masked atom slots at zero after center."""
-    center_positions(ca_only_np_example)
-    np.testing.assert_array_equal(
-        ca_only_np_example["atom_positions"][:, 0, :],
-        0.0,
+@pytest.fixture
+def expected_centered_positions(
+    center_scenario: CenterPositionsScenario,
+    np_example_to_center: dict[str, npt.NDArray[np.float64]],
+) -> npt.NDArray[np.float64]:
+    """Compute expected positions from the scenario's known CA center.
+
+    Args:
+        center_scenario: Scenario supplying the hand-derived CA center.
+        np_example_to_center: Input mapping the expectation is derived from.
+
+    Returns:
+        Positions shifted by the CA center, with absent atoms at zero.
+    """
+    atom_mask = einops.rearrange(
+        np_example_to_center["atom_mask"],
+        "res atom -> res atom 1",
     )
+    ca_center = np.array(center_scenario.ca_center, dtype=np.float64)
+    return (np_example_to_center["atom_positions"] - ca_center) * atom_mask
 
 
-def test_center_positions_modifies_in_place(
-    full_mask_np_example: Mapping[str, npt.NDArray[np.float64]],
+@pytest.mark.parametrize(
+    "center_scenario",
+    list(CenterPositionsScenario),
+    ids=[case.name for case in CenterPositionsScenario],
+    indirect=True,
+)
+def test_center_positions(
+    np_example_to_center: dict[str, npt.NDArray[np.float64]],
+    expected_centered_positions: npt.NDArray[np.float64],
 ) -> None:
-    """center_positions mutates input dict's atom_positions array."""
-    original = full_mask_np_example["atom_positions"].copy()
-    center_positions(full_mask_np_example)
-    assert not np.allclose(full_mask_np_example["atom_positions"], original)
+    """center_positions writes CA-centered, masked positions to the mapping.
+
+    Comparing exact values covers moving the CA center to the origin, keeping
+    absent atoms at zero, and updating the mapping the caller passed in. The
+    check does not depend on whether the array itself is mutated, because
+    the mapping entry is the function's contract with its callers.
+
+    Args:
+        np_example_to_center: Fixture-produced input mapping.
+        expected_centered_positions: Positions the mapping should hold after
+            centering.
+    """
+    center_positions(np_example_to_center)
+
+    np.testing.assert_allclose(
+        np_example_to_center["atom_positions"],
+        expected_centered_positions,
+        atol=1e-6,
+    )
 
 
 # ---------------------------------------------------------------------------
