@@ -13,6 +13,7 @@ jobs:
       runs-on: '["self-hosted", "cuda-gpu"]'
       devcontainer-config: .devcontainer/cuda/devcontainer.json
       image-name: devcontainer-cuda
+      static-checks-cmd: uv run --no-sync basedpyright pallatom
       cleanup-stale-container: true
       build-run-cmd: |
         show-platform
