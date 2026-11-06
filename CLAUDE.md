@@ -15,6 +15,10 @@ be merged** — see [GitHub Actions](#github-actions-required-for-merge) below.
 
 ### Hook inventory
 
+`black`, `ruff` and every other Python tool below run as `language: system` hooks,
+so their versions come from `uv.lock` and match CI. Don't add a `rev:`-pinned
+mirror for a tool that is already a dev dependency.
+
 | Stage | Hook | What it checks |
 |-------|------|----------------|
 | `commit-msg` | **commitlint** | Commit message follows [Conventional Commits](https://www.conventionalcommits.org/) (`feat:`, `fix:`, `docs:`, `test:`, `refactor:`, `chore:`, etc.) |
