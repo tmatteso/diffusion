@@ -33,7 +33,7 @@ mirror for a tool that is already a dev dependency.
 | `pre-commit` | **enforce-einops** | Bans raw tensor ops (see below) |
 | `pre-commit` | **enforce-jaxtyping** | Bans bare `torch.Tensor` / `Tensor` annotations (see below) |
 | `pre-commit` | **pydoclint** | Google-style docstring linting |
-| CI (`push`/`pull_request`) | **ARM64 CI** / **CUDA CI** | Rebuild the devcontainer, rerun every pre-commit hook above inside it, then run `pytest pallatom` — see below |
+| CI (`push`/`pull_request`) | **ARM64 CI** / **CUDA CI** | Rebuild the devcontainer, run the pre-commit hooks above inside it (`basedpyright` only on CUDA), then run `pytest pallatom` — see below |
 
 ---
 
@@ -187,13 +187,13 @@ devcontainer from scratch and reruns the full check suite inside it.
 
 | Workflow | Trigger | What it does |
 |----------|---------|---------------|
-| `.github/workflows/arm64.yml` (**ARM64 CI**) | every `push` to `main` and every `pull_request` | Builds the ARM64 devcontainer, then calls the reusable workflow below on `ubuntu-latest` |
-| `.github/workflows/cuda.yml` (**CUDA CI**) | every `push` to `main` and every `pull_request` | Builds the CUDA devcontainer on the self-hosted GPU runner, asserts `torch.cuda.is_available()`, then calls the same reusable workflow |
-| `.github/workflows/devcontainer-checks.yml` (reusable, called by both above) | — | Inside the built devcontainer: `check-yaml`, `check-github-workflows`, `check-taskfile`, `black --check`, `ruff check`, `basedpyright`, `pylint`, `xenon`, `pydoclint`, `enforce-einops`, `enforce-jaxtyping` each run as separate jobs; a final `test` job (depending on all of them) runs `pytest pallatom` |
+| `.github/workflows/arm64.yml` (**ARM64 CI**) | every `push` to `main` and every `pull_request` | Calls the reusable workflow below on `ubuntu-latest` with `pre-commit run --all-files` as its static checks, so every hook runs here once |
+| `.github/workflows/cuda.yml` (**CUDA CI**) | every `push` to `main` and every `pull_request` | Calls the same reusable workflow on the self-hosted GPU runner, asserts `torch.cuda.is_available()`, and runs only `basedpyright` as its static check, because torch resolves differently in this environment |
+| `.github/workflows/devcontainer-checks.yml` (reusable, called by both above) | — | Inside the devcontainer: a `static-checks` job runs the caller's command, then a `test` job that depends on it runs `pytest pallatom` |
 
 In short: every pre-commit hook runs a second time in CI against a clean container
-image on both architectures, on every push and every PR, and the full test suite
-only runs after all of them pass.
+image, once per push and PR. The GPU runner reruns only `basedpyright`, and the full
+test suite runs on both runners after their static checks pass.
 
 ---
 
