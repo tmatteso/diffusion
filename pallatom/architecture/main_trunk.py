@@ -1,6 +1,6 @@
 """MainTrunk — pure PyTorch implementation.
 
-Based on Algorithm 2 from the AlphaFold 3 paper.
+Based on Algorithm 2 from the P(all-atom) paper.
 
 Imports from previously implemented modules:
   - atom_attention_decoder.py  (LinearNoBias, AtomTransformer)
@@ -102,13 +102,8 @@ class PredictedOutputs:
     ]
 
 
-# ---------------------------------------------------------------------------
-# TimeFourierEmbedding  (used in step 3)
-# ---------------------------------------------------------------------------
-
-
 class TimeFourierEmbedding(nn.Module):
-    """Maps scalar t̂ to a Fourier feature vector ∈ R^{c_res} (Algorithm 22).
+    """Maps scalar t̂ to a Fourier feature vector ∈ R^{c_res} (AF3 Algo 22).
 
     Weights and biases are fixed random values sampled once at init, not
     learned.
@@ -154,14 +149,8 @@ class TimeFourierEmbedding(nn.Module):
         return torch.cos(angles)
 
 
-# ---------------------------------------------------------------------------
-# RelativePositionEncoding  (step 5)
-# Encodes relative token positions into pair embeddings z_ij^init.
-# ---------------------------------------------------------------------------
-
-
 class RelativePositionEncoding(nn.Module):
-    """Algorithm 3 relative position encoding.
+    """Alphafold3 Algorithm 3 relative position encoding.
 
     Produces p_ij ∈ R^{c_z} from per-token identity features, encoding relative
     residue position, relative token position within a residue, entity
@@ -299,11 +288,6 @@ class RelativePositionEncoding(nn.Module):
             dim=-1,
         )
         return self.proj(features)  # feat -> c_pair
-
-
-# ---------------------------------------------------------------------------
-# MainTrunk — Algorithm 2
-# ---------------------------------------------------------------------------
 
 
 class MainTrunk(nn.Module):
@@ -791,11 +775,6 @@ class MainTrunk(nn.Module):
             intermediate_denoised_coord_stack=intermediate_denoised_coord_stack,
             intermediate_pred_aa_logit_stack=intermediate_pred_aa_logit_stack,
         )
-
-
-# ---------------------------------------------------------------------------
-# EMA — exponential moving average of MainTrunk parameters for inference
-# ---------------------------------------------------------------------------
 
 
 class EMA:

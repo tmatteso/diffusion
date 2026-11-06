@@ -17,7 +17,7 @@ from helpers.data import Distogram
 from jaxtyping import Float, jaxtyped
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import Adam
-from torch.optim.lr_scheduler import StepLR
+from torch.optim.lr_scheduler import LambdaLR
 from tqdm import tqdm
 from train.train_config import TrainConfig
 
@@ -51,7 +51,8 @@ class ModelSetup:
         device: Target device string (e.g. ``"cuda:0"`` or ``"cpu"``).
         optimizer: Adam optimizer whose state is saved and restored on
             checkpoint.
-        scheduler: StepLR scheduler tied to the optimizer.
+        scheduler: LambdaLR applying AlphaFold 3's linear-warmup-then-
+            step-decay schedule, tied to the optimizer.
         ema: Exponential moving average of model parameters, updated after
             every optimizer step; its shadow weights are what get validated
             and saved for inference rather than the raw trained weights.
@@ -64,7 +65,7 @@ class ModelSetup:
     distogram_atom: Distogram
     device: torch.device
     optimizer: Adam
-    scheduler: StepLR
+    scheduler: LambdaLR
     ema: EMA
 
 

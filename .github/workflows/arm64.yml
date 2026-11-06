@@ -10,7 +10,7 @@ jobs:
   checks-arm64:
     uses: ./.github/workflows/devcontainer-checks.yml
     with:
-      runs-on: '["ubuntu-latest"]'
+      runs-on: '["ubuntu-24.04-arm"]'
       devcontainer-config: .devcontainer/arm64/devcontainer.json
       image-name: devcontainer-arm64
       stub-ssh-agent: true

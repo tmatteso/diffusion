@@ -7,6 +7,7 @@ metric logging, and the main per-epoch training loop.
 import argparse
 import contextlib
 import dataclasses
+import functools
 import math
 import os
 import time
@@ -55,7 +56,7 @@ from jaxtyping import Float, Int, jaxtyped
 from structlog.typing import FilteringBoundLogger
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import Adam
-from torch.optim.lr_scheduler import StepLR
+from torch.optim.lr_scheduler import LambdaLR
 from tqdm import tqdm
 from train.train_config import TrainArgs, TrainConfig
 
@@ -996,6 +997,38 @@ def _parse_args() -> TrainArgs:
     )
 
 
+def alphafold_lr_lambda(
+    step: int,
+    *,
+    warmup_steps: int,
+    decay_steps: int,
+    decay_factor: float,
+) -> float:
+    """AlphaFold 3-style LR multiplier: linear warmup, then step decay.
+
+    Ramps the multiplier linearly from ``1 / warmup_steps`` up to ``1.0``
+    over the first ``warmup_steps`` optimizer steps, then multiplies by
+    ``decay_factor`` every ``decay_steps`` steps thereafter, counted from
+    the end of warmup. Setting ``warmup_steps`` to ``0`` skips the ramp
+    entirely, reproducing a plain step decay from the first step.
+
+    Args:
+        step: Current optimizer step (0-indexed), as supplied by
+            ``LambdaLR``.
+        warmup_steps: Number of steps over which the LR ramps linearly up
+            to the peak LR.
+        decay_steps: Number of post-warmup steps between each decay.
+        decay_factor: Multiplicative factor applied every ``decay_steps``
+            post-warmup steps.
+
+    Returns:
+        The multiplier to apply to the optimizer's base LR at ``step``.
+    """
+    if step < warmup_steps:
+        return (step + 1) / warmup_steps
+    return decay_factor ** ((step - warmup_steps) // decay_steps)
+
+
 def main(args: TrainArgs, tcfg: TrainConfig) -> None:
     """Entry point for training; dispatches to DDP or not based on args.ddp.
 
@@ -1046,10 +1079,14 @@ def main(args: TrainArgs, tcfg: TrainConfig) -> None:
             lr=tp.lr,
             weight_decay=tp.weight_decay,
         )
-        scheduler = StepLR(
+        scheduler = LambdaLR(
             optimizer,
-            step_size=tp.lr_decay_steps,
-            gamma=tp.lr_decay_factor,
+            lr_lambda=functools.partial(
+                alphafold_lr_lambda,
+                warmup_steps=tp.lr_warmup_steps,
+                decay_steps=tp.lr_decay_steps,
+                decay_factor=tp.lr_decay_factor,
+            ),
         )
 
         distogram_template = build_distogram_module(tcfg.distogram_template)
