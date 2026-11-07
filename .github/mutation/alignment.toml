@@ -1,0 +1,18 @@
+# Mutation testing config for pallatom/helpers/alignment.py.
+# test-command uses the venv's python because uvx puts its own first on PATH.
+[cosmic-ray]
+module-path = "pallatom/helpers/alignment.py"
+timeout = 60.0
+excluded-modules = []
+test-command = "/opt/venv/bin/python -m pytest -x -q -p no:cacheprovider -o addopts= pallatom/tests/helpers/test_alignment.py"
+
+[cosmic-ray.distributor]
+name = "local"
+
+# Bit and integer operators produce hundreds of mutants that mostly crash on
+# tensors, which says nothing about test quality.
+[cosmic-ray.filters.operators-filter]
+exclude-operators = [
+    "core/ReplaceBinaryOperator_.*_(BitAnd|BitOr|BitXor|LShift|RShift|Mod|Pow|FloorDiv)",
+    "core/ReplaceBinaryOperator_(BitAnd|BitOr|BitXor|LShift|RShift|Mod|Pow|FloorDiv)_.*",
+]
