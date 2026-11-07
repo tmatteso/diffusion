@@ -282,4 +282,4 @@ jobs:
           imageName: ghcr.io/${{ github.repository }}/${{ inputs.image-name }}
           push: never
           noCache: ${{ inputs.no-cache }}
-          runCmd: PYTHONDONTWRITEBYTECODE=1 pytest -p no:cacheprovider pallatom
+          runCmd: PYTHONDONTWRITEBYTECODE=1 HYPOTHESIS_STORAGE_DIRECTORY=/tmp/hypothesis pytest -p no:cacheprovider pallatom

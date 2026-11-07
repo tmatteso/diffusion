@@ -33,3 +33,12 @@
 - **Fixtures:** Reuse existing fixtures; create new ones only when needed. When constructing a hard coded data fixture, always attempt to construct a factory fixture. If it cannot be factory fixture, explain why in the docstring.
 - **Temp files:** Use the `tmp_path` fixture for filesystem tests.
 - **Assertions:** Use `pytest.raises(ExceptionType)` for exception testing.
+
+## Property tests
+
+- Use **`hypothesis`** for mathematical code with a property that holds for every valid input, such as invariance under rotation, symmetry, or agreement with a closed form. Keep hard coded examples for behaviour with no general rule.
+- Put shared strategies in `tests/strategies.py`. Strategies return a tensor or a dataclass, the same rule as fixtures. `@given` arguments satisfy the rule that every test takes a fixture.
+- Don't combine `@given` with function-scoped fixtures: the fixture is not reset between examples. Build shared stateless objects at module level instead.
+- Use `torch.float64` for geometry, so tolerances measure the algorithm rather than float32 rounding. Losses that mix dtypes need float32 and wider tolerances.
+- Never assert a property of the code's current formula that you can't justify independently. A property should still hold after a correct fix.
+- Tests run with the `deterministic` profile from `tests/conftest.py`, so CI is reproducible. To search harder, run `pytest --hypothesis-profile=explore`.

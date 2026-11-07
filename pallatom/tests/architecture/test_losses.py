@@ -7,6 +7,8 @@ all-masked edge case, conditioning-dropout token conventions, and the
 featurize pipeline's handling of unknown amino acid 'X'.
 """
 
+import math
+
 import numpy as np
 import pytest
 import torch
@@ -46,7 +48,19 @@ from helpers.data import (
     featurize_single_item,
 )
 from helpers.useful_objects import manual_seed
+from hypothesis import given
+from hypothesis import strategies as st
 from jaxtyping import Bool, Float, Int, TypeCheckError, jaxtyped
+from tests.strategies import (
+    CloudPair,
+    MaskedCloudPair,
+    cloud_pairs,
+    masked_cloud_pairs,
+    point_clouds,
+    rotate,
+    rotations,
+    translations,
+)
 from train.train_config import (
     AtomDistogramParams,
     LossParams,
@@ -66,6 +80,11 @@ ATOMS_PER_RES, B_ATOM = 14, 22
 N_ATOMS = 8 * ATOMS_PER_RES  # 112
 TOLERANCE = 1e-5
 TIGHT_TOLERANCE = 1e-3
+LOSS_TOLERANCE = 1e-2
+LOSS_REL_TOLERANCE = 1e-3
+TIGHT_LOSS_TOLERANCE = 1e-4
+PAIRWISE_EPSILON = 1e-8
+LDDT_THRESHOLDS = (0.5, 1.0, 2.0, 4.0)
 K_NEIGH = 4
 N_ATOM_BINS = 10
 N_TEMPL_BINS = 38
@@ -99,22 +118,6 @@ def make_noisy(
         Noisy coordinate tensor with the same shape as base.
     """
     return base + sigma * torch.randn_like(base)
-
-
-@jaxtyped(typechecker=beartype)
-def pairwise_sq_dist(
-    x: Float[torch.Tensor, "N 3"],
-) -> Float[torch.Tensor, "N N"]:
-    """Compute the symmetric N by N pairwise squared Euclidean distance matrix.
-
-    Args:
-        x: Point cloud of shape (N, 3).
-
-    Returns:
-        Symmetric (N, N) matrix of squared distances; diagonal is zero.
-    """
-    diff = rearrange(x, "n d -> n 1 d") - rearrange(x, "n d -> 1 n d")
-    return einsum(diff, diff, "n m d, n m d -> n m")
 
 
 @jaxtyped(typechecker=beartype)
@@ -232,18 +235,6 @@ def noisy_coords(
         Perturbed coordinate tensor with the same shape.
     """
     return make_noisy(coords, sigma=0.5)
-
-
-@pytest.fixture
-def half_mask() -> Bool[torch.Tensor, "B N_atoms"]:
-    """Bool mask where first N//2 atoms are valid and the rest are masked out.
-
-    Returns:
-        Bool tensor of shape (B, N); True for first half of atoms per sample.
-    """
-    mask = torch.ones(B, N, dtype=torch.bool)
-    mask[:, N // 2 :] = False
-    return mask
 
 
 @pytest.fixture
@@ -438,47 +429,6 @@ def atom_local_mask() -> Bool[torch.Tensor, "B N_atoms N_atoms"]:
 # ---------------------------------------------------------------------------
 
 
-def test_atom_loss_perfect_near_zero(
-    coords: Float[torch.Tensor, "B N_atoms 3"],
-    uniform_aa_indices: Int[torch.Tensor, "B N_atoms"],
-) -> None:
-    """Same coords for both pred and GT yields near zero loss.
-
-    Verifies atom_loss(x, x) returns a per-sample loss vector of shape (B,)
-    whose maximum is below numerical tolerance when prediction equals ground
-    truth.
-    """
-    loss = atom_loss(
-        coords,
-        coords,
-        aa_indices=uniform_aa_indices,
-        lambda_sigma_weight=torch.ones(B),
-    )
-    assert loss.shape == (B,)
-    assert loss.max().item() < TOLERANCE
-
-
-def test_atom_loss_known_translation_near_zero(
-    coords: Float[torch.Tensor, "B N_atoms 3"],
-    uniform_aa_indices: Int[torch.Tensor, "B N_atoms"],
-) -> None:
-    """Gobal translation removed by alignment, leaving near-zero loss.
-
-    Verifies atom_loss is translation-invariant by confirming the loss remains
-    below a tight tolerance after applying a constant displacement to the
-    predictions.
-    """
-    translation = rearrange(torch.tensor([10.0, 5.0, -3.0]), "d -> 1 1 d")
-    r_translated = coords + translation
-    loss = atom_loss(
-        r_translated,
-        coords,
-        aa_indices=uniform_aa_indices,
-        lambda_sigma_weight=torch.ones(B),
-    )
-    assert (loss < TIGHT_TOLERANCE).all()
-
-
 def test_atom_loss_full_mask_matches_no_mask(
     coords: Float[torch.Tensor, "B N_atoms 3"],
     noisy_coords: Float[torch.Tensor, "B N_atoms 3"],
@@ -577,50 +527,6 @@ def test_atom_loss_gradient_flow() -> None:
         ],
     )
     assert r_gt2.grad is None
-
-
-def test_atom_loss_rotation_invariant(
-    coords: Float[torch.Tensor, "B N_atoms 3"],
-    rotation: Float[torch.Tensor, "3 3"],
-    r_gt: Float[torch.Tensor, "B N_atoms 3"],
-    uniform_aa_indices: Int[torch.Tensor, "B N_atoms"],
-) -> None:
-    """Global rotation to GT structure does not change loss after alignment.
-
-    Verifies rotation invariance by rotating r_gt by a random orthogonal
-    matrix and confirming the loss is unchanged up to a generous numerical
-    tolerance.
-    """
-    r_gt_rot = einsum(r_gt, rotation, "b n d, d e -> b n e")
-    w = torch.ones(B)
-    assert torch.allclose(
-        atom_loss(
-            coords,
-            r_gt,
-            aa_indices=uniform_aa_indices,
-            lambda_sigma_weight=w,
-        ),
-        atom_loss(
-            coords,
-            r_gt_rot,
-            aa_indices=uniform_aa_indices,
-            lambda_sigma_weight=w,
-        ),
-        atol=1e-4,
-    )
-
-
-def test_pairwise_sq_dist_shape_symmetric() -> None:
-    """The helper returns an [N, N] symmetric matrix with zero diagonal.
-
-    Verifies pairwise_sq_dist produces correct shape, that d(i,i)=0 for all i,
-    and that the matrix equals its transpose within numerical tolerance.
-    """
-    x = torch.randn(N, 3)
-    D = pairwise_sq_dist(x)
-    assert D.shape == (N, N)
-    assert D.diagonal().abs().max().item() < TOLERANCE
-    assert torch.allclose(D, D.T, atol=TOLERANCE)
 
 
 # ---------------------------------------------------------------------------
@@ -800,20 +706,6 @@ def test_med_loss_hyperparams_scale_contributions(
 # ---------------------------------------------------------------------------
 
 
-def test_smooth_lddt_identical_coords_expected_value() -> None:
-    """If Pred and true same, loss equals 1 - mean of four sigmoid scores at 0.
-
-    Verifies closed-form expected value when all pairwise distance differences
-    are zero, so sigmoid arguments collapse to the four fixed threshold values.
-    """
-    r = torch.randn(10, 3) * 0.1
-    loss = smooth_lddt_loss(r, r)
-    expected = 1.0 - 0.25 * sum(
-        torch.sigmoid(torch.tensor(t)).item() for t in [0.5, 1.0, 2.0, 4.0]
-    )
-    assert abs(loss.item() - expected) < TIGHT_TOLERANCE
-
-
 def test_smooth_lddt_noisy_exceeds_identical(
     coords: Float[torch.Tensor, "B N_atoms 3"],
 ) -> None:
@@ -827,28 +719,6 @@ def test_smooth_lddt_noisy_exceeds_identical(
     assert loss_noisy.item() > loss_identical.item()
 
 
-def test_smooth_lddt_bounded_in_unit_interval(
-    coords: Float[torch.Tensor, "B N_atoms 3"],
-    half_mask: Bool[torch.Tensor, "B N_atoms"],
-) -> None:
-    """smooth_lddt_loss is bounded in [0, 1] with and without a mask.
-
-    Verifies valid output range under large (sigma=5.0) perturbations without
-    a mask and under moderate (sigma=1.0) perturbations with half the atoms
-    masked, ensuring the sigmoid-based formulation keeps values in [0, 1] in
-    both cases.
-    """
-    loss_full = smooth_lddt_loss(make_noisy(coords, sigma=5.0), coords)
-    assert 0.0 <= loss_full.item() <= 1.0 + 1e-6
-    loss_masked = smooth_lddt_loss(
-        make_noisy(coords, sigma=1.0),
-        coords,
-        mask=half_mask,
-    )
-    assert torch.isfinite(loss_masked)
-    assert 0.0 <= loss_masked.item() <= 1.0 + 1e-6
-
-
 def test_smooth_lddt_gradient_flows() -> None:
     """The smooth-lDDT loss is differentiable w.r.t predicted coordinates.
 
@@ -859,19 +729,6 @@ def test_smooth_lddt_gradient_flows() -> None:
     r_pred = torch.randn(N, 3, requires_grad=True)
     (grad,) = torch.autograd.grad(smooth_lddt_loss(r_pred, r_true), r_pred)
     assert torch.isfinite(grad).all()
-
-
-def test_smooth_lddt_pairwise_sq_dist_matches_einsum() -> None:
-    """Pairwise_sq_dist produces same result as einsum over difference vectors.
-
-    Verifies helper against a reference implementation that explicitly computes
-    pairwise differences and contracts with einsum, up to 1e-6 absolute
-    tolerance.
-    """
-    x = torch.randn(N, 3)
-    diff = rearrange(x, "n d -> n 1 d") - rearrange(x, "n d -> 1 n d")
-    sq_ref = einsum(diff, diff, "n m d, n m d -> n m")
-    assert torch.allclose(pairwise_sq_dist(x), sq_ref, atol=1e-6)
 
 
 # ---------------------------------------------------------------------------
@@ -1367,65 +1224,6 @@ def test_seq_ce_loss_wrong_rank() -> None:
 
 
 @pytest.fixture
-def minimal_batch() -> FeaturizedBatch:
-    """FeaturizedBatch for conditioning-dropout tests (B=1, N_res=5).
-
-    All residues are marked valid via f_pseudo_beta_mask so dropout logic
-    operates on every position without any padding interference.
-    """
-    tok: Int[torch.Tensor, "1 25"] = repeat(
-        torch.repeat_interleave(torch.arange(_N_RES), _ATOMS_PER_RES),
-        "n -> b n",
-        b=_B,
-    ).contiguous()
-    cuid: Int[torch.Tensor, "1 25"] = repeat(
-        torch.arange(0, _N_ATOM, _ATOMS_PER_RES),
-        "n -> b (n a)",
-        b=_B,
-        a=_ATOMS_PER_RES,
-    ).contiguous()
-    return FeaturizedBatch(
-        ref_pos=torch.randn(_B, _N_ATOM, 3),
-        ref_element=torch.zeros(_B, _N_ATOM, 4),
-        ref_space_uid=torch.zeros(_B, _N_ATOM, dtype=torch.long),
-        gt_res_distogram_indices=torch.zeros(
-            _B,
-            _N_RES,
-            _N_RES,
-            dtype=torch.long,
-        ),
-        noised_res_distogram=torch.zeros(
-            _B,
-            _N_RES,
-            _N_RES,
-            _N_BINS,
-        ),
-        f_pseudo_beta_mask=torch.ones(_B, _N_RES, dtype=torch.long),
-        f_residue_idx=torch.zeros(_B, _N_RES, dtype=torch.long),
-        r_gt=torch.randn(_B, _N_ATOM, 3),
-        r_gt_noised=torch.randn(_B, _N_ATOM, 3),
-        atom5_mask=torch.ones(_B, _N_ATOM, dtype=torch.bool),
-        aa_indices=torch.randint(0, _N_AMINO, (_B, _N_RES), dtype=torch.long),
-        t_hat=torch.randn(_B),
-        t_normalized=torch.randn(_B, _N_RES, _N_RES),
-        tok_idx=tok,
-        center_uid=cuid,
-        gt_atom_distogram_sparse=torch.randn(
-            _B,
-            _N_ATOM,
-            _N_ATOM,
-            _N_AMINO_BINS,
-        ),
-        gt_atom_distogram_mask_sparse=torch.ones(
-            _B,
-            _N_ATOM,
-            _N_ATOM,
-            dtype=torch.bool,
-        ),
-    )
-
-
-@pytest.fixture
 def template_distogram_fn() -> Distogram:
     """Minimal self-conditioning template distogram function for tests.
 
@@ -1562,3 +1360,166 @@ def test_seq_ce_loss_all_ignored_returns_zero() -> None:
     loss: Float[torch.Tensor, ""] = seq_ce_loss(logits, aa_all_x)
 
     assert loss.item() == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Properties
+# ---------------------------------------------------------------------------
+
+
+def _atom_loss(
+    predicted: Float[torch.Tensor, "N 3"],
+    target: Float[torch.Tensor, "N 3"],
+    weight: float = 1.0,
+) -> float:
+    """Evaluate atom_loss on one float32 structure of uniform residue type.
+
+    Args:
+        predicted: Predicted coordinates.
+        target: Ground-truth coordinates.
+        weight: The EDM loss weight.
+
+    Returns:
+        The loss value.
+    """
+    return atom_loss(
+        rearrange(predicted.float(), "n d -> 1 n d"),
+        rearrange(target.float(), "n d -> 1 n d"),
+        aa_indices=torch.zeros(1, predicted.shape[0], dtype=torch.long),
+        lambda_sigma_weight=torch.tensor([weight]),
+    ).item()
+
+
+def _two_atoms(distance: float) -> Float[torch.Tensor, "2 3"]:
+    """Return two float32 atoms separated along x by a given distance."""
+    return torch.tensor([[0.0, 0.0, 0.0], [distance, 0.0, 0.0]])
+
+
+@given(points=point_clouds(), rotation=rotations(), shift=translations())
+def test_atom_loss_is_zero_for_rigid_copies(
+    points: Float[torch.Tensor, "N 3"],
+    rotation: Float[torch.Tensor, "3 3"],
+    shift: Float[torch.Tensor, "1 3"],
+) -> None:
+    """A prediction that differs only by a rigid motion costs nothing."""
+    moved = rotate(points, rotation) + shift
+    assert math.isclose(
+        _atom_loss(moved, points),
+        0.0,
+        abs_tol=LOSS_TOLERANCE,
+    )
+
+
+@given(pair=cloud_pairs(), rotation=rotations(), shift=translations())
+def test_atom_loss_ignores_rigid_motion_of_ground_truth(
+    pair: CloudPair,
+    rotation: Float[torch.Tensor, "3 3"],
+    shift: Float[torch.Tensor, "1 3"],
+) -> None:
+    """Moving the ground truth rigidly leaves the loss unchanged."""
+    moved = rotate(pair.target, rotation) + shift
+    assert math.isclose(
+        _atom_loss(pair.mobile, moved),
+        _atom_loss(pair.mobile, pair.target),
+        rel_tol=LOSS_REL_TOLERANCE,
+        abs_tol=LOSS_TOLERANCE,
+    )
+
+
+@given(pair=cloud_pairs(), weight=st.floats(0.01, 100.0))
+def test_atom_loss_scales_linearly_with_weight(
+    pair: CloudPair,
+    weight: float,
+) -> None:
+    """The EDM weight multiplies the loss."""
+    assert math.isclose(
+        _atom_loss(pair.mobile, pair.target, weight),
+        weight * _atom_loss(pair.mobile, pair.target),
+        rel_tol=LOSS_REL_TOLERANCE,
+        abs_tol=LOSS_TOLERANCE,
+    )
+
+
+@given(points=point_clouds())
+def test_pairwise_dist_matches_cdist(
+    points: Float[torch.Tensor, "N 3"],
+) -> None:
+    """Distances match torch.cdist, offset by the 1e-8 stabiliser."""
+    expected = torch.sqrt(torch.cdist(points, points) ** 2 + PAIRWISE_EPSILON)
+    assert torch.allclose(pairwise_dist(points), expected)
+
+
+@given(points=point_clouds(), rotation=rotations(), shift=translations())
+def test_pairwise_dist_ignores_rigid_motion(
+    points: Float[torch.Tensor, "N 3"],
+    rotation: Float[torch.Tensor, "3 3"],
+    shift: Float[torch.Tensor, "1 3"],
+) -> None:
+    """Rotating and translating a cloud leaves its distances unchanged."""
+    moved = rotate(points, rotation) + shift
+    assert torch.allclose(
+        pairwise_dist(moved),
+        pairwise_dist(points),
+        atol=LOSS_TOLERANCE,
+    )
+
+
+@given(
+    true_distance=st.floats(0.1, 14.9),
+    predicted_distance=st.floats(0.1, 40.0),
+)
+def test_smooth_lddt_two_atoms_match_closed_form(
+    true_distance: float,
+    predicted_distance: float,
+) -> None:
+    """Two atoms have one pair, so the loss has an exact closed form."""
+    delta = torch.tensor(abs(true_distance - predicted_distance))
+    thresholds = torch.tensor(LDDT_THRESHOLDS)
+    expected = 1.0 - torch.sigmoid(thresholds - delta).mean().item()
+    loss = smooth_lddt_loss(
+        _two_atoms(predicted_distance),
+        _two_atoms(true_distance),
+    )
+    assert math.isclose(loss.item(), expected, abs_tol=TIGHT_LOSS_TOLERANCE)
+
+
+@given(
+    true_distance=st.floats(15.0, 100.0),
+    predicted_distance=st.floats(0.1, 100.0),
+)
+def test_smooth_lddt_ignores_pairs_beyond_cutoff(
+    true_distance: float,
+    predicted_distance: float,
+) -> None:
+    """With no pair inside the cutoff, nothing is scored and the loss is 1."""
+    loss = smooth_lddt_loss(
+        _two_atoms(predicted_distance),
+        _two_atoms(true_distance),
+    )
+    assert math.isclose(loss.item(), 1.0, abs_tol=TIGHT_LOSS_TOLERANCE)
+
+
+@given(pair=cloud_pairs(), rotation=rotations(), shift=translations())
+def test_smooth_lddt_ignores_rigid_motion(
+    pair: CloudPair,
+    rotation: Float[torch.Tensor, "3 3"],
+    shift: Float[torch.Tensor, "1 3"],
+) -> None:
+    """The loss only sees distances, so rigid motion changes nothing."""
+    predicted = pair.mobile.float()
+    moved = (rotate(pair.mobile, rotation) + shift).float()
+    assert math.isclose(
+        smooth_lddt_loss(moved, pair.target.float()).item(),
+        smooth_lddt_loss(predicted, pair.target.float()).item(),
+        abs_tol=LOSS_TOLERANCE,
+    )
+
+
+@given(masked=masked_cloud_pairs())
+def test_smooth_lddt_stays_in_unit_interval(masked: MaskedCloudPair) -> None:
+    """The loss is a valid 0-1 score, with or without a mask."""
+    predicted = masked.pair.mobile.float()
+    target = masked.pair.target.float()
+    assert 0.0 <= smooth_lddt_loss(predicted, target).item() <= 1.0
+    masked_loss = smooth_lddt_loss(predicted, target, mask=masked.mask)
+    assert 0.0 <= masked_loss.item() <= 1.0
