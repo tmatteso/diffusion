@@ -1,9 +1,15 @@
 # Setting up a machine as a GitHub Actions self-hosted runner
 
-The [CUDA devcontainer workflow](../.github/workflows/devcontainer-cuda.yml) needs a
+The [CUDA devcontainer workflow](../.github/workflows/cuda.yml) needs a
 GPU-equipped self-hosted runner — GitHub's hosted runners don't have NVIDIA GPUs.
 This registers a machine as a runner; it's separate from (and can be done on the
 same box as) the devcontainer setup in [first_time_instructions.md](first_time_instructions.md).
+
+> **Run every step on the GPU host, not inside the devcontainer.** SSH into the
+> machine directly: a VS Code terminal attached to the devcontainer lands inside
+> the container, which has no `sudo`, Docker CLI, or `docker` group, and anything
+> set up there is lost on rebuild. The runner also needs the host's Docker daemon
+> to build the devcontainer.
 
 > **Security note:** only register self-hosted runners on private repos, or on
 > forks-disabled/trusted-contributor-only public repos. Anyone who can open a PR
@@ -23,7 +29,7 @@ The runner refuses to be configured as root (`./config.sh` errors with
 execute as root by default:
 
 ```bash
-useradd -m -s /bin/bash actions-runner
+sudo useradd -m -s /bin/bash actions-runner
 ```
 
 Give it Docker access so it can build/run the CUDA devcontainer without sudo:
@@ -40,10 +46,15 @@ directory to `actions-runner` before configuring):
 ```bash
 su - actions-runner
 mkdir -p ~/actions-runner && cd ~/actions-runner
-curl -o actions-runner-linux-x64.tar.gz -L \
-  https://github.com/actions/runner/releases/download/v2.321.0/actions-runner-linux-x64-2.321.0.tar.gz
-tar xzf ./actions-runner-linux-x64.tar.gz
+```
 
+Copy the **Download** commands from the **New self-hosted runner** page from
+step 1. They always use the current runner release, whereas GitHub refuses to
+register versions below its minimum, so a version pinned here would go stale.
+
+Then configure the runner, adding `--labels` to the command GitHub shows:
+
+```bash
 ./config.sh --url https://github.com/<owner>/<repo> \
   --token <registration-token> \
   --labels cuda-gpu

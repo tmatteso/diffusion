@@ -14,8 +14,9 @@ import hashlib
 import json
 import multiprocessing
 import pathlib
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from datetime import timedelta
+from enum import Enum
 from multiprocessing.queues import SimpleQueue
 from typing import cast
 
@@ -153,6 +154,215 @@ def _make_model_params(
     )
 
 
+def _make_model() -> MainTrunk:
+    """Build a small MainTrunk for training loop tests.
+
+    Returns:
+        MainTrunk built with reduced channel widths and block counts to keep
+        tests fast on CPU.
+    """
+    return MainTrunk(
+        model_params=ModelParams(
+            f_ref_dim=_F_REF_DIM,
+            c_atom=_C_ATOM,
+            c_pair=_C_PAIR,
+            c_res=_C_RES,
+            c_atompair=_C_ATOMPAIR,
+            K_unit=_K_UNIT,
+            n_blocks_atom_transformer_encoder=N_BLOCKS_ATOM_TRANSFORMER_ENCODER,
+            n_heads_atom_transformer_encoder=N_HEADS_ATOM_TRANSFORMER_ENCODER,
+            n_blocks_atom_transformer_decoder=N_BLOCKS_ATOM_TRANSFORMER_DECODER,
+            n_heads_atom_transformer_decoder=N_HEADS_ATOM_TRANSFORMER_DECODER,
+            n_pairformer_blocks_template_embedder=N_PAIRFORMER_BLOCKS_TEMPLATE_EMBEDDER,
+            n_paiformer_heads_template_embedder=N_HEADS_ATOM_TRANSFORMER_DECODER,
+            n_amino=N_AMINO,
+            max_residues=RESIDUE_NUMBER,
+        ),
+        template_distogram_params=TemplateDistogramParams(
+            n_bins=_N_BINS,
+            min_dist=3.25,
+            max_dist=50.75,
+        ),
+        residue_distogram_params=ResidueDistogramParams(
+            n_bins=_N_BINS,
+            min_dist=2.0,
+            max_dist=22.0,
+        ),
+        atom_distogram_params=AtomDistogramParams(
+            n_bins=_N_ATOM_BINS,
+            min_dist=0.0,
+            max_dist=10.0,
+        ),
+        noise_params=NoiseScheduleParams(
+            sigma_data=SIGMA_DATA,
+        ),
+    )
+
+
+def _make_distogram_template() -> Distogram:
+    """Build the self-conditioning template Distogram in eval mode.
+
+    Returns:
+        Distogram configured for template Cβ distances, set to eval mode.
+    """
+    return Distogram(
+        n_bins=_N_BINS,
+        min_dist=3.25,
+        max_dist=50.75,
+        overflow_bin=False,
+    ).eval()
+
+
+def _make_distogram_residue() -> Distogram:
+    """Build the residue-level Distogram in eval mode.
+
+    Returns:
+        Distogram configured for residue Cβ distances, set to eval mode.
+    """
+    return Distogram(
+        n_bins=_N_BINS,
+        min_dist=2.0,
+        max_dist=22.0,
+        overflow_bin=False,
+    ).eval()
+
+
+def _make_distogram_atom() -> Distogram:
+    """Build the atom-level Distogram in eval mode.
+
+    Returns:
+        Distogram configured for short-range atom distances, set to eval mode.
+    """
+    return Distogram(
+        n_bins=_N_ATOM_BINS,
+        min_dist=0.0,
+        max_dist=10.0,
+        overflow_bin=False,
+    ).eval()
+
+
+def _make_tcfg(
+    checkpoint_path: pathlib.Path,
+    *,
+    num_epochs: int = 1,
+    grad_clip: float | None = 1.0,
+    accumulated_token_budget: int = _BATCH_TOKENS,
+    use_wandb: bool = False,
+) -> TrainConfig:
+    """Build a TrainConfig for the small test model.
+
+    Args:
+        checkpoint_path: Where the best checkpoint is written.
+        num_epochs: Number of training epochs.
+        grad_clip: Gradient clipping threshold, or None to disable clipping.
+        accumulated_token_budget: Tokens accumulated before an optimizer step.
+        use_wandb: Whether to log to W&B.
+
+    Returns:
+        TrainConfig with the module's small model channel widths.
+    """
+    return TrainConfig(
+        training=TrainingParams(
+            num_epochs=num_epochs,
+            lr=LEARNING_RATE,
+            grad_clip=grad_clip,
+            accumulated_token_budget=accumulated_token_budget,
+        ),
+        model=ModelParams(
+            f_ref_dim=_F_REF_DIM,
+            c_atom=_C_ATOM,
+            c_pair=_C_PAIR,
+            c_res=_C_RES,
+            c_atompair=_C_ATOMPAIR,
+            K_unit=_K_UNIT,
+        ),
+        checkpoint=CheckpointParams(
+            checkpoint_path=checkpoint_path,
+            save_every=100,
+        ),
+        logging=LoggingParams(use_wandb=use_wandb),
+    )
+
+
+def _make_loaders(
+    work_dir: pathlib.Path,
+    dataset_jsonl: str,
+    splits_json: str,
+) -> tuple[
+    torch.utils.data.DataLoader[FeaturizedBatch],
+    torch.utils.data.DataLoader[FeaturizedBatch],
+]:
+    """Build train and test loaders over the synthetic proteins.
+
+    Args:
+        work_dir: Directory for shards, config, and structured logs.
+        dataset_jsonl: Path to the synthetic proteins JSONL file.
+        splits_json: Path to the train/val/test splits JSON.
+
+    Returns:
+        Train and test loaders streaming the synthetic proteins.
+    """
+    cfg = TrainConfig(
+        training=TrainingParams(
+            num_epochs=1,
+            lr=LEARNING_RATE,
+            grad_clip=1.0,
+            accumulated_token_budget=_BATCH_TOKENS,
+        ),
+        model=ModelParams(
+            f_ref_dim=_F_REF_DIM,
+            c_atom=_C_ATOM,
+            c_pair=_C_PAIR,
+            c_res=_C_RES,
+            c_atompair=_C_ATOMPAIR,
+            K_unit=_K_UNIT,
+        ),
+        distogram_template=TemplateDistogramParams(
+            n_bins=_N_BINS,
+            min_dist=3.25,
+            max_dist=50.75,
+        ),
+        distogram_residue=ResidueDistogramParams(
+            n_bins=_N_BINS,
+            min_dist=2.0,
+            max_dist=22.0,
+        ),
+        distogram_atom=AtomDistogramParams(
+            n_bins=_N_ATOM_BINS,
+            min_dist=0.0,
+            max_dist=10.0,
+        ),
+        checkpoint=CheckpointParams(
+            checkpoint_path=work_dir / "loader_best.pt",
+            save_every=100,
+        ),
+        logging=LoggingParams(use_wandb=False),
+        test_loader=LoaderConfig(batch_size=2),
+        train_loader=TrainLoaderConfig(
+            token_budget=63,
+            n_shards=1,
+            num_workers=1,
+            epoch_prefetch_depth=1,
+            batch_prefetch_depth=1,
+            n_threads=1,
+        ),
+    )
+    args = TrainArgs(
+        dataset_jsonl=pathlib.Path(dataset_jsonl),
+        shard_dir=work_dir / "shards",
+        keys_for_splits_json=pathlib.Path(splits_json),
+        config=work_dir / "config.json",
+        structlog_jsonl=work_dir / "structlog.jsonl",
+        ddp=False,
+        debug_run=False,
+    )
+    train_loader, test_loader, _ = make_bucketed_data_loaders(
+        cfg=cfg,
+        extra_train_args=args,
+    )
+    return train_loader, test_loader
+
+
 def _make_epoch_metrics(
     epoch: int,
     global_step: int = 0,
@@ -282,12 +492,7 @@ def distogram_template() -> Distogram:
     Returns:
         Distogram configured for template Cβ distances, set to eval mode.
     """
-    return Distogram(
-        n_bins=_N_BINS,
-        min_dist=3.25,
-        max_dist=50.75,
-        overflow_bin=False,
-    ).eval()
+    return _make_distogram_template()
 
 
 @pytest.fixture
@@ -297,12 +502,7 @@ def distogram_residue() -> Distogram:
     Returns:
         Distogram configured for residue Cβ distances, set to eval mode.
     """
-    return Distogram(
-        n_bins=_N_BINS,
-        min_dist=2.0,
-        max_dist=22.0,
-        overflow_bin=False,
-    ).eval()
+    return _make_distogram_residue()
 
 
 @pytest.fixture
@@ -312,12 +512,7 @@ def distogram_atom() -> Distogram:
     Returns:
         Distogram configured for short-range atom distances, set to eval mode.
     """
-    return Distogram(
-        n_bins=_N_ATOM_BINS,
-        min_dist=0.0,
-        max_dist=10.0,
-        overflow_bin=False,
-    ).eval()
+    return _make_distogram_atom()
 
 
 @pytest.fixture
@@ -325,45 +520,9 @@ def model() -> MainTrunk:
     """Provide a small MainTrunk instance for training loop tests.
 
     Returns:
-        MainTrunk built with reduced channel widths and block counts to keep
-        tests fast on CPU.
+        MainTrunk built by ``_make_model``.
     """
-    return MainTrunk(
-        model_params=ModelParams(
-            f_ref_dim=_F_REF_DIM,
-            c_atom=_C_ATOM,
-            c_pair=_C_PAIR,
-            c_res=_C_RES,
-            c_atompair=_C_ATOMPAIR,
-            K_unit=_K_UNIT,
-            n_blocks_atom_transformer_encoder=N_BLOCKS_ATOM_TRANSFORMER_ENCODER,
-            n_heads_atom_transformer_encoder=N_HEADS_ATOM_TRANSFORMER_ENCODER,
-            n_blocks_atom_transformer_decoder=N_BLOCKS_ATOM_TRANSFORMER_DECODER,
-            n_heads_atom_transformer_decoder=N_HEADS_ATOM_TRANSFORMER_DECODER,
-            n_pairformer_blocks_template_embedder=N_PAIRFORMER_BLOCKS_TEMPLATE_EMBEDDER,
-            n_paiformer_heads_template_embedder=N_HEADS_ATOM_TRANSFORMER_DECODER,
-            n_amino=N_AMINO,
-            max_residues=RESIDUE_NUMBER,
-        ),
-        template_distogram_params=TemplateDistogramParams(
-            n_bins=_N_BINS,
-            min_dist=3.25,
-            max_dist=50.75,
-        ),
-        residue_distogram_params=ResidueDistogramParams(
-            n_bins=_N_BINS,
-            min_dist=2.0,
-            max_dist=22.0,
-        ),
-        atom_distogram_params=AtomDistogramParams(
-            n_bins=_N_ATOM_BINS,
-            min_dist=0.0,
-            max_dist=10.0,
-        ),
-        noise_params=NoiseScheduleParams(
-            sigma_data=SIGMA_DATA,
-        ),
-    )
+    return _make_model()
 
 
 @pytest.fixture
@@ -377,55 +536,7 @@ def tcfg(tmp_path: pathlib.Path) -> TrainConfig:
         TrainConfig configured for one epoch with Adam learning rate and
         W&B disabled, writing checkpoints under pytest's tmp_path.
     """
-    return TrainConfig(
-        training=TrainingParams(
-            num_epochs=1,
-            lr=LEARNING_RATE,
-            grad_clip=1.0,
-            accumulated_token_budget=_BATCH_TOKENS,
-        ),
-        model=ModelParams(
-            f_ref_dim=_F_REF_DIM,
-            c_atom=_C_ATOM,
-            c_pair=_C_PAIR,
-            c_res=_C_RES,
-            c_atompair=_C_ATOMPAIR,
-            K_unit=_K_UNIT,
-        ),
-        checkpoint=CheckpointParams(
-            checkpoint_path=tmp_path / "best.pt",
-            save_every=100,
-        ),
-        logging=LoggingParams(use_wandb=False),
-    )
-
-
-@pytest.fixture
-def tcfg3(model_params: ModelSetup, tmp_path: pathlib.Path) -> TrainConfig:
-    """Three-epoch TrainConfig sharing model params from model_params fixture.
-
-    Args:
-        model_params: Fixture providing bundled model, optimizer, and config.
-        tmp_path: Pytest-provided temporary directory for checkpoint files.
-
-    Returns:
-        TrainConfig identical to tcfg except num_epochs=3, used for multi-epoch
-        set_epoch and W&B epoch-increment tests.
-    """
-    return TrainConfig(
-        training=TrainingParams(
-            num_epochs=3,
-            lr=LEARNING_RATE,
-            grad_clip=1.0,
-            accumulated_token_budget=_BATCH_TOKENS,
-        ),
-        model=model_params.tcfg.model,
-        checkpoint=CheckpointParams(
-            checkpoint_path=tmp_path / "best.pt",
-            save_every=100,
-        ),
-        logging=LoggingParams(use_wandb=False),
-    )
+    return _make_tcfg(tmp_path / "best.pt")
 
 
 @pytest.fixture
@@ -504,7 +615,7 @@ def loaders(
     torch.utils.data.DataLoader[FeaturizedBatch],
     torch.utils.data.DataLoader[FeaturizedBatch],
 ]:
-    """Provide a ShardDataLoader built by make_bucketed_data_loaders.
+    """Provide loaders built by make_bucketed_data_loaders.
 
     Args:
         tmp_path: Pytest-provided temporary directory for shards and config.
@@ -512,67 +623,9 @@ def loaders(
         splits_path: Fixture providing path to the train/val/test splits JSON.
 
     Returns:
-        ShardDataLoader streaming synthetic test proteins for one epoch.
+        Train and test loaders streaming the synthetic proteins.
     """
-    cfg = TrainConfig(
-        training=TrainingParams(
-            num_epochs=1,
-            lr=LEARNING_RATE,
-            grad_clip=1.0,
-            accumulated_token_budget=_BATCH_TOKENS,
-        ),
-        model=ModelParams(
-            f_ref_dim=_F_REF_DIM,
-            c_atom=_C_ATOM,
-            c_pair=_C_PAIR,
-            c_res=_C_RES,
-            c_atompair=_C_ATOMPAIR,
-            K_unit=_K_UNIT,
-        ),
-        distogram_template=TemplateDistogramParams(
-            n_bins=_N_BINS,
-            min_dist=3.25,
-            max_dist=50.75,
-        ),
-        distogram_residue=ResidueDistogramParams(
-            n_bins=_N_BINS,
-            min_dist=2.0,
-            max_dist=22.0,
-        ),
-        distogram_atom=AtomDistogramParams(
-            n_bins=_N_ATOM_BINS,
-            min_dist=0.0,
-            max_dist=10.0,
-        ),
-        checkpoint=CheckpointParams(
-            checkpoint_path=tmp_path / "loader_best.pt",
-            save_every=100,
-        ),
-        logging=LoggingParams(use_wandb=False),
-        test_loader=LoaderConfig(batch_size=2),
-        train_loader=TrainLoaderConfig(
-            token_budget=63,
-            n_shards=1,
-            num_workers=1,
-            epoch_prefetch_depth=1,
-            batch_prefetch_depth=1,
-            n_threads=1,
-        ),
-    )
-    args = TrainArgs(
-        dataset_jsonl=pathlib.Path(jsonl_path),
-        shard_dir=tmp_path / "shards",
-        keys_for_splits_json=pathlib.Path(splits_path),
-        config=tmp_path / "config.json",
-        structlog_jsonl=tmp_path / "structlog.jsonl",
-        ddp=False,
-        debug_run=False,
-    )
-    train_loader, test_loader, _ = make_bucketed_data_loaders(
-        cfg=cfg,
-        extra_train_args=args,
-    )
-    return train_loader, test_loader
+    return _make_loaders(tmp_path, jsonl_path, splits_path)
 
 
 @pytest.fixture
@@ -1593,197 +1646,6 @@ def test_log_epoch_wandb_payload_keys(
 # ---------------------------------------------------------------------------
 
 
-def test_train_updates_model_parameters(
-    model_params: ModelSetup,
-    loaders: tuple[
-        torch.utils.data.DataLoader[FeaturizedBatch],
-        torch.utils.data.DataLoader[FeaturizedBatch],
-    ],
-    log: FilteringBoundLogger,
-) -> None:
-    """Train modifies at least one model parameter via gradient descent."""
-    train_loader, test_loader = loaders
-    params_before = [
-        p.clone().detach() for p in model_params.model.parameters()
-    ]
-    train(
-        best_val_loss=torch.tensor(float("inf")),
-        train_loader=train_loader,
-        test_loader=test_loader,
-        model_params=model_params,
-        log=log,
-    )
-    assert any(
-        not torch.equal(b, a)
-        for b, a in zip(
-            params_before,
-            model_params.model.parameters(),
-            strict=False,
-        )
-    )
-
-
-def test_train_calls_all_reduce_mean_on_all_epoch_metrics(
-    model_params: ModelSetup,
-    loaders: tuple[
-        torch.utils.data.DataLoader[FeaturizedBatch],
-        torch.utils.data.DataLoader[FeaturizedBatch],
-    ],
-    log: FilteringBoundLogger,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """train() calls all_reduce_mean() on every metric feeding EpochMetrics.
-
-    Arrange: wrap TensorAccumulatorMixin.all_reduce_mean with a spy that
-    records every instance it's called on before delegating to the real
-    implementation (which no-ops here, since no distributed process group
-    is active in this test -- the reduction arithmetic itself is proven
-    separately, with real multi-rank processes, by
-    test_all_reduce_mean_averages_across_real_ranks in
-    test_useful_objects.py). This test only proves train() invokes the
-    reduction on the right objects, not the arithmetic.
-    Act: run train() for one epoch.
-    Assert: the spy was invoked on exactly four metric instances: two
-    LossMetrics (train and val), one ThroughputStatistics, and one
-    ComponentNorms -- matching every metric field of EpochMetrics.
-    """
-    train_loader, test_loader = loaders
-    calls: list[TensorAccumulatorMixin] = []
-    original = TensorAccumulatorMixin.all_reduce_mean
-
-    def _spy(self: TensorAccumulatorMixin) -> None:
-        calls.append(self)
-        original(self)
-
-    monkeypatch.setattr(TensorAccumulatorMixin, "all_reduce_mean", _spy)
-
-    train(
-        best_val_loss=torch.tensor(float("inf")),
-        train_loader=train_loader,
-        test_loader=test_loader,
-        model_params=model_params,
-        log=log,
-    )
-
-    expected_loss_metrics_calls = 2  # train_loss_metrics + val_loss_metrics
-    expected_throughput_calls = 1  # train_throughput_stats
-    expected_norms_calls = 1  # train_gradient_norms
-    expected_total_calls = (
-        expected_loss_metrics_calls
-        + expected_throughput_calls
-        + expected_norms_calls
-    )
-
-    assert len(calls) == expected_total_calls
-    assert (
-        sum(isinstance(c, LossMetrics) for c in calls)
-        == expected_loss_metrics_calls
-    )
-    assert (
-        sum(isinstance(c, ThroughputStatistics) for c in calls)
-        == expected_throughput_calls
-    )
-    assert (
-        sum(isinstance(c, ComponentNorms) for c in calls)
-        == expected_norms_calls
-    )
-
-
-def test_train_no_grad_clip_completes(
-    model_params: ModelSetup,
-    loaders: tuple[
-        torch.utils.data.DataLoader[FeaturizedBatch],
-        torch.utils.data.DataLoader[FeaturizedBatch],
-    ],
-    log: FilteringBoundLogger,
-    tmp_path: pathlib.Path,
-) -> None:
-    """Train completes without error when grad_clip is None."""
-    train_loader, test_loader = loaders
-    tcfg_nc = TrainConfig(
-        training=TrainingParams(
-            num_epochs=1,
-            lr=1e-4,
-            grad_clip=None,
-            accumulated_token_budget=_BATCH_TOKENS,
-        ),
-        model=model_params.tcfg.model,
-        checkpoint=CheckpointParams(
-            checkpoint_path=tmp_path / "no_clip.pt",
-            save_every=100,
-        ),
-        logging=LoggingParams(use_wandb=False),
-    )
-    mp_nc = _make_model_params(
-        model_params.model,
-        tcfg_nc,
-        model_params.distogram_template,
-        model_params.distogram_residue,
-        model_params.distogram_atom,
-    )
-    assert (
-        train(
-            best_val_loss=torch.tensor(float("inf")),
-            train_loader=train_loader,
-            test_loader=test_loader,
-            model_params=mp_nc,
-            log=log,
-        )
-        is None
-    )
-
-
-def test_train_partial_window_at_epoch_end_updates_params(
-    model_params: ModelSetup,
-    loaders: tuple[
-        torch.utils.data.DataLoader[FeaturizedBatch],
-        torch.utils.data.DataLoader[FeaturizedBatch],
-    ],
-    log: FilteringBoundLogger,
-    tmp_path: pathlib.Path,
-) -> None:
-    """Partial window flushed at epoch end when token budget is not reached.
-
-    With all loader batches fitting under 2*_BATCH_TOKENS, no pre-flush fires,
-    but the end-of-epoch flush still triggers one optimizer step so params must
-    change.
-    """
-    train_loader, test_loader = loaders
-    tcfg_acc = TrainConfig(
-        training=TrainingParams(
-            num_epochs=1,
-            lr=1e-4,
-            grad_clip=1.0,
-            accumulated_token_budget=2 * _BATCH_TOKENS,
-        ),
-        model=model_params.tcfg.model,
-        checkpoint=CheckpointParams(
-            checkpoint_path=tmp_path / "accum.pt",
-            save_every=100,
-        ),
-        logging=LoggingParams(use_wandb=False),
-    )
-    mp_acc = _make_model_params(
-        model_params.model,
-        tcfg_acc,
-        model_params.distogram_template,
-        model_params.distogram_residue,
-        model_params.distogram_atom,
-    )
-    params_before = [p.clone().detach() for p in mp_acc.model.parameters()]
-    train(
-        best_val_loss=torch.tensor(float("inf")),
-        train_loader=train_loader,
-        test_loader=test_loader,
-        model_params=mp_acc,
-        log=log,
-    )
-    assert any(
-        not torch.equal(b, a)
-        for b, a in zip(params_before, mp_acc.model.parameters(), strict=False)
-    )
-
-
 def test_train_token_budget_preflush_fires_before_oversized_batch(
     model_params: ModelSetup,
     jsonl_path: str,
@@ -1892,122 +1754,6 @@ def test_train_token_budget_preflush_fires_before_oversized_batch(
     assert window_sizes == [1, 1, 1, 1]
 
 
-def test_train_wandb_called_once_per_epoch_when_enabled(
-    model_params: ModelSetup,
-    loaders: tuple[
-        torch.utils.data.DataLoader[FeaturizedBatch],
-        torch.utils.data.DataLoader[FeaturizedBatch],
-    ],
-    log: FilteringBoundLogger,
-    wandb_payloads: list[dict[str, object]],
-    tmp_path: pathlib.Path,
-) -> None:
-    """Train calls wandb.log exactly once per epoch when use_wandb=True."""
-    train_loader, test_loader = loaders
-    tcfg_w = TrainConfig(
-        training=TrainingParams(
-            num_epochs=1,
-            lr=1e-4,
-            grad_clip=1.0,
-            accumulated_token_budget=_BATCH_TOKENS,
-        ),
-        model=model_params.tcfg.model,
-        checkpoint=CheckpointParams(
-            checkpoint_path=tmp_path / "wandb.pt",
-            save_every=100,
-        ),
-        logging=LoggingParams(use_wandb=True),
-    )
-    mp_w = _make_model_params(
-        model_params.model,
-        tcfg_w,
-        model_params.distogram_template,
-        model_params.distogram_residue,
-        model_params.distogram_atom,
-    )
-    train(
-        best_val_loss=torch.tensor(float("inf")),
-        train_loader=train_loader,
-        test_loader=test_loader,
-        model_params=mp_w,
-        log=log,
-    )
-    assert len(wandb_payloads) == 1
-
-
-def test_train_wandb_not_called_when_disabled(
-    model_params: ModelSetup,
-    loaders: tuple[
-        torch.utils.data.DataLoader[FeaturizedBatch],
-        torch.utils.data.DataLoader[FeaturizedBatch],
-    ],
-    log: FilteringBoundLogger,
-    wandb_call_counter: list[object],
-) -> None:
-    """Train does not call wandb.log when use_wandb=False."""
-    train_loader, test_loader = loaders
-    train(
-        best_val_loss=torch.tensor(float("inf")),
-        train_loader=train_loader,
-        test_loader=test_loader,
-        model_params=model_params,
-        log=log,
-    )
-    assert len(wandb_call_counter) == 0
-
-
-def test_train_metrics_nonzero_when_budget_exceeds_total_tokens(
-    model_params: ModelSetup,
-    loaders: tuple[
-        torch.utils.data.DataLoader[FeaturizedBatch],
-        torch.utils.data.DataLoader[FeaturizedBatch],
-    ],
-    log: FilteringBoundLogger,
-    wandb_payloads: list[dict[str, object]],
-    tmp_path: pathlib.Path,
-) -> None:
-    """train/total_loss logged to W&B non-zero when dataset fits under budget.
-
-    Regression: if the end-of-epoch flush is dropped, no training occurs and
-        loss = 0.
-    """
-    train_loader, test_loader = loaders
-    tcfg_large = TrainConfig(
-        training=TrainingParams(
-            num_epochs=1,
-            lr=1e-4,
-            grad_clip=1.0,
-            accumulated_token_budget=10 * _BATCH_TOKENS,
-        ),
-        model=model_params.tcfg.model,
-        checkpoint=CheckpointParams(
-            checkpoint_path=tmp_path / "large.pt",
-            save_every=100,
-        ),
-        logging=LoggingParams(use_wandb=True),
-    )
-    mp_large = _make_model_params(
-        model_params.model,
-        tcfg_large,
-        model_params.distogram_template,
-        model_params.distogram_residue,
-        model_params.distogram_atom,
-    )
-    train(
-        best_val_loss=torch.tensor(float("inf")),
-        train_loader=train_loader,
-        test_loader=test_loader,
-        model_params=mp_large,
-        log=log,
-    )
-    assert len(wandb_payloads) == 1
-    train_loss = wandb_payloads[0]["train/total_loss"]
-    assert isinstance(train_loss, float)
-    assert (
-        train_loss > 0.0
-    ), "train/total_loss is 0 — end-of-epoch flush was dropped"
-
-
 # ---------------------------------------------------------------------------
 # Config validation
 # ---------------------------------------------------------------------------
@@ -2095,10 +1841,10 @@ _VAL_NAMES_BUCKET = ["4dd.A"]
 _TEST_NAMES_BUCKET = ["5ee.A"]
 
 
-@pytest.fixture
-def jsonl_path(tmp_path: pathlib.Path) -> str:
+@pytest.fixture(scope="module")
+def jsonl_path(tmp_path_factory: pytest.TempPathFactory) -> str:
     """Write JSONL file with synthetic protein entries and return its path."""
-    path = tmp_path / "proteins.jsonl"
+    path = tmp_path_factory.mktemp("dataset") / "proteins.jsonl"
     with path.open("w") as f:
         for name in _ENTRY_NAMES_BUCKET:
             entry = {
@@ -2113,10 +1859,10 @@ def jsonl_path(tmp_path: pathlib.Path) -> str:
     return str(path)
 
 
-@pytest.fixture
-def splits_path(tmp_path: pathlib.Path) -> str:
+@pytest.fixture(scope="module")
+def splits_path(tmp_path_factory: pytest.TempPathFactory) -> str:
     """Write splits JSON with train/val/test name lists and return its path."""
-    path = tmp_path / "splits.json"
+    path = tmp_path_factory.mktemp("splits") / "splits.json"
     with path.open("w") as f:
         json.dump(
             {
@@ -2129,106 +1875,340 @@ def splits_path(tmp_path: pathlib.Path) -> str:
     return str(path)
 
 
-def test_train_one_epoch_with_bucketed_loader(
-    model_params: ModelSetup,
-    loaders: tuple[
-        torch.utils.data.DataLoader[FeaturizedBatch],
-        torch.utils.data.DataLoader[FeaturizedBatch],
-    ],
-    log: FilteringBoundLogger,
-) -> None:
-    """train() completes one epoch with a real ShardDataLoader."""
-    train_loader, test_loader = loaders
-    result = train(
-        best_val_loss=torch.tensor(float("inf")),
-        train_loader=train_loader,
-        test_loader=test_loader,
-        model_params=model_params,
-        log=log,
-    )
-    assert result is None
+class TrainScenario(Enum):
+    """Configurations train() runs under, each exercised by one shared run.
 
+    A real ``train()`` epoch takes seconds, so ``recorded_train_runs`` runs
+    each scenario once per module and every test asserts on the result.
+    Each member is a ``(num_epochs, budget_multiplier, grad_clip, use_wandb)``
+    tuple read through properties; the budget multiplier scales
+    ``_BATCH_TOKENS``. Tests share this one enum rather than each subclassing
+    a base enum, because members of separate subclasses are separate
+    parameters and would each trigger their own ``train()`` run.
 
-def test_train_accum_full_window_updates_params(
-    model_params: ModelSetup,
-    loaders: tuple[
-        torch.utils.data.DataLoader[FeaturizedBatch],
-        torch.utils.data.DataLoader[FeaturizedBatch],
-    ],
-    log: FilteringBoundLogger,
-    tmp_path: pathlib.Path,
-) -> None:
-    """Train loop completes one accumulation window under a token budget.
+    Every budget here, including ``large_token_budget``, is below the 168
+    tokens of the two synthetic train batches (84 tokens each). So each
+    epoch flushes the first batch when the second arrives, and flushes the
+    second at the end of the epoch: two optimizer steps per epoch.
 
-    With an accumulated token budget set to twice the per-batch token count
-    and all loader batches fitting under that budget, the training loop
-    should flush at epoch end and update model parameters.
+    Members:
+        default_budget: One epoch with clipping on and W&B off.
+        no_grad_clip: As ``default_budget`` with gradient clipping disabled.
+        large_token_budget: A budget above one batch's tokens, with W&B on.
+        multi_epoch: Two epochs with W&B on, the fewest that can show the
+            logged epoch advancing.
     """
-    train_loader, test_loader = loaders
+
+    default_budget = (1, 1, 1.0, False)
+    no_grad_clip = (1, 1, None, False)
+    large_token_budget = (1, 10, 1.0, True)
+    multi_epoch = (2, 1, 1.0, True)
+
+    @property
+    def num_epochs(self) -> int:
+        """Number of training epochs."""
+        return self.value[0]
+
+    @property
+    def accumulated_token_budget(self) -> int:
+        """Tokens accumulated before an optimizer step."""
+        return self.value[1] * _BATCH_TOKENS
+
+    @property
+    def grad_clip(self) -> float | None:
+        """Gradient clipping threshold, or None to disable clipping."""
+        return self.value[2]
+
+    @property
+    def use_wandb(self) -> bool:
+        """Whether W&B logging is enabled."""
+        return self.value[3]
+
+
+@dataclasses.dataclass(frozen=True)
+class TrainRun:
+    """What one train() run did, recorded by ``_record_train_run``.
+
+    Attributes:
+        parameters_changed: True if any model parameter changed in the run.
+        reduced_metrics: Every instance all_reduce_mean() was called on.
+        wandb_payloads: One dict per wandb.log call.
+        checkpoint: The saved checkpoint, loaded back from disk.
+        num_epochs: Number of epochs the run was configured for.
+    """
+
+    parameters_changed: bool
+    reduced_metrics: list[TensorAccumulatorMixin]
+    wandb_payloads: list[dict[str, object]]
+    checkpoint: dict[str, dict[str, object]]
+    num_epochs: int
+
+
+def _record_train_run(
+    scenario: TrainScenario,
+    work_dir: pathlib.Path,
+    dataset_jsonl: str,
+    splits_json: str,
+) -> TrainRun:
+    """Run train() once for a scenario and record what it did.
+
+    Arrange: build a fresh model and config, spy on all_reduce_mean(), and
+    capture wandb.log. Function-scoped ``monkeypatch`` cannot serve a
+    module-scoped cache, so the patches use ``MonkeyPatch.context``.
+    Act: run train() on the real loaders.
+
+    Args:
+        scenario: Configuration to run.
+        work_dir: Directory for the checkpoint, shards, and logs.
+        dataset_jsonl: Path to the synthetic proteins JSONL file.
+        splits_json: Path to the train/val/test splits JSON.
+
+    Returns:
+        TrainRun recording the scenario's outcome.
+    """
     _ = manual_seed(0)
-    tcfg_acc = TrainConfig(
-        training=TrainingParams(
-            num_epochs=1,
-            lr=1e-4,
-            grad_clip=1.0,
-            accumulated_token_budget=2 * _BATCH_TOKENS,
+    trunk = _make_model()
+    setup = _make_model_params(
+        trunk,
+        _make_tcfg(
+            work_dir / "best.pt",
+            num_epochs=scenario.num_epochs,
+            grad_clip=scenario.grad_clip,
+            accumulated_token_budget=scenario.accumulated_token_budget,
+            use_wandb=scenario.use_wandb,
         ),
-        model=model_params.tcfg.model,
-        checkpoint=CheckpointParams(
-            checkpoint_path=tmp_path / "full_accum.pt",
-            save_every=100,
+        _make_distogram_template(),
+        _make_distogram_residue(),
+        _make_distogram_atom(),
+    )
+    train_loader, test_loader = _make_loaders(
+        work_dir,
+        dataset_jsonl,
+        splits_json,
+    )
+    params_before = [p.clone().detach() for p in trunk.parameters()]
+    reduced_metrics: list[TensorAccumulatorMixin] = []
+    logged_payloads: list[dict[str, object]] = []
+    original_reduce = TensorAccumulatorMixin.all_reduce_mean
+
+    def _spy(self: TensorAccumulatorMixin) -> None:
+        """Record the instance, then run the real all_reduce_mean()."""
+        reduced_metrics.append(self)
+        original_reduce(self)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(TensorAccumulatorMixin, "all_reduce_mean", _spy)
+        patch.setattr("train.train_loop.wandb.log", logged_payloads.append)
+        train(
+            best_val_loss=torch.tensor(float("inf")),
+            train_loader=train_loader,
+            test_loader=test_loader,
+            model_params=setup,
+            log=cast(FilteringBoundLogger, structlog.get_logger()),
+        )
+    return TrainRun(
+        parameters_changed=any(
+            not torch.equal(before, after)
+            for before, after in zip(
+                params_before,
+                trunk.parameters(),
+                strict=True,
+            )
         ),
-        logging=LoggingParams(use_wandb=False),
-    )
-    mp_acc = _make_model_params(
-        model_params.model,
-        tcfg_acc,
-        model_params.distogram_template,
-        model_params.distogram_residue,
-        model_params.distogram_atom,
-    )
-    params_before = [p.clone().detach() for p in mp_acc.model.parameters()]
-    train(
-        best_val_loss=torch.tensor(float("inf")),
-        train_loader=train_loader,
-        test_loader=test_loader,
-        model_params=mp_acc,
-        log=log,
-    )
-    assert any(
-        not torch.equal(b, a)
-        for b, a in zip(params_before, mp_acc.model.parameters(), strict=False)
+        reduced_metrics=reduced_metrics,
+        wandb_payloads=logged_payloads,
+        checkpoint=cast(
+            dict[str, dict[str, object]],
+            torch.load(work_dir / "best.pt", weights_only=True),
+        ),
+        num_epochs=scenario.num_epochs,
     )
 
 
-def test_train_optimizer_state_non_zero_after_one_step(
-    model_params: ModelSetup,
-    loaders: tuple[
-        torch.utils.data.DataLoader[FeaturizedBatch],
-        torch.utils.data.DataLoader[FeaturizedBatch],
-    ],
-    log: FilteringBoundLogger,
+@pytest.fixture(scope="module")
+def recorded_train_runs(
+    tmp_path_factory: pytest.TempPathFactory,
+    jsonl_path: str,
+    splits_path: str,
+) -> Callable[[TrainScenario], TrainRun]:
+    """Provide a lookup that runs each TrainScenario at most once per module.
+
+    The cache is explicit because a parametrized module-scoped fixture does
+    not guarantee one run per scenario: pytest groups parameters by their
+    position in each ``parametrize`` list, so the same member in two lists
+    is torn down and built again.
+
+    Args:
+        tmp_path_factory: Factory for each run's temporary directory.
+        jsonl_path: Fixture providing path to synthetic proteins JSONL file.
+        splits_path: Fixture providing path to the train/val/test splits JSON.
+
+    Returns:
+        Callable returning the scenario's TrainRun, running it on first use.
+    """
+    runs: dict[TrainScenario, TrainRun] = {}
+
+    def _lookup(scenario: TrainScenario) -> TrainRun:
+        """Return the scenario's recorded run, running it on first use."""
+        if scenario not in runs:
+            runs[scenario] = _record_train_run(
+                scenario,
+                tmp_path_factory.mktemp(scenario.name),
+                jsonl_path,
+                splits_path,
+            )
+        return runs[scenario]
+
+    return _lookup
+
+
+@pytest.fixture
+def train_run(
+    request: pytest.FixtureRequest,
+    recorded_train_runs: Callable[[TrainScenario], TrainRun],
+) -> TrainRun:
+    """Provide the shared recorded run for a scenario.
+
+    Factory fixture: receives a ``TrainScenario`` through ``request.param``.
+    The result is a frozen snapshot rather than live training state, so the
+    tests sharing it stay order-independent.
+
+    Args:
+        request: Pytest request carrying the ``TrainScenario``.
+        recorded_train_runs: Module-wide lookup of recorded runs.
+
+    Returns:
+        TrainRun recording the scenario's outcome.
+    """
+    return recorded_train_runs(cast(TrainScenario, request.param))
+
+
+@pytest.mark.parametrize(
+    "train_run",
+    list(TrainScenario),
+    ids=[case.name for case in TrainScenario],
+    indirect=True,
+)
+def test_train_updates_model_parameters(train_run: TrainRun) -> None:
+    """Train changes model parameters under every scenario.
+
+    Args:
+        train_run: Recorded run for the scenario.
+    """
+    assert train_run.parameters_changed
+
+
+@pytest.mark.parametrize(
+    "train_run",
+    [pytest.param(TrainScenario.default_budget, id="default_budget")],
+    indirect=True,
+)
+def test_train_calls_all_reduce_mean_on_all_epoch_metrics(
+    train_run: TrainRun,
 ) -> None:
-    """Adam exp_avg in saved checkpoint is non-zero after one training step."""
-    train_loader, test_loader = loaders
-    train(
-        best_val_loss=torch.tensor(float("inf")),
-        train_loader=train_loader,
-        test_loader=test_loader,
-        model_params=model_params,
-        log=log,
+    """train() calls all_reduce_mean() on every metric feeding EpochMetrics.
+
+    Arrange: ``train_run`` wraps TensorAccumulatorMixin.all_reduce_mean with
+    a spy that records every instance before delegating to the real
+    implementation (which no-ops here, since no distributed process group
+    is active -- the reduction arithmetic itself is proven separately, with
+    real multi-rank processes, by
+    test_all_reduce_mean_averages_across_real_ranks in
+    test_useful_objects.py). This test only proves train() invokes the
+    reduction on the right objects, not the arithmetic.
+    Act: run train() for one epoch.
+    Assert: the spy was invoked on exactly four metric instances: two
+    LossMetrics (train and val), one ThroughputStatistics, and one
+    ComponentNorms -- matching every metric field of EpochMetrics.
+
+    One scenario is enough: the reduction calls do not depend on the
+    configuration.
+
+    Args:
+        train_run: Recorded one-epoch run.
+    """
+    calls = train_run.reduced_metrics
+    expected_loss_metrics_calls = 2  # train_loss_metrics + val_loss_metrics
+    expected_throughput_calls = 1  # train_throughput_stats
+    expected_norms_calls = 1  # train_gradient_norms
+    expected_total_calls = (
+        expected_loss_metrics_calls
+        + expected_throughput_calls
+        + expected_norms_calls
     )
-    ckpt = cast(
-        dict[str, object],
-        torch.load(
-            model_params.tcfg.checkpoint.checkpoint_path,
-            weights_only=True,
-        ),
+
+    assert len(calls) == expected_total_calls
+    assert (
+        sum(isinstance(c, LossMetrics) for c in calls)
+        == expected_loss_metrics_calls
     )
-    optimizer_ckpt = cast(dict[str, object], ckpt["optimizer"])
+    assert (
+        sum(isinstance(c, ThroughputStatistics) for c in calls)
+        == expected_throughput_calls
+    )
+    assert (
+        sum(isinstance(c, ComponentNorms) for c in calls)
+        == expected_norms_calls
+    )
+
+
+@pytest.mark.parametrize(
+    "train_run",
+    [
+        pytest.param(TrainScenario.default_budget, id="default_budget"),
+        pytest.param(TrainScenario.no_grad_clip, id="no_grad_clip"),
+    ],
+    indirect=True,
+)
+def test_train_wandb_not_called_when_disabled(train_run: TrainRun) -> None:
+    """Train does not call wandb.log when use_wandb=False.
+
+    Args:
+        train_run: Recorded run with W&B disabled.
+    """
+    assert train_run.wandb_payloads == []
+
+
+@pytest.mark.parametrize(
+    "train_run",
+    [pytest.param(TrainScenario.large_token_budget, id="large_token_budget")],
+    indirect=True,
+)
+def test_train_logs_nonzero_loss_under_large_token_budget(
+    train_run: TrainRun,
+) -> None:
+    """train/total_loss logged to W&B is non-zero under a large token budget.
+
+    The budget is well above one batch's tokens but below the two batches'
+    combined total (see ``TrainScenario``), so an optimizer step still runs.
+    A budget above that total would train nothing, because ``train()`` has
+    no end-of-epoch flush.
+
+    Args:
+        train_run: Recorded run with W&B enabled.
+    """
+    assert len(train_run.wandb_payloads) == 1
+    train_loss = train_run.wandb_payloads[0]["train/total_loss"]
+    assert isinstance(train_loss, float)
+    assert train_loss > 0.0, "train/total_loss is 0 — no optimizer step ran"
+
+
+@pytest.mark.parametrize(
+    "train_run",
+    [pytest.param(TrainScenario.default_budget, id="default_budget")],
+    indirect=True,
+)
+def test_train_optimizer_state_non_zero_after_one_step(
+    train_run: TrainRun,
+) -> None:
+    """Adam exp_avg in saved checkpoint is non-zero after one training step.
+
+    Args:
+        train_run: Recorded one-epoch run.
+    """
     opt_state = cast(
         dict[int, dict[str, torch.Tensor]],
-        optimizer_ckpt["state"],
+        train_run.checkpoint["optimizer"]["state"],
     )
     assert len(opt_state) > 0
     first_state = next(iter(opt_state.values()))
@@ -2236,66 +2216,48 @@ def test_train_optimizer_state_non_zero_after_one_step(
     assert first_state[_ADAM_EXP_AVG_KEY].abs().max().item() > 0
 
 
+@pytest.mark.parametrize(
+    "train_run",
+    [pytest.param(TrainScenario.default_budget, id="default_budget")],
+    indirect=True,
+)
 def test_train_scheduler_state_matches_optimizer_step_count(
-    model_params: ModelSetup,
-    loaders: tuple[
-        torch.utils.data.DataLoader[FeaturizedBatch],
-        torch.utils.data.DataLoader[FeaturizedBatch],
-    ],
-    log: FilteringBoundLogger,
+    train_run: TrainRun,
 ) -> None:
-    """Checkpointed scheduler last_epoch equals the optimizer step count."""
-    train_loader, test_loader = loaders
-    train(
-        best_val_loss=torch.tensor(float("inf")),
-        train_loader=train_loader,
-        test_loader=test_loader,
-        model_params=model_params,
-        log=log,
-    )
-    ckpt = cast(
-        dict[str, dict[str, object]],
-        torch.load(
-            model_params.tcfg.checkpoint.checkpoint_path,
-            weights_only=True,
-        ),
-    )
+    """Checkpointed scheduler last_epoch equals the optimizer step count.
+
+    The LR schedule is per optimizer step (AlphaFold 3-style warmup), so
+    the scheduler advances once per optimizer step, not once per epoch.
+    Adam's per-parameter ``step`` counter records the same number of
+    optimizer steps, so the two must agree in the saved checkpoint, and
+    both must be positive after a training epoch.
+
+    Args:
+        train_run: Recorded one-epoch run.
+    """
     opt_state = cast(
         dict[int, dict[str, torch.Tensor]],
-        ckpt["optimizer"]["state"],
+        train_run.checkpoint["optimizer"]["state"],
     )
     adam_steps = int(next(iter(opt_state.values()))["step"].item())
     assert adam_steps > 0
-    assert ckpt["scheduler"]["last_epoch"] == adam_steps
+    assert train_run.checkpoint["scheduler"]["last_epoch"] == adam_steps
 
 
+@pytest.mark.parametrize(
+    "train_run",
+    [pytest.param(TrainScenario.multi_epoch, id="multi_epoch")],
+    indirect=True,
+)
 def test_train_wandb_epoch_increments_across_epochs(
-    model_params: ModelSetup,
-    loaders: tuple[
-        torch.utils.data.DataLoader[FeaturizedBatch],
-        torch.utils.data.DataLoader[FeaturizedBatch],
-    ],
-    tcfg3: TrainConfig,
-    log: FilteringBoundLogger,
-    wandb_payloads: list[dict[str, object]],
+    train_run: TrainRun,
 ) -> None:
-    """W&B epoch values logged across a 3-epoch run are [1, 2, 3]."""
-    train_loader, test_loader = loaders
-    mp3 = _make_model_params(
-        model_params.model,
-        _tcfg_with_wandb(base=tcfg3, use_wandb=True),
-        model_params.distogram_template,
-        model_params.distogram_residue,
-        model_params.distogram_atom,
-    )
-    train(
-        best_val_loss=torch.tensor(float("inf")),
-        train_loader=train_loader,
-        test_loader=test_loader,
-        model_params=mp3,
-        log=log,
-    )
-    assert [p["epoch"] for p in wandb_payloads] == [1, 2, 3]
+    """W&B logs exactly once per epoch, with the epoch number advancing.
+
+    Args:
+        train_run: Recorded two-epoch run with W&B enabled.
+    """
+    assert [p["epoch"] for p in train_run.wandb_payloads] == [1, 2]
 
 
 def test_integration_gradient_flow_through_all_submodules(
@@ -2493,24 +2455,73 @@ def lockstep_setup(model_params: ModelSetup) -> ModelSetup:
     )
 
 
+class LockstepScenario(Enum):
+    """Per-rank protein lengths and the optimizer steps every rank must take.
+
+    Each member is ``(residues_by_rank, expected_steps)``, read through
+    properties. Rank ``r`` trains on two one-protein batches of
+    ``residues_by_rank[r]`` residues under a per-rank budget of 24 tokens.
+    Before its second batch, a rank holding 16-residue proteins wants to
+    flush (16 + 16 > 24) and a rank holding 8-residue proteins does not
+    (8 + 8 <= 24). Every scenario ends with one epoch-end flush of the
+    buffered micro-batches.
+
+    Members:
+        rank_1_over_budget: Only rank 1 wants to flush, so the vote must
+            flush rank 0 too: one pre-flush plus the epoch-end flush.
+        rank_0_over_budget: Only rank 0 wants to flush; catches a vote that
+            listens to only one rank.
+        neither_over_budget: No rank wants to flush, so the only step is the
+            epoch-end flush of both batches.
+        both_over_budget: Both ranks want to flush at the same batch.
+    """
+
+    rank_1_over_budget = ((LOCKSTEP_SHORT_RES, LOCKSTEP_LONG_RES), 2)
+    rank_0_over_budget = ((LOCKSTEP_LONG_RES, LOCKSTEP_SHORT_RES), 2)
+    neither_over_budget = ((LOCKSTEP_SHORT_RES, LOCKSTEP_SHORT_RES), 1)
+    both_over_budget = ((LOCKSTEP_LONG_RES, LOCKSTEP_LONG_RES), 2)
+
+    @property
+    def residues_by_rank(self) -> tuple[int, ...]:
+        """Residue count of every protein on each rank, indexed by rank."""
+        return self.value[0]
+
+    @property
+    def expected_steps(self) -> int:
+        """Optimizer steps every rank must take in the epoch."""
+        return self.value[1]
+
+
+@pytest.fixture
+def lockstep_scenario(request: pytest.FixtureRequest) -> LockstepScenario:
+    """Expose the indirect scenario to both the factory and the test.
+
+    Args:
+        request: Pytest fixture request whose ``.param`` attribute is a
+            LockstepScenario member.
+
+    Returns:
+        The scenario member for the current test case.
+    """
+    return cast(LockstepScenario, request.param)
+
+
 @pytest.fixture
 def lockstep_run(
-    request: pytest.FixtureRequest,
+    lockstep_scenario: LockstepScenario,
     lockstep_setup: ModelSetup,
     tmp_path: pathlib.Path,
 ) -> DDPLockstepRun:
     """Build a DDP run in which each rank holds proteins of its own length.
 
-    Factory fixture: receives, through
-    ``@pytest.mark.parametrize(..., indirect=["lockstep_run"])``, one
-    residue count per rank. Rank ``r`` gets ``LOCKSTEP_BATCHES_PER_RANK``
-    one-protein batches of ``straight_chain_protein(request.param[r])``, so
+    Factory fixture: rank ``r`` gets ``LOCKSTEP_BATCHES_PER_RANK``
+    one-protein batches of
+    ``straight_chain_protein(lockstep_scenario.residues_by_rank[r])``, so
     every rank yields the same number of batches while the ranks' token
     counts differ.
 
     Args:
-        request: Pytest request carrying the per-rank residue counts as a
-            ``tuple[int, ...]``.
+        lockstep_scenario: Scenario naming each rank's residue count.
         lockstep_setup: Fixture providing the model setup with the lockstep
             token budget.
         tmp_path: Pytest-provided directory for the rendezvous store and the
@@ -2519,7 +2530,6 @@ def lockstep_run(
     Returns:
         DDPLockstepRun ready to hand to ``torch.multiprocessing.spawn``.
     """
-    residues_by_rank = cast(tuple[int, ...], request.param)
     return DDPLockstepRun(
         setup=lockstep_setup,
         batches_by_rank=tuple(
@@ -2533,41 +2543,21 @@ def lockstep_run(
                 ),
             )
             * LOCKSTEP_BATCHES_PER_RANK
-            for n_res in residues_by_rank
+            for n_res in lockstep_scenario.residues_by_rank
         ),
         store_path=tmp_path / "gloo_store",
     )
 
 
 @pytest.mark.parametrize(
-    ("lockstep_run", "expected_steps"),
-    [
-        pytest.param(
-            (LOCKSTEP_SHORT_RES, LOCKSTEP_LONG_RES),
-            2,
-            id="only_rank_1_over_budget_flushes_both_ranks",
-        ),
-        pytest.param(
-            (LOCKSTEP_LONG_RES, LOCKSTEP_SHORT_RES),
-            2,
-            id="only_rank_0_over_budget_flushes_both_ranks",
-        ),
-        pytest.param(
-            (LOCKSTEP_SHORT_RES, LOCKSTEP_SHORT_RES),
-            1,
-            id="no_rank_over_budget_only_epoch_end_flush",
-        ),
-        pytest.param(
-            (LOCKSTEP_LONG_RES, LOCKSTEP_LONG_RES),
-            2,
-            id="both_ranks_over_budget_flush_together",
-        ),
-    ],
-    indirect=["lockstep_run"],
+    "lockstep_scenario",
+    list(LockstepScenario),
+    ids=[case.name for case in LockstepScenario],
+    indirect=True,
 )
 def test_train_ddp_keeps_ranks_in_lockstep(
+    lockstep_scenario: LockstepScenario,
     lockstep_run: DDPLockstepRun,
-    expected_steps: int,
 ) -> None:
     """Ranks with different token counts take the same steps and match.
 
@@ -2578,14 +2568,8 @@ def test_train_ddp_keeps_ranks_in_lockstep(
     partner, and the job hung until the collective timeout killed it. The
     flush decision is now a vote: if any rank's next batch would overflow,
     every rank flushes. Leftover micro-batches are flushed at epoch end
-    instead of being dropped.
-
-    Each rank holds two batches. Before the second batch, a rank holding
-    16-residue proteins wants to flush (16 + 16 > 24) and a rank holding
-    8-residue proteins does not (8 + 8 <= 24). The cases cover the vote
-    being won by rank 1 alone, by rank 0 alone (so a vote that listens to
-    only one rank fails), by nobody (only the epoch-end flush happens), and
-    by both ranks.
+    instead of being dropped. ``LockstepScenario`` covers the vote being
+    won by rank 1 alone, by rank 0 alone, by nobody, and by both ranks.
 
     Arrange: ``lockstep_run`` gives each rank two one-protein batches of the
     scenario's residue count, under a per-rank budget of 24 tokens.
@@ -2598,8 +2582,8 @@ def test_train_ddp_keeps_ranks_in_lockstep(
     fails instead of hanging.
 
     Args:
+        lockstep_scenario: Scenario naming the expected step count.
         lockstep_run: Factory-fixture-built run for this scenario.
-        expected_steps: Optimizer steps every rank must take in the epoch.
     """
     world_size = len(lockstep_run.batches_by_rank)
     reports: SimpleQueue[tuple[int, str]] = multiprocessing.get_context(
@@ -2609,5 +2593,7 @@ def test_train_ddp_keeps_ranks_in_lockstep(
     _ = spawn(train_one_rank, args=(lockstep_run, reports), nprocs=world_size)
 
     reported = {reports.get() for _ in range(world_size)}
-    assert {steps for steps, _ in reported} == {expected_steps}
+    assert {steps for steps, _ in reported} == {
+        lockstep_scenario.expected_steps,
+    }
     assert len({digest for _, digest in reported}) == 1

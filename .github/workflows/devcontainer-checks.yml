@@ -7,7 +7,7 @@ on:
   workflow_call:
     inputs:
       runs-on:
-        description: "JSON array of runner labels, e.g. '[\"ubuntu-latest\"]'"
+        description: "JSON array of runner labels, e.g. '[\"ubuntu-24.04-arm\"]'"
         required: true
         type: string
       devcontainer-config:
@@ -34,7 +34,7 @@ on:
         type: boolean
         default: false
       cleanup-stale-container:
-        description: "Remove leftover devcontainers before building (persistent self-hosted runners)"
+        description: "Remove leftover devcontainers and root-owned workspace files (persistent self-hosted runners)"
         required: false
         type: boolean
         default: false
@@ -43,6 +43,16 @@ jobs:
   build:
     runs-on: ${{ fromJson(inputs.runs-on) }}
     steps:
+      # The container runs as root and writes into the bind-mounted checkout.
+      # On a persistent runner those files outlive the job, and checkout (as
+      # the runner user) can't delete them. Hand them back before checkout.
+      # Every other job needs this one, so it runs first on the runner.
+      - name: Reclaim root-owned workspace files
+        if: inputs.cleanup-stale-container
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/w" alpine:3.20 \
+            chown -R "$(id -u):$(id -g)" /w
+
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
@@ -282,4 +292,8 @@ jobs:
           imageName: ghcr.io/${{ github.repository }}/${{ inputs.image-name }}
           push: never
           noCache: ${{ inputs.no-cache }}
-          runCmd: PYTHONDONTWRITEBYTECODE=1 pytest -p no:cacheprovider pallatom
+          # Keep pytest from writing into the bind-mounted checkout as root.
+          runCmd: |
+            export PYTHONDONTWRITEBYTECODE=1
+            export HYPOTHESIS_STORAGE_DIRECTORY=/tmp/hypothesis
+            pytest -p no:cacheprovider pallatom

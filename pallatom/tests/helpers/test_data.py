@@ -14,6 +14,7 @@ import math
 import pathlib
 import pickle
 from collections.abc import Callable, Mapping
+from concurrent.futures import Executor
 from typing import cast
 
 import numpy as np
@@ -1542,12 +1543,18 @@ def _write_jsonl(path: pathlib.Path, entries: list[dict[str, object]]) -> None:
         f.writelines(json.dumps(entry) + "\n" for entry in entries)
 
 
-@pytest.fixture
-def shard_budget(tmp_path: pathlib.Path) -> ShardBudgetParameters:
-    """Minimal ShardBudgetParameters for ProteinShardDataset tests."""
+def _make_shard_budget(work_dir: pathlib.Path) -> ShardBudgetParameters:
+    """Build minimal ShardBudgetParameters rooted at a work directory.
+
+    Args:
+        work_dir: Directory for shards and structured logs.
+
+    Returns:
+        ShardBudgetParameters for a single-rank, single-worker dataset.
+    """
     return ShardBudgetParameters(
-        shard_dir=tmp_path / "shards",
-        structlog_path=tmp_path / "train.jsonl",
+        shard_dir=work_dir / "shards",
+        structlog_path=work_dir / "train.jsonl",
         token_budget=512,
         max_seq_len=MAX_SEQ_LENGTH,
         seed=0,
@@ -1558,6 +1565,12 @@ def shard_budget(tmp_path: pathlib.Path) -> ShardBudgetParameters:
         noise_magnitude=0,
         num_workers=1,
     )
+
+
+@pytest.fixture
+def shard_budget(tmp_path: pathlib.Path) -> ShardBudgetParameters:
+    """Minimal ShardBudgetParameters for ProteinShardDataset tests."""
+    return _make_shard_budget(tmp_path)
 
 
 @pytest.fixture
@@ -1617,31 +1630,98 @@ def protein_shard_dataset_factory(
     return _build
 
 
-@pytest.fixture
-def shard_data_loader(
-    protein_shard_dataset_factory: Callable[
-        [list[str], list[int]],
-        ProteinShardDataset,
-    ],
-    shard_budget: ShardBudgetParameters,
-    bucketed_cfg: TrainConfig,
-) -> ShardDataLoader:
-    """A minimal ShardDataLoader over two synthetic proteins."""
-    ds = protein_shard_dataset_factory(["p1", "p2"], [10, 20])
-    distogram_template = build_distogram_module(
-        bucketed_cfg.distogram_template,
-    ).eval()
-    distogram_residue = build_distogram_module(
-        bucketed_cfg.distogram_residue,
-    ).eval()
-    distogram_atom = build_distogram_module(bucketed_cfg.distogram_atom).eval()
-    return ShardDataLoader(
-        dataset=ds,
-        budget=shard_budget,
-        tcfg=bucketed_cfg,
-        distogram_template=distogram_template,
-        distogram_residue=distogram_residue,
-        distogram_atom=distogram_atom,
+@dataclasses.dataclass(frozen=True)
+class ShardLoaderLifecycle:
+    """What one ShardDataLoader did over its life, recorded by a fixture.
+
+    Attributes:
+        len_after_construction: ``len(loader)`` right after construction.
+        epoch_before_iter: ``loader.epoch`` right after construction.
+        epoch_after_iter: ``loader.epoch`` after one full iteration.
+        process_executor_closed: True if ``__del__`` shut the process
+            executor down, so it refuses new work.
+        queue_watcher_closed: True if ``__del__`` shut the queue watcher
+            down, so it refuses new work.
+    """
+
+    len_after_construction: int
+    epoch_before_iter: int
+    epoch_after_iter: int
+    process_executor_closed: bool
+    queue_watcher_closed: bool
+
+
+def _refuses_new_work(executor: Executor) -> bool:
+    """Return True if an executor has been shut down.
+
+    Args:
+        executor: Executor to probe with a no-op task.
+
+    Returns:
+        True if submitting raises the RuntimeError of a closed executor.
+    """
+    try:
+        _ = executor.submit(int)
+    except RuntimeError:
+        return True
+    return False
+
+
+@pytest.fixture(scope="module")
+def shard_loader_lifecycle(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> ShardLoaderLifecycle:
+    """Take one ShardDataLoader through its whole life and record the result.
+
+    Constructing a ShardDataLoader spawns a worker that re-imports torch,
+    which takes seconds, so the tests share this module-scoped run. The
+    result is a frozen snapshot of each stage rather than the live loader,
+    so the tests stay order-independent even though iterating and shutting
+    down both change the loader.
+
+    ``__del__`` is called directly because the watcher thread can still hold
+    a reference to the loader after iteration, which would make the timing
+    of garbage collection unpredictable.
+
+    Args:
+        tmp_path_factory: Factory for the run's temporary directory.
+
+    Returns:
+        ShardLoaderLifecycle recorded across construction, one iteration,
+        and shutdown.
+    """
+    work_dir = tmp_path_factory.mktemp("shard_loader")
+    budget = _make_shard_budget(work_dir)
+    loader_cfg = _make_bucketed_cfg()
+    dataset_jsonl = work_dir / "p.jsonl"
+    _write_jsonl(dataset_jsonl, [_make_entry("p1", 10), _make_entry("p2", 20)])
+    loader = ShardDataLoader(
+        dataset=ProteinShardDataset(
+            budget_parameters=budget,
+            names=["p1", "p2"],
+            dataset_jsonl=dataset_jsonl,
+        ),
+        budget=budget,
+        tcfg=loader_cfg,
+        distogram_template=build_distogram_module(
+            loader_cfg.distogram_template,
+        ).eval(),
+        distogram_residue=build_distogram_module(
+            loader_cfg.distogram_residue,
+        ).eval(),
+        distogram_atom=build_distogram_module(loader_cfg.distogram_atom).eval(),
+    )
+    len_after_construction = len(loader)
+    epoch_before_iter = loader.epoch
+    _ = list(loader)
+    epoch_after_iter = loader.epoch
+    loader.__del__()  # pylint: disable=unnecessary-dunder-call
+    return ShardLoaderLifecycle(
+        len_after_construction=len_after_construction,
+        epoch_before_iter=epoch_before_iter,
+        epoch_after_iter=epoch_after_iter,
+        process_executor_closed=_refuses_new_work(loader.process_executor),
+        queue_watcher_closed=_refuses_new_work(loader.queue_watcher),
     )
 
 
@@ -1684,9 +1764,8 @@ def bucketed_splits(tmp_path: pathlib.Path) -> str:
     return str(path)
 
 
-@pytest.fixture
-def bucketed_cfg() -> TrainConfig:
-    """Minimal TrainConfig with token_budget=512 for bucketed loader tests."""
+def _make_bucketed_cfg() -> TrainConfig:
+    """Build a minimal TrainConfig with token_budget=512."""
     return TrainConfig(
         train_loader=TrainLoaderConfig(
             batch_size=2,
@@ -1701,6 +1780,12 @@ def bucketed_cfg() -> TrainConfig:
             max_seq_length=_MAX_SEQ,
         ),
     )
+
+
+@pytest.fixture
+def bucketed_cfg() -> TrainConfig:
+    """Minimal TrainConfig with token_budget=512 for bucketed loader tests."""
+    return _make_bucketed_cfg()
 
 
 @pytest.fixture
@@ -1982,26 +2067,26 @@ def test_build_sorted_shards_existing_metadata_prevents_rebuild(
 
 
 def test_shard_data_loader_epoch_increments_after_iter(
-    shard_data_loader: ShardDataLoader,
+    shard_loader_lifecycle: ShardLoaderLifecycle,
 ) -> None:
     """ShardDataLoader.epoch starts at 0 and increments with each __iter__."""
-    assert shard_data_loader.epoch == 0
-    _ = list(shard_data_loader)
-    assert shard_data_loader.epoch == 1
+    assert shard_loader_lifecycle.epoch_before_iter == 0
+    assert shard_loader_lifecycle.epoch_after_iter == 1
 
 
 def test_shard_data_loader_cached_len_is_positive(
-    shard_data_loader: ShardDataLoader,
+    shard_loader_lifecycle: ShardLoaderLifecycle,
 ) -> None:
     """__len__ returns a positive batch count immediately after construction."""
-    assert len(shard_data_loader) > 0
+    assert shard_loader_lifecycle.len_after_construction > 0
 
 
-def test_shard_data_loader_del_no_error(
-    shard_data_loader: ShardDataLoader,
+def test_shard_data_loader_del_shuts_down_executors(
+    shard_loader_lifecycle: ShardLoaderLifecycle,
 ) -> None:
-    """Deleting a ShardDataLoader shuts down executors without raising."""
-    del shard_data_loader
+    """__del__ shuts down both executors, so neither accepts new work."""
+    assert shard_loader_lifecycle.process_executor_closed
+    assert shard_loader_lifecycle.queue_watcher_closed
 
 
 # ---------------------------------------------------------------------------

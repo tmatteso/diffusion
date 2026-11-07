@@ -21,8 +21,7 @@ and inference pipelines.
 - **`atom_utils.py`** — the `Protein` dataclass, atom-type/residue-type
   constants, PDB parsing (`protein_from_pdb`) and writing (`to_pdb`), and
   tensor conversions between the atom37, atom5, and Cβ coordinate
-  representations (`atom37_to_atom5`, `atom5_to_atom37`, `atom37_to_cb`,
-  `pseudo_cb`).
+  representations (`atom37_to_atom5`, `atom5_to_atom37`, `atom37_to_cb`).
 - **`context_managers.py`** — distributed-training and logging context
   managers: `DistProcessGroup` (process-group lifecycle and peer-failure
   propagation), `FatalOnError`, `StructlogConfig`, `ShardWorkerState`,
