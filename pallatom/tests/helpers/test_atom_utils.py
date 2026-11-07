@@ -108,6 +108,39 @@ class TensorCase(enum.Enum):
     collinear = "collinear"
 
 
+class NamedAtom(enum.Enum):
+    """Backbone atoms with the index constants that must agree with their name.
+
+    Members:
+        n: Backbone nitrogen.
+        ca: Alpha carbon.
+        c: Carbonyl carbon.
+        o: Carbonyl oxygen.
+        cb: Beta carbon, which dataset entries never include.
+    """
+
+    n = ("N", ATOM37_N, ATOM5_N)
+    ca = ("CA", ATOM37_CA, ATOM5_CA)
+    c = ("C", ATOM37_C, ATOM5_C)
+    o = ("O", ATOM37_O, ATOM5_O)
+    cb = ("CB", ATOM37_CB, ATOM5_CB)
+
+    @property
+    def atom_name(self) -> str:
+        """PDB atom name."""
+        return self.value[0]
+
+    @property
+    def atom37_index(self) -> int:
+        """Index constant for this atom in the atom37 layout."""
+        return self.value[1]
+
+    @property
+    def atom5_index(self) -> int:
+        """Index constant for this atom in the atom5 layout."""
+        return self.value[2]
+
+
 class AtomTensorScenario(enum.Enum):
     """Base for per-test scenarios built by the atom tensor factory.
 
@@ -132,15 +165,16 @@ class AtomTensorScenario(enum.Enum):
         """Residue dimension of the tensors to build."""
         return cast(int, self.value[2])
 
-    @property
-    def o_slot(self) -> int:
-        """Index of the O atom in this scenario's atom layout."""
-        return ATOM37_O
+    def slot(self, atom: NamedAtom) -> int:
+        """Index of ``atom`` in this scenario's atom layout.
 
-    @property
-    def cb_slot(self) -> int:
-        """Index of the CB atom in this scenario's atom layout."""
-        return ATOM37_CB
+        Args:
+            atom: Backbone atom to locate.
+
+        Returns:
+            The atom's index along the atom axis of the built tensors.
+        """
+        return atom.atom37_index
 
     @property
     def representation(self) -> ResidueRepresentation:
@@ -195,17 +229,17 @@ class Atom5ToAtom37Scenario(AtomTensorScenario):
         """Atom layout of the tensors built for this scenario."""
         return ResidueRepresentation.atom5
 
-    @property
     @override
-    def o_slot(self) -> int:
-        """Index of the O atom in this scenario's atom layout."""
-        return ATOM5_O
+    def slot(self, atom: NamedAtom) -> int:
+        """Index of ``atom`` in this scenario's atom layout.
 
-    @property
-    @override
-    def cb_slot(self) -> int:
-        """Index of the CB atom in this scenario's atom layout."""
-        return ATOM5_CB
+        Args:
+            atom: Backbone atom to locate.
+
+        Returns:
+            The atom's index along the atom axis of the built tensors.
+        """
+        return atom.atom5_index
 
     @property
     def provide_mask(self) -> bool:
@@ -281,6 +315,7 @@ def atom_position_and_mask_factory(
         Tuple of (atom_positions, atom_mask) with shapes
         ``(B, N_res, atom_rep, 3)`` and ``(B, N_res, atom_rep)``.
     """
+    slot = atom_scenario.slot
     tensor_content = atom_scenario.tensor_content
     batch_size = atom_scenario.batch_size
     residue_number = atom_scenario.residue_number
@@ -291,18 +326,18 @@ def atom_position_and_mask_factory(
         TensorCase.standard,
         TensorCase.no_beta_carbon,
     ):
-        per_residue[ATOM37_N] = torch.tensor([1.0, 0.0, 0.0])
-        per_residue[ATOM37_CA] = torch.tensor([0.0, 0.0, 0.0])
-        per_residue[ATOM37_C] = torch.tensor([0.0, 1.0, 0.0])
-        per_residue[atom_scenario.o_slot] = torch.tensor([1.0, 1.0, 0.0])
+        per_residue[slot(NamedAtom.n)] = torch.tensor([1.0, 0.0, 0.0])
+        per_residue[slot(NamedAtom.ca)] = torch.tensor([0.0, 0.0, 0.0])
+        per_residue[slot(NamedAtom.c)] = torch.tensor([0.0, 1.0, 0.0])
+        per_residue[slot(NamedAtom.o)] = torch.tensor([1.0, 1.0, 0.0])
         if tensor_content == TensorCase.standard:
-            per_residue[atom_scenario.cb_slot] = torch.tensor([0.0, 0.0, 1.0])
+            per_residue[slot(NamedAtom.cb)] = torch.tensor([0.0, 0.0, 1.0])
     elif tensor_content == TensorCase.collinear:
         # N, CA, C on the x-axis: cross(CA-N, C-CA) = [0,0,0]
-        per_residue[ATOM37_N] = torch.tensor([0.0, 0.0, 0.0])
-        per_residue[ATOM37_CA] = torch.tensor([1.0, 0.0, 0.0])
-        per_residue[ATOM37_C] = torch.tensor([2.0, 0.0, 0.0])
-        per_residue[atom_scenario.o_slot] = torch.tensor([2.0, 1.0, 0.0])
+        per_residue[slot(NamedAtom.n)] = torch.tensor([0.0, 0.0, 0.0])
+        per_residue[slot(NamedAtom.ca)] = torch.tensor([1.0, 0.0, 0.0])
+        per_residue[slot(NamedAtom.c)] = torch.tensor([2.0, 0.0, 0.0])
+        per_residue[slot(NamedAtom.o)] = torch.tensor([2.0, 1.0, 0.0])
         # CB slot stays zero; mask will be zeroed below
 
     atom_positions = einops.repeat(
@@ -316,7 +351,7 @@ def atom_position_and_mask_factory(
     if tensor_content == TensorCase.half_mask:
         atom_mask[:, : residue_number // 2, :] = 0
     if tensor_content in (TensorCase.no_beta_carbon, TensorCase.collinear):
-        atom_mask[:, :, atom_scenario.cb_slot] = 0
+        atom_mask[:, :, slot(NamedAtom.cb)] = 0
 
     return atom_positions, atom_mask
 
@@ -1190,39 +1225,6 @@ def test_to_pdb_protein_from_pdb_roundtrip(
 # ---------------------------------------------------------------------------
 # Shape-contract enforcement — negative tests
 # ---------------------------------------------------------------------------
-
-
-class NamedAtom(enum.Enum):
-    """Backbone atoms with the index constants that must agree with their name.
-
-    Members:
-        n: Backbone nitrogen.
-        ca: Alpha carbon.
-        c: Carbonyl carbon.
-        o: Carbonyl oxygen.
-        cb: Beta carbon, which dataset entries never include.
-    """
-
-    n = ("N", ATOM37_N, ATOM5_N)
-    ca = ("CA", ATOM37_CA, ATOM5_CA)
-    c = ("C", ATOM37_C, ATOM5_C)
-    o = ("O", ATOM37_O, ATOM5_O)
-    cb = ("CB", ATOM37_CB, ATOM5_CB)
-
-    @property
-    def atom_name(self) -> str:
-        """PDB atom name."""
-        return self.value[0]
-
-    @property
-    def atom37_index(self) -> int:
-        """Index constant for this atom in the atom37 layout."""
-        return self.value[1]
-
-    @property
-    def atom5_index(self) -> int:
-        """Index constant for this atom in the atom5 layout."""
-        return self.value[2]
 
 
 @pytest.fixture
