@@ -11,7 +11,7 @@ import dataclasses
 import functools
 import json
 import pathlib
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from enum import Enum
 from typing import cast
 
@@ -1872,11 +1872,13 @@ def splits_path(tmp_path_factory: pytest.TempPathFactory) -> str:
 class TrainScenario(Enum):
     """Configurations train() runs under, each exercised by one shared run.
 
-    A real ``train()`` epoch takes seconds, so ``train_run`` runs each
-    scenario once per module and every test asserts on the recorded result.
+    A real ``train()`` epoch takes seconds, so ``recorded_train_runs`` runs
+    each scenario once per module and every test asserts on the result.
     Each member is a ``(num_epochs, budget_multiplier, grad_clip, use_wandb)``
     tuple read through properties; the budget multiplier scales
-    ``_BATCH_TOKENS``.
+    ``_BATCH_TOKENS``. Tests share this one enum rather than each subclassing
+    a base enum, because members of separate subclasses are separate
+    parameters and would each trigger their own ``train()`` run.
 
     Every budget here, including ``large_token_budget``, is below the 168
     tokens of the two synthetic train batches (84 tokens each). So each
@@ -1919,7 +1921,7 @@ class TrainScenario(Enum):
 
 @dataclasses.dataclass(frozen=True)
 class TrainRun:
-    """What one train() run did, recorded by the ``train_run`` fixture.
+    """What one train() run did, recorded by ``_record_train_run``.
 
     Attributes:
         parameters_changed: True if any model parameter changed in the run.
@@ -1936,36 +1938,28 @@ class TrainRun:
     num_epochs: int
 
 
-@pytest.fixture(scope="module")
-def train_run(
-    request: pytest.FixtureRequest,
-    tmp_path_factory: pytest.TempPathFactory,
-    jsonl_path: str,
-    splits_path: str,
+def _record_train_run(
+    scenario: TrainScenario,
+    work_dir: pathlib.Path,
+    dataset_jsonl: str,
+    splits_json: str,
 ) -> TrainRun:
     """Run train() once for a scenario and record what it did.
 
-    Factory fixture: receives a ``TrainScenario`` through
-    ``request.param``. Module scope means every test parametrized with the
-    same scenario shares one run. The result is a frozen snapshot rather
-    than live training state, so the tests sharing it stay order-independent.
-
     Arrange: build a fresh model and config, spy on all_reduce_mean(), and
     capture wandb.log. Function-scoped ``monkeypatch`` cannot serve a
-    module-scoped fixture, so the patches use ``MonkeyPatch.context``.
+    module-scoped cache, so the patches use ``MonkeyPatch.context``.
     Act: run train() on the real loaders.
 
     Args:
-        request: Pytest request carrying the ``TrainScenario``.
-        tmp_path_factory: Factory for the run's temporary directory.
-        jsonl_path: Fixture providing path to synthetic proteins JSONL file.
-        splits_path: Fixture providing path to the train/val/test splits JSON.
+        scenario: Configuration to run.
+        work_dir: Directory for the checkpoint, shards, and logs.
+        dataset_jsonl: Path to the synthetic proteins JSONL file.
+        splits_json: Path to the train/val/test splits JSON.
 
     Returns:
         TrainRun recording the scenario's outcome.
     """
-    scenario = cast(TrainScenario, request.param)
-    work_dir = tmp_path_factory.mktemp(scenario.name)
     _ = manual_seed(0)
     trunk = _make_model()
     setup = _make_model_params(
@@ -1983,8 +1977,8 @@ def train_run(
     )
     train_loader, test_loader = _make_loaders(
         work_dir,
-        jsonl_path,
-        splits_path,
+        dataset_jsonl,
+        splits_json,
     )
     params_before = [p.clone().detach() for p in trunk.parameters()]
     reduced_metrics: list[TensorAccumulatorMixin] = []
@@ -2025,9 +2019,68 @@ def train_run(
     )
 
 
+@pytest.fixture(scope="module")
+def recorded_train_runs(
+    tmp_path_factory: pytest.TempPathFactory,
+    jsonl_path: str,
+    splits_path: str,
+) -> Callable[[TrainScenario], TrainRun]:
+    """Provide a lookup that runs each TrainScenario at most once per module.
+
+    The cache is explicit because a parametrized module-scoped fixture does
+    not guarantee one run per scenario: pytest groups parameters by their
+    position in each ``parametrize`` list, so the same member in two lists
+    is torn down and built again.
+
+    Args:
+        tmp_path_factory: Factory for each run's temporary directory.
+        jsonl_path: Fixture providing path to synthetic proteins JSONL file.
+        splits_path: Fixture providing path to the train/val/test splits JSON.
+
+    Returns:
+        Callable returning the scenario's TrainRun, running it on first use.
+    """
+    runs: dict[TrainScenario, TrainRun] = {}
+
+    def _lookup(scenario: TrainScenario) -> TrainRun:
+        """Return the scenario's recorded run, running it on first use."""
+        if scenario not in runs:
+            runs[scenario] = _record_train_run(
+                scenario,
+                tmp_path_factory.mktemp(scenario.name),
+                jsonl_path,
+                splits_path,
+            )
+        return runs[scenario]
+
+    return _lookup
+
+
+@pytest.fixture
+def train_run(
+    request: pytest.FixtureRequest,
+    recorded_train_runs: Callable[[TrainScenario], TrainRun],
+) -> TrainRun:
+    """Provide the shared recorded run for a scenario.
+
+    Factory fixture: receives a ``TrainScenario`` through ``request.param``.
+    The result is a frozen snapshot rather than live training state, so the
+    tests sharing it stay order-independent.
+
+    Args:
+        request: Pytest request carrying the ``TrainScenario``.
+        recorded_train_runs: Module-wide lookup of recorded runs.
+
+    Returns:
+        TrainRun recording the scenario's outcome.
+    """
+    return recorded_train_runs(cast(TrainScenario, request.param))
+
+
 @pytest.mark.parametrize(
     "train_run",
-    [pytest.param(s, id=s.name) for s in TrainScenario],
+    list(TrainScenario),
+    ids=[case.name for case in TrainScenario],
     indirect=True,
 )
 def test_train_updates_model_parameters(train_run: TrainRun) -> None:
