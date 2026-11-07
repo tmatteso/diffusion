@@ -26,7 +26,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from architecture.main_trunk import EMA, MainTrunk
-from einops import reduce
+from einops import rearrange, reduce
 from helpers.atom_utils import RESTYPE_NUM, RESTYPE_NUM_NO_X, Protein
 from helpers.data import (
     Distogram,
@@ -2328,59 +2328,117 @@ def test_integration_gradient_flow_through_all_submodules(
 # DDP: collective flush decision keeps ranks in lockstep
 # ---------------------------------------------------------------------------
 
+LOCKSTEP_SHORT_RES = 8
+LOCKSTEP_LONG_RES = 16
+LOCKSTEP_BUDGET_PER_RANK = LOCKSTEP_SHORT_RES + LOCKSTEP_LONG_RES
+LOCKSTEP_BATCHES_PER_RANK = 2
+LOCKSTEP_ATOM_TYPES = 37
 
-def _featurized_protein(n_res: int, setup: ModelSetup) -> FeaturizedBatch:
-    """Featurize a one-protein batch of ``n_res`` residues."""
-    rng = np.random.default_rng(n_res)
-    protein = Protein(
-        atom_positions=rng.standard_normal((n_res, 37, 3)),
-        atom_mask=np.ones((n_res, 37)),
+
+@dataclasses.dataclass(frozen=True)
+class DDPLockstepRun:
+    """Inputs for a CPU gloo DDP run in which each rank trains on its own data.
+
+    Built by the ``lockstep_run`` factory fixture and pickled by
+    ``torch.multiprocessing.spawn`` into one process per rank, where
+    ``train_one_rank`` consumes it. The world size is the number of entries
+    in ``batches_by_rank``.
+
+    Attributes:
+        setup: Model, optimizer, scheduler, EMA and config shared by every
+            rank before training; each rank deep-copies it.
+        batches_by_rank: The training batches each rank iterates over,
+            indexed by rank. Every rank holds the same number of batches, as
+            ``DistributedSampler`` guarantees in real training.
+        store_path: File backing the gloo rendezvous store, so the test does
+            not have to reserve a free TCP port.
+    """
+
+    setup: ModelSetup
+    batches_by_rank: tuple[tuple[FeaturizedBatch, ...], ...]
+    store_path: pathlib.Path
+
+
+def straight_chain_protein(n_res: int) -> Protein:
+    """Build a deterministic, human-readable protein of ``n_res`` residues.
+
+    Residue ``i`` sits at ``(3.8 * i, 0, 0)`` angstroms, the typical spacing
+    of consecutive alpha carbons, and atom slot ``a`` of every residue is
+    offset from it by ``(0.1 * a, 0.3 * sin(a), 0.3 * cos(a))`` so the atoms
+    are not coplanar. Residue types cycle through the standard amino acids
+    in order, every atom is present, and all residues are on one chain. The
+    token count the training loop sees for this protein is ``n_res``, which
+    is the only property the lockstep test depends on.
+
+    Args:
+        n_res: Number of residues.
+
+    Returns:
+        The protein, with every array fully determined by ``n_res``.
+    """
+    residue_index = np.arange(n_res, dtype=np.float64)
+    atom_index = np.arange(LOCKSTEP_ATOM_TYPES, dtype=np.float64)
+    residue_origins = np.stack(
+        [3.8 * residue_index, np.zeros(n_res), np.zeros(n_res)],
+        axis=-1,
+    )
+    atom_offsets = np.stack(
+        [0.1 * atom_index, 0.3 * np.sin(atom_index), 0.3 * np.cos(atom_index)],
+        axis=-1,
+    )
+    return Protein(
+        atom_positions=rearrange(residue_origins, "n c -> n 1 c")
+        + rearrange(atom_offsets, "a c -> 1 a c"),
+        atom_mask=np.ones((n_res, LOCKSTEP_ATOM_TYPES)),
         residue_index=np.arange(n_res, dtype=np.intp),
-        aatype=rng.integers(low=0, high=RESTYPE_NUM, size=(n_res,)),
+        aatype=np.arange(n_res, dtype=np.intp) % RESTYPE_NUM_NO_X,
         chain_index=np.zeros(n_res, dtype=np.intp),
-        b_factors=np.zeros((n_res, 37)),
-    )
-    return featurize_batch(
-        [protein],
-        setup.tcfg,
-        setup.distogram_template,
-        setup.distogram_residue,
-        setup.distogram_atom,
+        b_factors=np.zeros((n_res, LOCKSTEP_ATOM_TYPES)),
     )
 
 
-def _train_rank(
+def train_one_rank(
     rank: int,
-    base_setup: ModelSetup,
-    batches_by_rank: tuple[list[FeaturizedBatch], ...],
-    store: pathlib.Path,
+    run: DDPLockstepRun,
     reports: SimpleQueue[tuple[int, str]],
 ) -> None:
-    """Train as one rank of a CPU gloo group; report steps and a weight hash.
+    """Train for one epoch as one rank of a CPU gloo group and report back.
+
+    This is the per-process entry point handed to
+    ``torch.multiprocessing.spawn``. It lives at module level because
+    ``spawn`` can only run a picklable callable in the child process, and
+    fixtures cannot run there.
+
+    The setup is deep-copied first. ``spawn`` pickles tensors through shared
+    memory, so without the copy every rank would train the very same
+    parameter storage and the cross-rank weight comparison in the test would
+    pass trivially. ``copy.deepcopy`` keeps the optimizer, scheduler and EMA
+    bound to the copied model.
+
+    After training, the rank reports its optimizer step count (the
+    scheduler steps once per optimizer step) and a SHA-256 digest of its
+    parameters, so the test can compare ranks exactly.
 
     Args:
         rank: This process's rank, supplied by ``spawn``.
-        base_setup: Model setup; deep-copied because ``spawn`` hands every
-            rank the same shared-memory tensors, which would make the weights
-            match trivially.
-        batches_by_rank: Training batches for each rank.
-        store: File backing the gloo rendezvous store.
-        reports: Queue receiving ``(optimizer_steps, weight_hash)``.
+        run: The shared run inputs; this rank trains on
+            ``run.batches_by_rank[rank]``.
+        reports: Queue receiving ``(optimizer_steps, weight_digest)``.
     """
     torch.set_num_threads(2)
     dist.init_process_group(
         backend="gloo",
-        init_method=store.as_uri(),
+        init_method=run.store_path.as_uri(),
         rank=rank,
-        world_size=len(batches_by_rank),
+        world_size=len(run.batches_by_rank),
         timeout=timedelta(seconds=60),
     )
-    setup = copy.deepcopy(base_setup)
+    setup = copy.deepcopy(run.setup)
     loader: torch.utils.data.DataLoader[FeaturizedBatch] = (
         torch.utils.data.DataLoader(
             cast(
                 torch.utils.data.Dataset[FeaturizedBatch],
-                cast(object, batches_by_rank[rank]),
+                cast(object, run.batches_by_rank[rank]),
             ),
             batch_size=None,
         )
@@ -2399,48 +2457,157 @@ def _train_rank(
     dist.destroy_process_group()
 
 
-def test_train_ddp_uneven_protein_lengths_keeps_ranks_in_lockstep(
-    model_params: ModelSetup,
-    tmp_path: pathlib.Path,
-) -> None:
-    """Ranks with different token counts step together and end up identical.
+@pytest.fixture
+def lockstep_setup(model_params: ModelSetup) -> ModelSetup:
+    """Provide ``model_params`` with a per-rank budget of short + long tokens.
 
-    Rank 1's proteins are twice as long, so only rank 1 hits the token budget
-    before its second batch. That must flush both ranks once, and the epoch
-    end must flush both again. Deciding per rank gives rank 1 an extra
-    gradient all-reduce with no partner, and the group deadlocks until gloo's
-    timeout kills it.
+    ``train()`` divides ``accumulated_token_budget`` by the world size, so
+    the global budget is ``LOCKSTEP_BUDGET_PER_RANK`` times the two ranks
+    used by ``lockstep_run``. With that per-rank budget of 24 tokens, two
+    short 8-residue batches fit in one window (16 <= 24) but two long
+    16-residue batches do not (32 > 24). This is a plain data fixture rather
+    than a factory fixture because every lockstep scenario needs the same
+    budget; the scenarios differ only in which proteins each rank holds.
+
+    Args:
+        model_params: Fixture providing the small model, optimizer,
+            scheduler, EMA and base TrainConfig.
+
+    Returns:
+        A ModelSetup sharing every component of ``model_params`` except the
+        TrainConfig, whose token budget is replaced.
     """
-    short, long = _N_KEEP // 2, _N_KEEP
-    budget_per_rank = short + long
-    world_size = 2
     base = model_params.tcfg
-    setup = dataclasses.replace(
+    return dataclasses.replace(
         model_params,
         tcfg=base.model_copy(
             update={
                 "training": base.training.model_copy(
                     update={
-                        "accumulated_token_budget": budget_per_rank
-                        * world_size,
+                        "accumulated_token_budget": 2
+                        * LOCKSTEP_BUDGET_PER_RANK,
                     },
                 ),
             },
         ),
     )
-    batches_by_rank = tuple(
-        [_featurized_protein(n_res, setup)] * 2 for n_res in (short, long)
+
+
+@pytest.fixture
+def lockstep_run(
+    request: pytest.FixtureRequest,
+    lockstep_setup: ModelSetup,
+    tmp_path: pathlib.Path,
+) -> DDPLockstepRun:
+    """Build a DDP run in which each rank holds proteins of its own length.
+
+    Factory fixture: receives, through
+    ``@pytest.mark.parametrize(..., indirect=["lockstep_run"])``, one
+    residue count per rank. Rank ``r`` gets ``LOCKSTEP_BATCHES_PER_RANK``
+    one-protein batches of ``straight_chain_protein(request.param[r])``, so
+    every rank yields the same number of batches while the ranks' token
+    counts differ.
+
+    Args:
+        request: Pytest request carrying the per-rank residue counts as a
+            ``tuple[int, ...]``.
+        lockstep_setup: Fixture providing the model setup with the lockstep
+            token budget.
+        tmp_path: Pytest-provided directory for the rendezvous store and the
+            checkpoint that rank 0 writes.
+
+    Returns:
+        DDPLockstepRun ready to hand to ``torch.multiprocessing.spawn``.
+    """
+    residues_by_rank = cast(tuple[int, ...], request.param)
+    return DDPLockstepRun(
+        setup=lockstep_setup,
+        batches_by_rank=tuple(
+            (
+                featurize_batch(
+                    [straight_chain_protein(n_res)],
+                    lockstep_setup.tcfg,
+                    lockstep_setup.distogram_template,
+                    lockstep_setup.distogram_residue,
+                    lockstep_setup.distogram_atom,
+                ),
+            )
+            * LOCKSTEP_BATCHES_PER_RANK
+            for n_res in residues_by_rank
+        ),
+        store_path=tmp_path / "gloo_store",
     )
+
+
+@pytest.mark.parametrize(
+    ("lockstep_run", "expected_steps"),
+    [
+        pytest.param(
+            (LOCKSTEP_SHORT_RES, LOCKSTEP_LONG_RES),
+            2,
+            id="only_rank_1_over_budget_flushes_both_ranks",
+        ),
+        pytest.param(
+            (LOCKSTEP_LONG_RES, LOCKSTEP_SHORT_RES),
+            2,
+            id="only_rank_0_over_budget_flushes_both_ranks",
+        ),
+        pytest.param(
+            (LOCKSTEP_SHORT_RES, LOCKSTEP_SHORT_RES),
+            1,
+            id="no_rank_over_budget_only_epoch_end_flush",
+        ),
+        pytest.param(
+            (LOCKSTEP_LONG_RES, LOCKSTEP_LONG_RES),
+            2,
+            id="both_ranks_over_budget_flush_together",
+        ),
+    ],
+    indirect=["lockstep_run"],
+)
+def test_train_ddp_keeps_ranks_in_lockstep(
+    lockstep_run: DDPLockstepRun,
+    expected_steps: int,
+) -> None:
+    """Ranks with different token counts take the same steps and match.
+
+    Regression test for an end-of-epoch DDP deadlock. Each rank used to
+    decide on its own when its next batch would overflow the token budget,
+    so a rank holding long proteins took more optimizer steps than a rank
+    holding short ones. Each extra step's gradient all-reduce had no
+    partner, and the job hung until the collective timeout killed it. The
+    flush decision is now a vote: if any rank's next batch would overflow,
+    every rank flushes. Leftover micro-batches are flushed at epoch end
+    instead of being dropped.
+
+    Each rank holds two batches. Before the second batch, a rank holding
+    16-residue proteins wants to flush (16 + 16 > 24) and a rank holding
+    8-residue proteins does not (8 + 8 <= 24). The cases cover the vote
+    being won by rank 1 alone, by rank 0 alone (so a vote that listens to
+    only one rank fails), by nobody (only the epoch-end flush happens), and
+    by both ranks.
+
+    Arrange: ``lockstep_run`` gives each rank two one-protein batches of the
+    scenario's residue count, under a per-rank budget of 24 tokens.
+    Act: ``torch.multiprocessing.spawn`` runs ``train_one_rank`` in two real
+    OS processes forming a CPU gloo group; each trains one epoch and reports
+    its optimizer step count and a digest of its weights.
+    Assert: every rank reports the scenario's step count, and all ranks'
+    weight digests are identical. A deadlock makes gloo abort the stuck
+    collective after 60 seconds, and ``spawn`` then raises, so the test
+    fails instead of hanging.
+
+    Args:
+        lockstep_run: Factory-fixture-built run for this scenario.
+        expected_steps: Optimizer steps every rank must take in the epoch.
+    """
+    world_size = len(lockstep_run.batches_by_rank)
     reports: SimpleQueue[tuple[int, str]] = multiprocessing.get_context(
         "spawn",
     ).SimpleQueue()
 
-    _ = spawn(
-        _train_rank,
-        args=(setup, batches_by_rank, tmp_path / "gloo_store", reports),
-        nprocs=world_size,
-    )
+    _ = spawn(train_one_rank, args=(lockstep_run, reports), nprocs=world_size)
 
-    (steps_0, weights_0), (steps_1, weights_1) = reports.get(), reports.get()
-    assert steps_0 == steps_1 == world_size
-    assert weights_0 == weights_1
+    reported = {reports.get() for _ in range(world_size)}
+    assert {steps for steps, _ in reported} == {expected_steps}
+    assert len({digest for _, digest in reported}) == 1
