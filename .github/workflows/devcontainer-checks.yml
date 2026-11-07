@@ -172,7 +172,9 @@ jobs:
           imageName: ghcr.io/${{ github.repository }}/${{ inputs.image-name }}
           push: never
           noCache: ${{ inputs.no-cache }}
-          runCmd: PYTHONDONTWRITEBYTECODE=1 PYTEST_ADDOPTS="-p no:cacheprovider" uv run --no-sync pylint pallatom
+          # pylint_pytest runs pytest collection, which imports the hypothesis
+          # tests; keep their cache out of the bind-mounted checkout.
+          runCmd: PYTHONDONTWRITEBYTECODE=1 PYTEST_ADDOPTS="-p no:cacheprovider" HYPOTHESIS_STORAGE_DIRECTORY=/tmp/hypothesis uv run --no-sync pylint pallatom
 
   xenon:
     needs: build
