@@ -6,7 +6,6 @@ log_epoch, and the end-to-end train() function including gradient
 accumulation and W&B logging.
 """
 
-import contextlib
 import dataclasses
 import functools
 import json
@@ -106,7 +105,7 @@ EXPECTED_CHECKPOINT_KEYS = frozenset(
 _ADAM_EXP_AVG_KEY = "exp_avg"
 
 
-def _make_model_params(
+def make_model_params(
     trunk: MainTrunk | DDP,
     train_cfg: TrainConfig,
     dgram_template: Distogram,
@@ -357,66 +356,6 @@ def _make_loaders(
     return train_loader, test_loader
 
 
-def _make_epoch_metrics(
-    epoch: int,
-    global_step: int = 0,
-    loss_metrics: LossMetrics | None = None,
-    throughput: ThroughputStatistics | None = None,
-    component_norms: ComponentNorms | None = None,
-) -> EpochMetrics:
-    """Build a minimal EpochMetrics with zero-valued fields for log_epoch tests.
-
-    Args:
-        epoch: Epoch number to embed.
-        global_step: Global step count.
-        loss_metrics: LossMetrics with all-zero fields; built internally
-            if None.
-        throughput: ThroughputStatistics with all-zero fields; built
-            internally if None.
-        component_norms: ComponentNorms with all-zero fields; built
-            internally if None.
-
-    Returns:
-        EpochMetrics suitable for passing to log_epoch.
-    """
-    z = torch.tensor(0.0)
-    lm = loss_metrics or LossMetrics(
-        total_loss=z,
-        Kabsch_aligned_MSE_loss=z,
-        CE_loss=z,
-        smooth_lddt_loss=z,
-        res_distogram_loss=z,
-        atom_distogram_loss=z,
-        intermediate_loss=z,
-        RMSD=z,
-    )
-    tp = throughput or ThroughputStatistics(
-        avg_batch_size=z,
-        token_pack_rate=z,
-        residues_per_sec=z,
-        atoms_per_sec=z,
-    )
-    cn = component_norms or ComponentNorms(
-        template_embedder=z,
-        atom_encoder=z,
-        atom_decoders=z,
-        residue_distogram_head=z,
-        atom_distogram_head=z,
-        inter_proj_seq=z,
-        inter_seq_logits=z,
-        proj_seq=z,
-        seq_logits=z,
-    )
-    return EpochMetrics(
-        epoch=epoch,
-        global_step=global_step,
-        train_loss_metrics=lm,
-        train_throughput_stats=tp,
-        train_gradient_norms=cn,
-        val_loss_metrics=lm,
-    )
-
-
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -476,6 +415,104 @@ def zero_component_norms() -> ComponentNorms:
         inter_seq_logits=z,
         proj_seq=z,
         seq_logits=z,
+    )
+
+
+@pytest.fixture
+def epoch_metrics(
+    zero_loss_metrics: LossMetrics,
+    zero_throughput: ThroughputStatistics,
+    zero_component_norms: ComponentNorms,
+) -> EpochMetrics:
+    """Provide zero-valued EpochMetrics for epoch ``EPOCH`` for log_epoch tests.
+
+    Every training and validation metric is zero, composed from the
+    ``zero_loss_metrics``, ``zero_throughput`` and ``zero_component_norms``
+    fixtures, with ``global_step`` set to 1. This is a plain data fixture
+    rather than a factory fixture because the log_epoch tests only check
+    whether and what log_epoch sends to W&B, not how metric values are
+    formatted, so they all share this one input. The only value any test
+    reads back is the epoch number, which is ``EPOCH``.
+
+    Args:
+        zero_loss_metrics: Fixture providing all-zero LossMetrics, used for
+            both the training and validation losses.
+        zero_throughput: Fixture providing all-zero ThroughputStatistics.
+        zero_component_norms: Fixture providing all-zero ComponentNorms.
+
+    Returns:
+        EpochMetrics for epoch ``EPOCH`` at global step 1.
+    """
+    return EpochMetrics(
+        epoch=EPOCH,
+        global_step=1,
+        train_loss_metrics=zero_loss_metrics,
+        train_throughput_stats=zero_throughput,
+        train_gradient_norms=zero_component_norms,
+        val_loss_metrics=zero_loss_metrics,
+    )
+
+
+@pytest.fixture
+def single_process_gloo_group() -> Generator[None]:
+    """Run the test inside a one-rank gloo process group, then tear it down.
+
+    DDP refuses to wrap a model unless a process group is initialised, so
+    tests that check DDP unwrapping request this fixture through
+    ``@pytest.mark.usefixtures``. A one-rank group needs no network ports,
+    GPUs or child processes: it rendezvouses through an in-memory
+    ``HashStore``. ``HashStore`` is a torch.distributed C-extension symbol
+    that is not officially re-exported, so it is looked up with
+    ``getattr``; a direct import trips the static private-import check,
+    whose result differs across torch's per-platform packaging. The group
+    is destroyed after the test even if the test fails, so later tests
+    start without one.
+
+    Yields:
+        None: The fixture only provides the initialised process group.
+    """
+    dist.init_process_group(
+        backend="gloo",
+        store=getattr(  # noqa: B009  # pyright: ignore[reportAny]
+            dist,
+            "HashStore",
+        )(),
+        rank=0,
+        world_size=1,
+    )
+    try:
+        yield
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.fixture
+def wandb_model_params(model_params: ModelSetup) -> ModelSetup:
+    """Provide ``model_params`` with W&B logging switched on.
+
+    Identical to ``model_params`` (same model, optimizer, scheduler, EMA
+    and config) except that ``tcfg.logging.use_wandb`` is True, so
+    log_epoch tests can check what is sent to ``wandb.log``. W&B calls are
+    captured by the ``wandb_payloads`` or ``wandb_call_counter`` fixtures,
+    so nothing reaches the network. This is a plain data fixture rather
+    than a factory fixture because the only other setting, W&B off, is
+    already ``model_params`` itself.
+
+    Args:
+        model_params: Fixture providing the model setup with W&B off.
+
+    Returns:
+        A ModelSetup sharing every component of ``model_params`` except the
+        TrainConfig, whose logging config enables W&B.
+    """
+    base = model_params.tcfg
+    return dataclasses.replace(
+        model_params,
+        tcfg=base.model_copy(
+            update={
+                "logging": base.logging.model_copy(update={"use_wandb": True}),
+            },
+        ),
     )
 
 
@@ -556,7 +593,7 @@ def model_params(
         AlphaFold-style warmup/decay LambdaLR scheduler configured from
         tcfg.
     """
-    return _make_model_params(
+    return make_model_params(
         model,
         tcfg,
         distogram_template,
@@ -1096,6 +1133,7 @@ def test_swapped_in_ema_weights_restores_raw_weights_on_exception(
         ), f"Param '{k}' not restored after error"
 
 
+@pytest.mark.usefixtures("single_process_gloo_group")
 def test_swapped_in_ema_weights_unwraps_ddp(
     model_params: ModelSetup,
 ) -> None:
@@ -1119,27 +1157,27 @@ def test_swapped_in_ema_weights_unwraps_ddp(
     }
     ema_sd = {k: v.clone() for k, v in model_params.ema.state_dict().items()}
 
-    with _single_process_gloo_group():
-        ddp_model_params = dataclasses.replace(
-            model_params,
-            model=DDP(model_params.model),
-        )
-        with swapped_in_ema_weights(ddp_model_params):
-            live_sd = cast(
-                dict[str, torch.Tensor],
-                model_params.model.state_dict(),
-            )
-            for k, v in live_sd.items():
-                assert torch.equal(v, ema_sd[k])
-
-        live_sd_after = cast(
+    ddp_model_params = dataclasses.replace(
+        model_params,
+        model=DDP(model_params.model),
+    )
+    with swapped_in_ema_weights(ddp_model_params):
+        live_sd = cast(
             dict[str, torch.Tensor],
             model_params.model.state_dict(),
         )
-        for k, v in live_sd_after.items():
-            assert torch.equal(v, raw_sd[k])
+        for k, v in live_sd.items():
+            assert torch.equal(v, ema_sd[k])
+
+    live_sd_after = cast(
+        dict[str, torch.Tensor],
+        model_params.model.state_dict(),
+    )
+    for k, v in live_sd_after.items():
+        assert torch.equal(v, raw_sd[k])
 
 
+@pytest.mark.usefixtures("single_process_gloo_group")
 def test_swapped_in_ema_weights_unwraps_ddp_and_restores_on_exception(
     model_params: ModelSetup,
 ) -> None:
@@ -1164,26 +1202,25 @@ def test_swapped_in_ema_weights_unwraps_ddp_and_restores_on_exception(
     }
 
     eval_failure_message = "simulated eval failure under ddp"
-    with _single_process_gloo_group():
-        ddp_model_params = dataclasses.replace(
-            model_params,
-            model=DDP(model_params.model),
-        )
-        with (
-            pytest.raises(RuntimeError, match=eval_failure_message),
-            swapped_in_ema_weights(ddp_model_params),
-        ):
-            raise RuntimeError(eval_failure_message)
+    ddp_model_params = dataclasses.replace(
+        model_params,
+        model=DDP(model_params.model),
+    )
+    with (
+        pytest.raises(RuntimeError, match=eval_failure_message),
+        swapped_in_ema_weights(ddp_model_params),
+    ):
+        raise RuntimeError(eval_failure_message)
 
-        live_sd = cast(
-            dict[str, torch.Tensor],
-            model_params.model.state_dict(),
-        )
-        for k, v in live_sd.items():
-            assert torch.equal(
-                v,
-                raw_sd[k],
-            ), f"Param '{k}' not restored after error"
+    live_sd = cast(
+        dict[str, torch.Tensor],
+        model_params.model.state_dict(),
+    )
+    for k, v in live_sd.items():
+        assert torch.equal(
+            v,
+            raw_sd[k],
+        ), f"Param '{k}' not restored after error"
 
 
 # ---------------------------------------------------------------------------
@@ -1474,28 +1511,7 @@ def test_checkpoint_round_trip_preserves_optimizer_and_scheduler_state(
     assert restored_last_epoch == saved_last_epoch
 
 
-@contextlib.contextmanager
-def _single_process_gloo_group() -> Generator[None]:
-    """Init and tear down a single-process gloo group for DDP-wrapping tests."""
-    # HashStore is a private torch.distributed C-extension symbol that
-    # isn't officially re-exported; getattr() sidesteps the static
-    # private-import check, whose result is otherwise inconsistent
-    # across torch's per-platform packaging.
-    dist.init_process_group(
-        backend="gloo",
-        store=getattr(  # noqa: B009  # pyright: ignore[reportAny]
-            dist,
-            "HashStore",
-        )(),
-        rank=0,
-        world_size=1,
-    )
-    try:
-        yield
-    finally:
-        dist.destroy_process_group()
-
-
+@pytest.mark.usefixtures("single_process_gloo_group")
 def test_save_checkpoint_strips_ddp_wrapper_prefix(
     model_params: ModelSetup,
     log: FilteringBoundLogger,
@@ -1508,17 +1524,16 @@ def test_save_checkpoint_strips_ddp_wrapper_prefix(
     plain model and never carry a "module." prefix.
     """
     plain_keys = set(model_params.model.state_dict().keys())
-    with _single_process_gloo_group():
-        ddp_model_params = dataclasses.replace(
-            model_params,
-            model=DDP(model_params.model),
-        )
-        save_checkpoint(
-            model_params=ddp_model_params,
-            rank=0,
-            log=log,
-            best_val_loss=torch.tensor(0.3),
-        )
+    ddp_model_params = dataclasses.replace(
+        model_params,
+        model=DDP(model_params.model),
+    )
+    save_checkpoint(
+        model_params=ddp_model_params,
+        rank=0,
+        log=log,
+        best_val_loss=torch.tensor(0.3),
+    )
 
     ckpt = cast(
         dict[str, object],
@@ -1537,37 +1552,16 @@ def test_save_checkpoint_strips_ddp_wrapper_prefix(
 # ---------------------------------------------------------------------------
 
 
-def _tcfg_with_wandb(*, base: TrainConfig, use_wandb: bool) -> TrainConfig:
-    """Return a copy of base with use_wandb overridden.
-
-    Args:
-        base: Base TrainConfig to copy from.
-        use_wandb: Whether to enable W&B logging.
-
-    Returns:
-        New TrainConfig with logging.use_wandb set to use_wandb.
-    """
-    return TrainConfig(
-        training=base.training,
-        model=base.model,
-        checkpoint=base.checkpoint,
-        logging=LoggingParams(use_wandb=use_wandb),
-    )
-
-
 def test_log_epoch_do_log_false_skips_wandb(
-    model_params: ModelSetup,
+    wandb_model_params: ModelSetup,
+    epoch_metrics: EpochMetrics,
     log: FilteringBoundLogger,
     wandb_call_counter: list[object],
 ) -> None:
     """log_epoch(do_log=False) does not call wandb.log if use_wandb=True."""
-    mp = dataclasses.replace(
-        model_params,
-        tcfg=_tcfg_with_wandb(base=model_params.tcfg, use_wandb=True),
-    )
     log_epoch(
-        epoch_metrics=_make_epoch_metrics(epoch=1, global_step=1),
-        model_params=mp,
+        epoch_metrics=epoch_metrics,
+        model_params=wandb_model_params,
         log=log,
         do_log=False,
     )
@@ -1576,12 +1570,13 @@ def test_log_epoch_do_log_false_skips_wandb(
 
 def test_log_epoch_wandb_disabled_skips_call(
     model_params: ModelSetup,
+    epoch_metrics: EpochMetrics,
     log: FilteringBoundLogger,
     wandb_call_counter: list[object],
 ) -> None:
     """log_epoch(use_wandb=False) does not call wandb.log if do_log=True."""
     log_epoch(
-        epoch_metrics=_make_epoch_metrics(epoch=1, global_step=1),
+        epoch_metrics=epoch_metrics,
         model_params=model_params,
         log=log,
         do_log=True,
@@ -1590,18 +1585,15 @@ def test_log_epoch_wandb_disabled_skips_call(
 
 
 def test_log_epoch_wandb_enabled_calls_once(
-    model_params: ModelSetup,
+    wandb_model_params: ModelSetup,
+    epoch_metrics: EpochMetrics,
     log: FilteringBoundLogger,
     wandb_payloads: list[dict[str, object]],
 ) -> None:
     """log_epoch with do_log=True and use_wandb=True calls wandb.log once."""
-    mp = dataclasses.replace(
-        model_params,
-        tcfg=_tcfg_with_wandb(base=model_params.tcfg, use_wandb=True),
-    )
     log_epoch(
-        epoch_metrics=_make_epoch_metrics(epoch=3, global_step=1),
-        model_params=mp,
+        epoch_metrics=epoch_metrics,
+        model_params=wandb_model_params,
         log=log,
         do_log=True,
     )
@@ -1609,7 +1601,8 @@ def test_log_epoch_wandb_enabled_calls_once(
 
 
 def test_log_epoch_wandb_payload_keys(
-    model_params: ModelSetup,
+    wandb_model_params: ModelSetup,
+    epoch_metrics: EpochMetrics,
     log: FilteringBoundLogger,
     wandb_payloads: list[dict[str, object]],
 ) -> None:
@@ -1620,13 +1613,9 @@ def test_log_epoch_wandb_payload_keys(
         - At least one key is prefixed with 'train/'.
         - At least one key is prefixed with 'val/'.
     """
-    mp = dataclasses.replace(
-        model_params,
-        tcfg=_tcfg_with_wandb(base=model_params.tcfg, use_wandb=True),
-    )
     log_epoch(
-        epoch_metrics=_make_epoch_metrics(epoch=EPOCH, global_step=1),
-        model_params=mp,
+        epoch_metrics=epoch_metrics,
+        model_params=wandb_model_params,
         log=log,
         do_log=True,
     )
@@ -1718,7 +1707,7 @@ def test_train_token_budget_preflush_fires_before_oversized_batch(
             n_threads=1,
         ),
     )
-    mp_b = _make_model_params(
+    mp_b = make_model_params(
         model_params.model,
         tcfg_b,
         model_params.distogram_template,
@@ -1962,7 +1951,7 @@ def _record_train_run(
     """
     _ = manual_seed(0)
     trunk = _make_model()
-    setup = _make_model_params(
+    setup = make_model_params(
         trunk,
         _make_tcfg(
             work_dir / "best.pt",
