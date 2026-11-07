@@ -47,6 +47,7 @@ N_ATOM = N_RES * NATOM  # 20
 SIGMA_MIN = 0.002
 SIGMA_MAX = 80.0
 N_ATOM_BINS = 22
+FAST_DDIM_STEPS = 4
 T_HAT_INIT = 1.0
 T_NORM_INIT = 0.5
 
@@ -160,7 +161,7 @@ def edm_sampler(
         trunk_mock,
         context,
         templ_disto,
-        SamplerParams(S_churn=0.0),
+        SamplerParams(S_churn=0.0, ddim_steps=FAST_DDIM_STEPS),
         NoiseScheduleParams(sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX),
     )
 
@@ -233,7 +234,7 @@ def identity_det_sampler(
         identity_denoiser_mock,
         context,
         templ_disto,
-        SamplerParams(S_churn=0.0),
+        SamplerParams(S_churn=0.0, ddim_steps=FAST_DDIM_STEPS),
         NoiseScheduleParams(sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX),
     )
 
@@ -258,7 +259,11 @@ def identity_stoch_sampler_tmin_high(
         identity_denoiser_mock,
         context,
         templ_disto,
-        SamplerParams(S_churn=2.0, S_tmin=SIGMA_MAX * 10),
+        SamplerParams(
+            S_churn=2.0,
+            S_tmin=SIGMA_MAX * 10,
+            ddim_steps=FAST_DDIM_STEPS,
+        ),
         NoiseScheduleParams(sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX),
     )
 
@@ -639,7 +644,7 @@ def test_edm_sampler_zero_denoiser_output_is_zero(
         zero_denoiser_mock,
         context,
         templ_disto,
-        SamplerParams(S_churn=0.0),
+        SamplerParams(S_churn=0.0, ddim_steps=FAST_DDIM_STEPS),
         NoiseScheduleParams(sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX),
     )
     out, seq_out = sampler.sample((1, N_ATOM, 3))
@@ -679,25 +684,28 @@ def test_edm_sampler_s_churn_produces_different_result_than_deterministic(
     ``S_churn > 0`` injects extra noise per step before the predictor. With the
     identity denoiser the injected noise accumulates unfiltered, so the output
     diverges from the ODE run. The zero denoiser is unsuitable here because it
-    drives coordinates to zero regardless of ``S_churn``.
+    drives coordinates to zero regardless of ``S_churn``. Each run is seeded
+    identically, so the injected noise is the only thing that can separate
+    them.
     """
     noise = NoiseScheduleParams(sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX)
-    _ = manual_seed(5)
     det = EDMSampler(
         identity_denoiser_mock,
         context,
         templ_disto,
-        SamplerParams(S_churn=0.0),
+        SamplerParams(S_churn=0.0, ddim_steps=FAST_DDIM_STEPS),
         noise,
     )
     stoch = EDMSampler(
         identity_denoiser_mock,
         context,
         templ_disto,
-        SamplerParams(S_churn=2.0),
+        SamplerParams(S_churn=2.0, ddim_steps=FAST_DDIM_STEPS),
         noise,
     )
+    _ = manual_seed(5)
     out_det, seq_det = det.sample((1, N_ATOM, 3))
+    _ = manual_seed(5)
     out_stoch, seq_stoch = stoch.sample((1, N_ATOM, 3))
     assert not torch.allclose(out_det, out_stoch)
     assert torch.isfinite(seq_det).all()
@@ -722,7 +730,9 @@ class SamplerTrajectoryScenario(Enum):
         ten_steps_gentle_step_scale: A smaller Euler step scale, so the
             per-step rescale differs from the default.
         pallatom_default: The production defaults (200 steps, step scale
-            2.25) with half-step jitter.
+            2.25) with half-step jitter. It takes seconds where the others
+            take milliseconds, so only the noise-level test runs it; the
+            other trajectory tests use ``_COARSE_SCENARIOS``.
 
     Every member runs with churn off (``S_churn = 0``), so both model calls
     in a step see the same noise level and the same noisy input.
@@ -753,6 +763,13 @@ class SamplerTrajectoryScenario(Enum):
     def expected_model_calls(self) -> int:
         """Model calls a full run must make: two per step."""
         return 2 * self.ddim_steps
+
+
+_COARSE_SCENARIOS = [
+    s
+    for s in SamplerTrajectoryScenario
+    if s is not SamplerTrajectoryScenario.pallatom_default
+]
 
 
 @jaxtyped(typechecker=beartype)
@@ -948,7 +965,7 @@ def sampler_trajectory(
 
 @pytest.mark.parametrize(
     ("sampler_trajectory", "scenario"),
-    [pytest.param(s, s, id=s.name) for s in SamplerTrajectoryScenario],
+    [pytest.param(s, s, id=s.name) for s in _COARSE_SCENARIOS],
     indirect=["sampler_trajectory"],
 )
 def test_edm_sampler_calls_model_twice_per_step(
@@ -1001,7 +1018,7 @@ def test_edm_sampler_visits_noise_levels_from_max_to_min(
 
 @pytest.mark.parametrize(
     "sampler_trajectory",
-    [pytest.param(s, id=s.name) for s in SamplerTrajectoryScenario],
+    [pytest.param(s, id=s.name) for s in _COARSE_SCENARIOS],
     indirect=True,
 )
 def test_edm_sampler_initial_noise_matches_first_step(
@@ -1036,7 +1053,7 @@ def test_edm_sampler_initial_noise_matches_first_step(
 
 @pytest.mark.parametrize(
     "sampler_trajectory",
-    [pytest.param(s, id=s.name) for s in SamplerTrajectoryScenario],
+    [pytest.param(s, id=s.name) for s in _COARSE_SCENARIOS],
     indirect=True,
 )
 def test_edm_sampler_euler_steps_target_next_lower_noise_level(
