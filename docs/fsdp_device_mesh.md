@@ -1,7 +1,7 @@
 # FSDP on a 2×2 device mesh: design notes
 
 **Status:** draft for discussion. Stacked on the DDP lockstep fix (#5), which is
-assumed correct. No training code changes yet.
+assumed correct. Tests are in; no training code changes yet.
 
 **Goal:** train across 2 nodes with 2 GPUs each, using FSDP within a node and
 DDP-style replication across nodes.
@@ -186,7 +186,8 @@ gave 44052.44313, against 44052.44315 for continuing without a restart.
   correctness was tested this way; no multi-node timing exists.
 - The runs were tiny: `K_unit=3`, 64 residues, batch size 2, 2–3 steps, torch
   2.11.0.
-- Dropout was off, so train-mode behaviour under FSDP is untested.
+- The figures above had dropout off. The CPU and two-node tests below cover
+  dropout on, and parity held.
 - Failures of a real network or node were not tested.
 
 To reproduce the emulation, run these two commands at once with the same port,
@@ -215,17 +216,83 @@ NCCL_HOSTID=fakenode1 NCCL_SOCKET_IFNAME=lo torchrun --nnodes=2 --node_rank=1 \
 3. **HSDP behind a flag.** Add a `--mesh NODESxGPUS` option, the EMA swap, the
    host assertion, `model: MainTrunk | DDP` union updates, and
    `require_equal_batch_counts` for validation.
-4. **Tests.** Port the parity checks above to `pallatom/tests/train`, covering
-   DDP vs HSDP weights, EMA evaluation and checkpoint round trip, then run on
-   real hardware.
+4. **Tests.** See [Tests](#tests). Run the two-node tier on real hardware, then
+   move the recipe in `harness.py` into production code.
+
+## Tests
+
+Both tiers share `pallatom/tests/fsdp/harness.py`, so they run the same workload
+through the real `optimizer_step`, `EMA` and `take_step`. Production has no FSDP
+code yet, so the sharding recipe lives in the harness for now.
+
+**CPU tier (`test_hsdp_cpu.py`).** FSDP runs on a 2×2 CPU gloo mesh, so this
+tier needs no GPU and runs in `pytest pallatom` on both CI runners. It adds about
+4 minutes per run.
+
+| Test | Today |
+|---|---|
+| Hybrid matches DDP: 5 scenarios (clipping, accumulation, window sync, dropout) | Pass |
+| Replicas agree only when seeded | Pass |
+| Gathered checkpoint resumes exactly | Pass |
+| Six sharded classes reach module hooks (change 1) | Strict xfail |
+| `EMA.swap` after a `no_grad` forward (change 2) | Strict xfail |
+| Checkpoint loads into a plain model (change 4) | Strict xfail |
+
+A strict xfail fails CI as soon as its fix lands, so the marker has to be removed
+with the fix. `route_calls_through_module_hooks` removes the typed `__call__`
+overrides inside workers so that the other tests reach their own defect. Delete
+it once change 1 lands.
+
+These tests were checked on a scratch copy. Applying the fixes flipped all 8
+xfails, which also shows that the fixes work together. Giving hybrid a different
+init, skipping its clipping, or skipping the Adam restore each failed the
+relevant test.
+
+**Two-node tier (`test_two_node.py`).** Skipped unless launched for it. Run this
+on both nodes at the same time, from the same commit:
+
+```bash
+scripts/run_two_node_tests.sh 0 <node-A-address>  # on node A
+scripts/run_two_node_tests.sh 1 <node-A-address>  # on node B
+```
+
+Set `PALLATOM_DATASET_JSONL` to also compare the dataset across nodes. Measurements
+go to `$PALLATOM_TWO_NODE_REPORT`, by default
+`/tmp/pallatom_two_node_report.json`.
+
+It checks GPU placement, that shard groups stay within a node, dataset identity,
+and hybrid-vs-DDP parity on GPUs. It records within-node and cross-node link
+speed, step time and peak memory. Timing and memory are recorded, not asserted,
+because no threshold means anything before the first real run.
+
+This tier has only run under the one-machine emulation (6 passed), **not on two
+real nodes**. Expect to need `NCCL_SOCKET_IFNAME` there.
+
+## Later work
+
+- Run the two-node tier on real hardware and use the report to decide whether
+  FSDP is worth continuing.
+- Add a node-failure test: kill a node mid-step and check that survivors exit
+  within the timeout rather than hang. This needs process control outside
+  pytest, so it isn't written.
+- Test seeding through `main()`. Today's test shows the hazard, but production
+  has no seam to test the fix (change 3).
+- Measure `set_requires_gradient_sync` memory, and decide between per-backward and
+  per-window sync. Parity holds for both.
+- Add `require_equal_batch_counts` for the validation loader, with a test that
+  unequal counts fail rather than hang.
+- Add a startup assertion in production that shard groups stay on one host. Only
+  the test checks this today.
+- Measure activation memory reductions (more activation checkpointing, mixed
+  precision), which target the 96% that FSDP can't reach.
+- Run the full `pytest pallatom` suite and both CI workflows. Only
+  `pallatom/tests/fsdp` and the jaxtyping gate have been run locally.
 
 ## Open questions
 
 1. **What is the goal?** If it's more throughput or longer proteins, FSDP won't
    help. If a much larger parameter count is planned, it might.
-2. **Are 2 nodes available to test on?** Network speed decides whether the
-   cross-node savings matter at all.
-3. **Would cutting activation memory serve better?** `node_updates`,
+2. **Would cutting activation memory serve better?** `node_updates`,
    `template_embedder` and `atom_encoder` aren't activation-checkpointed today,
    and mixed precision isn't used. Neither has been measured, but both target
    the 96%.
