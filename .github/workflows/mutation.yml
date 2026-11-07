@@ -1,0 +1,54 @@
+name: Mutation Testing
+
+# Advisory report, not a required check: some mutants don't change behaviour
+# and can never be caught. Read the report and add tests for real gaps.
+on:
+  schedule:
+    - cron: "0 3 * * 0" # Sundays 03:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  mutation:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 340
+    strategy:
+      fail-fast: false
+      matrix:
+        module: [alignment]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Stub SSH agent socket for Docker Desktop mount
+        run: sudo mkdir -p /run/host-services && sudo touch /run/host-services/ssh-auth.sock
+
+      - name: Run cosmic-ray in devcontainer
+        uses: devcontainers/ci@v0.3
+        with:
+          configFile: .devcontainer/arm64/devcontainer.json
+          imageName: ghcr.io/${{ github.repository }}/devcontainer-arm64
+          push: never
+          runCmd: |
+            set -e
+            export PYTHONDONTWRITEBYTECODE=1
+            CONFIG=.github/mutation/${{ matrix.module }}.toml
+            CR="uvx --from cosmic-ray==8.7.0"
+            $CR cosmic-ray init "$CONFIG" session.sqlite
+            $CR cr-filter-operators session.sqlite "$CONFIG"
+            timeout 18000 $CR cosmic-ray exec "$CONFIG" session.sqlite || [ $? -eq 124 ]
+            $CR cr-html session.sqlite > report.html
+            $CR cr-rate session.sqlite
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mutation-${{ matrix.module }}
+          path: |
+            report.html
+            session.sqlite
