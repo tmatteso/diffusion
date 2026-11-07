@@ -418,31 +418,18 @@ def _free_port() -> int:
         return cast(int, sock.getsockname()[1])
 
 
-def _all_reduce_mean_worker(
-    rank: int,
-    world_size: int,
-    port: int,
-    result_queue: "mp.Queue[float]",
-) -> None:
-    """Multiprocess worker for test_all_reduce_mean_averages_across_real_ranks.
-
-    Builds a LossMetrics whose every field equals this process's own rank
-    index, calls all_reduce_mean() inside a real gloo process group shared
-    with the other worker processes, and reports the resulting total_loss
-    back to the parent process so it can confirm every rank converged to
-    the same, correctly-computed global mean.
+def _rank_loss_metrics(
+    rank_value: Float[torch.Tensor, ""],
+) -> LossMetrics:
+    """Build a LossMetrics with every field set to the given value.
 
     Args:
-        rank: This process's rank.
-        world_size: Total number of ranks in the process group.
-        port: TCP port used for process-group rendezvous.
-        result_queue: Multiprocessing queue to report the post-reduce value.
+        rank_value: Scalar each field is cloned from.
+
+    Returns:
+        LossMetrics holding ``rank_value`` in every field.
     """
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = str(port)
-    dist.init_process_group(backend="gloo", rank=rank, world_size=world_size)
-    rank_value = torch.tensor(float(rank))
-    metrics = LossMetrics(
+    return LossMetrics(
         total_loss=rank_value.clone(),
         Kabsch_aligned_MSE_loss=rank_value.clone(),
         CE_loss=rank_value.clone(),
@@ -452,9 +439,6 @@ def _all_reduce_mean_worker(
         intermediate_loss=rank_value.clone(),
         RMSD=rank_value.clone(),
     )
-    metrics.all_reduce_mean()
-    result_queue.put(metrics.total_loss.item())
-    dist.destroy_process_group()
 
 
 def _start_and_collect(
@@ -477,75 +461,41 @@ def _start_and_collect(
     return [result_queue.get(timeout=60) for _ in range(world_size)]
 
 
-def test_all_reduce_mean_averages_across_real_ranks() -> None:
-    """all_reduce_mean() averages a field across genuinely separate processes.
-
-    Arrange: spawn WORLD_SIZE=3 real OS processes, each building a
-    LossMetrics with every field set to its own rank (0, 1, 2) -- so the
-    correct global mean is (0+1+2)/3 = 1.0, a value none of the three
-    ranks started with.
-    Act: each process calls all_reduce_mean() inside a real gloo process
-    group and reports its resulting total_loss back to this parent
-    process via a multiprocessing queue.
-    Assert: every rank's post-reduce total_loss equals 1.0 -- proving the
-    reduction actually communicated across process boundaries, which a
-    broken implementation (e.g. one that silently no-ops, or divides by
-    the wrong denominator) cannot fake, since each rank started with a
-    different value only real inter-process communication could unify.
-    """
-    world_size = 3
-    port = _free_port()
-    ctx = mp.get_context("spawn")
-    result_queue: "mp.Queue[float]" = ctx.Queue()
-    processes = [
-        ctx.Process(
-            target=_all_reduce_mean_worker,
-            args=(rank, world_size, port, result_queue),
-        )
-        for rank in range(world_size)
-    ]
-    try:
-        results = _start_and_collect(processes, result_queue, world_size)
-    finally:
-        for p in processes:
-            p.join(timeout=60)
-            if p.is_alive():
-                p.terminate()
-
-    expected_mean = sum(range(world_size)) / world_size
-    for result in results:
-        assert abs(result - expected_mean) < _ALL_REDUCE_TOLERANCE
-
-
 _PRIOR_COLLECTIVE_CALLS = 3
 
 
-def _multi_metric_all_reduce_worker(
+def _all_reduce_mean_worker(
     rank: int,
     world_size: int,
     port: int,
-    result_queue: "mp.Queue[tuple[float, float, float]]",
+    result_queue: "mp.Queue[tuple[float, float, float, float]]",
 ) -> None:
-    """Multiprocess worker: all_reduce_mean() after prior collective calls.
+    """Multiprocess worker for test_all_reduce_mean_averages_across_real_ranks.
 
-    Simulates the realistic DDP pattern where other collectives (e.g.
-    gradient all-reduces during backward) already exercised the process
-    group before any epoch-metrics reduction runs: performs a few generic
-    all_reduce calls on scratch tensors first, then builds a LossMetrics,
-    ThroughputStatistics, and ComponentNorms -- every field set to this
-    rank's own value -- and calls all_reduce_mean() on each in turn,
-    reporting one representative field per class back to the parent.
+    Reduces a LossMetrics on the fresh process group first. Then simulates
+    the realistic DDP pattern where other collectives (e.g. gradient
+    all-reduces during backward) already exercised the group before any
+    epoch-metrics reduction runs: performs a few generic all_reduce calls
+    on scratch tensors, then builds a LossMetrics, ThroughputStatistics,
+    and ComponentNorms -- every field set to this rank's own value -- and
+    calls all_reduce_mean() on each in turn. Reports one representative
+    field per reduction back to the parent.
 
     Args:
         rank: This process's rank.
         world_size: Total number of ranks in the process group.
         port: TCP port used for process-group rendezvous.
         result_queue: Multiprocessing queue to report the post-reduce
-            ``(total_loss, avg_batch_size, template_embedder)`` triple.
+            ``(fresh_group_total_loss, total_loss, avg_batch_size,
+            template_embedder)`` values.
     """
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(port)
     dist.init_process_group(backend="gloo", rank=rank, world_size=world_size)
+    rank_value = torch.tensor(float(rank))
+
+    fresh_group_metrics = _rank_loss_metrics(rank_value)
+    fresh_group_metrics.all_reduce_mean()
 
     for _ in range(_PRIOR_COLLECTIVE_CALLS):
         scratch = torch.tensor(float(rank))
@@ -554,17 +504,7 @@ def _multi_metric_all_reduce_worker(
             op=dist.ReduceOp.SUM,
         )
 
-    rank_value = torch.tensor(float(rank))
-    worker_loss_metrics = LossMetrics(
-        total_loss=rank_value.clone(),
-        Kabsch_aligned_MSE_loss=rank_value.clone(),
-        CE_loss=rank_value.clone(),
-        smooth_lddt_loss=rank_value.clone(),
-        res_distogram_loss=rank_value.clone(),
-        atom_distogram_loss=rank_value.clone(),
-        intermediate_loss=rank_value.clone(),
-        RMSD=rank_value.clone(),
-    )
+    worker_loss_metrics = _rank_loss_metrics(rank_value)
     worker_throughput_stats = ThroughputStatistics(
         avg_batch_size=rank_value.clone(),
         token_pack_rate=rank_value.clone(),
@@ -589,6 +529,7 @@ def _multi_metric_all_reduce_worker(
 
     result_queue.put(
         (
+            fresh_group_metrics.total_loss.item(),
             worker_loss_metrics.total_loss.item(),
             worker_throughput_stats.avg_batch_size.item(),
             worker_component_norms.template_embedder.item(),
@@ -597,34 +538,39 @@ def _multi_metric_all_reduce_worker(
     dist.destroy_process_group()
 
 
-def test_all_reduce_mean_after_prior_collective_calls() -> None:
-    """all_reduce_mean() works correctly after other collectives already ran.
+def test_all_reduce_mean_averages_across_real_ranks() -> None:
+    """all_reduce_mean() averages across genuinely separate processes.
 
-    Arrange: spawn WORLD_SIZE=3 real processes. Each rank first performs
-    several generic all_reduce calls on scratch tensors -- mimicking the
-    common DDP pattern where gradient synchronization (or other
-    collectives) already exercised the process group before any
-    epoch-metrics reduction runs -- then builds a LossMetrics,
-    ThroughputStatistics, and ComponentNorms, every field set to its own
-    rank value.
-    Act: each rank calls all_reduce_mean() on all three metric instances,
-    in the same order on every rank (collectives require every rank to
-    issue the same sequence of calls, or the process group hangs or
-    mismatches).
-    Assert: every rank converges to the correct global mean (1.0) for all
-    three metric types, proving prior collective traffic doesn't leave
-    the process group in a state that corrupts, hangs, or desynchronizes
-    subsequent all_reduce_mean() calls -- and that all_reduce_mean()
-    itself behaves identically on all three metric dataclasses, not just
-    LossMetrics.
+    Takes no fixtures and is not parametrized because every case shares one
+    process group: spawning real ranks re-imports torch in each, which takes
+    seconds, and the scenarios below are consecutive stages of one group's
+    life rather than independent inputs.
+
+    Arrange: spawn WORLD_SIZE=3 real OS processes. Each rank's metrics have
+    every field set to its own rank (0, 1, 2) -- so the correct global mean
+    is (0+1+2)/3 = 1.0, a value no rank started with.
+    Act: each rank calls all_reduce_mean() on a LossMetrics in the fresh
+    process group, then performs several generic all_reduce calls on scratch
+    tensors -- mimicking the common DDP pattern where gradient
+    synchronization already exercised the group before any epoch-metrics
+    reduction runs -- then calls all_reduce_mean() on a LossMetrics,
+    ThroughputStatistics, and ComponentNorms, in the same order on every
+    rank (collectives require every rank to issue the same sequence of
+    calls, or the process group hangs or mismatches).
+    Assert: every rank converges to 1.0 for all four reductions. This proves
+    the reduction really communicated across process boundaries, which a
+    broken implementation (one that silently no-ops, or divides by the wrong
+    denominator) cannot fake; that prior collective traffic doesn't corrupt,
+    hang, or desynchronize later reductions; and that all_reduce_mean()
+    behaves identically on all three metric dataclasses.
     """
     world_size = 3
     port = _free_port()
     ctx = mp.get_context("spawn")
-    result_queue: "mp.Queue[tuple[float, float, float]]" = ctx.Queue()
+    result_queue: "mp.Queue[tuple[float, float, float, float]]" = ctx.Queue()
     processes = [
         ctx.Process(
-            target=_multi_metric_all_reduce_worker,
+            target=_all_reduce_mean_worker,
             args=(rank, world_size, port, result_queue),
         )
         for rank in range(world_size)
@@ -638,7 +584,6 @@ def test_all_reduce_mean_after_prior_collective_calls() -> None:
                 p.terminate()
 
     expected_mean = sum(range(world_size)) / world_size
-    for loss_total, throughput_avg, norms_template in results:
-        assert abs(loss_total - expected_mean) < _ALL_REDUCE_TOLERANCE
-        assert abs(throughput_avg - expected_mean) < _ALL_REDUCE_TOLERANCE
-        assert abs(norms_template - expected_mean) < _ALL_REDUCE_TOLERANCE
+    for rank_results in results:
+        for result in rank_results:
+            assert abs(result - expected_mean) < _ALL_REDUCE_TOLERANCE
