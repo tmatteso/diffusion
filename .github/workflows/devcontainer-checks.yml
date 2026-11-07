@@ -52,7 +52,8 @@ jobs:
       # The container runs as root and writes into the bind-mounted checkout.
       # On a persistent runner those files outlive the job, and checkout (as
       # the runner user) can't delete them. Hand them back before checkout.
-      # Every other job needs this one, so it runs first on the runner.
+      # Jobs from other runs can land on the runner between ours, so every
+      # job does this, not just the first.
       - name: Reclaim root-owned workspace files
         if: inputs.cleanup-stale-container
         run: |
@@ -92,6 +93,12 @@ jobs:
     needs: static-checks
     runs-on: ${{ fromJson(inputs.runs-on) }}
     steps:
+      - name: Reclaim root-owned workspace files
+        if: inputs.cleanup-stale-container
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/w" alpine:3.20 \
+            chown -R "$(id -u):$(id -g)" /w
+
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
