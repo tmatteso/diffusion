@@ -21,6 +21,8 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+# hypothesis example database and caches
+.hypothesis/
 # pytest cache
 .pytest_cache/
 # ruff cache

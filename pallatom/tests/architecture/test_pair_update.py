@@ -6,6 +6,8 @@ DropoutColumnwise, and PairUpdate including output shapes, finite-value
 checks, gradient flow, dropout semantics, and SE(3) geometric invariance.
 """
 
+import math
+
 import pytest
 import torch
 from architecture.pair_update import (
@@ -21,6 +23,8 @@ from architecture.pair_update import (
 from beartype import beartype
 from einops import einsum, rearrange, reduce
 from helpers.useful_objects import manual_seed
+from hypothesis import given
+from hypothesis import strategies as st
 from jaxtyping import Float, TypeCheckError, jaxtyped
 
 _ = manual_seed(42)
@@ -31,6 +35,11 @@ N_HEADS = 4
 B = 2
 
 TOLERANCE = 1e-5
+_RBF = TransformRBF(ParamsForRBF()).eval()
+_RBF_INDICES = st.integers(0, ParamsForRBF().n_rbf - 1)
+_RBF_OFFSETS = st.floats(0.0, 3.0)
+_RBF_TOLERANCE = 1e-5
+
 # ---------------------------------------------------------------------------
 # Typed helpers
 # ---------------------------------------------------------------------------
@@ -775,3 +784,50 @@ def test_pair_update_forward_wrong_shape(
     z_bad = torch.zeros(B, N_RES, N_RES)  # missing c_pair dim
     with pytest.raises(TypeCheckError):
         _ = pair_update(z_bad, r_center)
+
+
+# ---------------------------------------------------------------------------
+# TransformRBF properties
+# ---------------------------------------------------------------------------
+
+
+def _rbf_at(distance: Float[torch.Tensor, ""]) -> Float[torch.Tensor, "n_rbf"]:
+    """Evaluate the default RBF basis at a single distance."""
+    return _RBF(rearrange(distance, " -> 1 1 1"))[0, 0, 0]
+
+
+@given(index=_RBF_INDICES)
+def test_transform_rbf_peaks_at_its_centre(index: int) -> None:
+    """A distance on a centre gives that basis function its maximum of 1."""
+    assert math.isclose(
+        _rbf_at(_RBF.centers[index])[index].item(),
+        1.0,
+        abs_tol=_RBF_TOLERANCE,
+    )
+
+
+@given(index=_RBF_INDICES, offset=_RBF_OFFSETS)
+def test_transform_rbf_is_symmetric_about_its_centre(
+    index: int,
+    offset: float,
+) -> None:
+    """Equal distances either side of a centre give equal values."""
+    centre = _RBF.centers[index]
+    above = _rbf_at(centre + offset)[index]
+    below = _rbf_at(centre - offset)[index]
+    assert math.isclose(above.item(), below.item(), abs_tol=_RBF_TOLERANCE)
+
+
+@given(index=_RBF_INDICES, near=_RBF_OFFSETS, far=_RBF_OFFSETS)
+def test_transform_rbf_decays_away_from_its_centre(
+    index: int,
+    near: float,
+    far: float,
+) -> None:
+    """Moving further from a centre never increases its value."""
+    centre = _RBF.centers[index]
+    closer, further = sorted((near, far))
+    near_value = _rbf_at(centre + closer)[index].item()
+    assert (
+        _rbf_at(centre + further)[index].item() <= near_value + _RBF_TOLERANCE
+    )
