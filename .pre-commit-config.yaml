@@ -109,6 +109,22 @@ repos:
         always_run: true
         stages: [pre-commit]
 
+      - id: enforce-test-fixtures
+        name: enforce a fixture in every test
+        entry: python scripts/check_test_quality.py --rule fixtures
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-commit]
+
+      - id: enforce-test-determinism
+        name: enforce concrete tensors over torch.rand* in tests
+        entry: python scripts/check_test_quality.py --rule random
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-commit]
+
   ### Dockerfile ###
   # - repo: https://github.com/hadolint/hadolint
   #   rev: v2.12.0
