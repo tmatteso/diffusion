@@ -6,6 +6,26 @@
 - Use **`pytest` fixtures** for all shared tensors and inputs. Prefer factory fixtures over hard coded data fixtures. Factory fixtures construct data fixtures from input arguments. Use indirect=True for `@pytest.mark.parametrize` to pass parameters directly from the test function to fixture factory. Data fixtures should return a single `torch.Tensor`, dataclass,  custom object. Avoid fixtures that return dicts, tuples, or other composite builtin types. Fixtures may depend on other fixtures via argument injection — prefer composing small fixtures over writing large monolithic ones.
 - Brainstorm with the Arrange-Act-Assert (AAA) Pattern: Always structure your thoughts using this triad to define exactly what you are testing: Arrange: Set up the exact state of the world, initial inputs, and necessary mocks.Act: Perform the specific function, method, or API call you are testing.Assert: Verify the exact outcome (return values, exceptions, or side effects).
 - Aggressively use the `@pytest.mark.parametrize` marker for tests. Instead of writing 10 different test functions for 10 different inputs, use the @pytest.mark.parametrize decorator to cover base cases, boundaries, and edge cases in a single, readable function. Add ids so failures to the parameterized tests tell a story.
+- Default to the combination of a **factory fixture** + a **companion enum** + a single `@pytest.mark.parametrize`-driven test function when a test covers several named scenarios. Give each scenario an enum member, passed with `indirect=True` to build the case, instead of branching on raw values (`if`/`elif`/`match`) inside the test body — branching per scenario is what drives up cyclomatic complexity and is exactly what this pattern avoids. When a scenario needs several pieces of data, bundle them into the enum member's value and expose each as a `@property` (e.g. `scenario.present_from`, `scenario.expect_distinct_pseudo_cb`) — the test reads attributes off the enum, it never compares enum identity to select behavior. See `test_protein_rejects_invalid_shapes` and its `InvalidProteinShape` enum for a worked example.
+- **Every parametrized case must fit on one line.** Never write a `pytest.param(` that spans multiple lines: Black explodes any case over 80 characters, one argument per line, which makes the case table hard to scan. A short case may stay as a one-line `pytest.param(..., id="...")`; otherwise it becomes a one-line enum member whose name is the id, and the `parametrize` call stays this small:
+
+  ```python
+  class InvalidProteinShape(enum.Enum):
+      mask_no_atom_axis = ("atom_mask", (N_RES,))
+      aatype_column_vector = ("aatype", (N_RES, 1))
+
+  @pytest.mark.parametrize(
+      "invalid_protein_factory",
+      list(InvalidProteinShape),
+      ids=[case.name for case in InvalidProteinShape],
+      indirect=True,
+  )
+  ```
+
+  - If a member does not fit in 80 characters, shorten its name and move the detail into the enum's `Members:` docstring section. Do not fall back to a multi-line case, a wrapper dataclass, or a dict of cases.
+  - Use lowercase member names, and give every member a distinct value: members with equal values silently become aliases and drop out of `list(...)`, which loses a test case without any error.
+  - Build `ids` with a list comprehension as above, not a lambda: basedpyright types the lambda's parameter as `Any`.
+  - When several tests share one factory, subclass a member-free base enum that exposes the factory's inputs, and give each test its own subclass holding that test's expectations. A small `indirect=True` fixture returns the member so the factory and the test read the same scenario. See `AtomTensorScenario`, its subclasses, and the `atom_scenario` fixture.
 - A great test suite is reliable and order-independent. Brainstorm potential hidden dependencies between your tests. If your tests rely on global states or network calls, design them to use monkeypatch to isolate environments securely.
 - Avoid Mocking as much as possible. Functional tests and integration tests are always superior to highly mocked unit tests.
 - Data Pipelines, deep learning models, file input and output, training and sampling scripts, all MUST have End to End tests to validate the entire workflow.
