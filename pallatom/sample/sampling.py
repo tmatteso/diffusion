@@ -23,6 +23,7 @@ from helpers.alignment import centre_random_augment, masked_com
 from helpers.atom_utils import (
     ATOM5_ELEMENTS,
     ATOM37_CA,
+    ATOM37_CB,
     Protein,
     atom5_to_atom37,
     atom37_to_atom5,
@@ -88,6 +89,30 @@ class TemplateContext:
 
 
 @jaxtyped(typechecker=beartype)
+@jaxtyped(typechecker=beartype)
+def backbone_cb_positions(
+    atom37_positions: Float[torch.Tensor, "B N_res 37 3"],
+    atom37_mask: Float[torch.Tensor, "B N_res 37"],
+) -> Float[torch.Tensor, "B N_res 3"]:
+    """Derive Cβ positions from the backbone, ignoring any CB coordinates.
+
+    Training data has no CB atoms, so the model's CB slot is unsupervised and
+    the training template always uses pseudo-Cβ. Sampling marks every atom as
+    present, so masking CB here keeps self-conditioning matched to training.
+
+    Args:
+        atom37_positions: Atom37 coordinates (B, N_res, 37, 3).
+        atom37_mask: Atom37 presence mask (B, N_res, 37).
+
+    Returns:
+        Pseudo-Cβ positions (B, N_res, 3).
+    """
+    backbone_mask = atom37_mask.clone()
+    backbone_mask[:, :, ATOM37_CB] = 0.0
+    cb_positions, _ = atom37_to_cb(atom37_positions, backbone_mask)
+    return cb_positions
+
+
 def build_aa_context(
     prot: Protein,
     atom_distogram_fn: Distogram,
@@ -690,8 +715,9 @@ class EDMSampler:
                     a=NATOM,
                 ).float(),
             )
-            cb_positions: Float[torch.Tensor, "B N_res 3"]
-            cb_positions, _ = atom37_to_cb(atom37_positions, atom37_mask)
+            cb_positions: Float[torch.Tensor, "B N_res 3"] = (
+                backbone_cb_positions(atom37_positions, atom37_mask)
+            )
             self_condition_residue_mask: Bool[torch.Tensor, "B N_res"] = (
                 self.context.f_pseudo_beta_mask.bool()
             )

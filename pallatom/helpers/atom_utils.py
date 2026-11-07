@@ -16,7 +16,7 @@ import numpy as np
 import numpy.typing as npt
 import torch
 from beartype import beartype
-from einops import rearrange, reduce
+from einops import rearrange
 from helpers.errors import (
     InvalidAAtypesError,
     NoAtomRecordsError,
@@ -66,15 +66,16 @@ ATOM5_ELEMENTS = torch.tensor(
 ATOM37_N: int = 0
 ATOM37_CA: int = 1
 ATOM37_C: int = 2
-ATOM37_CB: int = 4
-ATOM37_O: int = 3
+ATOM37_CB: int = 3
+ATOM37_O: int = 4
 
-# atom5 slot indices -- same as ATOM37.
-ATOM5_N: int = ATOM37_N
-ATOM5_CA: int = ATOM37_CA
-ATOM5_C: int = ATOM37_C
-ATOM5_CB: int = ATOM37_CB
-ATOM5_O: int = ATOM37_O
+# atom5 slot indices, ordered per ATOM5_NAMES. O and CB are in the opposite
+# order to atom37, so these are not interchangeable with the ATOM37 indices.
+ATOM5_N: int = 0
+ATOM5_CA: int = 1
+ATOM5_C: int = 2
+ATOM5_O: int = 3
+ATOM5_CB: int = 4
 
 # atom5 slot (index) -> atom37 slot (value), ordered per ATOM5_NAMES.
 ATOM5_TO_ATOM37: list[int] = [
@@ -979,7 +980,7 @@ def atom37_to_cb(
     a virtual Cβ from backbone geometry (Gly-safe), matching the AlphaFold2 /
     ESMFold convention exactly.
 
-    Use the standard ideal-geometry recipe:
+    Use the standard ideal-geometry recipe, on unnormalized bond vectors:
       b = C alpha - N        (N→C alpha bond vector)
       d = C  - C alpha       (C alpha→C  bond vector)
       Cross them, then combine with ideal tetrahedral offsets.
@@ -1001,24 +1002,10 @@ def atom37_to_cb(
     cb_present = atom37_mask[:, :, ATOM37_CB].bool()  # (B, N_res)
     b = ca - n
     d = c - ca
-    bc: Float[torch.Tensor, "... 3"] = b / (
-        torch.sqrt(reduce(b**2, "... d -> ... 1", "sum")) + 1e-8
-    )
-    dc: Float[torch.Tensor, "... 3"] = d / (
-        torch.sqrt(reduce(d**2, "... d -> ... 1", "sum")) + 1e-8
-    )
-    n_vec: Float[torch.Tensor, "... 3"] = torch.cross(bc, dc, dim=-1)
-    n_vec = n_vec / (
-        torch.sqrt(reduce(n_vec**2, "... d -> ... 1", "sum")) + 1e-8
-    )
+    n_vec: Float[torch.Tensor, "... 3"] = torch.cross(b, d, dim=-1)
 
-    # Ideal Cβ placement constants (Hs or N→C→C alpha geometry)
-    # values from Havel (1998) / AlphaFold2 supplementary
-    m = -0.58273431
-    s = 0.56802827
-    c_ = 0.54463904
-
-    p_cb = ca + m * n_vec + s * (bc + dc) + c_ * (bc - dc)
+    # Ideal Cβ placement constants from AlphaFold2 / ProteinMPNN.
+    p_cb = ca - 0.58273431 * n_vec + 0.56802827 * b - 0.54067466 * d
     cb = torch.where(rearrange(cb_present, "b n -> b n 1"), cb, p_cb)
 
     return cb, cb_present
