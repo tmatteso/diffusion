@@ -12,7 +12,16 @@ from architecture.main_trunk import PredictedOutputs
 from beartype import beartype
 from einops import rearrange, reduce
 from helpers.alignment import masked_com
-from helpers.atom_utils import RESTYPE_NUM_NO_X, Protein, restype_order
+from helpers.atom_utils import (
+    ATOM37_C,
+    ATOM37_CA,
+    ATOM37_CB,
+    ATOM37_N,
+    RESTYPE_NUM_NO_X,
+    Protein,
+    restype_order,
+    rigid_group_atom_positions,
+)
 from helpers.data import Distogram, FeaturizedBatch
 from helpers.useful_objects import manual_seed
 from jaxtyping import Bool, Float, TypeCheckError, jaxtyped
@@ -22,6 +31,7 @@ from sample.sampling import (
     AllAtomContext,
     EDMSampler,
     TemplateContext,
+    backbone_cb_positions,
     build_aa_context,
     build_sampling_context,
     build_template_context,
@@ -1617,3 +1627,70 @@ def test_template_context_wrong_shape() -> None:
             ),  # missing bins dim
             f_pseudo_beta_mask=torch.zeros(1, N_RES, dtype=torch.long),
         )
+
+
+@pytest.fixture
+def ideal_alanine_atoms() -> dict[str, tuple[float, float, float]]:
+    """Provide ideal alanine atom positions keyed by PDB atom name.
+
+    Returns:
+        A dict mapping atom name to its (x, y, z) position.
+    """
+    return {
+        atom_name: position
+        for atom_name, _, position in rigid_group_atom_positions["ALA"]
+    }
+
+
+@pytest.fixture
+def sampled_cb_slot_positions(
+    request: pytest.FixtureRequest,
+    ideal_alanine_atoms: dict[str, tuple[float, float, float]],
+) -> Float[torch.Tensor, "1 1 37 3"]:
+    """Build one ideal alanine with a chosen value in its CB slot.
+
+    Args:
+        request: Pytest fixture request whose ``.param`` attribute is the
+            value to place in the CB slot.
+        ideal_alanine_atoms: Ideal positions keyed by PDB atom name.
+
+    Returns:
+        Atom37 positions shaped like a sampled structure.
+    """
+    positions = torch.zeros(1, 1, 37, 3, dtype=torch.float32)
+    positions[0, 0, ATOM37_N] = torch.tensor(ideal_alanine_atoms["N"])
+    positions[0, 0, ATOM37_CA] = torch.tensor(ideal_alanine_atoms["CA"])
+    positions[0, 0, ATOM37_C] = torch.tensor(ideal_alanine_atoms["C"])
+    positions[0, 0, ATOM37_CB] = cast(float, request.param)
+    return positions
+
+
+@pytest.mark.parametrize(
+    "sampled_cb_slot_positions",
+    [
+        pytest.param(0.0, id="zero_cb_slot"),
+        pytest.param(99.0, id="far_cb_slot"),
+    ],
+    indirect=True,
+)
+def test_backbone_cb_positions_ignores_cb_slot(
+    sampled_cb_slot_positions: Float[torch.Tensor, "1 1 37 3"],
+    ideal_alanine_atoms: dict[str, tuple[float, float, float]],
+) -> None:
+    """Self-conditioning Cβ comes from the backbone, not the CB slot.
+
+    The model's CB slot is unsupervised and sampling marks every atom as
+    present, so whatever that slot holds must not reach the template.
+
+    Args:
+        sampled_cb_slot_positions: Ideal alanine with a chosen CB slot value.
+        ideal_alanine_atoms: Ideal positions, including the known CB.
+    """
+    expected_cb = torch.tensor(ideal_alanine_atoms["CB"])
+
+    cb_positions = backbone_cb_positions(
+        sampled_cb_slot_positions,
+        torch.ones(1, 1, 37),
+    )
+
+    assert torch.allclose(cb_positions, expected_cb, atol=0.01)
