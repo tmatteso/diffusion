@@ -1,30 +1,34 @@
 """Tests for data types, featurization utilities, and dataset / data loading.
 
-Covers FeaturizedItem and FeaturizedBatch shape contracts; Distogram shape,
-one-hot, masking, symmetry, and bin-assignment properties; featurize_batch
-output shapes and value contracts;
-sinusoidal_encoding and ref_pos_for_residue correctness; ProteinDataset
-length/indexing; and make_bucketed_data_loaders behaviour.
+Covers the jaxtyping contracts of FeaturizedItem and FeaturizedBatch; the
+Distogram's bin assignment, masking, symmetry and shape; the closed form of
+sinusoidal_encoding and ref_pos_for_residue's frame; featurize_single_item
+and featurize_batch outputs and index maps; FeaturizeCollate after a pickle
+round trip; ProteinDataset selection, padding, truncation and pickling;
+ProteinShardDataset metadata, caching and parsing; the ShardDataLoader
+lifecycle; make_bucketed_data_loaders end to end; and DatasetSplitsManifest
+parsing.
+
+Every synthetic protein has deterministic backbone coordinates, so no test
+depends on a random generator except through ``featurize``'s noise, which
+is seeded in its fixtures.
 """
 
 import dataclasses
-import functools
+import enum
 import json
 import math
 import pathlib
 import pickle
 from collections.abc import Callable, Mapping
 from concurrent.futures import Executor
-from typing import cast
+from typing import Protocol, cast
 
 import numpy as np
-import numpy.typing as npt
 import pytest
 import torch
-import torch.nn as nn
-from architecture.main_trunk import EMA, MainTrunk
 from einops import rearrange, reduce, repeat
-from helpers.atom_utils import RESTYPE_NUM_NO_X, Protein, restype_order
+from helpers.atom_utils import ATOMS_PER_RES, Protein, restype_order
 from helpers.data import (
     DatasetSplitsManifest,
     Distogram,
@@ -43,1520 +47,384 @@ from helpers.data import (
     ref_pos_for_residue,
     sinusoidal_encoding,
 )
-from helpers.useful_objects import ModelSetup, manual_seed
-from jaxtyping import Bool, Float, TypeCheckError
-from torch.optim import Adam
-from torch.optim.lr_scheduler import LambdaLR
-from train.train_config import (
-    LoaderConfig as EvalLoaderConfig,
-)
-from train.train_config import (
-    TrainArgs,
-    TrainConfig,
-    TrainLoaderConfig,
-)
-from train.train_loop import alphafold_lr_lambda
+from helpers.useful_objects import manual_seed
+from jaxtyping import TypeCheckError
+from tests.conftest import PatternFactory
+from train.train_config import LoaderConfig as EvalLoaderConfig
+from train.train_config import TrainArgs, TrainConfig, TrainLoaderConfig
 
-# ---------------------------------------------------------------------------
-# test_batch_types block — FeaturizedItem and FeaturizedBatch shape contracts
-# ---------------------------------------------------------------------------
-
-BT_B = 2
-BT_N_RES = 8
-BT_N_ATOM = BT_N_RES * 5
-BT_N_TEMPL_BINS = 38
-BT_C_RES = 32
-BT_K = 16
+type Entry = dict[str, object]
+type EntryFactory = Callable[[str, int], Entry]
+type JsonlWriter = Callable[[pathlib.Path, list[Entry]], pathlib.Path]
+type ShardFactory = Callable[[list[str], list[int]], ProteinShardDataset]
 
 
-# ---------------------------------------------------------------------------
-# Protein batch — fixtures
-# ---------------------------------------------------------------------------
+class ArgsFactory(Protocol):
+    """Builds TrainArgs over a fresh dataset of ``n`` proteins."""
+
+    def __call__(self, n: int, *, debug_run: bool) -> TrainArgs:
+        """Write the dataset and return arguments pointing at it.
+
+        Args:
+            n: Number of proteins.
+            debug_run: Value of ``TrainArgs.debug_run``.
+
+        Returns:
+            Arguments pointing at the new dataset.
+        """
+        ...  # pylint: disable=unnecessary-ellipsis
 
 
-def make_protein() -> Protein:
-    """Construct a single Protein with BT_N_RES=8 residues.
+@dataclasses.dataclass(frozen=True)
+class Distograms:
+    """The three distogram modules featurization takes.
 
-    Returns:
-        A Protein with randomly-initialised atom_positions and all-ones masks.
+    Attributes:
+        template: Self-conditioning template distogram.
+        residue: Residue-level ground-truth distogram.
+        atom: Sparse atom-level distogram.
     """
-    return Protein(
-        atom_positions=np.random.default_rng().standard_normal(
-            (BT_N_RES, 37, 3),
-        ),
-        aatype=np.zeros(BT_N_RES, dtype=np.intp),
-        atom_mask=np.ones((BT_N_RES, 37), dtype=np.float64),
-        residue_index=np.arange(BT_N_RES, dtype=np.intp),
-        chain_index=np.zeros(BT_N_RES, dtype=np.intp),
-        b_factors=np.zeros((BT_N_RES, 37), dtype=np.float64),
-    )
+
+    template: Distogram
+    residue: Distogram
+    atom: Distogram
 
 
-@pytest.fixture
-def protein_batch_raw() -> list[Protein]:
-    """Provide BT_B=2 valid Protein objects, each with BT_N_RES=8 residues.
+@dataclasses.dataclass(frozen=True)
+class FieldBreak:
+    """A featurized field replaced by a tensor with one axis wrong.
 
-    Returns:
-        A list of BT_B fully-constructed Protein instances.
+    Attributes:
+        field: Name of the dataclass field to replace.
+        malform: Maps the valid tensor to the malformed one.
     """
-    return [make_protein() for _ in range(BT_B)]
+
+    field: str
+    malform: Callable[[torch.Tensor], torch.Tensor]
 
 
-# ---------------------------------------------------------------------------
-# Protein batch — valid construction
-# ---------------------------------------------------------------------------
+class ItemBreak(enum.Enum):
+    """FeaturizedItem fields whose shape contract a replacement breaks.
 
-
-def test_protein_batch_constructs(protein_batch_raw: list[Protein]) -> None:
-    """list[Protein] has BT_B items with the correct types and array shapes.
-
-    Verifies that the fixture produces a list of BT_B Protein instances and that
-    each instance carries atom_positions (BT_N_RES, 37, 3), atom_mask
-    (BT_N_RES, 37), residue_index (BT_N_RES,), and aatype (BT_N_RES,) arrays
-    of the expected shape.
+    Members:
+        coords_flat: ``r_gt`` loses its xyz axis.
+        coords_four: ``r_gt`` gains a fourth coordinate.
+        element_width: ``ref_element`` has 3 element classes, not 4.
+        atom_count_drift: ``atom5_mask`` has one atom more than ``r_gt``.
+        residue_count_drift: ``aa_indices`` has one residue fewer.
     """
-    assert len(protein_batch_raw) == BT_B
-    for protein in protein_batch_raw:
-        assert isinstance(protein, Protein)
-        assert protein.atom_positions.shape == (BT_N_RES, 37, 3)
-        assert protein.atom_mask.shape == (BT_N_RES, 37)
-        assert protein.residue_index.shape == (BT_N_RES,)
-        assert protein.aatype.shape == (BT_N_RES,)
+
+    coords_flat = FieldBreak("r_gt", lambda t: t[:, 0])
+    coords_four = FieldBreak("r_gt", lambda t: torch.cat([t, t[:, :1]], -1))
+    element_width = FieldBreak("ref_element", lambda t: t[:, :3])
+    atom_count_drift = FieldBreak("atom5_mask", lambda t: torch.cat([t, t[:1]]))
+    residue_count_drift = FieldBreak("aa_indices", lambda t: t[1:])
 
 
-# ---------------------------------------------------------------------------
-# Protein batch — shape enforcement
-# ---------------------------------------------------------------------------
+class BatchBreak(enum.Enum):
+    """FeaturizedBatch fields whose shape contract a replacement breaks.
 
-
-def test_protein_rejects_2d_atom_positions() -> None:
-    """Protein raises when atom_positions is 2-D (missing the per-atom dim).
-
-    Verifies that passing an array of shape (BT_N_RES, 3) instead of
-    (BT_N_RES, 37, 3) triggers a shape-contract violation.
+    Members:
+        unbatched_ref_pos: ``ref_pos`` loses its batch axis.
+        coords_four: ``r_gt`` gains a fourth coordinate.
+        batch_drift: ``t_hat`` has one batch item fewer.
     """
-    with pytest.raises((TypeCheckError, Exception)):
-        _ = Protein(
-            atom_positions=np.random.default_rng().standard_normal(
-                (BT_N_RES, 3),
-            ),
-            aatype=np.zeros(BT_N_RES, dtype=np.intp),
-            atom_mask=np.ones((BT_N_RES, 37), dtype=np.float64),
-            residue_index=np.arange(BT_N_RES, dtype=np.intp),
-            chain_index=np.zeros(BT_N_RES, dtype=np.intp),
-            b_factors=np.zeros((BT_N_RES, 37), dtype=np.float64),
-        )
+
+    unbatched_ref_pos = FieldBreak("ref_pos", lambda t: t[0])
+    coords_four = FieldBreak("r_gt", lambda t: torch.cat([t, t[..., :1]], -1))
+    batch_drift = FieldBreak("t_hat", lambda t: t[1:])
 
 
-def test_protein_rejects_mismatched_atom_count() -> None:
-    """Error raised when atom_positions, atom_mask have different atom counts.
+@dataclasses.dataclass(frozen=True)
+class BinCase:
+    """A pair distance and where a 16-bin, 2-22 angstrom Distogram puts it.
 
-    Verifies that passing atom_positions of shape (BT_N_RES, 36, 3) while
-    atom_mask has shape (BT_N_RES, 37) triggers a shape-contract violation
-    because the symbolic num_atom_type dimension must be consistent across
-    fields.
+    Bin edges are ``2 + 1.25 k``; a distance lands in the first bin whose
+    upper edge it does not exceed.
+
+    Attributes:
+        distance: Distance between the two atoms, in angstroms.
+        expected_bin: Index of the one-hot bin.
+        overflow: Whether the Distogram has an overflow bin.
+        valid: Whether the pair mask keeps the pair.
     """
-    with pytest.raises((TypeCheckError, Exception)):
-        _ = Protein(
-            atom_positions=np.random.default_rng().standard_normal(
-                (BT_N_RES, 36, 3),
-            ),
-            aatype=np.zeros(BT_N_RES, dtype=np.intp),
-            atom_mask=np.ones((BT_N_RES, 37), dtype=np.float64),
-            residue_index=np.arange(BT_N_RES, dtype=np.intp),
-            chain_index=np.zeros(BT_N_RES, dtype=np.intp),
-            b_factors=np.zeros((BT_N_RES, 37), dtype=np.float64),
-        )
+
+    distance: float
+    expected_bin: int
+    overflow: bool
+    valid: bool
 
 
-# ---------------------------------------------------------------------------
-# FeaturizedItem — fixtures
-# ---------------------------------------------------------------------------
+class BinScenario(enum.Enum):
+    """Distances across the bin range, with and without an overflow bin.
 
-
-@pytest.fixture
-def featurized_item_raw() -> FeaturizedItem:
-    """Provide a valid FeaturizedItem with BT_N_RES=8, BT_N_ATOM=40.
-
-    Returns:
-        A fully-constructed FeaturizedItem using tensors of the correct shapes.
+    Members:
+        coincident: 0 angstroms falls below the first edge, into bin 0.
+        interior: 9 angstroms: ``(9 - 2) / 1.25 = 5.6``, so bin 5.
+        top_edge: 22 angstroms is the last edge, so bin 15, still valid.
+        far_overflow: 1000 angstroms goes to overflow bin 16 and stays valid.
+        far_clipped: Without overflow, 1000 angstroms is clipped to bin 15
+            and masked out.
     """
-    return FeaturizedItem(
-        r_gt=torch.randn(BT_N_ATOM, 3),
-        r_gt_noised=torch.randn(BT_N_ATOM, 3),
-        atom5_mask=torch.ones(BT_N_ATOM, dtype=torch.bool),
-        f_pseudo_beta_mask=torch.zeros(BT_N_RES, dtype=torch.long),
-        gt_res_distogram_indices=torch.zeros(
-            BT_N_RES,
-            BT_N_RES,
-            dtype=torch.long,
-        ),
-        noised_res_distogram=torch.zeros(
-            BT_N_RES,
-            BT_N_RES,
-            BT_N_TEMPL_BINS,
-        ),
-        aa_indices=torch.zeros(BT_N_RES, dtype=torch.long),
-        ref_pos=torch.randn(BT_N_ATOM, 3),
-        ref_element=torch.zeros(BT_N_ATOM, 4),
-        f_residue_idx=torch.arange(BT_N_RES, dtype=torch.long),
-        t_hat=torch.randn([]),
-        t_normalized=torch.randn(BT_N_RES, BT_N_RES),
-        ref_space_uid=torch.arange(
-            BT_N_RES,
-            dtype=torch.long,
-        ).repeat_interleave(5),
-        tok_idx=torch.arange(BT_N_RES, dtype=torch.long).repeat_interleave(5),
-        center_uid=(
-            torch.arange(BT_N_RES, dtype=torch.long) * 5 + 1
-        ).repeat_interleave(5),
-        gt_atom_distogram_sparse=torch.zeros(BT_N_ATOM, BT_K, dtype=torch.long),
-        gt_atom_distogram_mask_sparse=torch.ones(
-            BT_N_ATOM,
-            BT_K,
-            dtype=torch.bool,
-        ),
-    )
 
-
-# ---------------------------------------------------------------------------
-# FeaturizedItem — valid construction
-# ---------------------------------------------------------------------------
-
-
-def test_featurized_item_constructs(
-    featurized_item_raw: FeaturizedItem,
-) -> None:
-    """FeaturizedItem constructed successfully with correct types and shapes.
-
-    Verifies that the fixture produces a FeaturizedItem instance and that key
-    tensors retain expected shapes: r_gt (BT_N_ATOM, 3), atom5_mask
-    (BT_N_ATOM,), gt_res_distogram_indices (BT_N_RES, BT_N_RES),
-    ref_pos (BT_N_ATOM, 3), ref_element (BT_N_ATOM, 4), and f_residue_idx
-    (BT_N_RES,).
-    """
-    assert isinstance(featurized_item_raw, FeaturizedItem)
-    assert featurized_item_raw.r_gt.shape == (BT_N_ATOM, 3)
-    assert featurized_item_raw.atom5_mask.shape == (BT_N_ATOM,)
-    assert featurized_item_raw.gt_res_distogram_indices.shape == (
-        BT_N_RES,
-        BT_N_RES,
-    )
-    assert featurized_item_raw.ref_pos.shape == (BT_N_ATOM, 3)
-    assert featurized_item_raw.ref_element.shape == (BT_N_ATOM, 4)
-    assert featurized_item_raw.f_residue_idx.shape == (BT_N_RES,)
-
-
-# ---------------------------------------------------------------------------
-# FeaturizedItem — shape enforcement
-# ---------------------------------------------------------------------------
-
-
-def test_featurized_item_rejects_1d_r_gt() -> None:
-    """FeaturizedItem raises when r_gt is 1-D instead of (BT_N_ATOM, 3).
-
-    Verifies that passing a tensor of shape (BT_N_ATOM,) instead of
-    (BT_N_ATOM, 3) triggers a shape-contract violation.
-    """
-    with pytest.raises((TypeCheckError, Exception)):
-        _ = FeaturizedItem(
-            r_gt=torch.randn(BT_N_ATOM),
-            r_gt_noised=torch.randn(BT_N_ATOM, 3),
-            atom5_mask=torch.ones(BT_N_ATOM, dtype=torch.bool),
-            f_pseudo_beta_mask=torch.zeros(BT_N_RES, dtype=torch.long),
-            gt_res_distogram_indices=torch.zeros(
-                BT_N_RES,
-                BT_N_RES,
-                dtype=torch.long,
-            ),
-            noised_res_distogram=torch.zeros(
-                BT_N_RES,
-                BT_N_RES,
-                BT_N_TEMPL_BINS,
-            ),
-            aa_indices=torch.zeros(BT_N_RES, dtype=torch.long),
-            ref_pos=torch.randn(BT_N_ATOM, 3),
-            ref_element=torch.zeros(BT_N_ATOM, 4),
-            f_residue_idx=torch.arange(BT_N_RES, dtype=torch.long),
-            t_hat=torch.randn([]),
-            t_normalized=torch.randn(BT_N_RES, BT_N_RES),
-            ref_space_uid=torch.zeros(BT_N_ATOM, dtype=torch.long),
-            tok_idx=torch.zeros(BT_N_ATOM, dtype=torch.long),
-            center_uid=torch.zeros(BT_N_ATOM, dtype=torch.long),
-            gt_atom_distogram_sparse=torch.zeros(
-                BT_N_ATOM,
-                BT_K,
-                dtype=torch.long,
-            ),
-            gt_atom_distogram_mask_sparse=torch.zeros(
-                BT_N_ATOM,
-                BT_K,
-                dtype=torch.bool,
-            ),
-        )
-
-
-def test_featurized_item_rejects_wrong_ref_element_dim() -> None:
-    """FeaturizedItem raises when ref_element last dim is 3 instead of 4.
-
-    Verifies that passing a tensor of shape (BT_N_ATOM, 3) instead of
-    (BT_N_ATOM, 4) triggers a shape-contract violation because exactly four
-    element classes are required.
-    """
-    with pytest.raises((TypeCheckError, Exception)):
-        _ = FeaturizedItem(
-            r_gt=torch.randn(BT_N_ATOM, 3),
-            r_gt_noised=torch.randn(BT_N_ATOM, 3),
-            atom5_mask=torch.ones(BT_N_ATOM, dtype=torch.bool),
-            f_pseudo_beta_mask=torch.zeros(BT_N_RES, dtype=torch.long),
-            gt_res_distogram_indices=torch.zeros(
-                BT_N_RES,
-                BT_N_RES,
-                dtype=torch.long,
-            ),
-            noised_res_distogram=torch.zeros(
-                BT_N_RES,
-                BT_N_RES,
-                BT_N_TEMPL_BINS,
-            ),
-            aa_indices=torch.zeros(BT_N_RES, dtype=torch.long),
-            ref_pos=torch.randn(BT_N_ATOM, 3),
-            ref_element=torch.zeros(BT_N_ATOM, 3),
-            f_residue_idx=torch.arange(BT_N_RES, dtype=torch.long),
-            t_hat=torch.randn([]),
-            t_normalized=torch.randn(BT_N_RES, BT_N_RES),
-            ref_space_uid=torch.zeros(BT_N_ATOM, dtype=torch.long),
-            tok_idx=torch.zeros(BT_N_ATOM, dtype=torch.long),
-            center_uid=torch.zeros(BT_N_ATOM, dtype=torch.long),
-            gt_atom_distogram_sparse=torch.zeros(
-                BT_N_ATOM,
-                BT_K,
-                dtype=torch.long,
-            ),
-            gt_atom_distogram_mask_sparse=torch.zeros(
-                BT_N_ATOM,
-                BT_K,
-                dtype=torch.bool,
-            ),
-        )
-
-
-# ---------------------------------------------------------------------------
-# FeaturizedBatch — fixtures
-# ---------------------------------------------------------------------------
-
-
-@pytest.fixture
-def featurized_batch_raw() -> FeaturizedBatch:
-    """Provide a valid FeaturizedBatch with BT_B=2, BT_N_RES=8, BT_N_ATOM=40.
-
-    Returns:
-        A fully-constructed FeaturizedBatch using tensors of the correct shapes.
-    """
-    return FeaturizedBatch(
-        ref_pos=torch.randn(BT_B, BT_N_ATOM, 3),
-        ref_element=torch.zeros(BT_B, BT_N_ATOM, 4),
-        ref_space_uid=torch.zeros(BT_B, BT_N_ATOM, dtype=torch.long),
-        gt_res_distogram_indices=torch.zeros(
-            BT_B,
-            BT_N_RES,
-            BT_N_RES,
-            dtype=torch.long,
-        ),
-        noised_res_distogram=torch.zeros(
-            BT_B,
-            BT_N_RES,
-            BT_N_RES,
-            BT_N_TEMPL_BINS,
-        ),
-        f_pseudo_beta_mask=torch.zeros(BT_B, BT_N_RES, dtype=torch.long),
-        f_residue_idx=repeat(
-            torch.arange(BT_N_RES, dtype=torch.long),
-            "n -> b n",
-            b=BT_B,
-        ),
-        r_gt=torch.randn(BT_B, BT_N_ATOM, 3),
-        r_gt_noised=torch.randn(BT_B, BT_N_ATOM, 3),
-        atom5_mask=torch.ones(BT_B, BT_N_ATOM, dtype=torch.bool),
-        aa_indices=torch.zeros(BT_B, BT_N_RES, dtype=torch.long),
-        t_hat=torch.randn(BT_B),
-        t_normalized=torch.rand(BT_B, BT_N_RES, BT_N_RES),
-        tok_idx=torch.zeros(BT_B, BT_N_ATOM, dtype=torch.long),
-        center_uid=torch.zeros(BT_B, BT_N_ATOM, dtype=torch.long),
-        gt_atom_distogram_sparse=torch.zeros(
-            BT_B,
-            BT_N_ATOM,
-            BT_K,
-            dtype=torch.long,
-        ),
-        gt_atom_distogram_mask_sparse=torch.ones(
-            BT_B,
-            BT_N_ATOM,
-            BT_K,
-            dtype=torch.bool,
-        ),
-    )
-
-
-# ---------------------------------------------------------------------------
-# FeaturizedBatch — valid construction
-# ---------------------------------------------------------------------------
-
-
-def test_featurized_batch_valid_construction(
-    featurized_batch_raw: FeaturizedBatch,
-) -> None:
-    """FeaturizedBatch constructed successfully with correct shapes.
-
-    Verifies instance type, key tensor shapes, floating-point dtype of t_hat,
-    and that t_normalized values lie within the closed unit interval [0, 1].
-
-    Args:
-        featurized_batch_raw: A valid FeaturizedBatch fixture.
-    """
-    assert featurized_batch_raw.ref_pos.shape == (BT_B, BT_N_ATOM, 3)
-    assert featurized_batch_raw.ref_element.shape == (BT_B, BT_N_ATOM, 4)
-    assert featurized_batch_raw.gt_res_distogram_indices.shape == (
-        BT_B,
-        BT_N_RES,
-        BT_N_RES,
-    )
-    assert featurized_batch_raw.f_residue_idx.shape == (BT_B, BT_N_RES)
-    assert featurized_batch_raw.atom5_mask.shape == (BT_B, BT_N_ATOM)
-    assert featurized_batch_raw.gt_atom_distogram_sparse.shape == (
-        BT_B,
-        BT_N_ATOM,
-        BT_K,
-    )
-    assert featurized_batch_raw.t_hat.is_floating_point()
-    assert featurized_batch_raw.t_normalized.min() >= 0.0
-    assert featurized_batch_raw.t_normalized.max() <= 1.0
-
-
-# ---------------------------------------------------------------------------
-# FeaturizedBatch — shape enforcement
-# ---------------------------------------------------------------------------
-
-
-def test_featurized_batch_rejects_unbatched_ref_pos() -> None:
-    """FeaturizedBatch raises error when ref_pos missing the batch dimension.
-
-    Verifies that passing tensor of shape (BT_N_ATOM, 3) instead of
-    (BT_B, BT_N_ATOM, 3) triggers a shape-contract violation.
-    """
-    with pytest.raises((TypeCheckError, Exception)):
-        _ = FeaturizedBatch(
-            ref_pos=torch.randn(BT_N_ATOM, 3),
-            ref_element=torch.zeros(BT_B, BT_N_ATOM, 4),
-            ref_space_uid=torch.zeros(BT_B, BT_N_ATOM, dtype=torch.long),
-            gt_res_distogram_indices=torch.zeros(
-                BT_B,
-                BT_N_RES,
-                BT_N_RES,
-                dtype=torch.long,
-            ),
-            noised_res_distogram=torch.zeros(
-                BT_B,
-                BT_N_RES,
-                BT_N_RES,
-                BT_N_TEMPL_BINS,
-            ),
-            f_pseudo_beta_mask=torch.zeros(BT_B, BT_N_RES, dtype=torch.long),
-            f_residue_idx=torch.randn(BT_B, BT_N_RES, BT_C_RES),
-            r_gt=torch.randn(BT_B, BT_N_ATOM, 3),
-            r_gt_noised=torch.randn(BT_B, BT_N_ATOM, 3),
-            atom5_mask=torch.ones(BT_B, BT_N_ATOM, dtype=torch.bool),
-            aa_indices=torch.zeros(BT_B, BT_N_RES, dtype=torch.long),
-            t_hat=torch.randn(BT_B),
-            t_normalized=torch.randn(BT_B, BT_N_RES, BT_N_RES),
-            tok_idx=torch.zeros(BT_B, BT_N_ATOM, dtype=torch.long),
-            center_uid=torch.zeros(BT_B, BT_N_ATOM, dtype=torch.long),
-            gt_atom_distogram_sparse=torch.zeros(
-                BT_B,
-                BT_N_ATOM,
-                BT_K,
-                dtype=torch.long,
-            ),
-            gt_atom_distogram_mask_sparse=torch.ones(
-                BT_B,
-                BT_N_ATOM,
-                BT_K,
-                dtype=torch.bool,
-            ),
-        )
-
-
-def test_featurized_batch_rejects_wrong_coords_dim() -> None:
-    """FeaturizedBatch raises when r_gt last dim is 4 instead of 3.
-
-    Verifies that passing an r_gt tensor of shape (BT_B, BT_N_ATOM, 4) instead
-    of (BT_B, BT_N_ATOM, 3) triggers a shape-contract violation.
-    """
-    with pytest.raises((TypeCheckError, Exception)):
-        _ = FeaturizedBatch(
-            ref_pos=torch.randn(BT_B, BT_N_ATOM, 3),
-            ref_element=torch.zeros(BT_B, BT_N_ATOM, 4),
-            ref_space_uid=torch.zeros(BT_B, BT_N_ATOM, dtype=torch.long),
-            gt_res_distogram_indices=torch.zeros(
-                BT_B,
-                BT_N_RES,
-                BT_N_RES,
-                dtype=torch.long,
-            ),
-            noised_res_distogram=torch.zeros(
-                BT_B,
-                BT_N_RES,
-                BT_N_RES,
-                BT_N_TEMPL_BINS,
-            ),
-            f_pseudo_beta_mask=torch.zeros(BT_B, BT_N_RES, dtype=torch.long),
-            f_residue_idx=torch.randn(BT_B, BT_N_RES, BT_C_RES),
-            r_gt=torch.randn(BT_B, BT_N_ATOM, 4),
-            r_gt_noised=torch.randn(BT_B, BT_N_ATOM, 3),
-            atom5_mask=torch.ones(BT_B, BT_N_ATOM, dtype=torch.bool),
-            aa_indices=torch.zeros(BT_B, BT_N_RES, dtype=torch.long),
-            t_hat=torch.randn(BT_B),
-            t_normalized=torch.randn(BT_B, BT_N_RES, BT_N_RES),
-            tok_idx=torch.zeros(BT_B, BT_N_ATOM, dtype=torch.long),
-            center_uid=torch.zeros(BT_B, BT_N_ATOM, dtype=torch.long),
-            gt_atom_distogram_sparse=torch.zeros(
-                BT_B,
-                BT_N_ATOM,
-                BT_K,
-                dtype=torch.long,
-            ),
-            gt_atom_distogram_mask_sparse=torch.ones(
-                BT_B,
-                BT_N_ATOM,
-                BT_K,
-                dtype=torch.bool,
-            ),
-        )
-
-
-# ---------------------------------------------------------------------------
-# FeaturizedBatch — pin_memory
-# ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
-# test_featurize block — Distogram, featurize_batch, and related utilities
-# ---------------------------------------------------------------------------
-
-_ = manual_seed(42)
-
-FZ_B = 2
-N_RES = 12
-N_BINS = 16
-C_RES = 32
-MIN_DIST = 2.0
-MAX_DIST = 22.0
-AA_SEQ = "ACDEFGHIKLMN"  # length N_RES
-TOLERANCE = 1e-6
-X_TOKEN = RESTYPE_NUM_NO_X
-
-# ---------------------------------------------------------------------------
-# restype order and count — X as mask token
-# ---------------------------------------------------------------------------
-
-
-def test_restype_order_x_is_20() -> None:
-    """Mask token 'X' is assigned index 20, one past the 20 canon amino acids.
-
-    Verifies that the mask/unknown token always occupies a fixed slot distinct
-    from the 20 canonical residue indices so downstream one-hot encodings are
-    consistent.
-    """
-    assert restype_order["X"] == X_TOKEN
-
-
-# ---------------------------------------------------------------------------
-# Fixtures — models
-# ---------------------------------------------------------------------------
-
-
-@pytest.fixture
-def disto() -> Distogram:
-    """Provide a Distogram without overflow bin in eval mode.
-
-    Uses N_BINS bins spanning [MIN_DIST, MAX_DIST]; pairs beyond max_dist are
-    masked rather than captured in an overflow bin.
-    """
-    return Distogram(
-        n_bins=N_BINS,
-        overflow_bin=False,
-        min_dist=MIN_DIST,
-        max_dist=MAX_DIST,
-    ).eval()
-
-
-@pytest.fixture
-def disto_overflow() -> Distogram:
-    """Provide a Distogram with overflow bin in eval mode.
-
-    Uses N_BINS bins spanning [MIN_DIST, MAX_DIST] plus one extra overflow bin
-    that captures pairs beyond max_dist; the pair mask is never gated by
-    distance.
-    """
-    return Distogram(
-        n_bins=N_BINS,
-        min_dist=MIN_DIST,
-        max_dist=MAX_DIST,
-        overflow_bin=True,
-    ).eval()
-
-
-# ---------------------------------------------------------------------------
-# Fixtures — tensors
-# ---------------------------------------------------------------------------
-
-
-@pytest.fixture
-def coords() -> Float[torch.Tensor, "N_res 3"]:
-    """Provide random single-chain coordinates (N_RES, 3).
-
-    Drawn from a standard normal distribution; used as representative
-    real-valued residue positions for Distogram forward-pass tests.
-    """
-    return torch.randn(N_RES, 3)
-
-
-@pytest.fixture
-def coords_batch() -> Float[torch.Tensor, "B N_res 3"]:
-    """Provide random batched coordinates (2, N_RES, 3).
-
-    Drawn from a standard normal distribution; shaped for tests that require a
-    leading batch dimension.
-    """
-    return torch.randn(2, N_RES, 3)
-
-
-@pytest.fixture
-def mask() -> Bool[torch.Tensor, "N_res"]:
-    """Provide an all-True residue mask (N_RES,).
-
-    Indicates that every residue slot is valid; used as a baseline mask fixture
-    before individual tests override specific entries.
-    """
-    return torch.ones(N_RES, dtype=torch.bool)
-
-
-# ---------------------------------------------------------------------------
-# Distogram — overflow bin shape
-# ---------------------------------------------------------------------------
-
-
-def test_distogram_overflow_bin_output_shape(
-    disto_overflow: Distogram,
-    coords: Float[torch.Tensor, "N_res 3"],
-) -> None:
-    """Distogram with overflow bin outputs shape (N_RES, N_RES, N_BINS + 1).
-
-    Verifies that enabling overflow_bin appends exactly one extra bin to the
-    last dimension, giving N_BINS + 1 total bins.
-    """
-    with torch.no_grad():
-        f, _ = disto_overflow(coords)
-    assert f.shape == (N_RES, N_RES, N_BINS + 1)
-
-
-# ---------------------------------------------------------------------------
-# Distogram — one-hot property
-# ---------------------------------------------------------------------------
-
-
-def test_distogram_one_hot_sums_to_one(
-    disto: Distogram,
-    coords: Float[torch.Tensor, "N_res 3"],
-) -> None:
-    """Distogram bin probabilities sum to 1 for every residue pair.
-
-    Verifies that the soft-one-hot output from the standard (no-overflow)
-    Distogram is a valid probability distribution over bins for each (i, j)
-    pair.
-    """
-    with torch.no_grad():
-        f, _ = disto(coords)
-    bin_sums = reduce(f, "i j b -> i j", "sum")
-    assert torch.allclose(bin_sums, torch.ones_like(bin_sums))
-
-
-def test_distogram_overflow_one_hot_sums_to_one(
-    disto_overflow: Distogram,
-    coords: Float[torch.Tensor, "N_res 3"],
-) -> None:
-    """Overflow-bin Distogram probabilities also sum to 1 for every pair.
-
-    Verifies that adding overflow bin does not break the one-hot normalization
-    property — the N_BINS + 1 bin outputs still form a valid probability
-    distribution.
-    """
-    with torch.no_grad():
-        f, _ = disto_overflow(coords)
-    bin_sums = reduce(f, "i j b -> i j", "sum")
-    assert torch.allclose(bin_sums, torch.ones_like(bin_sums))
-
-
-# ---------------------------------------------------------------------------
-# Distogram — pair mask
-# ---------------------------------------------------------------------------
-
-
-def test_distogram_mask_none_gives_all_true_within_range(
-    disto: Distogram,
-) -> None:
-    """Without a mask, every residue pair within max_dist is unmasked.
-
-    Verifies the default behaviour when no coords_mask is supplied: all pairs
-    whose distance is below max_dist should appear as True in the returned mask.
-    """
-    c = torch.zeros(N_RES, 3)
-    with torch.no_grad():
-        _, m = disto(c)
-    assert m.all()
-
-
-def test_distogram_mask_zeros_out_invalid_residues(
-    mask: Bool[torch.Tensor, "N_res"],
-    disto: Distogram,
-    coords: Float[torch.Tensor, "N_res 3"],
-) -> None:
-    """Distogram masks row 0 and column 0 when residue 0 is excluded from mask.
-
-    Verifies that setting a residue as invalid (False in coords_mask) zeros out
-    both its row and column in the pair mask, while leaving all other pairs
-    intact.
-    """
-    mask[0] = False
-    with torch.no_grad():
-        _, m = disto(coords, mask)
-    assert not m[0, :].any()
-    assert not m[:, 0].any()
-    assert m[1:, 1:].any()
-
-
-def test_distogram_overflow_mask_ignores_distance_cutoff(
-    disto_overflow: Distogram,
-) -> None:
-    """With overflow_bin=True the pair mask is not gated by a distance cutoff.
-
-    Verifies that even when one residue is placed very far from all others, the
-    overflow-bin Distogram marks all pairs as valid because distant pairs are
-    captured by the overflow bin rather than being masked out.
-    """
-    c = torch.zeros(N_RES, 3)
-    c[0] = 1000.0
-    with torch.no_grad():
-        _, m = disto_overflow(c)
-    assert m.all()
-
-
-def test_distogram_no_overflow_masks_distant_pairs(disto: Distogram) -> None:
-    """Without overflow_bin, pairs beyond max_dist are set to False in the mask.
-
-    Verifies that the standard Distogram (no overflow bin) applies a distance
-    cutoff: pairs whose Euclidean distance exceeds max_dist are masked to False.
-    """
-    c = torch.zeros(N_RES, 3)
-    c[0] = MAX_DIST * 2
-    with torch.no_grad():
-        _, m = disto(c)
-    assert not m[0, 1:].any()
-
-
-# ---------------------------------------------------------------------------
-# Distogram — symmetry
-# ---------------------------------------------------------------------------
-
-
-def test_distogram_is_symmetric(
-    disto: Distogram,
-    coords: Float[torch.Tensor, "N_res 3"],
-) -> None:
-    """Distogram output is symmetric: f[i,j] == f[j,i] and m[i,j] == m[j,i].
-
-    Verifies that both the bin-probability tensor and the pair-mask tensor are
-    symmetric matrices, as required by the pairwise distance formulation.
-    """
-    with torch.no_grad():
-        f, m = disto(coords)
-    assert torch.allclose(f, rearrange(f, "i j b -> j i b"))
-    assert torch.equal(m, rearrange(m, "i j -> j i"))
-
-
-# ---------------------------------------------------------------------------
-# Distogram — bin correctness
-# ---------------------------------------------------------------------------
-
-
-def test_distogram_close_pairs_land_in_first_bin(disto: Distogram) -> None:
-    """Pairs at distance 0 (all at origin) are assigned to first distance bin.
-
-    Verifies bin-assignment correctness at the lower boundary: when all
-    residues share the same position, every pairwise distance is 0 which
-    falls in bin 0.
-    """
-    c = torch.zeros(N_RES, 3)
-    with torch.no_grad():
-        f, _ = disto(c)
-    assert f[..., 0].all()
-
-
-def test_distogram_overflow_far_pairs_land_in_last_bin(
-    disto_overflow: Distogram,
-) -> None:
-    """Pairs beyond max_dist land in the overflow bin when overflow_bin=True.
-
-    Verifies that cross-group pairs whose distance vastly exceeds max_dist are
-    assigned entirely to the last (overflow) bin index.
-    """
-    c = torch.zeros(N_RES, 3)
-    c[N_RES // 2 :] = MAX_DIST * 10
-    with torch.no_grad():
-        f, _ = disto_overflow(c)
-    cross = f[: N_RES // 2, N_RES // 2 :, :]
-    assert cross[..., -1].all()
-
-
-def test_distogram_exact_bin_for_known_interior_distance(
-    disto: Distogram,
-) -> None:
-    """Distogram assigns a 9 Å pair to bin 5 given bin_width=(22-2)/16=1.25 Å.
-
-    Verifies exact bin-index arithmetic: for a known distance of 9.0 Å,
-    floor((9.0 - 2.0) / 1.25) = 5, so bin 5 should be 1.0 and all others 0.0.
-    """
-    c = torch.zeros(N_RES, 3)
-    c[0, 0] = 9.0
-    expected_bin = 5
-    with torch.no_grad():
-        f, _ = disto(c)
-    assert math.isclose(f[0, 1, expected_bin].item(), 1.0)
-    assert f[0, 1, :expected_bin].abs().max().item() < TOLERANCE
-    assert f[0, 1, expected_bin + 1 :].abs().max().item() < TOLERANCE
-
-
-# ---------------------------------------------------------------------------
-# featurize_batch — fixtures
-# ---------------------------------------------------------------------------
-
-
-@pytest.fixture
-def single_protein() -> Protein:
-    """Provide a single Protein with random coordinates of length N_RES."""
-    rng = np.random.default_rng(42)
-    return Protein(
-        atom_positions=rng.standard_normal((N_RES, 37, 3)),
-        aatype=np.array([restype_order[aa] for aa in AA_SEQ], dtype=np.intp),
-        atom_mask=np.ones((N_RES, 37), dtype=np.float64),
-        residue_index=np.arange(N_RES, dtype=np.intp),
-        chain_index=np.zeros(N_RES, dtype=np.intp),
-        b_factors=np.zeros((N_RES, 37), dtype=np.float64),
-    )
-
-
-@pytest.fixture
-def featurize_protein_batch(single_protein: Protein) -> list[Protein]:
-    """Provide FZ_B=2 identical Protein objects for batch featurization.
-
-    Args:
-        single_protein: A single Protein used to fill the batch.
-
-    Returns:
-        A list of FZ_B identical Protein instances.
-    """
-    return [single_protein for _ in range(FZ_B)]
+    coincident = BinCase(0.0, 0, overflow=False, valid=True)
+    interior = BinCase(9.0, 5, overflow=False, valid=True)
+    top_edge = BinCase(22.0, 15, overflow=False, valid=True)
+    far_overflow = BinCase(1000.0, 16, overflow=True, valid=True)
+    far_clipped = BinCase(1000.0, 15, overflow=False, valid=False)
 
 
 @pytest.fixture
 def tcfg() -> TrainConfig:
-    """Provide a default TrainConfig with standard settings."""
+    """Return the default training configuration.
+
+    Returns:
+        ``TrainConfig()``.
+    """
     return TrainConfig()
 
 
 @pytest.fixture
-def template_distogram_fn(tcfg: TrainConfig) -> Distogram:
-    """Provide the self-conditioning template Distogram from tcfg."""
-    return build_distogram_module(tcfg.distogram_template).eval()
+def distograms(tcfg: TrainConfig) -> Distograms:
+    """Build the template, residue and atom distograms from ``tcfg``.
 
+    Args:
+        tcfg: Configuration holding the three distogram parameter sets.
 
-@pytest.fixture
-def residue_distogram_fn(tcfg: TrainConfig) -> Distogram:
-    """Provide the residue-level Cβ Distogram from tcfg.distogram_residue."""
-    return build_distogram_module(tcfg.distogram_residue).eval()
-
-
-@pytest.fixture
-def atom_distogram_fn(tcfg: TrainConfig) -> Distogram:
-    """Provide the atom-level Distogram configured from tcfg.distogram_atom."""
-    return build_distogram_module(tcfg.distogram_atom).eval()
-
-
-@pytest.fixture
-def model_params(
-    tcfg: TrainConfig,
-    template_distogram_fn: Distogram,
-    residue_distogram_fn: Distogram,
-    atom_distogram_fn: Distogram,
-) -> ModelSetup:
-    """Provide ModelSetup bundling MainTrunk with training configuration."""
-    trunk: MainTrunk = MainTrunk(
-        model_params=tcfg.model,
-        template_distogram_params=tcfg.distogram_template,
-        residue_distogram_params=tcfg.distogram_residue,
-        atom_distogram_params=tcfg.distogram_atom,
-        noise_params=tcfg.noise,
-    ).eval()
-    optimizer = Adam(trunk.parameters(), lr=tcfg.training.lr)
-    scheduler = LambdaLR(
-        optimizer,
-        lr_lambda=functools.partial(
-            alphafold_lr_lambda,
-            warmup_steps=tcfg.training.lr_warmup_steps,
-            decay_steps=tcfg.training.lr_decay_steps,
-            decay_factor=tcfg.training.lr_decay_factor,
-        ),
+    Returns:
+        The three distograms, in eval mode.
+    """
+    return Distograms(
+        template=build_distogram_module(tcfg.distogram_template).eval(),
+        residue=build_distogram_module(tcfg.distogram_residue).eval(),
+        atom=build_distogram_module(tcfg.distogram_atom).eval(),
     )
-    return ModelSetup(
-        model=trunk,
-        tcfg=tcfg,
-        distogram_template=template_distogram_fn,
-        distogram_residue=residue_distogram_fn,
-        distogram_atom=atom_distogram_fn,
-        device=torch.device("cpu"),
-        optimizer=optimizer,
-        scheduler=scheduler,
-        ema=EMA(trunk, decay=tcfg.training.ema_decay),
+
+
+@pytest.fixture
+def protein() -> Protein:
+    """Return a 12-residue protein with every atom present.
+
+    Atom ``a`` of residue ``i`` sits at ``(3.8 i + 0.1 a, sin(i + a), 0)``,
+    and the sequence is ``ACDEFGHIKLMN``.
+
+    Returns:
+        The protein.
+    """
+    n = 12
+    i = rearrange(np.arange(n, dtype=np.float64), "i -> i 1")
+    a = rearrange(np.arange(37, dtype=np.float64), "a -> 1 a")
+    positions = np.stack(
+        [3.8 * i + 0.1 * a, np.sin(i + a), np.zeros((n, 37))],
+        axis=-1,
+    )
+    return Protein(
+        atom_positions=positions,
+        aatype=np.array([restype_order[c] for c in "ACDEFGHIKLMN"]),
+        atom_mask=np.ones((n, 37)),
+        residue_index=np.arange(n),
+        chain_index=np.zeros(n, dtype=np.intp),
+        b_factors=np.zeros((n, 37)),
     )
 
 
 @pytest.fixture
 def featurized_item(
-    single_protein: Protein,
+    protein: Protein,
     tcfg: TrainConfig,
-    template_distogram_fn: Distogram,
-    residue_distogram_fn: Distogram,
-    atom_distogram_fn: Distogram,
+    distograms: Distograms,
 ) -> FeaturizedItem:
-    """FeaturizedItem produced by featurize_single_item on single_protein.
+    """Featurize ``protein`` alone under a fixed seed.
 
-    Sets a fixed random seed so that the log-normal noise sample lands within
-    [sigma_min, sigma_max], keeping t_normalized in [0, 1] regardless of prior
-    RNG state.
+    Seed 1 keeps the sampled noise level inside the configured range, so
+    ``t_normalized`` stays in ``[0, 1]``.
+
+    Args:
+        protein: Protein to featurize.
+        tcfg: Configuration.
+        distograms: Template, residue and atom distograms.
+
+    Returns:
+        The featurized item.
     """
     _ = manual_seed(1)
     return featurize_single_item(
-        prot=single_protein,
-        template_distogram_fn=template_distogram_fn,
-        residue_distogram_fn=residue_distogram_fn,
-        atom_distogram_fn=atom_distogram_fn,
-        tcfg=tcfg,
-        max_seq_len_in_batch=N_RES,
+        protein,
+        distograms.template,
+        distograms.residue,
+        distograms.atom,
+        tcfg,
+        max_seq_len_in_batch=len(protein.aatype),
     )
 
 
 @pytest.fixture
 def featurized_batch(
-    featurize_protein_batch: list[Protein],
-    model_params: ModelSetup,
+    protein: Protein,
+    tcfg: TrainConfig,
+    distograms: Distograms,
 ) -> FeaturizedBatch:
-    """FeaturizedBatch produced by featurize_batch on featurize_protein_batch.
+    """Featurize two copies of ``protein`` as a batch under a fixed seed.
 
-    Sets a fixed random seed so that the log-normal noise sample lands within
-    [sigma_min, sigma_max], keeping t_normalized in [0, 1] regardless of prior
-    RNG state.
+    Args:
+        protein: Protein to featurize twice.
+        tcfg: Configuration.
+        distograms: Template, residue and atom distograms.
+
+    Returns:
+        The featurized batch.
     """
     _ = manual_seed(1)
     return featurize_batch(
-        batch=featurize_protein_batch,
-        tcfg=model_params.tcfg,
-        distogram_template=model_params.distogram_template,
-        distogram_residue=model_params.distogram_residue,
-        distogram_atom=model_params.distogram_atom,
+        [protein, protein],
+        tcfg,
+        distograms.template,
+        distograms.residue,
+        distograms.atom,
     )
 
 
-# ---------------------------------------------------------------------------
-# featurize_batch — output shapes
-# Batched layout for FZ_B=2, N_RES=12: tensors are (FZ_B, N_RES, *) or
-# (FZ_B, N_ATOM, *)
-# ---------------------------------------------------------------------------
-
-N_ATOM = N_RES * 5  # 5 atoms per residue, no separators
-
-
-def test_featurize_batch_output_shapes(
-    featurized_batch: FeaturizedBatch,
-) -> None:
-    """featurize_batch produces correct shapes and values for all output fields.
-
-    Batched layout for FZ_B=2, N_RES=12: tensors are (FZ_B, N_RES, *) or
-    (FZ_B, N_ATOM, *). Checks shapes, finiteness, noise-level bounds, and
-    index mapping invariants.
-    """
-    expected_shapes: dict[str, tuple[int, ...]] = {
-        "ref_pos": (FZ_B, N_ATOM, 3),
-        "ref_element": (FZ_B, N_ATOM, 4),
-        "ref_space_uid": (FZ_B, N_ATOM),
-        "gt_res_distogram_indices": (FZ_B, N_RES, N_RES),
-        "noised_res_distogram": (FZ_B, N_RES, N_RES, 39),
-        "f_pseudo_beta_mask": (FZ_B, N_RES),
-        "tok_idx": (FZ_B, N_ATOM),
-        "center_uid": (FZ_B, N_ATOM),
-    }
-    batch_dict: dict[str, object] = dataclasses.asdict(featurized_batch)
-    assert {
-        k: tuple(cast(torch.Tensor, batch_dict[k]).shape)
-        for k in expected_shapes
-    } == expected_shapes
-
-    for field_name, val in batch_dict.items():
-        if isinstance(val, torch.Tensor):
-            assert torch.isfinite(
-                val.float(),
-            ).all(), f"non-finite in field '{field_name}'"
-
-    assert all(
-        [
-            bool((featurized_batch.t_hat > 0.0).all()),
-            bool((featurized_batch.t_normalized >= 0.0).all()),
-            bool((featurized_batch.t_normalized <= 1.0).all()),
-        ],
-    )
-
-    expected_res_idx = repeat(
-        torch.arange(N_RES),
-        "r -> b (r five)",
-        b=FZ_B,
-        five=5,
-    )
-    assert torch.equal(featurized_batch.ref_space_uid, expected_res_idx)
-    assert torch.equal(featurized_batch.tok_idx, expected_res_idx)
-
-    expected_ca = repeat(
-        (torch.arange(N_RES) * 5 + 1).repeat_interleave(5),
-        "a -> b a",
-        b=FZ_B,
-    )
-    assert torch.equal(featurized_batch.center_uid, expected_ca)
-
-
-# ---------------------------------------------------------------------------
-# featurize_single_item — output shapes
-# Unbatched layout for N_RES=12: tensors are (N_RES, *) or (N_ATOM, *)
-# ---------------------------------------------------------------------------
-
-
-def test_featurize_single_item_output_shapes(
-    featurized_item: FeaturizedItem,
-) -> None:
-    """featurize_single_item produces correct shapes and values for all fields.
-
-    Unbatched layout for N_RES=12: tensors are (N_RES, *) or (N_ATOM, *).
-    Checks shapes, finiteness, noise-level bounds, and index mapping invariants.
-    """
-    expected_shapes: dict[str, tuple[int, ...]] = {
-        "ref_pos": (N_ATOM, 3),
-        "ref_element": (N_ATOM, 4),
-        "ref_space_uid": (N_ATOM,),
-        "gt_res_distogram_indices": (N_RES, N_RES),
-        "noised_res_distogram": (N_RES, N_RES, 39),
-        "f_pseudo_beta_mask": (N_RES,),
-        "tok_idx": (N_ATOM,),
-        "center_uid": (N_ATOM,),
-    }
-    item_dict: dict[str, object] = dataclasses.asdict(featurized_item)
-    assert {
-        k: tuple(cast(torch.Tensor, item_dict[k]).shape)
-        for k in expected_shapes
-    } == expected_shapes
-
-    for field_name, val in item_dict.items():
-        if isinstance(val, torch.Tensor):
-            assert torch.isfinite(
-                val.float(),
-            ).all(), f"non-finite in field '{field_name}'"
-
-    assert all(
-        [
-            bool(featurized_item.t_hat > 0.0),
-            bool((featurized_item.t_normalized >= 0.0).all()),
-            bool((featurized_item.t_normalized <= 1.0).all()),
-        ],
-    )
-
-    expected_res_idx = torch.arange(N_RES).repeat_interleave(5)
-    assert torch.equal(featurized_item.ref_space_uid, expected_res_idx)
-    assert torch.equal(featurized_item.tok_idx, expected_res_idx)
-
-    expected_ca = (torch.arange(N_RES) * 5 + 1).repeat_interleave(5)
-    assert torch.equal(featurized_item.center_uid, expected_ca)
-
-
-# ---------------------------------------------------------------------------
-# featurize_batch — Protein type enforcement
-# ---------------------------------------------------------------------------
-
-
-def test_featurize_batch_rejects_wrong_atom_positions_rank() -> None:
-    """Protein raises when atom_positions is 2-D instead of the required 3-D."""
-    with pytest.raises((TypeError, Exception)):
-        _ = Protein(
-            atom_positions=np.random.default_rng().standard_normal(
-                (N_RES, 37),
-            ),
-            aatype=np.array(
-                [restype_order[aa] for aa in AA_SEQ],
-                dtype=np.intp,
-            ),
-            atom_mask=np.ones((N_RES, 37), dtype=np.float64),
-            residue_index=np.arange(N_RES, dtype=np.intp),
-            chain_index=np.zeros(N_RES, dtype=np.intp),
-            b_factors=np.zeros((N_RES, 37), dtype=np.float64),
-        )
-
-
-def test_featurize_batch_rejects_wrong_atom_count() -> None:
-    """Protein raises when atom_positions has 36 atoms instead of 37."""
-    with pytest.raises((TypeError, Exception)):
-        _ = Protein(
-            atom_positions=np.random.default_rng().standard_normal(
-                (N_RES, 36, 3),
-            ),
-            aatype=np.array(
-                [restype_order[aa] for aa in AA_SEQ],
-                dtype=np.intp,
-            ),
-            atom_mask=np.ones((N_RES, 37), dtype=np.float64),
-            residue_index=np.arange(N_RES, dtype=np.intp),
-            chain_index=np.zeros(N_RES, dtype=np.intp),
-            b_factors=np.zeros((N_RES, 37), dtype=np.float64),
-        )
-
-
-# ---------------------------------------------------------------------------
-# FeaturizeCollate
-# ---------------------------------------------------------------------------
-
-
-def test_featurize_collate_returns_featurized_batch(
-    featurize_protein_batch: list[Protein],
-    tcfg: TrainConfig,
-    template_distogram_fn: Distogram,
-    residue_distogram_fn: Distogram,
-    atom_distogram_fn: Distogram,
-) -> None:
-    """FeaturizeCollate.__call__ returns a FeaturizedBatch."""
-    collate = FeaturizeCollate(
-        tcfg=tcfg,
-        distogram_template=template_distogram_fn,
-        distogram_residue=residue_distogram_fn,
-        distogram_atom=atom_distogram_fn,
-    )
-    result = collate(featurize_protein_batch)
-    assert isinstance(result, FeaturizedBatch)
-
-
-def test_featurize_collate_is_picklable(
-    featurize_protein_batch: list[Protein],
-    tcfg: TrainConfig,
-    template_distogram_fn: Distogram,
-    residue_distogram_fn: Distogram,
-    atom_distogram_fn: Distogram,
-) -> None:
-    """FeaturizeCollate survives a pickle round-trip for num_workers > 0."""
-    collate = FeaturizeCollate(
-        tcfg=tcfg,
-        distogram_template=template_distogram_fn,
-        distogram_residue=residue_distogram_fn,
-        distogram_atom=atom_distogram_fn,
-    )
-    restored = cast(
-        FeaturizeCollate,
-        pickle.loads(pickle.dumps(collate)),  # noqa: S301
-    )
-    result = restored(featurize_protein_batch)
-    assert isinstance(result, FeaturizedBatch)
-
-
-# ---------------------------------------------------------------------------
-# sinusoidal_encoding, ref_pos_for_residue, featurize_single_item
-# ---------------------------------------------------------------------------
-
-
-def test_sinusoidal_encoding_output_shape_and_shape() -> None:
-    """Maps (batch, N_res) indices to a finite (batch, N_res, dim) tensor."""
-    positions = rearrange(torch.arange(N_RES).float(), "n -> 1 n")
-    out = sinusoidal_encoding(positions, dim=32)
-    assert out.shape == (1, N_RES, 32)
-    assert torch.isfinite(out).all()
-
-
-def test_ref_pos_for_residue_output_shape_and_finite() -> None:
-    """ref_pos_for_residue returns finite (5, 3) reference position tensor."""
-    pos = ref_pos_for_residue("ALA")
-    assert pos.shape == (5, 3)
-    assert torch.isfinite(pos).all()
-
-
-# ---------------------------------------------------------------------------
-# Shape-contract enforcement — negative tests
-# ---------------------------------------------------------------------------
-
-
-def test_distogram_forward_wrong_shape(disto: Distogram) -> None:
-    """Wrong coords last dim (4 instead of 3) triggers TypeCheckError."""
-    coords_bad = torch.zeros(N_RES, 4)
-    with pytest.raises(TypeCheckError):
-        _ = disto(coords_bad)
-
-
-def test_sinusoidal_encoding_wrong_shape() -> None:
-    """Wrong positions ndim (3-D instead of 2-D) triggers TypeCheckError."""
-    positions_bad = torch.zeros(FZ_B, N_RES, 1)
-    with pytest.raises(TypeCheckError):
-        _ = sinusoidal_encoding(positions_bad)
-
-
-# ---------------------------------------------------------------------------
-# test_data block — ProteinDataset, ProteinShardDataset, data loaders
-# ---------------------------------------------------------------------------
-
-_N_RES_DATA = 6  # residues per synthetic entry
-_MAX_SEQ = 8  # padded / truncated to this length
-_ENTRY_NAMES = ["1aa.A", "2bb.A", "3cc.A", "4dd.A", "5ee.A"]
-_TRAIN_NAMES = ["1aa.A", "2bb.A", "3cc.A"]
-_VAL_NAMES = ["4dd.A"]
-_TEST_NAMES = ["5ee.A"]
-_N_DEBUG = 252  # debug_run sampler uses SubsetRandomSampler(range(252))
-PROT_1_LEN = 8
-PROT_2_LEN = 16
-PROT_3_LEN = 24
-PROT_4_LEN = 32
-PROT_5_LEN = 40
-B = 5
-MAX_SEQ_LENGTH = 128
-
-
-def _make_coords(n: int) -> Mapping[str, list[list[float]]]:
-    """Return synthetic backbone coordinates for N, CA, C, O atoms.
+@pytest.fixture
+def break_case(request: pytest.FixtureRequest) -> FieldBreak:
+    """Return the ``FieldBreak`` of the enum member routed in via param.
 
     Args:
-        n: Number of residues to generate coordinates for.
+        request: Pytest request carrying an ``ItemBreak`` or ``BatchBreak``.
 
     Returns:
-        Mapping from atom name to a list of (n, 3) coordinate lists.
+        The field and reshape to apply.
     """
-    rng = np.random.default_rng()
-    return {
-        atom: rng.standard_normal((n, 3)).tolist()
-        for atom in ("N", "CA", "C", "O")
+    return cast(ItemBreak | BatchBreak, request.param).value
+
+
+@pytest.fixture
+def bin_scenario(request: pytest.FixtureRequest) -> BinScenario:
+    """Return the ``BinScenario`` member routed in via indirect param.
+
+    Args:
+        request: Pytest request carrying the scenario in ``param``.
+
+    Returns:
+        The scenario under test.
+    """
+    return cast(BinScenario, request.param)
+
+
+@pytest.fixture(scope="module")
+def make_entry() -> EntryFactory:
+    """Return a factory for JSONL protein entries with fixed coordinates.
+
+    ``make(name, n)`` gives an all-alanine entry whose residue ``i`` has its
+    CA at ``(3.8 i, 0, 0)`` and N, C and O at fixed offsets from it.
+
+    Module-scoped so the module-scoped loader lifecycle can use it; it
+    holds no state.
+
+    Returns:
+        The factory.
+    """
+    offsets = {
+        "N": (-1.2, 0.6, 0.0),
+        "CA": (0.0, 0.0, 0.0),
+        "C": (1.2, 0.6, 0.0),
+        "O": (1.4, 1.8, 0.0),
     }
 
+    def make(name: str, n: int) -> Entry:
+        """Build one entry.
 
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
+        Args:
+            name: Entry name.
+            n: Residue count.
 
-
-@pytest.fixture
-def jsonl_path(tmp_path: pathlib.Path) -> str:
-    """Write JSONL file with synthetic protein entries and return its path.
-
-    Writes one entry per name in _ENTRY_NAMES, each with _N_RES_DATA residues.
-    """
-    path = tmp_path / "proteins.jsonl"
-    with path.open("w") as f:
-        for name in _ENTRY_NAMES:
-            entry = {
-                "name": name,
-                "seq": "ACDEFG"[:_N_RES_DATA],
-                "coords": _make_coords(_N_RES_DATA),
-            }
-            _ = f.write(json.dumps(entry) + "\n")
-    return str(path)
-
-
-@pytest.fixture
-def splits_path(tmp_path: pathlib.Path) -> str:
-    """Write splits JSON with train/val/test name lists and return its path.
-
-    Uses _TRAIN_NAMES, _VAL_NAMES, and _TEST_NAMES as the split contents.
-    """
-    path = tmp_path / "splits.json"
-    with path.open("w") as f:
-        json.dump(
-            {
-                "train": _TRAIN_NAMES,
-                "validation": _VAL_NAMES,
-                "test": _TEST_NAMES,
-            },
-            f,
-        )
-    return str(path)
-
-
-@pytest.fixture
-def train_dataset(jsonl_path: str) -> ProteinDataset:
-    """ProteinDataset loaded from the synthetic JSONL with training names.
-
-    Loads only the entries listed in _TRAIN_NAMES with max_seq_length=_MAX_SEQ.
-    """
-    return ProteinDataset(jsonl_path, _TRAIN_NAMES, max_seq_length=_MAX_SEQ)
-
-
-@pytest.fixture
-def cfg() -> TrainConfig:
-    """Minimal TrainConfig with batch_size=2 and max_seq_length=_MAX_SEQ.
-
-    Both train and test loaders share the same batch_size and max_seq_length.
-    """
-    return TrainConfig(
-        train_loader=TrainLoaderConfig(batch_size=2, max_seq_length=_MAX_SEQ),
-        test_loader=EvalLoaderConfig(batch_size=2, max_seq_length=_MAX_SEQ),
-    )
-
-
-# ---------------------------------------------------------------------------
-# ProteinDataset — length and indexing
-# ---------------------------------------------------------------------------
-
-
-def test_protein_dataset_len(train_dataset: ProteinDataset) -> None:
-    """ProteinDataset length equals the number of listed training names.
-
-    Verifies that len(dataset) matches len(_TRAIN_NAMES).
-    """
-    assert len(train_dataset) == len(_TRAIN_NAMES)
-
-
-def test_protein_dataset_excludes_unlisted_names(jsonl_path: str) -> None:
-    """ProteinDataset excludes entries whose names are not in provided list.
-
-    Verifies that constructing dataset with only ["1aa.A"] yields single entry.
-    """
-    ds = ProteinDataset(jsonl_path, ["1aa.A"], max_seq_length=_MAX_SEQ)
-    assert len(ds) == 1
-
-
-def test_protein_dataset_empty_names(jsonl_path: str) -> None:
-    """ProteinDataset with an empty names list has length 0.
-
-    Verifies that passing an empty list to ProteinDataset yields a dataset of
-    length zero.
-    """
-    ds = ProteinDataset(jsonl_path, [], max_seq_length=_MAX_SEQ)
-    assert len(ds) == 0
-
-
-# ---------------------------------------------------------------------------
-# ProteinDataset — sample structure
-# ---------------------------------------------------------------------------
-
-
-def test_protein_dataset_sample_keys(train_dataset: ProteinDataset) -> None:
-    """Checks that ProteinDataset sample is a Protein instance.
-
-    Verifies the sample is a Protein instance and has the expected attributes.
-    Also asserts ProteinDataset pads/truncates all protein fields to _MAX_SEQ.
-    """
-    sample = train_dataset[0]
-    assert isinstance(sample, Protein)
-
-    # aatype shape is (_MAX_SEQ,) — not one-hot encoded
-    expected_shapes: dict[str, tuple[int, ...]] = {
-        "atom_positions": (_MAX_SEQ, 37, 3),
-        "atom_mask": (_MAX_SEQ, 37),
-        "residue_index": (_MAX_SEQ,),
-        "aatype": (_MAX_SEQ,),
-    }
-    for field, shape in expected_shapes.items():
-        arr = cast(object, getattr(sample, field))
-        assert isinstance(arr, np.ndarray)
-        assert arr.shape == shape
-
-
-def test_protein_dataset_float_fields_are_float64(
-    train_dataset: ProteinDataset,
-) -> None:
-    """Float fields in a ProteinDataset sample have dtype float64.
-
-    Verifies atom_positions and atom_mask are numpy float64 arrays.
-    """
-    sample = train_dataset[0]
-    assert sample.atom_positions.dtype == np.float64
-    assert sample.atom_mask.dtype == np.float64
-
-
-def test_protein_dataset_aatype_is_integer_array(
-    train_dataset: ProteinDataset,
-) -> None:
-    """The aatype field in a ProteinDataset sample is an integer numpy array.
-
-    Verifies aatype is an ndarray with an integer dtype.
-    """
-    aatype = train_dataset[0].aatype
-    assert isinstance(aatype, np.ndarray)
-    assert np.issubdtype(aatype.dtype, np.integer)
-
-
-def test_protein_dataset_aatype_truncated_to_max_seq_length(
-    tmp_path: pathlib.Path,
-) -> None:
-    """ProteinDataset truncates aatype to max_seq_length entries.
-
-    Verifies 100-residue entry is truncated to PROT_1_LEN entries in aatype.
-    """
-    path = pathlib.Path(tmp_path / "long.jsonl")
-    with path.open("w", encoding="utf-8") as f:
-        entry = {
-            "name": "long.A",
-            "seq": "A" * 100,
-            "coords": _make_coords(100),
+        Returns:
+            Entry with ``name``, ``seq`` and ``coords``.
+        """
+        coords = {
+            atom: [[3.8 * i + dx, dy, dz] for i in range(n)]
+            for atom, (dx, dy, dz) in offsets.items()
         }
-        _ = f.write(json.dumps(entry) + "\n")
-    ds = ProteinDataset(path, ["long.A"], max_seq_length=PROT_1_LEN)
-    assert ds[0].aatype.shape[0] == PROT_1_LEN
+        return {"name": name, "seq": "A" * n, "coords": coords}
+
+    return make
 
 
-def test_protein_dataset_all_items_accessible(
-    train_dataset: ProteinDataset,
-) -> None:
-    """Every index in ProteinDataset is accessible and returns a Protein.
+@pytest.fixture(scope="module")
+def write_jsonl() -> JsonlWriter:
+    """Return a function that writes entries as JSON lines.
 
-    Verifies __getitem__ succeeds for valid indices and returns a Protein.
+    Module-scoped for the same reason as ``make_entry``.
+
+    Returns:
+        ``write(path, entries)``, which returns ``path``.
     """
-    for i in range(len(train_dataset)):
-        assert isinstance(train_dataset[i], Protein)
 
+    def write(path: pathlib.Path, entries: list[Entry]) -> pathlib.Path:
+        """Write one JSON object per line.
 
-# ---------------------------------------------------------------------------
-# ProteinDataset — pickle / multiprocessing compatibility
-# ---------------------------------------------------------------------------
+        Args:
+            path: Destination file.
+            entries: Objects to serialise.
 
+        Returns:
+            The path written.
+        """
+        _ = path.write_text("".join(json.dumps(e) + "\n" for e in entries))
+        return path
 
-def test_protein_dataset_picklable_before_open(
-    train_dataset: ProteinDataset,
-) -> None:
-    """ProteinDataset can be pickled and restored before JSONL file is opened.
-
-    Verifies the dataset length is preserved after a pickle round-trip with no
-    prior access.
-    """
-    ds2 = cast(
-        ProteinDataset,
-        pickle.loads(pickle.dumps(train_dataset)),  # noqa: S301
-    )
-    assert len(ds2) == len(train_dataset)
-
-
-def test_protein_dataset_picklable_after_open(
-    train_dataset: ProteinDataset,
-) -> None:
-    """ProteinDataset can be pickled and restored after file handle open.
-
-    Verifies atom_positions shape is correct after a pickle round-trip with the
-    handle open.
-    """
-    _ = train_dataset[0]  # opens the file handle
-    ds2 = cast(
-        ProteinDataset,
-        pickle.loads(pickle.dumps(train_dataset)),  # noqa: S301
-    )
-    assert ds2[0].atom_positions.shape == (_MAX_SEQ, 37, 3)
-
-
-# ---------------------------------------------------------------------------
-# make_data_loaders — debug_run=True
-# ---------------------------------------------------------------------------
-
-# The debug sampler is SubsetRandomSampler(range(8)), so iterating requires
-# a dataset with ≥256 entries; len() only reads sampler size and works cheaply.
+    return write
 
 
 @pytest.fixture
-def debug_jsonl_path(tmp_path: pathlib.Path) -> str:
-    """Write a JSONL file with _N_DEBUG protein entries for debug-mode testing.
+def dataset_jsonl(
+    tmp_path: pathlib.Path,
+    make_entry: EntryFactory,
+    write_jsonl: JsonlWriter,
+) -> pathlib.Path:
+    """Write five 6-residue entries named ``1aa.A`` to ``5ee.A``.
 
-    Each entry has _N_RES_DATA residues; names are zero-padded integers with
-    the "x.A" suffix.
+    Args:
+        tmp_path: Per-test directory.
+        make_entry: Entry factory.
+        write_jsonl: JSONL writer.
+
+    Returns:
+        Path of the JSONL file.
     """
-    path = tmp_path / "debug_proteins.jsonl"
-    names = [f"{i:04d}x.A" for i in range(_N_DEBUG)]
-    with path.open("w") as f:
-        for name in names:
-            entry = {
-                "name": name,
-                "seq": "ACDEFG"[:_N_RES_DATA],
-                "coords": _make_coords(_N_RES_DATA),
-            }
-            _ = f.write(json.dumps(entry) + "\n")
-    return str(path)
+    names = ["1aa.A", "2bb.A", "3cc.A", "4dd.A", "5ee.A"]
+    entries = [make_entry(name, 6) for name in names]
+    return write_jsonl(tmp_path / "proteins.jsonl", entries)
 
 
 @pytest.fixture
-def debug_splits_path(tmp_path: pathlib.Path) -> str:
-    """Write splits JSON assigning _N_DEBUG entries to train for debug-mode.
-
-    Validation and test splits receive only first entry to satisfy schema.
-    """
-    names = [f"{i:04d}x.A" for i in range(_N_DEBUG)]
-    path = tmp_path / "debug_splits.json"
-    with path.open("w") as f:
-        json.dump(
-            {"train": names, "validation": names[:1], "test": names[:1]},
-            f,
-        )
-    return str(path)
-
-
-# ---------------------------------------------------------------------------
-# Helpers for ProteinShardDataset tests
-# ---------------------------------------------------------------------------
-
-
-def _make_entry(name: str, seq_len: int) -> dict[str, object]:
-    """Build a minimal JSONL entry with the given name and sequence length.
+def train_dataset(dataset_jsonl: pathlib.Path) -> ProteinDataset:
+    """Load the first three entries, padded to 8 residues.
 
     Args:
-        name: Protein entry identifier.
-        seq_len: Number of residues (all set to alanine 'A').
+        dataset_jsonl: Five-entry JSONL.
 
     Returns:
-        Dict with name, seq, and backbone coords for JSONL serialisation.
+        The dataset.
     """
-    return {
-        "name": name,
-        "seq": "A" * seq_len,
-        "coords": _make_coords(seq_len),
-    }
+    names = ["1aa.A", "2bb.A", "3cc.A"]
+    return ProteinDataset(dataset_jsonl, names, max_seq_length=8)
 
 
-def _write_jsonl(path: pathlib.Path, entries: list[dict[str, object]]) -> None:
-    """Write entries as JSONL to path.
+@pytest.fixture
+def shard_budget(tmp_path: pathlib.Path) -> ShardBudgetParameters:
+    """Return single-rank, single-worker shard parameters under ``tmp_path``.
 
     Args:
-        path: Destination file path.
-        entries: List of dicts to serialise, one JSON object per line.
-    """
-    with path.open("w") as f:
-        f.writelines(json.dumps(entry) + "\n" for entry in entries)
-
-
-def _make_shard_budget(work_dir: pathlib.Path) -> ShardBudgetParameters:
-    """Build minimal ShardBudgetParameters rooted at a work directory.
-
-    Args:
-        work_dir: Directory for shards and structured logs.
+        tmp_path: Per-test directory for shards and logs.
 
     Returns:
-        ShardBudgetParameters for a single-rank, single-worker dataset.
+        The parameters.
     """
     return ShardBudgetParameters(
-        shard_dir=work_dir / "shards",
-        structlog_path=work_dir / "train.jsonl",
+        shard_dir=tmp_path / "shards",
+        structlog_path=tmp_path / "train.jsonl",
         token_budget=512,
-        max_seq_len=MAX_SEQ_LENGTH,
+        max_seq_len=128,
         seed=0,
         n_threads=1,
         world_size=1,
@@ -1568,66 +436,182 @@ def _make_shard_budget(work_dir: pathlib.Path) -> ShardBudgetParameters:
 
 
 @pytest.fixture
-def shard_budget(tmp_path: pathlib.Path) -> ShardBudgetParameters:
-    """Minimal ShardBudgetParameters for ProteinShardDataset tests."""
-    return _make_shard_budget(tmp_path)
+def make_shard_dataset(
+    tmp_path: pathlib.Path,
+    shard_budget: ShardBudgetParameters,
+    make_entry: EntryFactory,
+    write_jsonl: JsonlWriter,
+) -> ShardFactory:
+    """Return a factory for ProteinShardDatasets over fresh JSONL files.
 
+    ``make(names, lengths)`` writes one entry per name, then builds a
+    dataset sharding them into a directory unique to that call.
 
-@pytest.fixture
-def multi_shard_budget(tmp_path: pathlib.Path) -> ShardBudgetParameters:
-    """ShardBudgetParameters with two workers and zero noise for plan tests.
+    Args:
+        tmp_path: Per-test directory.
+        shard_budget: Base shard parameters.
+        make_entry: Entry factory.
+        write_jsonl: JSONL writer.
 
-    token_budget=250 is chosen so ffd_pack on four equal-length proteins
-    produces two batches of two (3*L²>250 flushes at count 2).
+    Returns:
+        The factory.
     """
-    return ShardBudgetParameters(
-        shard_dir=tmp_path / "shards",
-        structlog_path=tmp_path / "train.jsonl",
-        token_budget=250,
-        max_seq_len=MAX_SEQ_LENGTH,
-        seed=0,
-        n_threads=1,
-        world_size=1,
-        rank=0,
-        n_proteins_in_shard=100,
-        noise_magnitude=0,
-        num_workers=2,
+    calls: list[int] = []
+
+    def make(names: list[str], lengths: list[int]) -> ProteinShardDataset:
+        """Write the entries and shard them.
+
+        Args:
+            names: Entry names.
+            lengths: Residue count per entry.
+
+        Returns:
+            The dataset.
+        """
+        calls.append(len(calls))
+        entries = [
+            make_entry(n, k) for n, k in zip(names, lengths, strict=True)
+        ]
+        jsonl = write_jsonl(tmp_path / f"p{len(calls)}.jsonl", entries)
+        budget = dataclasses.replace(
+            shard_budget,
+            shard_dir=tmp_path / f"shards{len(calls)}",
+        )
+        return ProteinShardDataset(
+            budget_parameters=budget,
+            names=names,
+            dataset_jsonl=jsonl,
+        )
+
+    return make
+
+
+@pytest.fixture(scope="module")
+def bucketed_cfg() -> TrainConfig:
+    """Return a small bucketed-loader configuration with a 512-token budget.
+
+    Module-scoped because the module-scoped loader lifecycle needs it; the
+    config is a frozen pydantic model, so sharing it is safe.
+
+    Returns:
+        The configuration.
+    """
+    return TrainConfig(
+        train_loader=TrainLoaderConfig(
+            batch_size=2,
+            max_seq_length=8,
+            token_budget=512,
+            num_workers=1,
+            epoch_prefetch_depth=1,
+            n_shards=1,
+        ),
+        test_loader=EvalLoaderConfig(batch_size=2, max_seq_length=8),
     )
 
 
-# ---------------------------------------------------------------------------
-# ProteinShardDataset
-# ---------------------------------------------------------------------------
+@pytest.fixture
+def make_train_args(
+    tmp_path: pathlib.Path,
+    make_entry: EntryFactory,
+    write_jsonl: JsonlWriter,
+) -> ArgsFactory:
+    """Return a factory for TrainArgs over a dataset of ``n`` proteins.
+
+    ``make(n, debug_run)`` writes ``n`` 6-residue entries, puts them all in
+    the train split (and the first in validation and test), and shares one
+    shard directory across calls, as successive runs on one machine do.
+
+    Args:
+        tmp_path: Per-test directory.
+        make_entry: Entry factory.
+        write_jsonl: JSONL writer.
+
+    Returns:
+        The factory.
+    """
+
+    def make(n: int, *, debug_run: bool) -> TrainArgs:
+        """Write a dataset of ``n`` proteins and point TrainArgs at it.
+
+        Args:
+            n: Number of proteins.
+            debug_run: Value of ``TrainArgs.debug_run``.
+
+        Returns:
+            The arguments.
+        """
+        names = [f"{i:04d}p.A" for i in range(n)]
+        jsonl = tmp_path / f"proteins_{n}.jsonl"
+        _ = write_jsonl(jsonl, [make_entry(name, 6) for name in names])
+        splits = tmp_path / f"splits_{n}.json"
+        _ = splits.write_text(
+            json.dumps(
+                {"train": names, "validation": names[:1], "test": names[:1]},
+            ),
+        )
+        return TrainArgs(
+            dataset_jsonl=jsonl,
+            shard_dir=tmp_path / "shards",
+            keys_for_splits_json=splits,
+            config=tmp_path / "config.json",
+            structlog_jsonl=tmp_path / "train.jsonl",
+            ddp=False,
+            debug_run=debug_run,
+        )
+
+    return make
 
 
 @pytest.fixture
-def protein_shard_dataset_factory(
-    tmp_path: pathlib.Path,
-    shard_budget: ShardBudgetParameters,
-) -> Callable[[list[str], list[int]], ProteinShardDataset]:
-    """Returns callable to build ProteinShardDataset from names and lengths."""
+def debug_train_size(
+    request: pytest.FixtureRequest,
+    bucketed_cfg: TrainConfig,
+    make_train_args: ArgsFactory,
+) -> int:
+    """Build a debug-run loader over 300 proteins and return its train size.
 
-    def _build(
-        protein_name_array: list[str],
-        protein_len_array: list[int],
-    ) -> ProteinShardDataset:
-        entries: list[dict[str, object]] = [
-            _make_entry(name, length)
-            for name, length in zip(
-                protein_name_array,
-                protein_len_array,
-                strict=True,
-            )
-        ]
-        dataset_jsonl_path = tmp_path / "p.jsonl"
-        _write_jsonl(dataset_jsonl_path, entries)
-        return ProteinShardDataset(
-            budget_parameters=shard_budget,
-            names=protein_name_array,
-            dataset_jsonl=dataset_jsonl_path,
+    With a True param, a full-dataset loader is built first in the same
+    shard directory, leaving a 300-protein shard cache behind.
+
+    Args:
+        request: Pytest request carrying whether to build the full loader.
+        bucketed_cfg: Loader configuration.
+        make_train_args: TrainArgs factory.
+
+    Returns:
+        Number of proteins in the debug-run train dataset.
+    """
+    if cast(bool, request.param):
+        _ = make_bucketed_data_loaders(
+            cfg=bucketed_cfg,
+            extra_train_args=make_train_args(300, debug_run=False),
         )
+    train_loader, _, _ = make_bucketed_data_loaders(
+        cfg=bucketed_cfg,
+        extra_train_args=make_train_args(300, debug_run=True),
+    )
+    return len(cast(ProteinDataset, train_loader.dataset))
 
-    return _build
+
+@pytest.fixture
+def pickled_dataset(
+    request: pytest.FixtureRequest,
+    train_dataset: ProteinDataset,
+) -> ProteinDataset:
+    """Pickle round-trip ``train_dataset``, optionally after reading from it.
+
+    Args:
+        request: Pytest request carrying whether to read a sample first,
+            which opens the dataset's file handle.
+        train_dataset: Dataset to pickle.
+
+    Returns:
+        The restored copy.
+    """
+    if cast(bool, request.param):
+        _ = train_dataset[0]
+    raw = pickle.dumps(train_dataset)
+    return cast(ProteinDataset, pickle.loads(raw))  # noqa: S301
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1638,6 +622,7 @@ class ShardLoaderLifecycle:
         len_after_construction: ``len(loader)`` right after construction.
         epoch_before_iter: ``loader.epoch`` right after construction.
         epoch_after_iter: ``loader.epoch`` after one full iteration.
+        batches: Number of batches the iteration yielded.
         process_executor_closed: True if ``__del__`` shut the process
             executor down, so it refuses new work.
         queue_watcher_closed: True if ``__del__`` shut the queue watcher
@@ -1647,12 +632,16 @@ class ShardLoaderLifecycle:
     len_after_construction: int
     epoch_before_iter: int
     epoch_after_iter: int
+    batches: int
     process_executor_closed: bool
     queue_watcher_closed: bool
 
 
-def _refuses_new_work(executor: Executor) -> bool:
+def refuses_new_work(executor: Executor) -> bool:
     """Return True if an executor has been shut down.
+
+    A plain function because the module-scoped lifecycle fixture calls it
+    after the loader is torn down, where no fixture can be requested.
 
     Args:
         executor: Executor to probe with a no-op task.
@@ -1670,6 +659,9 @@ def _refuses_new_work(executor: Executor) -> bool:
 @pytest.fixture(scope="module")
 def shard_loader_lifecycle(
     tmp_path_factory: pytest.TempPathFactory,
+    bucketed_cfg: TrainConfig,
+    make_entry: EntryFactory,
+    write_jsonl: JsonlWriter,
 ) -> ShardLoaderLifecycle:
     """Take one ShardDataLoader through its whole life and record the result.
 
@@ -1677,565 +669,665 @@ def shard_loader_lifecycle(
     which takes seconds, so the tests share this module-scoped run. The
     result is a frozen snapshot of each stage rather than the live loader,
     so the tests stay order-independent even though iterating and shutting
-    down both change the loader.
-
-    ``__del__`` is called directly because the watcher thread can still hold
-    a reference to the loader after iteration, which would make the timing
-    of garbage collection unpredictable.
+    down both change the loader. ``__del__`` is called directly because the
+    watcher thread can still hold a reference to the loader after
+    iteration, which would make garbage collection unpredictable.
 
     Args:
         tmp_path_factory: Factory for the run's temporary directory.
+        bucketed_cfg: Loader configuration.
+        make_entry: Entry factory.
+        write_jsonl: JSONL writer.
 
     Returns:
         ShardLoaderLifecycle recorded across construction, one iteration,
         and shutdown.
     """
-    work_dir = tmp_path_factory.mktemp("shard_loader")
-    budget = _make_shard_budget(work_dir)
-    loader_cfg = _make_bucketed_cfg()
-    dataset_jsonl = work_dir / "p.jsonl"
-    _write_jsonl(dataset_jsonl, [_make_entry("p1", 10), _make_entry("p2", 20)])
+    work = tmp_path_factory.mktemp("shard_loader")
+    budget = ShardBudgetParameters(
+        shard_dir=work / "shards",
+        structlog_path=work / "train.jsonl",
+        token_budget=512,
+        max_seq_len=128,
+        seed=0,
+        n_threads=1,
+        world_size=1,
+        rank=0,
+        n_proteins_in_shard=100,
+        noise_magnitude=0,
+        num_workers=1,
+    )
+    entries = [make_entry("p1", 10), make_entry("p2", 20)]
+    jsonl = write_jsonl(work / "p.jsonl", entries)
     loader = ShardDataLoader(
         dataset=ProteinShardDataset(
             budget_parameters=budget,
             names=["p1", "p2"],
-            dataset_jsonl=dataset_jsonl,
+            dataset_jsonl=jsonl,
         ),
         budget=budget,
-        tcfg=loader_cfg,
+        tcfg=bucketed_cfg,
         distogram_template=build_distogram_module(
-            loader_cfg.distogram_template,
+            bucketed_cfg.distogram_template,
         ).eval(),
         distogram_residue=build_distogram_module(
-            loader_cfg.distogram_residue,
+            bucketed_cfg.distogram_residue,
         ).eval(),
-        distogram_atom=build_distogram_module(loader_cfg.distogram_atom).eval(),
+        distogram_atom=build_distogram_module(
+            bucketed_cfg.distogram_atom,
+        ).eval(),
     )
     len_after_construction = len(loader)
     epoch_before_iter = loader.epoch
-    _ = list(loader)
+    batches = len(list(loader))
     epoch_after_iter = loader.epoch
     loader.__del__()  # pylint: disable=unnecessary-dunder-call
     return ShardLoaderLifecycle(
         len_after_construction=len_after_construction,
         epoch_before_iter=epoch_before_iter,
         epoch_after_iter=epoch_after_iter,
-        process_executor_closed=_refuses_new_work(loader.process_executor),
-        queue_watcher_closed=_refuses_new_work(loader.queue_watcher),
+        batches=batches,
+        process_executor_closed=refuses_new_work(loader.process_executor),
+        queue_watcher_closed=refuses_new_work(loader.queue_watcher),
     )
 
 
-# ---------------------------------------------------------------------------
-# Fixtures for bucketed loader tests
-# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "break_case",
+    list(ItemBreak),
+    ids=[case.name for case in ItemBreak],
+    indirect=True,
+)
+def test_featurized_item_rejects_a_malformed_field(
+    featurized_item: FeaturizedItem,
+    break_case: FieldBreak,
+) -> None:
+    """Rebuilding a valid item with one malformed field fails the contract.
 
+    Every other field stays valid, so the error can only come from the
+    replaced one.
 
-@pytest.fixture
-def bucketed_jsonl(tmp_path: pathlib.Path) -> str:
-    """Write a JSONL with 5 proteins of varying lengths.
-
-    Proteins p1-p5 have lengths 8, 16, 24, 32, and 40 residues respectively.
+    Args:
+        featurized_item: Valid item from ``featurize_single_item``.
+        break_case: Field and reshape to apply.
     """
-    entries = [
-        _make_entry("p1", 8),
-        _make_entry("p2", 16),
-        _make_entry("p3", 24),
-        _make_entry("p4", 32),
-        _make_entry("p5", 40),
-    ]
-    path = tmp_path / "proteins.jsonl"
-    _write_jsonl(path, entries)
-    return str(path)
-
-
-@pytest.fixture
-def bucketed_splits(tmp_path: pathlib.Path) -> str:
-    """Write a splits JSON using the 5-protein JSONL names."""
-    path = tmp_path / "splits.json"
-    with path.open("w") as f:
-        json.dump(
-            {
-                "train": ["p1", "p2", "p3"],
-                "validation": ["p4"],
-                "test": ["p5"],
-            },
-            f,
+    old = cast(torch.Tensor, getattr(featurized_item, break_case.field))
+    with pytest.raises(TypeCheckError):
+        _ = dataclasses.replace(
+            featurized_item,
+            **{break_case.field: break_case.malform(old)},
         )
-    return str(path)
 
 
-def _make_bucketed_cfg() -> TrainConfig:
-    """Build a minimal TrainConfig with token_budget=512."""
-    return TrainConfig(
-        train_loader=TrainLoaderConfig(
-            batch_size=2,
-            max_seq_length=_MAX_SEQ,
-            token_budget=512,
-            num_workers=1,
-            epoch_prefetch_depth=1,
-            n_shards=1,
-        ),
-        test_loader=EvalLoaderConfig(
-            batch_size=2,
-            max_seq_length=_MAX_SEQ,
-        ),
-    )
+@pytest.mark.parametrize(
+    "break_case",
+    list(BatchBreak),
+    ids=[case.name for case in BatchBreak],
+    indirect=True,
+)
+def test_featurized_batch_rejects_a_malformed_field(
+    featurized_batch: FeaturizedBatch,
+    break_case: FieldBreak,
+) -> None:
+    """Rebuilding a valid batch with one malformed field fails the contract.
 
-
-@pytest.fixture
-def bucketed_cfg() -> TrainConfig:
-    """Minimal TrainConfig with token_budget=512 for bucketed loader tests."""
-    return _make_bucketed_cfg()
-
-
-@pytest.fixture
-def bucketed_train_args(
-    bucketed_jsonl: str,
-    bucketed_splits: str,
-    tmp_path: pathlib.Path,
-) -> TrainArgs:
-    """TrainArgs pointing at the bucketed JSONL and splits fixtures."""
-    return TrainArgs(
-        dataset_jsonl=pathlib.Path(bucketed_jsonl),
-        shard_dir=tmp_path / "shards",
-        keys_for_splits_json=pathlib.Path(bucketed_splits),
-        config=tmp_path / "config.json",
-        structlog_jsonl=tmp_path / "train.jsonl",
-        ddp=False,
-        debug_run=False,
-    )
-
-
-@pytest.fixture
-def debug_train_args(
-    debug_jsonl_path: str,
-    debug_splits_path: str,
-    tmp_path: pathlib.Path,
-) -> TrainArgs:
-    """TrainArgs fixture with debug_run=True."""
-    return TrainArgs(
-        dataset_jsonl=pathlib.Path(debug_jsonl_path),
-        shard_dir=tmp_path / "shards",
-        keys_for_splits_json=pathlib.Path(debug_splits_path),
-        config=tmp_path / "config.json",
-        structlog_jsonl=tmp_path / "train.jsonl",
-        ddp=False,
-        debug_run=True,
-    )
-
-
-@pytest.fixture
-def full_dataset_jsonl(tmp_path: pathlib.Path) -> pathlib.Path:
-    """Write a JSONL file with _N_FULL synthetic protein entries.
-
-    Used to seed a shard cache before a debug_run=True call so the
-    cache-poisoning scenario can be exercised.
+    Args:
+        featurized_batch: Valid batch from ``featurize_batch``.
+        break_case: Field and reshape to apply.
     """
-    path = tmp_path / "full_proteins.jsonl"
-    names = [f"{i:04d}p.A" for i in range(_N_FULL)]
-    with path.open("w") as f:
-        for name in names:
-            entry = {
-                "name": name,
-                "seq": "ACDEFG"[:_N_RES_DATA],
-                "coords": _make_coords(_N_RES_DATA),
-            }
-            _ = f.write(json.dumps(entry) + "\n")
-    return path
-
-
-@pytest.fixture
-def full_dataset_splits(tmp_path: pathlib.Path) -> pathlib.Path:
-    """Write a splits JSON assigning all _N_FULL entries to train."""
-    names = [f"{i:04d}p.A" for i in range(_N_FULL)]
-    path = tmp_path / "full_splits.json"
-    with path.open("w") as f:
-        json.dump(
-            {"train": names, "validation": names[:1], "test": names[:1]},
-            f,
+    old = cast(torch.Tensor, getattr(featurized_batch, break_case.field))
+    with pytest.raises(TypeCheckError):
+        _ = dataclasses.replace(
+            featurized_batch,
+            **{break_case.field: break_case.malform(old)},
         )
-    return path
 
 
-@pytest.fixture
-def full_train_args(
-    full_dataset_jsonl: pathlib.Path,
-    full_dataset_splits: pathlib.Path,
-    tmp_path: pathlib.Path,
-) -> TrainArgs:
-    """TrainArgs pointing at the _N_FULL dataset with debug_run=False."""
-    return TrainArgs(
-        dataset_jsonl=full_dataset_jsonl,
-        shard_dir=tmp_path / "shards",
-        keys_for_splits_json=full_dataset_splits,
-        config=tmp_path / "config.json",
-        structlog_jsonl=tmp_path / "train.jsonl",
-        ddp=False,
-        debug_run=False,
-    )
-
-
-@pytest.fixture
-def full_debug_train_args(
-    full_dataset_jsonl: pathlib.Path,
-    full_dataset_splits: pathlib.Path,
-    tmp_path: pathlib.Path,
-) -> TrainArgs:
-    """TrainArgs pointing at the _N_FULL dataset with debug_run=True."""
-    return TrainArgs(
-        dataset_jsonl=full_dataset_jsonl,
-        shard_dir=tmp_path / "shards",
-        keys_for_splits_json=full_dataset_splits,
-        config=tmp_path / "config.json",
-        structlog_jsonl=tmp_path / "train.jsonl",
-        ddp=False,
-        debug_run=True,
-    )
-
-
-# ---------------------------------------------------------------------------
-# make_bucketed_data_loaders tests
-# ---------------------------------------------------------------------------
-
-
-def test_bucketed_train_loader_yields_featurized_batch(
-    bucketed_cfg: TrainConfig,
-    bucketed_train_args: TrainArgs,
+@pytest.mark.parametrize(
+    "bin_scenario",
+    list(BinScenario),
+    ids=[case.name for case in BinScenario],
+    indirect=True,
+)
+def test_distogram_assigns_each_distance_its_bin(
+    bin_scenario: BinScenario,
 ) -> None:
-    """Training loader yields FeaturizedBatch objects, not raw Protein lists."""
-    train_loader, _, _ = make_bucketed_data_loaders(
-        cfg=bucketed_cfg,
-        extra_train_args=bucketed_train_args,
-    )
-    batch = cast(FeaturizedBatch, next(iter(train_loader)))
-    assert isinstance(batch, FeaturizedBatch)
+    """Two atoms ``distance`` apart get the expected one-hot bin and mask.
 
-
-def test_bucketed_debug_run_train_dataset_has_252_items(
-    bucketed_cfg: TrainConfig,
-    debug_train_args: TrainArgs,
-) -> None:
-    """Using debug_run=True yields a train dataset of _N_DEBUG items."""
-    train_loader, _, _ = make_bucketed_data_loaders(
-        cfg=bucketed_cfg,
-        extra_train_args=debug_train_args,
-    )
-    loader_dataset = cast(ProteinDataset, train_loader.dataset)
-    assert len(loader_dataset) == _N_DEBUG
-
-
-_N_FULL = 300  # dataset larger than _N_DEBUG to expose cache-poisoning bug
-
-
-def test_bucketed_debug_run_not_poisoned_by_prior_full_cache(
-    bucketed_cfg: TrainConfig,
-    full_train_args: TrainArgs,
-    full_debug_train_args: TrainArgs,
-) -> None:
-    """debug_run=True caps at _N_DEBUG even after full-dataset loader built.
-
-    Building a loader over all _N_FULL proteins must not affect a subsequent
-    debug_run=True call that slices train names to _N_DEBUG.
+    Args:
+        bin_scenario: Distance, overflow setting and expected outcome.
     """
-    # Build a full-dataset loader first.
-    _, _, _ = make_bucketed_data_loaders(
-        cfg=bucketed_cfg,
-        extra_train_args=full_train_args,
+    case = bin_scenario.value
+    disto = Distogram(n_bins=16, overflow_bin=case.overflow).eval()
+    coords = torch.tensor([[0.0, 0, 0], [case.distance, 0, 0]])
+    with torch.no_grad():
+        onehot, mask = disto(coords)
+    expected = torch.zeros(16 + case.overflow)
+    expected[case.expected_bin] = 1
+    assert torch.equal(onehot[0, 1], expected)
+    assert bool(mask[0, 1]) == case.valid
+
+
+@pytest.mark.parametrize("overflow", [False, True], ids=["clipped", "overflow"])
+def test_distogram_is_a_symmetric_one_hot_over_its_bins(
+    overflow: bool,  # noqa: FBT001
+    make_pattern: PatternFactory,
+) -> None:
+    """Every pair gets exactly one bin, and ``(i, j)`` matches ``(j, i)``.
+
+    The overflow bin adds one class to the last axis.
+
+    Args:
+        overflow: Whether the Distogram has an overflow bin.
+        make_pattern: Builds 12 coordinates spread over about 20 angstroms.
+    """
+    disto = Distogram(n_bins=16, overflow_bin=overflow).eval()
+    coords = 20 * make_pattern((12, 3), 0.37)
+    with torch.no_grad():
+        onehot, mask = disto(coords)
+    assert onehot.shape == (12, 12, 16 + overflow)
+    assert torch.equal(
+        reduce(onehot, "i j b -> i j", "sum"),
+        torch.ones(12, 12),
     )
-
-    # A subsequent debug_run=True call must cap at _N_DEBUG.
-    train_loader, _, _ = make_bucketed_data_loaders(
-        cfg=bucketed_cfg,
-        extra_train_args=full_debug_train_args,
-    )
-    loader_dataset = cast(ProteinDataset, train_loader.dataset)
-    assert len(loader_dataset) == _N_DEBUG
+    assert torch.equal(onehot, rearrange(onehot, "i j b -> j i b"))
+    assert torch.equal(mask, rearrange(mask, "i j -> j i"))
 
 
-# ---------------------------------------------------------------------------
-# write_shard_metadata_sidecar tests
-# ---------------------------------------------------------------------------
+def test_distogram_masks_every_pair_of_an_invalid_atom(
+    make_pattern: PatternFactory,
+) -> None:
+    """An atom marked invalid drops its whole row and column of pairs.
+
+    Every coordinate is within 2 angstroms of every other, so no distance
+    cutoff applies and the mask alone decides. Not parametrized: which
+    atom is invalid does not matter.
+
+    Args:
+        make_pattern: Builds 12 nearby coordinates.
+    """
+    disto = Distogram(n_bins=16, overflow_bin=False).eval()
+    valid = torch.ones(12, dtype=torch.bool)
+    valid[0] = False
+    with torch.no_grad():
+        _, mask = disto(make_pattern((12, 3), 0.37), valid)
+    expected = rearrange(valid, "i -> i 1") & rearrange(valid, "j -> 1 j")
+    assert torch.equal(mask, expected)
 
 
-def test_write_shard_metadata_fields_match_inputs(
-    protein_shard_dataset_factory: Callable[
-        [list[str], list[int]],
-        ProteinShardDataset,
+@pytest.mark.parametrize(
+    ("positions", "dim", "expected"),
+    [
+        pytest.param((0.0,), 4, (0.0, 0.0, 1.0, 1.0), id="origin"),
+        pytest.param(
+            (1.0,),
+            4,
+            (math.sin(1), math.sin(1e-4), math.cos(1), math.cos(1e-4)),
+            id="position_one",
+        ),
+        pytest.param(
+            (2.0,),
+            4,
+            (math.sin(2), math.sin(2e-4), math.cos(2), math.cos(2e-4)),
+            id="two_freqs",
+        ),
     ],
+)
+def test_sinusoidal_encoding_matches_its_closed_form(
+    positions: tuple[float, ...],
+    dim: int,
+    expected: tuple[float, ...],
 ) -> None:
-    """ShardMetadata JSON fields match the values used at construction."""
-    ds = protein_shard_dataset_factory(["p1", "p2"], [10, 20])
-    meta = ShardMetadata.model_validate_json(ds.shard_metadata_path.read_text())
-    assert meta.token_budget == ds.token_budget
-    assert meta.shard_size == ds.n_proteins_in_shard
+    """Position ``p`` maps to ``sin(p f)`` then ``cos(p f)`` per frequency.
+
+    Frequencies are ``10000 ** (-k / (dim/2 - 1))``, so ``dim = 4`` gives
+    ``1`` and ``1e-4``.
+
+    Args:
+        positions: One residue position.
+        dim: Embedding width.
+        expected: The ``dim`` encoded values.
+    """
+    out = sinusoidal_encoding(torch.tensor([positions]), dim=dim)
+    torch.testing.assert_close(out, torch.tensor([[expected]]))
+
+
+@pytest.mark.parametrize(
+    ("resname", "has_cb"),
+    [
+        pytest.param("ALA", True, id="alanine"),
+        pytest.param("GLY", False, id="glycine_has_no_cb"),
+        pytest.param("TRP", True, id="tryptophan"),
+    ],
+)
+def test_ref_pos_for_residue_puts_ca_at_the_origin(
+    resname: str,
+    has_cb: bool,  # noqa: FBT001
+) -> None:
+    """CA is at the origin, N and C are off it, and a missing CB is zero.
+
+    Glycine is the only canonical residue without a CB, so its CB row
+    falls back to ``(0, 0, 0)``.
+
+    Args:
+        resname: Three-letter residue name.
+        has_cb: Whether the residue has a CB atom.
+    """
+    pos = ref_pos_for_residue(resname)
+    assert pos.shape == (ATOMS_PER_RES, 3)
+    assert torch.equal(pos[1], torch.zeros(3))
+    assert bool((pos[[0, 2]].abs().sum(-1) > 1).all())
+    assert bool(pos[4].abs().sum() > 0) == has_cb
+
+
+def test_featurize_single_item_shapes_ranges_and_index_maps(
+    featurized_item: FeaturizedItem,
+    protein: Protein,
+    tcfg: TrainConfig,
+) -> None:
+    """The item has every field at its shape, finite, with exact index maps.
+
+    Atom ``l`` belongs to residue ``l // 5``, its centre atom is that
+    residue's CA at ``5 r + 1``, and the noise level ``t_normalized`` lies
+    in ``[0, 1]``. Not parametrized: one protein covers the layout.
+
+    Args:
+        featurized_item: The featurized protein.
+        protein: The 12-residue input.
+        tcfg: Supplies the template distogram width.
+    """
+    x = featurized_item
+    n_res = len(protein.aatype)
+    n_atom = n_res * ATOMS_PER_RES
+    residue = torch.arange(n_res).repeat_interleave(ATOMS_PER_RES)
+    shapes = {
+        "ref_pos": (n_atom, 3),
+        "ref_element": (n_atom, 4),
+        "ref_space_uid": (n_atom,),
+        "gt_res_distogram_indices": (n_res, n_res),
+        "noised_res_distogram": (n_res, n_res, tcfg.distogram_template.n_bins),
+        "f_pseudo_beta_mask": (n_res,),
+        "tok_idx": (n_atom,),
+        "center_uid": (n_atom,),
+    }
+    fields: Mapping[str, torch.Tensor] = {
+        f.name: cast(torch.Tensor, getattr(x, f.name))
+        for f in dataclasses.fields(x)
+    }
+    assert {k: tuple(fields[k].shape) for k in shapes} == shapes
+    assert all(torch.isfinite(t.float()).all() for t in fields.values())
+    assert bool(x.t_hat > 0)
+    assert bool(((x.t_normalized >= 0) & (x.t_normalized <= 1)).all())
+    assert torch.equal(x.ref_space_uid, residue)
+    assert torch.equal(x.tok_idx, residue)
+    assert torch.equal(x.center_uid, ATOMS_PER_RES * residue + 1)
+
+
+def test_featurize_batch_stacks_items_along_a_batch_axis(
+    featurized_batch: FeaturizedBatch,
+    featurized_item: FeaturizedItem,
+) -> None:
+    """Each batch field is ``(2, *item_shape)``, with each item's index maps.
+
+    Not parametrized: the item test above covers the per-field contents.
+
+    Args:
+        featurized_batch: Two copies of the protein, featurized together.
+        featurized_item: The protein featurized alone.
+    """
+    batch, item = featurized_batch, featurized_item
+    pairs = [
+        (
+            cast(torch.Tensor, getattr(batch, f.name)).shape,
+            cast(torch.Tensor, getattr(item, f.name)).shape,
+        )
+        for f in dataclasses.fields(item)
+    ]
+    assert all(b == (2, *i) for b, i in pairs)
+    assert torch.equal(batch.tok_idx, repeat(item.tok_idx, "n -> 2 n"))
+    assert torch.equal(batch.center_uid, repeat(item.center_uid, "n -> 2 n"))
+
+
+def test_featurize_collate_works_after_a_pickle_round_trip(
+    protein: Protein,
+    tcfg: TrainConfig,
+    distograms: Distograms,
+    featurized_batch: FeaturizedBatch,
+) -> None:
+    """A collate restored from pickle, as DataLoader workers get it, works.
+
+    It must produce a FeaturizedBatch shaped like ``featurize_batch``'s.
+    Not parametrized: pickling is the one transport DataLoader uses.
+
+    Args:
+        protein: Protein to collate twice.
+        tcfg: Configuration.
+        distograms: Template, residue and atom distograms.
+        featurized_batch: Reference batch of the same two proteins.
+    """
+    collate = FeaturizeCollate(
+        tcfg=tcfg,
+        distogram_template=distograms.template,
+        distogram_residue=distograms.residue,
+        distogram_atom=distograms.atom,
+    )
+    raw = pickle.dumps(collate)
+    restored = cast(FeaturizeCollate, pickle.loads(raw))  # noqa: S301
+    out = restored([protein, protein])
+    assert isinstance(out, FeaturizedBatch)
+    assert out.r_gt.shape == featurized_batch.r_gt.shape
+
+
+@pytest.mark.parametrize(
+    ("names", "expected"),
+    [
+        pytest.param(["1aa.A", "2bb.A", "3cc.A"], 3, id="three_listed"),
+        pytest.param(["1aa.A"], 1, id="one_listed"),
+        pytest.param([], 0, id="none_listed"),
+    ],
+)
+def test_protein_dataset_holds_only_listed_names(
+    dataset_jsonl: pathlib.Path,
+    names: list[str],
+    expected: int,
+) -> None:
+    """The dataset's length is the number of listed names, and each loads.
+
+    Args:
+        dataset_jsonl: Five-entry JSONL.
+        names: Names to load.
+        expected: Expected length.
+    """
+    dataset = ProteinDataset(dataset_jsonl, names, max_seq_length=8)
+    assert len(dataset) == expected
+    assert all(isinstance(dataset[i], Protein) for i in range(expected))
+
+
+def test_protein_dataset_pads_samples_to_max_length(
+    train_dataset: ProteinDataset,
+) -> None:
+    """A 6-residue entry comes back padded to 8, with float64 coordinates.
+
+    The two padded residues have every atom masked out. Not parametrized:
+    truncation is the next test.
+
+    Args:
+        train_dataset: Dataset of 6-residue entries padded to 8.
+    """
+    sample = train_dataset[0]
+    assert sample.atom_positions.shape == (8, 37, 3)
+    assert sample.atom_mask.shape == (8, 37)
+    assert sample.residue_index.shape == (8,)
+    assert sample.aatype.shape == (8,)
+    assert sample.atom_positions.dtype == np.float64
+    assert sample.atom_mask.dtype == np.float64
+    assert np.issubdtype(sample.aatype.dtype, np.integer)
+    assert not sample.atom_mask[6:].any()
+
+
+def test_protein_dataset_truncates_long_entries(
+    tmp_path: pathlib.Path,
+    make_entry: EntryFactory,
+    write_jsonl: JsonlWriter,
+) -> None:
+    """A 100-residue entry comes back cut to ``max_seq_length = 8``.
+
+    Not parametrized: padding is the test above.
+
+    Args:
+        tmp_path: Per-test directory.
+        make_entry: Entry factory.
+        write_jsonl: JSONL writer.
+    """
+    path = write_jsonl(tmp_path / "long.jsonl", [make_entry("long.A", 100)])
+    sample = ProteinDataset(path, ["long.A"], max_seq_length=8)[0]
+    assert sample.aatype.shape == (8,)
+    assert sample.atom_positions.shape == (8, 37, 3)
+
+
+@pytest.mark.parametrize(
+    "pickled_dataset",
+    [False, True],
+    ids=["unopened", "opened"],
+    indirect=True,
+)
+def test_protein_dataset_survives_pickling(
+    train_dataset: ProteinDataset,
+    pickled_dataset: ProteinDataset,
+) -> None:
+    """The dataset pickles whether or not its file handle is open yet.
+
+    DataLoader workers receive it by pickle, sometimes after the parent
+    has already read from it.
+
+    Args:
+        train_dataset: The original dataset.
+        pickled_dataset: Its pickle round trip.
+    """
+    restored = pickled_dataset
+    assert len(restored) == len(train_dataset)
+    np.testing.assert_array_equal(
+        restored[0].atom_positions,
+        train_dataset[0].atom_positions,
+    )
+
+
+def test_shard_metadata_records_the_build_parameters(
+    make_shard_dataset: ShardFactory,
+) -> None:
+    """The metadata sidecar records the token budget and shard size used.
+
+    Not parametrized: the fields are copied from the budget as is.
+
+    Args:
+        make_shard_dataset: Shard dataset factory.
+    """
+    dataset = make_shard_dataset(["p1", "p2"], [10, 20])
+    meta = ShardMetadata.model_validate_json(
+        dataset.shard_metadata_path.read_text(),
+    )
+    assert meta.token_budget == dataset.token_budget
+    assert meta.shard_size == dataset.n_proteins_in_shard
     assert meta.n_shards >= 1
 
 
-def test_write_shard_metadata_names_hash_stable(
+@pytest.mark.parametrize(
+    ("names_a", "names_b"),
+    [
+        pytest.param(["p1", "p2"], ["p1", "p2"], id="same_names"),
+        pytest.param(["p2", "p1"], ["p1", "p2"], id="same_names_reordered"),
+        pytest.param(["p1"], ["p1", "p2"], id="different_names"),
+    ],
+)
+def test_shard_metadata_names_hash_identifies_the_name_set(
+    make_shard_dataset: ShardFactory,
+    names_a: list[str],
+    names_b: list[str],
+) -> None:
+    """Two builds share a names hash exactly when they shard the same names.
+
+    The hash is over the sorted names, so order does not matter.
+
+    Args:
+        make_shard_dataset: Shard dataset factory.
+        names_a: Names of the first build.
+        names_b: Names of the second build.
+    """
+    hashes = [
+        ShardMetadata.model_validate_json(
+            make_shard_dataset(
+                names,
+                [10] * len(names),
+            ).shard_metadata_path.read_text(),
+        ).names_hash
+        for names in (names_a, names_b)
+    ]
+    assert (hashes[0] == hashes[1]) == (sorted(names_a) == sorted(names_b))
+
+
+def test_shard_dataset_reuses_existing_metadata(
     tmp_path: pathlib.Path,
     shard_budget: ShardBudgetParameters,
+    make_entry: EntryFactory,
+    write_jsonl: JsonlWriter,
 ) -> None:
-    """The same name set produces an identical names_hash on both runs."""
-    names = ["p1", "p2"]
-    _write_jsonl(
-        tmp_path / "p.jsonl",
-        [_make_entry(n, 10) for n in names],
-    )
-    ds_a = ProteinShardDataset(
-        budget_parameters=dataclasses.replace(
-            shard_budget,
-            shard_dir=tmp_path / "shards_a",
-        ),
-        names=names,
-        dataset_jsonl=tmp_path / "p.jsonl",
-    )
-    ds_b = ProteinShardDataset(
-        budget_parameters=dataclasses.replace(
-            shard_budget,
-            shard_dir=tmp_path / "shards_b",
-        ),
-        names=names,
-        dataset_jsonl=tmp_path / "p.jsonl",
-    )
-    hash_a = ShardMetadata.model_validate_json(
-        ds_a.shard_metadata_path.read_text(),
-    ).names_hash
-    hash_b = ShardMetadata.model_validate_json(
-        ds_b.shard_metadata_path.read_text(),
-    ).names_hash
-    assert hash_a == hash_b
+    """A second dataset in the same shard directory leaves the shards alone.
 
+    The metadata file is not rewritten, so its mtime is unchanged. Not
+    parametrized: the cache check reads one file.
 
-def test_write_shard_metadata_names_hash_changes_on_different_names(
-    tmp_path: pathlib.Path,
-    shard_budget: ShardBudgetParameters,
-) -> None:
-    """Different name sets produce different names_hash values."""
-    _write_jsonl(
-        tmp_path / "p.jsonl",
-        [_make_entry("p1", 10), _make_entry("p2", 20)],
-    )
-    ds_a = ProteinShardDataset(
-        budget_parameters=dataclasses.replace(
-            shard_budget,
-            shard_dir=tmp_path / "shards_a",
-        ),
-        names=["p1"],
-        dataset_jsonl=tmp_path / "p.jsonl",
-    )
-    ds_b = ProteinShardDataset(
-        budget_parameters=dataclasses.replace(
-            shard_budget,
-            shard_dir=tmp_path / "shards_b",
-        ),
-        names=["p1", "p2"],
-        dataset_jsonl=tmp_path / "p.jsonl",
-    )
-    hash_a = ShardMetadata.model_validate_json(
-        ds_a.shard_metadata_path.read_text(),
-    ).names_hash
-    hash_b = ShardMetadata.model_validate_json(
-        ds_b.shard_metadata_path.read_text(),
-    ).names_hash
-    assert hash_a != hash_b
-
-
-def test_build_sorted_shards_existing_metadata_prevents_rebuild(
-    tmp_path: pathlib.Path,
-    shard_budget: ShardBudgetParameters,
-) -> None:
-    """A second init with the same shard_dir reuses cached metadata as-is."""
-    _write_jsonl(tmp_path / "p.jsonl", [_make_entry("p1", 10)])
+    Args:
+        tmp_path: Per-test directory.
+        shard_budget: Shard parameters, shared by both builds.
+        make_entry: Entry factory.
+        write_jsonl: JSONL writer.
+    """
+    jsonl = write_jsonl(tmp_path / "p.jsonl", [make_entry("p1", 10)])
     first = ProteinShardDataset(
         budget_parameters=shard_budget,
         names=["p1"],
-        dataset_jsonl=tmp_path / "p.jsonl",
+        dataset_jsonl=jsonl,
     )
-    mtime_before = first.shard_metadata_path.stat().st_mtime
+    before = first.shard_metadata_path.stat().st_mtime_ns
     _ = ProteinShardDataset(
         budget_parameters=shard_budget,
         names=["p1"],
-        dataset_jsonl=tmp_path / "p.jsonl",
+        dataset_jsonl=jsonl,
     )
-    mtime_after = first.shard_metadata_path.stat().st_mtime
-    assert mtime_before == mtime_after
+    assert first.shard_metadata_path.stat().st_mtime_ns == before
 
 
-# ---------------------------------------------------------------------------
-# ShardDataLoader lifecycle tests
-# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("encoded", [False, True], ids=["dict", "bytes"])
+def test_parse_protein_centres_ca_and_maps_unknown_residues_to_x(
+    make_shard_dataset: ShardFactory,
+    make_entry: EntryFactory,
+    encoded: bool,  # noqa: FBT001
+) -> None:
+    """Parsing gives a CA centroid at the origin and ``X`` for unknown codes.
+
+    The JSON may arrive as bytes or as a decoded dict, as webdataset hands
+    over either; both must parse the same way.
+
+    Args:
+        make_shard_dataset: Shard dataset factory.
+        make_entry: Entry factory.
+        encoded: Whether to pass the entry as JSON bytes.
+    """
+    dataset = make_shard_dataset(["p1"], [10])
+    entry = make_entry("p1", 10) | {"seq": "ZZZZZAAAAA"}
+    raw: object = json.dumps(entry).encode() if encoded else entry
+    parsed = dataset.parse_protein({"json": raw})
+    ca = torch.tensor(parsed.atom_positions[:, 1])
+    ca_mask = rearrange(torch.tensor(parsed.atom_mask[:, 1]), "n -> n 1")
+    centroid = reduce(ca * ca_mask, "n d -> d", "sum") / ca_mask.sum()
+    aatype = torch.tensor(parsed.aatype)
+    torch.testing.assert_close(centroid, torch.zeros(3, dtype=torch.float64))
+    assert torch.equal(aatype[:5], torch.full((5,), restype_order["X"]))
+    assert torch.equal(aatype[5:], torch.full((5,), restype_order["A"]))
 
 
-def test_shard_data_loader_epoch_increments_after_iter(
+def test_shard_data_loader_counts_and_advances_epochs(
     shard_loader_lifecycle: ShardLoaderLifecycle,
 ) -> None:
-    """ShardDataLoader.epoch starts at 0 and increments with each __iter__."""
-    assert shard_loader_lifecycle.epoch_before_iter == 0
-    assert shard_loader_lifecycle.epoch_after_iter == 1
+    """``len`` is known at construction and one pass advances the epoch.
 
+    The pass yields exactly ``len`` batches. Not parametrized: the shared
+    module-scoped run covers one lifecycle.
 
-def test_shard_data_loader_cached_len_is_positive(
-    shard_loader_lifecycle: ShardLoaderLifecycle,
-) -> None:
-    """__len__ returns a positive batch count immediately after construction."""
-    assert shard_loader_lifecycle.len_after_construction > 0
+    Args:
+        shard_loader_lifecycle: Snapshot of the run.
+    """
+    x = shard_loader_lifecycle
+    assert x.len_after_construction > 0
+    assert x.batches == x.len_after_construction
+    assert (x.epoch_before_iter, x.epoch_after_iter) == (0, 1)
 
 
 def test_shard_data_loader_del_shuts_down_executors(
     shard_loader_lifecycle: ShardLoaderLifecycle,
 ) -> None:
-    """__del__ shuts down both executors, so neither accepts new work."""
+    """``__del__`` shuts down both executors, so neither accepts new work.
+
+    Not parametrized: both executors are checked.
+
+    Args:
+        shard_loader_lifecycle: Snapshot of the run.
+    """
     assert shard_loader_lifecycle.process_executor_closed
     assert shard_loader_lifecycle.queue_watcher_closed
 
 
-# ---------------------------------------------------------------------------
-# parse_protein tests
-# ---------------------------------------------------------------------------
-
-
-def test_parse_protein_bytes_and_dict_give_identical_result(
-    protein_shard_dataset_factory: Callable[
-        [list[str], list[int]],
-        ProteinShardDataset,
-    ],
+def test_bucketed_train_loader_yields_featurized_batches(
+    bucketed_cfg: TrainConfig,
+    make_train_args: ArgsFactory,
 ) -> None:
-    """parse_protein accepts raw bytes and a decoded dict with equal results."""
-    ds = protein_shard_dataset_factory(["p1"], [10])
-    raw_bytes: bytes = json.dumps(_make_entry("p1", 10)).encode()
-    raw_dict: dict[str, object] = cast(
-        "dict[str, object]",
-        json.loads(raw_bytes),
+    """The bucketed training loader yields FeaturizedBatch, not raw proteins.
+
+    Not parametrized: one batch shows the collate is wired in.
+
+    Args:
+        bucketed_cfg: Loader configuration.
+        make_train_args: TrainArgs factory.
+    """
+    train_loader, _, _ = make_bucketed_data_loaders(
+        cfg=bucketed_cfg,
+        extra_train_args=make_train_args(5, debug_run=False),
     )
-    p_from_bytes = ds.parse_protein({"json": raw_bytes})
-    p_from_dict = ds.parse_protein({"json": raw_dict})
-    np.testing.assert_array_equal(
-        p_from_bytes.atom_positions,
-        p_from_dict.atom_positions,
-    )
+    assert isinstance(next(iter(train_loader)), FeaturizedBatch)
 
 
-def test_parse_protein_coordinates_are_centered(
-    protein_shard_dataset_factory: Callable[
-        [list[str], list[int]],
-        ProteinShardDataset,
+@pytest.mark.parametrize(
+    ("debug_train_size", "expected"),
+    [
+        pytest.param(False, 252, id="fresh_cache"),
+        pytest.param(True, 252, id="after_full_dataset_cache"),
     ],
+    indirect=["debug_train_size"],
+)
+def test_bucketed_debug_run_caps_train_split_at_252(
+    debug_train_size: int,
+    expected: int,
 ) -> None:
-    """After parsing, the masked CA-position centroid is near zero."""
-    ds = protein_shard_dataset_factory(["p1"], [10])
-    entry: dict[str, object] = _make_entry("p1", 10)
-    protein = ds.parse_protein({"json": entry})
-    ca_pos = protein.atom_positions[:, 1, :]  # (n_res, 3)
-    ca_mask = protein.atom_mask[:, 1]  # (n_res,)
-    masked_mean = cast(
-        npt.NDArray[np.float64],
-        np.sum(ca_mask[:, None] * ca_pos, axis=0) / np.sum(ca_mask),
-    )
-    np.testing.assert_allclose(masked_mean, np.zeros(3), atol=1e-6)
+    """``debug_run`` trains on the first 252 proteins of a 300-protein split.
+
+    With a shard cache already built for all 300 proteins in the same
+    directory, the debug run must still cap at 252 rather than reuse the
+    full cache.
+
+    Args:
+        debug_train_size: Train-set size of the debug-run loader.
+        expected: The cap ``make_bucketed_data_loaders`` applies.
+    """
+    assert debug_train_size == expected
 
 
-def test_parse_protein_unknown_aa_maps_to_restype_x(
-    protein_shard_dataset_factory: Callable[
-        [list[str], list[int]],
-        ProteinShardDataset,
+@pytest.mark.parametrize(
+    ("extra", "cath_nodes"),
+    [
+        pytest.param({}, {}, id="cath_nodes_default_empty"),
+        pytest.param(
+            {"cath_nodes": {"p1": ["1.20.5"]}},
+            {"p1": ["1.20.5"]},
+            id="cath_nodes_populated",
+        ),
+        pytest.param({"unknown_field": 42}, {}, id="unknown_field_dropped"),
     ],
+)
+def test_dataset_splits_manifest_parses_splits_and_cath_nodes(
+    extra: dict[str, object],
+    cath_nodes: dict[str, list[str]],
 ) -> None:
-    """Amino acids not in restype_order are mapped to restype_order['X']."""
-    ds = protein_shard_dataset_factory(["p1"], [3])
-    entry: dict[str, object] = {
-        "name": "p1",
-        "seq": "ZZZ",
-        "coords": _make_coords(3),
-    }
-    protein = ds.parse_protein({"json": entry})
-    expected_idx = restype_order["X"]
-    aatype_list = cast(list[int], protein.aatype.tolist())
-    assert all(a == expected_idx for a in aatype_list)
+    """The manifest reads the three splits, ``cath_nodes``, and ignores extras.
 
-
-# ---------------------------------------------------------------------------
-# DatasetSplitsManifest tests
-# ---------------------------------------------------------------------------
-
-
-def test_dataset_splits_manifest_ignores_extra_fields() -> None:
-    """DatasetSplitsManifest silently drops unknown JSON fields."""
-    data: dict[str, object] = {
-        "train": ["p1"],
-        "validation": ["p2"],
-        "test": ["p3"],
-        "unknown_field": "ignored",
-        "also_ignored": 42,
-    }
+    Args:
+        extra: Fields added to the three splits.
+        cath_nodes: Expected ``cath_nodes``.
+    """
+    data = {"train": ["p1"], "validation": ["p2"], "test": ["p3"]} | extra
     manifest = DatasetSplitsManifest.model_validate(data)
-    assert manifest.train == ["p1"]
-    assert manifest.validation == ["p2"]
-    assert manifest.test == ["p3"]
-
-
-def test_dataset_splits_manifest_cath_nodes_defaults_empty() -> None:
-    """cath_nodes defaults to an empty dict when absent from the JSON."""
-    data: dict[str, object] = {
-        "train": ["p1"],
-        "validation": ["p2"],
-        "test": ["p3"],
-    }
-    manifest = DatasetSplitsManifest.model_validate(data)
-    assert manifest.cath_nodes == {}
-
-
-def test_dataset_splits_manifest_cath_nodes_populated() -> None:
-    """cath_nodes is fully populated when present in the JSON."""
-    data: dict[str, object] = {
-        "train": ["p1"],
-        "validation": ["p2"],
-        "test": ["p3"],
-        "cath_nodes": {"p1": ["1.20.5"], "p2": ["2.60.40"]},
-    }
-    manifest = DatasetSplitsManifest.model_validate(data)
-    assert manifest.cath_nodes == {"p1": ["1.20.5"], "p2": ["2.60.40"]}
-
-
-# ---------------------------------------------------------------------------
-# FeaturizedItem and FeaturizedBatch — importability from helpers.data
-# ---------------------------------------------------------------------------
-
-
-def test_featurized_item_is_importable_from_data() -> None:
-    """FeaturizedItem is a dataclass importable directly from helpers.data."""
-    assert dataclasses.is_dataclass(FeaturizedItem)
-
-
-def test_featurized_batch_is_importable_from_data() -> None:
-    """FeaturizedBatch is a dataclass importable directly from helpers.data."""
-    assert dataclasses.is_dataclass(FeaturizedBatch)
-
-
-# ---------------------------------------------------------------------------
-# Featurization utilities — importability from helpers.data
-# ---------------------------------------------------------------------------
-
-
-def test_distogram_is_importable_from_data() -> None:
-    """Distogram is an nn.Module importable directly from helpers.data."""
-    assert issubclass(Distogram, nn.Module)
-
-
-def test_sinusoidal_encoding_is_importable_from_data() -> None:
-    """sinusoidal_encoding is callable and importable from helpers.data."""
-    assert callable(sinusoidal_encoding)
-
-
-def test_ref_pos_for_residue_is_importable_from_data() -> None:
-    """ref_pos_for_residue is callable and importable from helpers.data."""
-    assert callable(ref_pos_for_residue)
-
-
-def test_featurize_single_item_is_importable_from_data() -> None:
-    """featurize_single_item is callable and importable from helpers.data."""
-    assert callable(featurize_single_item)
-
-
-def test_featurize_batch_is_importable_from_data() -> None:
-    """featurize_batch is callable and importable from helpers.data."""
-    assert callable(featurize_batch)
+    assert (manifest.train, manifest.validation, manifest.test) == (
+        ["p1"],
+        ["p2"],
+        ["p3"],
+    )
+    assert manifest.cath_nodes == cath_nodes
