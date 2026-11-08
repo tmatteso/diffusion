@@ -189,9 +189,10 @@ returned.
 
 Loads a checkpoint into `MainTrunk`, builds the atom/template `Distogram`
 modules and the static sampling context (`build_sampling_context`), runs
-`EDMSampler.sample`, converts the resulting atom5 coordinates back to atom37
-(`atom5_to_atom37`), and writes every sampled structure as a PDB string into
-a single JSON list at `scfg.output.output_path`.
+`EDMSampler.sample`, and writes every sampled structure as a PDB string into
+a single JSON list at `scfg.output.output_path`. `sampled_structure_to_pdb`
+converts each structure back to atom37 (`atom5_to_atom37`) and leaves out the
+model's unsupervised `CB` slot, so PDBs hold `N`, `CA`, `C` and `O` only.
 
 ## Parameters (`sample_config.py`)
 

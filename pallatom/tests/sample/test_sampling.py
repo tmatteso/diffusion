@@ -13,6 +13,8 @@ from beartype import beartype
 from einops import rearrange, reduce
 from helpers.alignment import masked_com
 from helpers.atom_utils import (
+    ATOM5_CB,
+    ATOM5_NAMES,
     ATOM37_C,
     ATOM37_CA,
     ATOM37_CB,
@@ -35,6 +37,7 @@ from sample.sampling import (
     build_aa_context,
     build_sampling_context,
     build_template_context,
+    sampled_structure_to_pdb,
 )
 from train.train_config import NoiseScheduleParams
 
@@ -1711,3 +1714,29 @@ def test_backbone_cb_positions_ignores_cb_slot(
     )
 
     assert torch.allclose(cb_positions, expected_cb, atol=0.01)
+
+
+def test_sampled_structure_to_pdb_writes_backbone_without_cb() -> None:
+    """Sampled PDBs hold N, CA, C and O per residue and no CB.
+
+    The model's CB slot is unsupervised, so a far-off value there must not
+    reach the PDB.
+    """
+    n_res = 3
+    atom5_positions = torch.rand(n_res, NATOM, 3)
+    atom5_positions[:, ATOM5_CB] = 99.0
+    backbone_names = [
+        name for slot, name in enumerate(ATOM5_NAMES) if slot != ATOM5_CB
+    ]
+
+    pdb = sampled_structure_to_pdb(
+        atom5_positions,
+        torch.full((n_res,), restype_order["A"]),
+    )
+
+    atom_names = [
+        line[12:16].strip()
+        for line in pdb.splitlines()
+        if line.startswith("ATOM")
+    ]
+    assert atom_names == backbone_names * n_res

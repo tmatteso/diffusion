@@ -12,7 +12,6 @@ from pathlib import Path
 from typing import cast
 
 import numpy as np
-import numpy.typing as npt
 import structlog
 import torch
 from architecture.atom_transformers import WINDOW_SIZE, build_sparse_pairs
@@ -21,6 +20,7 @@ from beartype import beartype
 from einops import rearrange, repeat
 from helpers.alignment import centre_random_augment, masked_com
 from helpers.atom_utils import (
+    ATOM5_CB,
     ATOM5_ELEMENTS,
     ATOM37_CA,
     ATOM37_CB,
@@ -38,13 +38,11 @@ from helpers.data import (
     build_distogram_module,
     ref_pos_for_residue,
 )
-from jaxtyping import Bool, Float, Int, jaxtyped
+from jaxtyping import Bool, Float, Int, Num, jaxtyped
 from sample.sample_config import SampleConfig, SamplerParams
 from structlog.typing import FilteringBoundLogger
 from train.train_config import NoiseScheduleParams
 
-# atom5 slot → atom37 index (used when writing PDB via atom37 representation)
-# atom5: N=0, CA=1, C=2, O=3, CB=4  →  atom37: N=0, CA=1, C=2, O=3, CB=4
 NATOM = 5  # atoms per residue
 
 
@@ -111,6 +109,47 @@ def backbone_cb_positions(
     backbone_mask[:, :, ATOM37_CB] = 0.0
     cb_positions, _ = atom37_to_cb(atom37_positions, backbone_mask)
     return cb_positions
+
+
+@jaxtyped(typechecker=beartype)
+def sampled_structure_to_pdb(
+    atom5_positions: Float[torch.Tensor, "N_res 5 3"],
+    aatype: Num[torch.Tensor, "N_res"],
+) -> str:
+    """Write one sampled structure as a single-chain backbone PDB.
+
+    The model's CB slot is unsupervised, so its coordinates are arbitrary.
+    Masking it out leaves N, CA, C and O for every residue.
+
+    Args:
+        atom5_positions: Sampled atom5 coordinates (N_res, 5, 3).
+        aatype: Sampled residue types (N_res,).
+
+    Returns:
+        The structure as a PDB string.
+    """
+    n_res = atom5_positions.shape[0]
+    atom5_mask = torch.ones(1, n_res, NATOM, dtype=atom5_positions.dtype)
+    atom5_mask[:, :, ATOM5_CB] = 0.0
+    atom37_positions, atom37_mask = atom5_to_atom37(
+        rearrange(atom5_positions, "n a d -> 1 n a d"),
+        atom5_mask,
+    )
+    prot = Protein(
+        atom_positions=np.asarray(
+            rearrange(atom37_positions, "1 n a d -> n a d"),
+            dtype=np.float64,
+        ),
+        atom_mask=np.asarray(
+            rearrange(atom37_mask, "1 n a -> n a"),
+            dtype=np.float64,
+        ),
+        residue_index=np.arange(n_res, dtype=np.intp),
+        aatype=np.asarray(aatype, dtype=np.intp),
+        chain_index=np.zeros(n_res, dtype=np.intp),  # single chain
+        b_factors=np.ones((n_res, 37), dtype=np.float64),
+    )
+    return to_pdb(prot)
 
 
 def build_aa_context(
@@ -895,36 +934,17 @@ def main(args: SamplingArgs, scfg: SampleConfig, device: str) -> None:
         )
         log.info("sampling complete", n_res=N_RES, n_samples=B_SAMPLE)
 
-        pdb_strings: list[str] = []
-        for b in range(B_SAMPLE):
-            coords_t: Float[torch.Tensor, "1 N_res 5 3"] = rearrange(
-                coords_batch[b].cpu(),
-                "(n a) d -> 1 n a d",
-                n=N_RES,
-                a=NATOM,
+        pdb_strings: list[str] = [
+            sampled_structure_to_pdb(
+                rearrange(coords, "(n a) d -> n a d", n=N_RES, a=NATOM),
+                seqs,
             )
-            x_37_b, mask_37_b = atom5_to_atom37(coords_t)
-            atom_positions: npt.NDArray[np.float64] = np.asarray(
-                rearrange(x_37_b, "1 n a d -> n a d"),
-                dtype=np.float64,
+            for coords, seqs in zip(
+                coords_batch.cpu(),
+                seqs_batch.cpu(),
+                strict=True,
             )
-            atom_mask: npt.NDArray[np.float64] = np.asarray(
-                rearrange(mask_37_b, "1 n a -> n a"),
-                dtype=np.float64,
-            )
-            aatype: npt.NDArray[np.intp] = np.asarray(
-                seqs_batch[b].cpu(),
-                dtype=np.intp,
-            )
-            prot = Protein(
-                atom_positions=atom_positions,
-                atom_mask=atom_mask,
-                residue_index=np.arange(N_RES, dtype=np.intp),
-                aatype=aatype,
-                chain_index=np.zeros(N_RES, dtype=np.intp),  # single chain
-                b_factors=np.ones((N_RES, 37), dtype=np.float64),
-            )
-            pdb_strings.append(to_pdb(prot))
+        ]
 
         _ = Path(scfg.output.output_path).write_text(
             json.dumps(pdb_strings),
