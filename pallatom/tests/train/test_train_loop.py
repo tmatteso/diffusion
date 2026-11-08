@@ -28,7 +28,12 @@ import torch.distributed as dist
 import torch.nn as nn
 from architecture.main_trunk import EMA, MainTrunk
 from einops import rearrange, reduce
-from helpers.atom_utils import RESTYPE_NUM, RESTYPE_NUM_NO_X, Protein
+from helpers.atom_utils import (
+    RESTYPE_NUM,
+    RESTYPE_NUM_NO_X,
+    Protein,
+    ResidueRepresentation,
+)
 from helpers.data import (
     Distogram,
     FeaturizedBatch,
@@ -2290,12 +2295,6 @@ def test_integration_gradient_flow_through_all_submodules(
 # DDP: collective flush decision keeps ranks in lockstep
 # ---------------------------------------------------------------------------
 
-LOCKSTEP_SHORT_RES = 8
-LOCKSTEP_LONG_RES = 16
-LOCKSTEP_BUDGET_PER_RANK = LOCKSTEP_SHORT_RES + LOCKSTEP_LONG_RES
-LOCKSTEP_BATCHES_PER_RANK = 2
-LOCKSTEP_ATOM_TYPES = 37
-
 
 @dataclasses.dataclass(frozen=True)
 class DDPLockstepRun:
@@ -2339,7 +2338,7 @@ def straight_chain_protein(n_res: int) -> Protein:
         The protein, with every array fully determined by ``n_res``.
     """
     residue_index = np.arange(n_res, dtype=np.float64)
-    atom_index = np.arange(LOCKSTEP_ATOM_TYPES, dtype=np.float64)
+    atom_index = np.arange(ResidueRepresentation.atom37, dtype=np.float64)
     residue_origins = np.stack(
         [3.8 * residue_index, np.zeros(n_res), np.zeros(n_res)],
         axis=-1,
@@ -2351,11 +2350,11 @@ def straight_chain_protein(n_res: int) -> Protein:
     return Protein(
         atom_positions=rearrange(residue_origins, "n c -> n 1 c")
         + rearrange(atom_offsets, "a c -> 1 a c"),
-        atom_mask=np.ones((n_res, LOCKSTEP_ATOM_TYPES)),
+        atom_mask=np.ones((n_res, ResidueRepresentation.atom37)),
         residue_index=np.arange(n_res, dtype=np.intp),
         aatype=np.arange(n_res, dtype=np.intp) % RESTYPE_NUM_NO_X,
         chain_index=np.zeros(n_res, dtype=np.intp),
-        b_factors=np.zeros((n_res, LOCKSTEP_ATOM_TYPES)),
+        b_factors=np.zeros((n_res, ResidueRepresentation.atom37)),
     )
 
 
@@ -2419,50 +2418,18 @@ def train_one_rank(
     dist.destroy_process_group()
 
 
-@pytest.fixture
-def lockstep_setup(model_params: ModelSetup) -> ModelSetup:
-    """Provide ``model_params`` with a per-rank budget of short + long tokens.
-
-    ``train()`` divides ``accumulated_token_budget`` by the world size, so
-    the global budget is ``LOCKSTEP_BUDGET_PER_RANK`` times the two ranks
-    used by ``lockstep_run``. With that per-rank budget of 24 tokens, two
-    short 8-residue batches fit in one window (16 <= 24) but two long
-    16-residue batches do not (32 > 24). This is a plain data fixture rather
-    than a factory fixture because every lockstep scenario needs the same
-    budget; the scenarios differ only in which proteins each rank holds.
-
-    Args:
-        model_params: Fixture providing the small model, optimizer,
-            scheduler, EMA and base TrainConfig.
-
-    Returns:
-        A ModelSetup sharing every component of ``model_params`` except the
-        TrainConfig, whose token budget is replaced.
-    """
-    base = model_params.tcfg
-    return dataclasses.replace(
-        model_params,
-        tcfg=base.model_copy(
-            update={
-                "training": base.training.model_copy(
-                    update={
-                        "accumulated_token_budget": 2
-                        * LOCKSTEP_BUDGET_PER_RANK,
-                    },
-                ),
-            },
-        ),
-    )
-
-
 class LockstepScenario(Enum):
-    """Per-rank protein lengths and the optimizer steps every rank must take.
+    """Per-rank batches, the token budget, and the steps every rank must take.
 
-    Each member is ``(residues_by_rank, expected_steps)``, read through
-    properties. Rank ``r`` trains on two one-protein batches of
-    ``residues_by_rank[r]`` residues under a per-rank budget of 24 tokens.
-    Before its second batch, a rank holding 16-residue proteins wants to
-    flush (16 + 16 > 24) and a rank holding 8-residue proteins does not
+    Each member is ``(residues_by_rank, budget_per_rank, expected_steps)``,
+    read through properties. ``residues_by_rank[r]`` lists the residue
+    count of each one-protein batch rank ``r`` trains on, so the number of
+    ranks and the number of batches per rank are both visible in the
+    member. Every rank holds the same number of batches, as
+    ``DistributedSampler`` guarantees in real training. A 16-residue
+    protein has 16 tokens, so with a per-rank budget of 24 a rank holding
+    two 16-residue batches wants to flush before its second batch
+    (16 + 16 > 24) and a rank holding two 8-residue batches does not
     (8 + 8 <= 24). Every scenario ends with one epoch-end flush of the
     buffered micro-batches.
 
@@ -2476,25 +2443,30 @@ class LockstepScenario(Enum):
         both_over_budget: Both ranks want to flush at the same batch.
     """
 
-    rank_1_over_budget = ((LOCKSTEP_SHORT_RES, LOCKSTEP_LONG_RES), 2)
-    rank_0_over_budget = ((LOCKSTEP_LONG_RES, LOCKSTEP_SHORT_RES), 2)
-    neither_over_budget = ((LOCKSTEP_SHORT_RES, LOCKSTEP_SHORT_RES), 1)
-    both_over_budget = ((LOCKSTEP_LONG_RES, LOCKSTEP_LONG_RES), 2)
+    rank_1_over_budget = (((8, 8), (16, 16)), 24, 2)
+    rank_0_over_budget = (((16, 16), (8, 8)), 24, 2)
+    neither_over_budget = (((8, 8), (8, 8)), 24, 1)
+    both_over_budget = (((16, 16), (16, 16)), 24, 2)
 
     @property
-    def residues_by_rank(self) -> tuple[int, ...]:
-        """Residue count of every protein on each rank, indexed by rank."""
+    def residues_by_rank(self) -> tuple[tuple[int, ...], ...]:
+        """Residue count of each one-protein batch, indexed by rank."""
         return self.value[0]
+
+    @property
+    def budget_per_rank(self) -> int:
+        """Tokens one rank may accumulate before it wants to flush."""
+        return self.value[1]
 
     @property
     def expected_steps(self) -> int:
         """Optimizer steps every rank must take in the epoch."""
-        return self.value[1]
+        return self.value[2]
 
 
 @pytest.fixture
 def lockstep_scenario(request: pytest.FixtureRequest) -> LockstepScenario:
-    """Expose the indirect scenario to both the factory and the test.
+    """Expose the indirect scenario to the factories and the test.
 
     Args:
         request: Pytest fixture request whose ``.param`` attribute is a
@@ -2507,6 +2479,44 @@ def lockstep_scenario(request: pytest.FixtureRequest) -> LockstepScenario:
 
 
 @pytest.fixture
+def lockstep_setup(
+    lockstep_scenario: LockstepScenario,
+    model_params: ModelSetup,
+) -> ModelSetup:
+    """Provide ``model_params`` with the scenario's token budget.
+
+    Factory fixture: ``train()`` divides ``accumulated_token_budget`` by the
+    world size to get each rank's budget, so the global budget is the
+    scenario's ``budget_per_rank`` times its number of ranks.
+
+    Args:
+        lockstep_scenario: Scenario naming the per-rank budget and, through
+            the length of ``residues_by_rank``, the number of ranks.
+        model_params: Fixture providing the small model, optimizer,
+            scheduler, EMA and base TrainConfig.
+
+    Returns:
+        A ModelSetup sharing every component of ``model_params`` except the
+        TrainConfig, whose token budget is replaced.
+    """
+    base = model_params.tcfg
+    world_size = len(lockstep_scenario.residues_by_rank)
+    return dataclasses.replace(
+        model_params,
+        tcfg=base.model_copy(
+            update={
+                "training": base.training.model_copy(
+                    update={
+                        "accumulated_token_budget": world_size
+                        * lockstep_scenario.budget_per_rank,
+                    },
+                ),
+            },
+        ),
+    )
+
+
+@pytest.fixture
 def lockstep_run(
     lockstep_scenario: LockstepScenario,
     lockstep_setup: ModelSetup,
@@ -2514,16 +2524,14 @@ def lockstep_run(
 ) -> DDPLockstepRun:
     """Build a DDP run in which each rank holds proteins of its own length.
 
-    Factory fixture: rank ``r`` gets ``LOCKSTEP_BATCHES_PER_RANK``
-    one-protein batches of
-    ``straight_chain_protein(lockstep_scenario.residues_by_rank[r])``, so
-    every rank yields the same number of batches while the ranks' token
-    counts differ.
+    Factory fixture: rank ``r`` trains on one one-protein batch of
+    ``straight_chain_protein(n_res)`` for each ``n_res`` in
+    ``lockstep_scenario.residues_by_rank[r]``.
 
     Args:
-        lockstep_scenario: Scenario naming each rank's residue count.
-        lockstep_setup: Fixture providing the model setup with the lockstep
-            token budget.
+        lockstep_scenario: Scenario naming each rank's batch lengths.
+        lockstep_setup: Fixture providing the model setup with the
+            scenario's token budget.
         tmp_path: Pytest-provided directory for the rendezvous store and the
             checkpoint that rank 0 writes.
 
@@ -2533,17 +2541,17 @@ def lockstep_run(
     return DDPLockstepRun(
         setup=lockstep_setup,
         batches_by_rank=tuple(
-            (
+            tuple(
                 featurize_batch(
                     [straight_chain_protein(n_res)],
                     lockstep_setup.tcfg,
                     lockstep_setup.distogram_template,
                     lockstep_setup.distogram_residue,
                     lockstep_setup.distogram_atom,
-                ),
+                )
+                for n_res in rank_residues
             )
-            * LOCKSTEP_BATCHES_PER_RANK
-            for n_res in lockstep_scenario.residues_by_rank
+            for rank_residues in lockstep_scenario.residues_by_rank
         ),
         store_path=tmp_path / "gloo_store",
     )
@@ -2571,8 +2579,8 @@ def test_train_ddp_keeps_ranks_in_lockstep(
     instead of being dropped. ``LockstepScenario`` covers the vote being
     won by rank 1 alone, by rank 0 alone, by nobody, and by both ranks.
 
-    Arrange: ``lockstep_run`` gives each rank two one-protein batches of the
-    scenario's residue count, under a per-rank budget of 24 tokens.
+    Arrange: ``lockstep_run`` gives each rank the scenario's one-protein
+    batches, and ``lockstep_setup`` applies the scenario's token budget.
     Act: ``torch.multiprocessing.spawn`` runs ``train_one_rank`` in two real
     OS processes forming a CPU gloo group; each trains one epoch and reports
     its optimizer step count and a digest of its weights.
