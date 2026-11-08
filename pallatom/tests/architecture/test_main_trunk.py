@@ -1,20 +1,25 @@
-"""Tests for the main trunk forward pass.
+"""Tests for the main trunk forward pass and its EMA.
 
-Covers sinusoidal encoding, TimeFourierEmbedding, RelativePositionEncoding,
-ResidueDistogramHead, AtomDistogramHead, and end-to-end MainTrunk forward
-pass including output shapes, symmetry properties, loss computability, and
-gradient flow through a composite training loss.
+Covers TimeFourierEmbedding, RelativePositionEncoding (Algorithm 3) and
+the end-to-end MainTrunk forward pass: every output's shape and range, the
+mask-token input, and finite nonzero gradients reaching every top-level
+submodule from a composite training loss. Also covers EMA initialisation,
+its bias-corrected update, buffer handling, DDP unwrapping, checkpoint round
+trips, and the zero-copy ``swap``.
+
+The trunk runs on 20 residues with a window of 8, so each atom has fewer
+sparse neighbours than there are atoms, as in training. Inputs are
+deterministic and the model is built under a fixed seed.
 """
 
-import contextlib
 import dataclasses
-from collections.abc import Generator
-from typing import cast
+import enum
+from typing import Literal, cast
 
 import pytest
 import torch
-import torch.distributed as dist
 import torch.nn.functional as F
+from architecture.atom_transformers import build_sparse_pairs
 from architecture.losses import (
     atom_loss,
     distogram_loss_atom,
@@ -29,12 +34,12 @@ from architecture.main_trunk import (
     RelativePositionEncoding,
     TimeFourierEmbedding,
 )
-from beartype import beartype
-from einops import einsum, rearrange, reduce, repeat
+from einops import rearrange, repeat
 from helpers.atom_utils import RESTYPE_NUM_NO_X
-from helpers.data import FeaturizedBatch, sinusoidal_encoding
+from helpers.data import FeaturizedBatch
 from helpers.useful_objects import manual_seed
-from jaxtyping import Bool, Float, Int, jaxtyped
+from jaxtyping import Float
+from tests.conftest import PatternFactory
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import Adam
 from train.train_config import (
@@ -45,1091 +50,782 @@ from train.train_config import (
     TemplateDistogramParams,
 )
 
-# there should exist a set of enums that are imported here and in the configs
-B = 2
-N_RES = 50
-ATOMS_PER_RES = 3
-N_ATOM = N_RES * ATOMS_PER_RES  # 150
-E = 4  # element one-hot dim
-C_RES = 32
-C_PAIR = 32
-C_ATOM = 32
-C_ATOMPAIR = 16
-N_BINS = 38
-N_ATOM_BINS = 22  # distinct from N_BINS; must match AtomDistogramParams.n_bins
-K_UNIT = 2
-# ModelParams.window_size=32 -> half=16;
-# max neighbors = (32-1)*ATOMS_PER_RES = 93
-MODEL_WINDOW_SIZE = 32
-K_SPARSE = (MODEL_WINDOW_SIZE - 1) * ATOMS_PER_RES
-F_REF_DIM = ATOMS_PER_RES * (
-    3 + E
-)  # encoder groups all sibling atoms: n_per_res*(pos_dim+elem_dim)
-
-N_BLOCKS_ATOM_TRANSFORMER_ENCODER = 3
-N_HEADS_ATOM_TRANSFORMER_ENCODER = 4
-N_BLOCKS_ATOM_TRANSFORMER_DECODER = 3
-N_HEADS_ATOM_TRANSFORMER_DECODER = 4
-N_PAIRFORMER_BLOCKS_TEMPLATE_EMBEDDER = 2
-N_PAIFORMER_HEADS_TEMPLATE_EMBEDDER = 16
-SIGMA_DATA = 16
-N_AMINO = RESTYPE_NUM_NO_X
-TOLERANCE = 1e-5
-RESIDUE_NUMBER = 50
-DISTOGRAM_RANK = 4
-_ = manual_seed(42)
-
-# ---------------------------------------------------------------------------
-# Typed helpers
-# ---------------------------------------------------------------------------
+type StateDict = dict[str, Float[torch.Tensor, "..."]]
 
 
-@jaxtyped(typechecker=beartype)
-def sq_dist_matrix(
-    x: Float[torch.Tensor, "N D"],
-) -> Float[torch.Tensor, "N N"]:
-    """Compute pairwise squared Euclidean distances between N row-vectors.
+@dataclasses.dataclass(frozen=True)
+class TrunkDims:
+    """Sizes the trunk, its inputs and its expected outputs share.
 
-    Args:
-        x: Row vectors of shape (N, D).
-
-    Returns:
-        Symmetric (N, N) matrix of squared Euclidean distances.
+    Attributes:
+        batch: Batch size ``B``.
+        n_res: Residues ``N_res``.
+        atoms_per_res: Atoms per residue.
+        n_elements: Width ``E`` of the element one-hot.
+        c_res: Residue single width.
+        c_pair: Residue pair width.
+        c_atom: Atom single width.
+        c_atompair: Atom pair width.
+        n_bins: Template and residue distogram bins.
+        n_atom_bins: Atom distogram bins.
+        k_unit: Decoder units, so intermediate outputs per forward pass.
+        window_size: Sparse attention window in residues.
     """
-    diff = rearrange(x, "n d -> n 1 d") - rearrange(x, "n d -> 1 n d")
-    return einsum(diff, diff, "n m d, n m d -> n m")
+
+    batch: int
+    n_res: int
+    atoms_per_res: int
+    n_elements: int
+    c_res: int
+    c_pair: int
+    c_atom: int
+    c_atompair: int
+    n_bins: int
+    n_atom_bins: int
+    k_unit: int
+    window_size: int
+
+    @property
+    def n_atom(self) -> int:
+        """Total atoms ``N_atom = n_res * atoms_per_res``.
+
+        Returns:
+            Atom count.
+        """
+        return self.n_res * self.atoms_per_res
 
 
-@jaxtyped(typechecker=beartype)
-def mean_abs_asymmetry(
-    x: Float[torch.Tensor, "B N N D"],
-) -> Float[torch.Tensor, ""]:
-    """Return mean abs diff between x[b,i,j] and x[b,j,i] for non-symmetry.
+@dataclasses.dataclass(frozen=True)
+class SubmoduleGrads:
+    """Which top-level submodules got a usable gradient from a loss.
 
-    Args:
-        x: Tensor of shape (B, N, N, D) to test for transpose symmetry.
-
-    Returns:
-        Scalar mean absolute asymmetry; zero iff x is perfectly symmetric.
+    Attributes:
+        submodules: Every top-level submodule name that owns parameters.
+        without_usable_grad: Those where no parameter got a finite,
+            nonzero gradient, including those left out of the graph.
     """
-    diff = x - rearrange(x, "b i j d -> b j i d")
-    return reduce(diff.abs(), "b i j d -> ", "mean")
+
+    submodules: tuple[str, ...]
+    without_usable_grad: tuple[str, ...]
 
 
-# ---------------------------------------------------------------------------
-# Model fixture
-# ---------------------------------------------------------------------------
+@dataclasses.dataclass(frozen=True)
+class PairEncodings:
+    """One pair's relative position encoding before and after an edit.
+
+    Attributes:
+        before: Encoding of the pair on the base layout.
+        after: Encoding of the same pair on the edited layout.
+    """
+
+    before: Float[torch.Tensor, " c_pair"]
+    after: Float[torch.Tensor, " c_pair"]
+
+
+@dataclasses.dataclass(frozen=True)
+class RelPosCase:
+    """One input change to RelativePositionEncoding and its effect on a pair.
+
+    The base layout has four tokens with ``residue_index = 0..3`` and one
+    entity, on one chain (``asym_id = sym_id = 0``) or two chains
+    (``asym_id = sym_id = (0, 0, 1, 1)``).
+
+    Attributes:
+        chains: 1 or 2, selecting the base layout.
+        field: Keyword argument of the encoding to replace.
+        values: Replacement values for that argument, one per token.
+        i: Row of the pair to compare.
+        j: Column of the pair to compare.
+        effect: Whether the pair's encoding stays the ``"same"`` or
+            ``"differs"`` after the change.
+    """
+
+    chains: int
+    field: str
+    values: tuple[int, ...]
+    i: int
+    j: int
+    effect: Literal["same", "differs"]
+
+
+class RelPosScenario(enum.Enum):
+    """Algorithm 3 features that must, or must not, reach a pair's encoding.
+
+    Members:
+        cross_gap: Across chains, a residue gap of 50 changes nothing: such
+            pairs always use the overflow bin.
+        chain_gap: Within a chain, spreading residues 3 apart changes the
+            clipped residue offset.
+        entity: Splitting tokens into two entities flips the same-entity
+            flag for the pair ``(0, 2)``.
+        sym: Across chains, shifting ``sym_id`` changes the clipped chain
+            offset.
+    """
+
+    cross_gap = RelPosCase(2, "residue_index", (0, 1, 50, 51), 0, 2, "same")
+    chain_gap = RelPosCase(1, "residue_index", (0, 3, 6, 9), 0, 1, "differs")
+    entity = RelPosCase(1, "entity_id", (0, 0, 1, 1), 0, 2, "differs")
+    sym = RelPosCase(2, "sym_id", (0, 0, 2, 2), 0, 2, "differs")
 
 
 @pytest.fixture
-def model() -> MainTrunk:
-    """Provide a small MainTrunk instance in eval mode.
+def dims() -> TrunkDims:
+    """Return the small sizes the trunk is built and fed at.
 
     Returns:
-        A MainTrunk constructed with test-sized hyperparameters and set to eval.
+        Sizes with a window smaller than the chain, so ``K < N_atom``.
     """
+    return TrunkDims(
+        batch=2,
+        n_res=20,
+        atoms_per_res=3,
+        n_elements=4,
+        c_res=32,
+        c_pair=32,
+        c_atom=32,
+        c_atompair=16,
+        n_bins=38,
+        n_atom_bins=22,
+        k_unit=2,
+        window_size=8,
+    )
+
+
+@pytest.fixture
+def model(dims: TrunkDims) -> MainTrunk:
+    """Build a small MainTrunk in eval mode under a fixed seed.
+
+    Args:
+        dims: Model sizes.
+
+    Returns:
+        The trunk.
+    """
+    _ = manual_seed(0)
     return MainTrunk(
         model_params=ModelParams(
-            window_size=MODEL_WINDOW_SIZE,
-            f_ref_dim=F_REF_DIM,
-            c_atom=C_ATOM,
-            c_pair=C_PAIR,
-            c_res=C_RES,
-            c_atompair=C_ATOMPAIR,
-            K_unit=K_UNIT,
-            max_residues=RESIDUE_NUMBER,
-            n_amino=N_AMINO,
-            n_blocks_atom_transformer_encoder=N_BLOCKS_ATOM_TRANSFORMER_ENCODER,
-            n_heads_atom_transformer_encoder=N_HEADS_ATOM_TRANSFORMER_ENCODER,
-            n_blocks_atom_transformer_decoder=N_BLOCKS_ATOM_TRANSFORMER_DECODER,
-            n_heads_atom_transformer_decoder=N_HEADS_ATOM_TRANSFORMER_DECODER,
-            n_pairformer_blocks_template_embedder=N_PAIRFORMER_BLOCKS_TEMPLATE_EMBEDDER,
-            n_paiformer_heads_template_embedder=N_HEADS_ATOM_TRANSFORMER_DECODER,
+            window_size=dims.window_size,
+            f_ref_dim=dims.atoms_per_res * (3 + dims.n_elements),
+            c_atom=dims.c_atom,
+            c_pair=dims.c_pair,
+            c_res=dims.c_res,
+            c_atompair=dims.c_atompair,
+            K_unit=dims.k_unit,
+            max_residues=dims.n_res,
+            n_amino=RESTYPE_NUM_NO_X,
+            n_blocks_atom_transformer_encoder=1,
+            n_heads_atom_transformer_encoder=4,
+            n_blocks_atom_transformer_decoder=1,
+            n_heads_atom_transformer_decoder=4,
+            n_pairformer_blocks_template_embedder=1,
+            n_paiformer_heads_template_embedder=4,
         ),
-        template_distogram_params=TemplateDistogramParams(n_bins=N_BINS),
-        residue_distogram_params=ResidueDistogramParams(n_bins=N_BINS),
-        atom_distogram_params=AtomDistogramParams(n_bins=N_ATOM_BINS),
-        noise_params=NoiseScheduleParams(sigma_data=SIGMA_DATA),
+        template_distogram_params=TemplateDistogramParams(n_bins=dims.n_bins),
+        residue_distogram_params=ResidueDistogramParams(n_bins=dims.n_bins),
+        atom_distogram_params=AtomDistogramParams(n_bins=dims.n_atom_bins),
+        noise_params=NoiseScheduleParams(sigma_data=16),
     ).eval()
 
 
-# ---------------------------------------------------------------------------
-# Input tensor fixtures  (all have leading B dim)
-# ---------------------------------------------------------------------------
-
-
 @pytest.fixture
-def ref_pos() -> Float[torch.Tensor, "B N_atom 3"]:
-    """Provide random reference atom positions (B, N_ATOM, 3).
-
-    Returns:
-        Tensor of shape (B, N_ATOM, 3) drawn from standard normal distribution.
-    """
-    return torch.randn(B, N_ATOM, 3)
-
-
-@pytest.fixture
-def ref_element() -> Float[torch.Tensor, "B N_atom E"]:
-    """Provide random one-hot element features (B, N_ATOM, E).
-
-    Returns:
-        Float one-hot tensor of shape (B, N_ATOM, E) with randomly chosen
-        element classes.
-    """
-    return F.one_hot(torch.randint(0, E, (B, N_ATOM)), num_classes=E).float()
-
-
-@pytest.fixture
-def ref_space_uid() -> Int[torch.Tensor, "B N_atom"]:
-    """Provide all-zero chain/space UIDs (B, N_ATOM) for a single-chain input.
-
-    Returns:
-        Integer tensor of shape (B, N_ATOM) filled with zeros, representing
-        a single chain.
-    """
-    return torch.zeros(B, N_ATOM, dtype=torch.long)
-
-
-@pytest.fixture
-def f_distogram() -> Float[torch.Tensor, "B N_res N_res N_bins"]:
-    """One-hot template distogram with random bin assignments.
-
-    Returns:
-        Float one-hot tensor of shape (B, N_RES, N_RES, N_BINS) with each
-        entry selecting a random distance bin.
-    """
-    return F.one_hot(
-        torch.randint(0, N_BINS, (B, N_RES, N_RES)),
-        num_classes=N_BINS,
-    ).float()
-
-
-@pytest.fixture
-def f_pseudo_beta_mask() -> Float[torch.Tensor, "B N_res"]:
-    """All-ones pseudo-β mask — every residue has a valid pseudo-β position.
-
-    Returns:
-        Float tensor of ones with shape (B, N_RES); no residue is masked out.
-    """
-    return torch.ones(B, N_RES)
-
-
-@pytest.fixture
-def f_residue_idx() -> Int[torch.Tensor, "B N_res"]:
-    """Residue position indices— monotonically increasing per batch item.
-
-    Returns:
-        Long tensor of shape (B, N_RES) where each row is [0, 1, ..., N_RES-1].
-    """
-    return repeat(
-        torch.arange(N_RES, dtype=torch.long),
-        "n -> b n",
-        b=B,
-    ).contiguous()
-
-
-@pytest.fixture
-def r_input() -> Float[torch.Tensor, "B N_atom 3"]:
-    """Noisy atom positions fed to the trunk as the diffusion denoising input.
-
-    Returns:
-        Random tensor of shape [B, N_ATOM, 3] sampled from a standard normal,
-        simulating perturbed atom coordinates at an arbitrary diffusion step.
-    """
-    return torch.randn(B, N_ATOM, 3)
-
-
-@pytest.fixture
-def tok_idx() -> Int[torch.Tensor, "B N_atom"]:
-    """Residue index for each atom, mapping atoms to their parent residue.
-
-    Constructs a contiguous mapping where every ATOMS_PER_RES consecutive atoms
-    share the same residue index in [0, N_RES), then tiles it across the batch.
-
-    Returns:
-        Integer tensor of shape [B, N_ATOM] where atom i belongs to residue
-        i // ATOMS_PER_RES.
-    """
-    single = torch.repeat_interleave(torch.arange(N_RES), ATOMS_PER_RES)
-    return repeat(single, "n -> b n", b=B).contiguous()
-
-
-@pytest.fixture
-def center_uid() -> Int[torch.Tensor, "B N_atom"]:
-    """Center atom index for each atom, broadcast from the per-residue center.
-
-    Picks one representative atom per residue (every ATOMS_PER_RES-th atom
-    starting at 0) and broadcasts that index to all atoms in the same residue,
-    then tiles across the batch.
-
-    Returns:
-        Integer tensor of shape [B, N_ATOM] where every atom in residue r holds
-        the global index of residue r's center atom.
-    """
-    res_centers = torch.arange(
-        0,
-        N_ATOM,
-        ATOMS_PER_RES,
-    )  # [0, 3, 6, ..., 147] — one per residue
-    single = repeat(
-        res_centers,
-        "n -> (n a)",
-        a=ATOMS_PER_RES,
-    )  # broadcast to every atom in residue
-    return repeat(single, "n -> b n", b=B).contiguous()
-
-
-@pytest.fixture
-def gt_atom_distogram_sparse() -> Int[torch.Tensor, "B N_atom K_sparse"]:
-    """Random ground-truth sparse atom distogram bin indices."""
-    return torch.randint(0, N_ATOM_BINS, (B, N_ATOM, K_SPARSE))
-
-
-@pytest.fixture
-def gt_atom_distogram_mask_sparse() -> Bool[torch.Tensor, "B N_atom K_sparse"]:
-    """All-True validity mask for sparse atom distogram — no padding."""
-    return torch.ones(B, N_ATOM, K_SPARSE, dtype=torch.bool)
-
-
-# ---------------------------------------------------------------------------
-# FeaturizedBatch fixture and forward helper
-# ---------------------------------------------------------------------------
-
-
-@pytest.fixture
-def featurized_batch(  # noqa: PLR0913
-    ref_pos: Float[torch.Tensor, "B N_atom 3"],
-    ref_element: Float[torch.Tensor, "B N_atom E"],
-    ref_space_uid: Int[torch.Tensor, "B N_atom"],
-    f_distogram: Float[torch.Tensor, "B N_res N_res N_bins"],
-    f_pseudo_beta_mask: Float[torch.Tensor, "B N_res"],
-    f_residue_idx: Int[torch.Tensor, "B N_res"],
-    r_input: Float[torch.Tensor, "B N_atom 3"],
-    tok_idx: Int[torch.Tensor, "B N_atom"],
-    center_uid: Int[torch.Tensor, "B N_res"],
-    gt_atom_distogram_sparse: Float[
-        torch.Tensor,
-        "B N_atom K_sparse N_atom_bins",
-    ],
-    gt_atom_distogram_mask_sparse: Bool[torch.Tensor, "B N_atom K_sparse"],
+def featurized_batch(
+    dims: TrunkDims,
+    make_pattern: PatternFactory,
 ) -> FeaturizedBatch:
-    """Assemble FeaturizedBatch from input fixtures for trunk tests."""
-    return FeaturizedBatch(
-        ref_pos=ref_pos,
-        ref_element=ref_element,
-        ref_space_uid=ref_space_uid,
-        gt_res_distogram_indices=torch.zeros(B, N_RES, N_RES, dtype=torch.long),
-        noised_res_distogram=f_distogram,
-        f_pseudo_beta_mask=f_pseudo_beta_mask.long(),
-        f_residue_idx=f_residue_idx,
-        r_gt=torch.zeros_like(r_input),
-        r_gt_noised=r_input,
-        atom5_mask=torch.ones(B, N_ATOM, dtype=torch.bool),
-        aa_indices=torch.zeros(B, N_RES, dtype=torch.long),
-        t_hat=torch.rand(B) + 0.1,
-        t_normalized=torch.randn(B, N_RES, N_RES),
-        tok_idx=tok_idx,
-        center_uid=center_uid,
-        gt_atom_distogram_sparse=gt_atom_distogram_sparse,
-        gt_atom_distogram_mask_sparse=gt_atom_distogram_mask_sparse,
-    )
-
-
-def _forward(trunk: MainTrunk, batch: FeaturizedBatch) -> PredictedOutputs:
-    """Run model forward pass and return the PredictedOutputs dataclass."""
-    with torch.no_grad():
-        return trunk(batch)
-
-
-# ---------------------------------------------------------------------------
-# sinusoidal_encoding
-# ---------------------------------------------------------------------------
-
-
-def test_sinusoidal_encoding_output_shape() -> None:
-    """sinusoidal_encoding returns [B, N_res, dim] with all finite values."""
-    positions = repeat(
-        torch.arange(N_RES, dtype=torch.float32),
-        "n -> b n",
-        b=2,
-    )
-    out = sinusoidal_encoding(positions, dim=C_RES)
-    assert out.shape == (2, N_RES, C_RES)
-    assert torch.isfinite(out).all()
-
-
-def test_sinusoidal_encoding_varies_across_positions() -> None:
-    """Every residue position maps to distinct encoding."""
-    positions = repeat(torch.arange(N_RES, dtype=torch.float32), "n -> 1 n")
-    enc = rearrange(sinusoidal_encoding(positions, dim=C_RES), "1 n d -> n d")
-    off_diag = sq_dist_matrix(enc) + torch.eye(N_RES) * 1e10
-    assert off_diag.min().item() > 0
-
-
-# ---------------------------------------------------------------------------
-# TimeFourierEmbedding
-# ---------------------------------------------------------------------------
-
-
-def test_time_fourier_embedding_output_shape(model: MainTrunk) -> None:
-    """TimeFourierEmbedding maps length-N noise level to finite [N, C_res]."""
-    out = model.time_fourier(torch.randn(N_RES))
-    assert out.shape == (N_RES, C_RES)
-    assert torch.isfinite(out).all()
-
-
-def test_time_fourier_embedding_fixed_buffers() -> None:
-    """Freqs and phases are non-trainable buffers, outputs bounded [-1, 1]."""
-    emb = TimeFourierEmbedding(C_RES)
-    assert not emb.freqs.requires_grad
-    assert not emb.phases.requires_grad
-    assert len(list(emb.parameters())) == 0
-    out = emb(torch.randn(N_RES))
-    assert (out >= -1.0).all()
-    assert (out <= 1.0).all()
-
-
-# ---------------------------------------------------------------------------
-# RelativePositionEncoding
-# ---------------------------------------------------------------------------
-
-
-def test_rel_pos_enc_output_shape(model: MainTrunk) -> None:
-    """RelativePositionEncoding returns finite output of correct shape."""
-    res_idx = repeat(torch.arange(N_RES, dtype=torch.long), "n -> b n", b=B)
-    zeros = torch.zeros(B, N_RES, dtype=torch.long)
-    out = model.rel_pos_enc(
-        residue_index=res_idx,
-        asym_id=zeros,
-        entity_id=zeros,
-        token_index=res_idx,
-        sym_id=zeros,
-    )
-    assert out.shape == (B, N_RES, N_RES, C_PAIR)
-    assert torch.isfinite(out).all()
-
-
-def test_rel_pos_enc_deterministic(model: MainTrunk) -> None:
-    """RelativePositionEncoding returns same inputs return same output."""
-    res_idx = repeat(torch.arange(N_RES, dtype=torch.long), "n -> b n", b=B)
-    zeros = torch.zeros(B, N_RES, dtype=torch.long)
-    kwargs = {
-        "residue_index": res_idx,
-        "asym_id": zeros,
-        "entity_id": zeros,
-        "token_index": res_idx,
-        "sym_id": zeros,
-    }
-    out1 = model.rel_pos_enc(**kwargs)
-    out2 = model.rel_pos_enc(**kwargs)
-    assert torch.allclose(out1, out2)
-
-
-def test_rel_pos_enc_algo3_output_shape() -> None:
-    """Algorithm 3 returns [1, N, N, C_pair] for batch-size-1 inputs."""
-    enc = RelativePositionEncoding(C_PAIR, r_max=4, s_max=2)
-    N = 10
-    residue_index = rearrange(torch.arange(N, dtype=torch.long), "n -> 1 n")
-    asym_id = torch.zeros(1, N, dtype=torch.long)
-    entity_id = torch.zeros(1, N, dtype=torch.long)
-    token_index = torch.zeros(1, N, dtype=torch.long)
-    sym_id = torch.zeros(1, N, dtype=torch.long)
-    out = enc(
-        residue_index=residue_index,
-        asym_id=asym_id,
-        entity_id=entity_id,
-        token_index=token_index,
-        sym_id=sym_id,
-    )
-    assert out.shape == (1, N, N, C_PAIR)
-    assert torch.isfinite(out).all()
-
-
-def test_rel_pos_enc_algo3_cross_chain_ignores_residue_distance() -> None:
-    """Cross-chain pairs always use overflow bin.
-
-    Regardless of residue_index values, cross-chain pairs are assigned to the
-    overflow bin.
-    """
-    enc = RelativePositionEncoding(C_PAIR, r_max=4, s_max=2)
-    N = 4
-    asym_id = rearrange(
-        torch.tensor([0, 0, 1, 1], dtype=torch.long),
-        "n -> 1 n",
-    )
-    entity_id = torch.zeros(1, N, dtype=torch.long)
-    token_index = torch.zeros(1, N, dtype=torch.long)
-    sym_id = rearrange(torch.tensor([0, 0, 1, 1], dtype=torch.long), "n -> 1 n")
-
-    idx_a = rearrange(torch.tensor([0, 1, 0, 1], dtype=torch.long), "n -> 1 n")
-    idx_b = rearrange(
-        torch.tensor([0, 1, 50, 51], dtype=torch.long),
-        "n -> 1 n",
-    )
-
-    out_a = enc(
-        residue_index=idx_a,
-        asym_id=asym_id,
-        entity_id=entity_id,
-        token_index=token_index,
-        sym_id=sym_id,
-    )
-    out_b = enc(
-        residue_index=idx_b,
-        asym_id=asym_id,
-        entity_id=entity_id,
-        token_index=token_index,
-        sym_id=sym_id,
-    )
-
-    assert torch.allclose(out_a[0, 0, 2], out_b[0, 0, 2])
-    assert torch.allclose(out_a[0, 1, 3], out_b[0, 1, 3])
-
-
-def test_rel_pos_enc_algo3_same_chain_uses_residue_distance() -> None:
-    """Same-chain pairs encode clipped residue index diff, not overflow bin."""
-    enc = RelativePositionEncoding(C_PAIR, r_max=4, s_max=2)
-    N = 6
-    asym_id = torch.zeros(1, N, dtype=torch.long)
-    entity_id = torch.zeros(1, N, dtype=torch.long)
-    token_index = torch.zeros(1, N, dtype=torch.long)
-    sym_id = torch.zeros(1, N, dtype=torch.long)
-
-    idx_close = rearrange(torch.arange(N, dtype=torch.long), "n -> 1 n")
-    idx_spread = rearrange(torch.arange(N, dtype=torch.long) * 3, "n -> 1 n")
-
-    out_close = enc(
-        residue_index=idx_close,
-        asym_id=asym_id,
-        entity_id=entity_id,
-        token_index=token_index,
-        sym_id=sym_id,
-    )
-    out_spread = enc(
-        residue_index=idx_spread,
-        asym_id=asym_id,
-        entity_id=entity_id,
-        token_index=token_index,
-        sym_id=sym_id,
-    )
-
-    assert not torch.allclose(out_close[0, 0, 1], out_spread[0, 0, 1])
-
-
-def test_rel_pos_enc_algo3_entity_flag_differs_across_entities() -> None:
-    """b_same_entity flag differs when entity_ids differ.
-
-    b_same_entity is 1 iff entity_id[i] == entity_id[j]; differing entity_ids
-    produce a different output encoding.
-    """
-    enc = RelativePositionEncoding(C_PAIR, r_max=4, s_max=2)
-    N = 4
-    residue_index = rearrange(torch.arange(N, dtype=torch.long), "n -> 1 n")
-    asym_id = torch.zeros(1, N, dtype=torch.long)
-    token_index = torch.zeros(1, N, dtype=torch.long)
-    sym_id = torch.zeros(1, N, dtype=torch.long)
-
-    entity_same = torch.zeros(1, N, dtype=torch.long)
-    entity_split = rearrange(
-        torch.tensor([0, 0, 1, 1], dtype=torch.long),
-        "n -> 1 n",
-    )
-
-    out_same = enc(
-        residue_index=residue_index,
-        asym_id=asym_id,
-        entity_id=entity_same,
-        token_index=token_index,
-        sym_id=sym_id,
-    )
-    out_split = enc(
-        residue_index=residue_index,
-        asym_id=asym_id,
-        entity_id=entity_split,
-        token_index=token_index,
-        sym_id=sym_id,
-    )
-
-    assert not torch.allclose(out_same[0, 0, 2], out_split[0, 0, 2])
-
-
-def test_rel_pos_enc_algo3_chain_distance_varies_with_sym_id() -> None:
-    """Cross-chain d_chain varies with sym_id.
-
-    d_chain = clip(sym_i - sym_j + s_max, 0, 2*s_max); different sym_ids
-    produce a different output encoding.
-    """
-    enc = RelativePositionEncoding(C_PAIR, r_max=4, s_max=2)
-    N = 4
-    residue_index = rearrange(torch.arange(N, dtype=torch.long), "n -> 1 n")
-    asym_id = rearrange(
-        torch.tensor([0, 0, 1, 1], dtype=torch.long),
-        "n -> 1 n",
-    )
-    entity_id = torch.zeros(1, N, dtype=torch.long)
-    token_index = torch.zeros(1, N, dtype=torch.long)
-
-    sym_id_a = rearrange(
-        torch.tensor([0, 0, 1, 1], dtype=torch.long),
-        "n -> 1 n",
-    )
-    sym_id_b = rearrange(
-        torch.tensor([0, 0, 2, 2], dtype=torch.long),
-        "n -> 1 n",
-    )
-
-    out_a = enc(
-        residue_index=residue_index,
-        asym_id=asym_id,
-        entity_id=entity_id,
-        token_index=token_index,
-        sym_id=sym_id_a,
-    )
-    out_b = enc(
-        residue_index=residue_index,
-        asym_id=asym_id,
-        entity_id=entity_id,
-        token_index=token_index,
-        sym_id=sym_id_b,
-    )
-
-    assert not torch.allclose(out_a[0, 0, 2], out_b[0, 0, 2])
-
-
-# ---------------------------------------------------------------------------
-# MainTrunk.forward — output shapes and values
-# ---------------------------------------------------------------------------
-
-
-def test_main_trunk_r_denoised_shape_finite(
-    model: MainTrunk,
-    featurized_batch: FeaturizedBatch,
-) -> None:
-    """Main trunk returns finite denoised atom coordinates of correct shape."""
-    out = _forward(model, featurized_batch)
-    assert out.r_denoised.shape == (B, N_ATOM, 3)
-    assert torch.isfinite(out.r_denoised).all()
-
-
-def test_main_trunk_residue_distogram_shape_finite(
-    model: MainTrunk,
-    featurized_batch: FeaturizedBatch,
-) -> None:
-    """Residue distogram head returns finite logits of correct shape."""
-    out = _forward(model, featurized_batch)
-    assert out.residue_distogram_logits.shape == (B, N_RES, N_RES, N_BINS)
-    assert torch.isfinite(out.residue_distogram_logits).all()
-
-
-def test_main_trunk_atom_distogram_shape_finite(
-    model: MainTrunk,
-    featurized_batch: FeaturizedBatch,
-) -> None:
-    """Atom distogram output shape is [B, N_ATOM, ..., N_ATOM_BINS]."""
-    out = _forward(model, featurized_batch)
-    assert out.atom_distogram_logits.ndim == DISTOGRAM_RANK
-    assert out.atom_distogram_logits.shape[0] == B
-    assert out.atom_distogram_logits.shape[1] == N_ATOM
-    assert out.atom_distogram_logits.shape[3] == N_ATOM_BINS
-    assert torch.isfinite(out.atom_distogram_logits).all()
-
-
-def test_main_trunk_atom_distogram_bins_match_ground_truth(
-    model: MainTrunk,
-    featurized_batch: FeaturizedBatch,
-) -> None:
-    """K-neighbour dim matches and gt indices are valid bin indices."""
-    out = _forward(model, featurized_batch)
-    n_bins = out.atom_distogram_logits.shape[-1]
-    assert (
-        out.atom_distogram_logits.shape[2]
-        == featurized_batch.gt_atom_distogram_sparse.shape[2]
-    )
-    assert featurized_batch.gt_atom_distogram_sparse.max() < n_bins
-    assert featurized_batch.gt_atom_distogram_sparse.min() >= 0
-
-
-def test_main_trunk_distogram_loss_atom_computable(
-    model: MainTrunk,
-    featurized_batch: FeaturizedBatch,
-) -> None:
-    """Atom distogram logits from trunk correct shape for loss."""
-    out = _forward(model, featurized_batch)
-    loss = distogram_loss_atom(
-        out.atom_distogram_logits,
-        featurized_batch.gt_atom_distogram_sparse,
-        featurized_batch.gt_atom_distogram_mask_sparse,
-    ).mean()
-    assert loss.ndim == 0
-    assert torch.isfinite(loss)
-
-
-def test_main_trunk_sequence_head_shapes_and_vocab_bound(
-    model: MainTrunk,
-    featurized_batch: FeaturizedBatch,
-) -> None:
-    """Sequence head output has correct shape, finite, never predicts "X"."""
-    out = _forward(model, featurized_batch)
-
-    assert out.seq_logits.shape == (B, N_RES, N_AMINO)
-    assert torch.isfinite(out.seq_logits).all()
-    assert (
-        out.seq_logits.argmax(dim=-1).max() < N_AMINO
-    )  # X is never the argmax
-
-    assert len(out.intermediate_denoised_coord_stack) == K_UNIT
-    assert len(out.intermediate_pred_aa_logit_stack) == K_UNIT
-    for inter_logits in out.intermediate_pred_aa_logit_stack:
-        assert inter_logits.shape == (B, N_RES, N_AMINO)
-        assert (
-            inter_logits.argmax(dim=-1).max() < N_AMINO
-        )  # X is never the argmax
-
-
-def test_main_trunk_intermediate_coords_shape_finite(
-    model: MainTrunk,
-    featurized_batch: FeaturizedBatch,
-) -> None:
-    """Every intermediate denoised coord tensor has shape [B, N_atom, 3]."""
-    out = _forward(model, featurized_batch)
-    for r in out.intermediate_denoised_coord_stack:
-        assert r.shape == (B, N_ATOM, 3)
-        assert torch.isfinite(r).all()
-
-
-def test_main_trunk_forward_with_mask_token_aa_indices(
-    model: MainTrunk,
-    featurized_batch: FeaturizedBatch,
-) -> None:
-    """Mask token 'X' must not raise IndexError during forward pass."""
-    # aa_indices containing 20 (mask token "X") must not raise IndexError
-    masked_batch = dataclasses.replace(
-        featurized_batch,
-        aa_indices=torch.full((B, N_RES), N_AMINO, dtype=torch.long),
-    )
-    with torch.no_grad():
-        out = model(masked_batch)
-    assert out.r_denoised.shape == (B, N_ATOM, 3)
-    assert torch.isfinite(out.r_denoised).all()
-
-
-# you need to add integration tests here. don't be afraid to use pytest mocks.
-
-
-def _assert_submodule_grads(trunk: MainTrunk) -> None:
-    """Assert top-level submodules have at least one finite nonzero gradient.
+    """Build a deterministic FeaturizedBatch at the test sizes.
+
+    Positions and noise levels are sine patterns; residue ``r`` has amino
+    acid ``r % 20``, atom ``l`` has element ``l % E``, the template
+    distogram puts pair ``(i, j)`` in bin ``(i + j) % n_bins``, and the
+    sparse atom distogram target for slot ``k`` of atom ``l`` is bin
+    ``(l + k) % n_atom_bins``. ``K`` comes from ``build_sparse_pairs`` at
+    the model's window, as the data pipeline computes it.
 
     Args:
-        trunk: Trunk module after a backward pass has been called.
+        dims: Batch sizes.
+        make_pattern: Sine-pattern factory.
+
+    Returns:
+        The batch.
     """
-    buckets: dict[str, list[Float[torch.Tensor, "..."]]] = {}
-    for name, param in trunk.named_parameters():
-        if param.grad is not None:
-            buckets.setdefault(name.split(".")[0], []).append(param.grad)
-    assert buckets, "no parameters have gradients — backward was not called"
-    for prefix, grads in buckets.items():
-        assert any(
-            torch.isfinite(g).all().item() and g.abs().max().item() > 0
-            for g in grads
-        ), f"submodule '{prefix}' has no finite nonzero gradients"
+    b, r, n = dims.batch, dims.n_res, dims.n_atom
+    tok = torch.repeat_interleave(torch.arange(r), dims.atoms_per_res)
+    _, mask = build_sparse_pairs(tok, window_size=dims.window_size)
+    k = mask.shape[1]
+    pair_bin = rearrange(torch.arange(r), "i -> i 1") + torch.arange(r)
+    slot_bin = rearrange(torch.arange(n), "l -> l 1") + torch.arange(k)
+    centres = repeat(
+        torch.arange(0, n, dims.atoms_per_res),
+        "r -> (r a)",
+        a=dims.atoms_per_res,
+    )
+    r_gt = make_pattern((b, n, 3), 0.61)
+    return FeaturizedBatch(
+        ref_pos=make_pattern((b, n, 3), 0.37),
+        ref_element=repeat(
+            F.one_hot(
+                torch.arange(n) % dims.n_elements,
+                dims.n_elements,
+            ).float(),
+            "n e -> b n e",
+            b=b,
+        ),
+        ref_space_uid=torch.zeros(b, n, dtype=torch.long),
+        gt_res_distogram_indices=repeat(
+            pair_bin % dims.n_bins,
+            "i j -> b i j",
+            b=b,
+        ),
+        noised_res_distogram=repeat(
+            F.one_hot(pair_bin % dims.n_bins, dims.n_bins).float(),
+            "i j c -> b i j c",
+            b=b,
+        ),
+        f_pseudo_beta_mask=torch.ones(b, r, dtype=torch.long),
+        f_residue_idx=repeat(torch.arange(r), "r -> b r", b=b),
+        r_gt=r_gt,
+        r_gt_noised=r_gt + make_pattern((b, n, 3), 0.83),
+        atom5_mask=torch.ones(b, n, dtype=torch.bool),
+        aa_indices=repeat(
+            torch.arange(r) % RESTYPE_NUM_NO_X,
+            "r -> b r",
+            b=b,
+        ),
+        t_hat=torch.tensor([0.5, 1.5]),
+        t_normalized=make_pattern((b, r, r), 0.29),
+        tok_idx=repeat(tok, "n -> b n", b=b),
+        center_uid=repeat(centres, "n -> b n", b=b),
+        gt_atom_distogram_sparse=repeat(
+            slot_bin % dims.n_atom_bins,
+            "n k -> b n k",
+            b=b,
+        ),
+        gt_atom_distogram_mask_sparse=repeat(mask, "n k -> b n k", b=b),
+    )
 
 
-def test_integration_gradient_flow_composite_loss(
+@pytest.fixture
+def outputs(
     model: MainTrunk,
     featurized_batch: FeaturizedBatch,
-) -> None:
-    """Composite loss propagates finite nonzero grads to every submodule."""
-    _ = model.train()
-    pred: PredictedOutputs = model(featurized_batch)
+) -> PredictedOutputs:
+    """Run the trunk on the batch without gradients.
 
-    kabsch_loss = atom_loss(
-        pred.r_denoised,
-        featurized_batch.r_gt,
-        featurized_batch.atom5_mask.float(),
-        aa_indices=featurized_batch.aa_indices,
-        lambda_sigma_weight=torch.ones(B),
-    ).mean()
-    ce_loss = seq_ce_loss(pred.seq_logits, featurized_batch.aa_indices)
-    lddt = smooth_lddt_loss(
-        pred.r_denoised,
-        featurized_batch.r_gt,
-        featurized_batch.atom5_mask,
-        cutoff=15.0,
-    )
-    gt_res_bin_idx = featurized_batch.gt_res_distogram_indices.clamp(
-        0,
-        pred.residue_distogram_logits.size(-1) - 1,
-    )
-    res_distogram_loss = distogram_loss_residue(
-        pred.residue_distogram_logits,
-        gt_res_bin_idx,
-        featurized_batch.f_pseudo_beta_mask.float(),
-    ).mean()
-    atom_distogram_loss = distogram_loss_atom(
-        pred.atom_distogram_logits,
-        featurized_batch.gt_atom_distogram_sparse,
-        featurized_batch.gt_atom_distogram_mask_sparse,
-    ).mean()
+    Args:
+        model: Trunk under test.
+        featurized_batch: Input batch.
 
-    K_unit = len(pred.intermediate_denoised_coord_stack)
-    intermediate_loss = torch.tensor(0.0)
-    for k_idx, (inter_coords, inter_logits) in enumerate(
+    Returns:
+        Every head's output.
+    """
+    with torch.no_grad():
+        return model(featurized_batch)
+
+
+@pytest.fixture
+def submodule_grads(
+    model: MainTrunk,
+    featurized_batch: FeaturizedBatch,
+) -> SubmoduleGrads:
+    """Backpropagate the training's composite loss and group the gradients.
+
+    The loss sums the Kabsch-aligned atom loss, sequence cross-entropy,
+    smooth LDDT, both distogram losses, and the decayed intermediate loss
+    over every decoder unit, as the train loop does. Gradients are grouped
+    by the first component of each parameter's name.
+
+    Args:
+        model: Trunk to train; switched to train mode here.
+        featurized_batch: Input batch with ground truth.
+
+    Returns:
+        Every parameter-owning submodule, and those with no usable
+        gradient.
+    """
+    x = featurized_batch
+    pred: PredictedOutputs = model.train()(x)
+    weight = torch.ones(x.t_hat.shape)
+    mask = x.atom5_mask
+    units = list(
         zip(
             pred.intermediate_denoised_coord_stack,
             pred.intermediate_pred_aa_logit_stack,
-            strict=False,
+            strict=True,
         ),
-    ):
-        gamma: float = 0.99 ** (K_unit - k_idx - 1)
-        k_loss = atom_loss(
-            inter_coords,
-            featurized_batch.r_gt,
-            featurized_batch.atom5_mask.float(),
-            aa_indices=featurized_batch.aa_indices,
-            lambda_sigma_weight=torch.ones(B),
-        ) + seq_ce_loss(inter_logits, featurized_batch.aa_indices)
-        intermediate_loss = intermediate_loss + gamma * k_loss
-    intermediate_loss = (intermediate_loss / max(K_unit, 1)).mean()
-
-    total_loss = (
-        kabsch_loss
-        + ce_loss
-        + lddt
-        + res_distogram_loss
-        + atom_distogram_loss
-        + intermediate_loss
     )
-    torch.autograd.backward([total_loss])
+    intermediate = sum(
+        0.99 ** (len(units) - k - 1)
+        * (
+            atom_loss(
+                coords,
+                x.r_gt,
+                mask.float(),
+                aa_indices=x.aa_indices,
+                lambda_sigma_weight=weight,
+            )
+            + seq_ce_loss(logits, x.aa_indices)
+        )
+        for k, (coords, logits) in enumerate(units)
+    )
+    total = (
+        atom_loss(
+            pred.r_denoised,
+            x.r_gt,
+            mask.float(),
+            aa_indices=x.aa_indices,
+            lambda_sigma_weight=weight,
+        ).mean()
+        + seq_ce_loss(pred.seq_logits, x.aa_indices)
+        + smooth_lddt_loss(pred.r_denoised, x.r_gt, mask)
+        + distogram_loss_residue(
+            pred.residue_distogram_logits,
+            x.gt_res_distogram_indices,
+            x.f_pseudo_beta_mask.float(),
+        ).mean()
+        + distogram_loss_atom(
+            pred.atom_distogram_logits,
+            x.gt_atom_distogram_sparse,
+            x.gt_atom_distogram_mask_sparse,
+        ).mean()
+        + cast(torch.Tensor, intermediate / len(units)).mean()
+    )
+    torch.autograd.backward([total])
+    usable: dict[str, bool] = {}
+    for name, param in model.named_parameters():
+        grad = param.grad
+        good = (
+            grad is not None
+            and bool(torch.isfinite(grad).all())
+            and bool(grad.abs().max() > 0)
+        )
+        prefix = name.split(".")[0]
+        usable[prefix] = usable.get(prefix, False) or good
+    return SubmoduleGrads(
+        submodules=tuple(sorted(usable)),
+        without_usable_grad=tuple(
+            sorted(p for p, ok in usable.items() if not ok),
+        ),
+    )
 
-    _assert_submodule_grads(model)
 
+@pytest.fixture
+def rel_pos_scenario(request: pytest.FixtureRequest) -> RelPosScenario:
+    """Return the ``RelPosScenario`` member routed in via indirect param.
 
-# ---------------------------------------------------------------------------
-# EMA
-# ---------------------------------------------------------------------------
+    Args:
+        request: Pytest request carrying the scenario in ``param``.
 
-_EMA_TOLERANCE = 1e-6
-_SYNTHETIC_STEP_COUNT = 7
-
-
-def test_ema_init_shadow_matches_model_and_is_independent_copy(
-    model: MainTrunk,
-) -> None:
-    """Shadow starts equal to model weights but is a detached, independent copy.
-
-    Not parametrized: this test exercises a single invariant (the shadow is
-    a snapshot, not a view) with no meaningful axis of variation; the decay
-    arithmetic itself is covered by the parametrized formula test below.
+    Returns:
+        The scenario under test.
     """
-    ema = EMA(model, decay=0.999)
-    state_dict = cast(dict[str, torch.Tensor], model.state_dict())
-    for name, tensor in state_dict.items():
-        assert torch.equal(ema.shadow[name], tensor)
+    return cast(RelPosScenario, request.param)
 
-    name, param = next(model.named_parameters())
-    original = param.detach().clone()
+
+@pytest.fixture
+def rel_pos_encodings(
+    rel_pos_scenario: RelPosScenario,
+    dims: TrunkDims,
+) -> PairEncodings:
+    """Encode the scenario's base layout and its edited copy.
+
+    Args:
+        rel_pos_scenario: Base layout and the change to apply.
+        dims: Supplies the pair width.
+
+    Returns:
+        The pair ``(i, j)``'s encoding before and after the change.
+    """
+    case = rel_pos_scenario.value
+    _ = manual_seed(0)
+    encoding = RelativePositionEncoding(dims.c_pair, r_max=4, s_max=2)
+    chain = (0, 0, case.chains - 1, case.chains - 1)
+    base = {
+        "residue_index": (0, 1, 2, 3),
+        "asym_id": chain,
+        "entity_id": (0, 0, 0, 0),
+        "token_index": (0, 0, 0, 0),
+        "sym_id": chain,
+    }
+    edited = base | {case.field: case.values}
     with torch.no_grad():
-        _ = param.add_(1.0)
-    assert torch.equal(ema.shadow[name], original)
+        before, after = (
+            encoding(
+                **{
+                    key: rearrange(torch.tensor(val), "n -> 1 n")
+                    for key, val in layout.items()
+                },
+            )[0, case.i, case.j]
+            for layout in (base, edited)
+        )
+    return PairEncodings(before=before, after=after)
+
+
+def test_time_fourier_embedding_is_fixed_and_bounded(
+    dims: TrunkDims,
+    make_pattern: PatternFactory,
+) -> None:
+    """The embedding has no parameters, frozen buffers, and outputs in [-1, 1].
+
+    Its frequencies and phases are fixed at init, so they must not train;
+    the output is a cosine, so it is bounded. Not parametrized: the
+    contract does not depend on the noise levels fed in.
+
+    Args:
+        dims: Supplies the embedding width and a sequence length.
+        make_pattern: Builds noise levels.
+    """
+    embedding = TimeFourierEmbedding(dims.c_res)
+    out = embedding(3 * make_pattern((dims.n_res,), 0.7))
+    assert not list(embedding.parameters())
+    assert not embedding.freqs.requires_grad
+    assert not embedding.phases.requires_grad
+    assert out.shape == (dims.n_res, dims.c_res)
+    assert bool(((out >= -1) & (out <= 1)).all())
+
+
+def test_relative_position_encoding_shape_and_finite(
+    dims: TrunkDims,
+    featurized_batch: FeaturizedBatch,
+) -> None:
+    """The encoding of a single chain is a finite ``(B, N, N, c_pair)``.
+
+    Not parametrized: the scenario test below covers the layouts.
+
+    Args:
+        dims: Expected sizes.
+        featurized_batch: Supplies residue indices.
+    """
+    _ = manual_seed(0)
+    encoding = RelativePositionEncoding(dims.c_pair)
+    res_idx = featurized_batch.f_residue_idx
+    zeros = torch.zeros_like(res_idx)
+    with torch.no_grad():
+        out = encoding(
+            residue_index=res_idx,
+            asym_id=zeros,
+            entity_id=zeros,
+            token_index=res_idx,
+            sym_id=zeros,
+        )
+    assert out.shape == (dims.batch, dims.n_res, dims.n_res, dims.c_pair)
+    assert torch.isfinite(out).all()
 
 
 @pytest.mark.parametrize(
-    ("decay", "step", "expected_effective_decay"),
+    "rel_pos_scenario",
+    list(RelPosScenario),
+    ids=[case.name for case in RelPosScenario],
+    indirect=True,
+)
+def test_relative_position_encoding_reads_the_right_features(
+    rel_pos_scenario: RelPosScenario,
+    rel_pos_encodings: PairEncodings,
+) -> None:
+    """A feature change alters a pair's encoding exactly when it should.
+
+    Args:
+        rel_pos_scenario: Change and expected effect.
+        rel_pos_encodings: The pair's encoding before and after.
+    """
+    x = rel_pos_encodings
+    unchanged = torch.allclose(x.before, x.after)
+    expect_unchanged = {"same": True, "differs": False}
+    assert unchanged == expect_unchanged[rel_pos_scenario.value.effect]
+
+
+def test_main_trunk_outputs_have_their_shapes_and_are_finite(
+    dims: TrunkDims,
+    featurized_batch: FeaturizedBatch,
+    outputs: PredictedOutputs,
+) -> None:
+    """Every head returns a finite tensor of its documented shape.
+
+    One forward pass checks all heads at once, since the trunk computes
+    them together. The atom distogram's ``K`` axis must match the sparse
+    targets it is scored against, and there is one intermediate output per
+    decoder unit. Not parametrized: shapes depend only on ``dims``.
+
+    Args:
+        dims: Expected sizes.
+        featurized_batch: Supplies the sparse target layout.
+        outputs: Every head's output.
+    """
+    b, r, n = dims.batch, dims.n_res, dims.n_atom
+    k = featurized_batch.gt_atom_distogram_sparse.shape[2]
+    tensors = {
+        "r_denoised": (outputs.r_denoised, (b, n, 3)),
+        "seq_logits": (outputs.seq_logits, (b, r, RESTYPE_NUM_NO_X)),
+        "residue_distogram_logits": (
+            outputs.residue_distogram_logits,
+            (b, r, r, dims.n_bins),
+        ),
+        "atom_distogram_logits": (
+            outputs.atom_distogram_logits,
+            (b, n, k, dims.n_atom_bins),
+        ),
+    }
+    for unit, coords in enumerate(outputs.intermediate_denoised_coord_stack):
+        tensors[f"coords_{unit}"] = (coords, (b, n, 3))
+    for unit, logits in enumerate(outputs.intermediate_pred_aa_logit_stack):
+        tensors[f"aa_logits_{unit}"] = (logits, (b, r, RESTYPE_NUM_NO_X))
+    wrong = [
+        name
+        for name, (tensor, shape) in tensors.items()
+        if tuple(tensor.shape) != shape or not torch.isfinite(tensor).all()
+    ]
+    assert len(outputs.intermediate_denoised_coord_stack) == dims.k_unit
+    assert len(outputs.intermediate_pred_aa_logit_stack) == dims.k_unit
+    assert not wrong
+
+
+def test_main_trunk_accepts_mask_token_amino_acids(
+    dims: TrunkDims,
+    model: MainTrunk,
+    featurized_batch: FeaturizedBatch,
+) -> None:
+    """A batch whose every residue is the mask token ``X`` runs cleanly.
+
+    ``X`` has index ``RESTYPE_NUM_NO_X``, one past the predicted vocabulary,
+    so an embedding sized to the vocabulary would raise ``IndexError``. Not
+    parametrized: all-``X`` is the extreme of any partial masking.
+
+    Args:
+        dims: Expected sizes.
+        model: Trunk under test.
+        featurized_batch: Batch whose amino acids are replaced here.
+    """
+    masked = dataclasses.replace(
+        featurized_batch,
+        aa_indices=torch.full_like(
+            featurized_batch.aa_indices,
+            RESTYPE_NUM_NO_X,
+        ),
+    )
+    with torch.no_grad():
+        out = model(masked)
+    assert out.r_denoised.shape == (dims.batch, dims.n_atom, 3)
+    assert torch.isfinite(out.r_denoised).all()
+
+
+def test_composite_loss_reaches_every_submodule(
+    submodule_grads: SubmoduleGrads,
+) -> None:
+    """Every top-level submodule gets a finite, nonzero gradient.
+
+    A submodule without one would never train, and under DDP would crash
+    the unused-parameter check. Not parametrized: the composite loss is the
+    single objective the trunk is trained on.
+
+    Args:
+        submodule_grads: Per-submodule gradient summary.
+    """
+    assert submodule_grads.submodules
+    assert not submodule_grads.without_usable_grad
+
+
+def test_ema_init_shadow_is_an_independent_snapshot(model: MainTrunk) -> None:
+    """The shadow starts equal to the model's state but shares no storage.
+
+    Not parametrized: it is a single invariant (the shadow is a snapshot,
+    not a view); the decay arithmetic is tested below.
+
+    Args:
+        model: Trunk to snapshot; perturbed here after the EMA is built.
+    """
+    ema = EMA(model, decay=0.999)
+    state = cast(StateDict, model.state_dict())
+    matches = all(torch.equal(ema.shadow[k], v) for k, v in state.items())
+    snapshot = {k: v.clone() for k, v in ema.shadow.items()}
+    with torch.no_grad():
+        for param in model.parameters():
+            _ = param.add_(1.0)
+    assert matches
+    assert all(torch.equal(ema.shadow[k], v) for k, v in snapshot.items())
+
+
+@pytest.mark.parametrize(
+    ("decay", "step", "effective"),
     [
         pytest.param(0.999, 0, 1.0 / 10.0, id="step0_ramp_dominates"),
         pytest.param(0.999, 89, 90.0 / 99.0, id="mid_ramp_below_target"),
         pytest.param(0.9, 10_000, 0.9, id="late_step_target_decay_dominates"),
     ],
 )
-def test_ema_update_matches_bias_corrected_decay_formula(
+def test_ema_update_blends_by_bias_corrected_decay(
     model: MainTrunk,
     decay: float,
     step: int,
-    expected_effective_decay: float,
+    effective: float,
 ) -> None:
-    """update() blends shadow and param by min(decay, (step+1)/(step+10)).
+    """``update`` blends by ``min(decay, (step + 1) / (step + 10))``.
 
-    Covers the ramp's dominant regime at step 0, a mid-ramp step where the
-    bias-correction term is still below the target decay, and a late step
-    where the target decay has taken over.
+    Covers the ramp's dominant regime at step 0, a mid-ramp step still
+    below the target decay, and a late step where the target has taken
+    over.
+
+    Args:
+        model: Trunk whose parameters are shifted by 1 here.
+        decay: Target decay.
+        step: Optimizer step passed to ``update``.
+        effective: Hand-computed effective decay.
     """
     ema = EMA(model, decay=decay)
     name, param = next(model.named_parameters())
     before = ema.shadow[name].clone()
-
     with torch.no_grad():
         _ = param.add_(1.0)
-    after_param = cast(
-        dict[str, torch.Tensor],
-        model.state_dict(),
-    )[name].clone()
     ema.update(model, step=step)
-
-    expected = (
-        expected_effective_decay * before
-        + (1.0 - expected_effective_decay) * after_param
-    )
-    assert torch.allclose(ema.shadow[name], expected, atol=_EMA_TOLERANCE)
+    expected = effective * before + (1 - effective) * param.detach()
+    torch.testing.assert_close(ema.shadow[name], expected, atol=1e-6, rtol=0)
 
 
-def test_ema_non_floating_point_buffer_is_copied_not_averaged(
+@pytest.mark.parametrize("count", [7, -3], ids=["positive", "negative"])
+def test_ema_copies_integer_buffers_instead_of_blending(
     model: MainTrunk,
+    count: int,
 ) -> None:
-    """Non-float buffers are copied verbatim instead of decay-blended.
+    """A non-float buffer's new value is copied into the shadow as is.
 
-    Not parametrized: MainTrunk has no integer buffers today (freqs, phases,
-    and centers are all float and fixed at init), so this test registers a
-    synthetic int64 buffer to exercise the copy-not-blend branch directly.
+    MainTrunk has no integer buffers today, so this test registers a
+    synthetic int64 counter to reach the copy branch. Blending 0 and
+    ``count`` at decay 0.1 would give a different, non-integer value.
+
+    Args:
+        model: Trunk to which an integer buffer is added here.
+        count: Value the counter is set to before the update.
     """
-    model.register_buffer("step_count", torch.tensor(0, dtype=torch.int64))
+    model.register_buffer("step_count", torch.tensor(0))
     ema = EMA(model, decay=0.999)
-
-    _ = model.get_buffer("step_count").fill_(_SYNTHETIC_STEP_COUNT)
+    _ = model.get_buffer("step_count").fill_(count)
     ema.update(model, step=0)
-
-    assert ema.shadow["step_count"].item() == _SYNTHETIC_STEP_COUNT
-
-
-@contextlib.contextmanager
-def _single_process_gloo_group() -> Generator[None]:
-    """Init and tear down a single-process gloo group for DDP-wrapping tests."""
-    # HashStore is a private torch.distributed C-extension symbol that
-    # isn't officially re-exported; getattr() sidesteps the static
-    # private-import check, whose result is otherwise inconsistent
-    # across torch's per-platform packaging.
-    dist.init_process_group(
-        backend="gloo",
-        store=getattr(  # noqa: B009  # pyright: ignore[reportAny]
-            dist,
-            "HashStore",
-        )(),
-        rank=0,
-        world_size=1,
-    )
-    try:
-        yield
-    finally:
-        dist.destroy_process_group()
+    assert ema.shadow["step_count"].item() == count
 
 
-def test_ema_unwraps_ddp_module_prefix_on_init_and_update(
-    model: MainTrunk,
-) -> None:
-    """EMA strips the DDP "module." prefix so shadow keys match a plain model.
+def test_ema_state_dict_round_trips(model: MainTrunk) -> None:
+    """``load_state_dict`` restores a saved shadow exactly.
 
-    Not parametrized: this is a single structural invariant (DDP-wrapped and
-    plain models must produce identically-keyed shadows, matching the
-    prefix-stripped keys ``save_checkpoint`` writes for the raw model) with
-    no meaningful axis of variation.
-    """
-    plain_keys = set(model.state_dict().keys())
-    with _single_process_gloo_group():
-        ddp_model = DDP(model)
-        ema = EMA(ddp_model, decay=0.999)
-        assert set(ema.shadow.keys()) == plain_keys
-        assert not any(k.startswith("module.") for k in ema.shadow)
+    Not parametrized: one round trip of a shadow that differs from the
+    model covers serialization.
 
-        with torch.no_grad():
-            for p in ddp_model.parameters():
-                _ = p.add_(1.0)
-        ema.update(ddp_model, step=0)
-        assert set(ema.shadow.keys()) == plain_keys
-
-
-def test_ema_state_dict_and_load_state_dict_round_trip(
-    model: MainTrunk,
-) -> None:
-    """load_state_dict restores a previously saved shadow exactly.
-
-    Not parametrized: this exercises a single serialization round trip with
-    no meaningful axis of variation beyond what the decay-formula and
-    buffer-handling tests above already cover.
+    Args:
+        model: Trunk whose parameters are shifted here.
     """
     ema = EMA(model, decay=0.999)
     with torch.no_grad():
-        for p in model.parameters():
-            _ = p.add_(1.0)
+        for param in model.parameters():
+            _ = param.add_(1.0)
     ema.update(model, step=500)
-    saved = {name: tensor.clone() for name, tensor in ema.state_dict().items()}
-
-    fresh_ema = EMA(model, decay=0.999)
-    fresh_ema.load_state_dict(saved)
-
-    for name, tensor in saved.items():
-        assert torch.equal(fresh_ema.shadow[name], tensor)
+    saved = {k: v.clone() for k, v in ema.state_dict().items()}
+    restored = EMA(model, decay=0.999)
+    restored.load_state_dict(saved)
+    assert all(torch.equal(restored.shadow[k], v) for k, v in saved.items())
 
 
-# ---------------------------------------------------------------------------
-# EMA.swap (zero-copy pointer swap, used by swapped_in_ema_weights)
-# ---------------------------------------------------------------------------
+@pytest.mark.usefixtures("single_process_gloo_group")
+def test_ema_unwraps_ddp_for_init_update_and_swap(model: MainTrunk) -> None:
+    """Given a DDP wrapper, EMA keys and swaps against the inner trunk.
+
+    ``DDP.state_dict()`` prefixes every key with ``module.``; the shadow
+    must instead match the plain model's keys, which is what
+    ``save_checkpoint`` writes, through init, update and swap. Not
+    parametrized: one wrapped model exercises all three paths.
+
+    Args:
+        model: Trunk to wrap in a one-rank DDP group.
+    """
+    plain_keys = set(model.state_dict())
+    ddp_model = DDP(model)
+    ema = EMA(ddp_model, decay=0.999)
+    keys_at_init = set(ema.shadow)
+    name, param = next(model.named_parameters())
+    shadow_before = ema.shadow[name].clone()
+    with torch.no_grad():
+        _ = param.add_(1.0)
+    ema.update(ddp_model, step=0)
+    keys_after_update = set(ema.shadow)
+    shadow_after_update = ema.shadow[name].clone()
+    ema.swap(ddp_model)
+    assert keys_at_init == keys_after_update == plain_keys
+    assert not torch.equal(shadow_after_update, shadow_before)
+    assert torch.equal(
+        dict(model.named_parameters())[name],
+        shadow_after_update,
+    )
 
 
-def test_ema_swap_exchanges_parameter_and_buffer_storage_with_shadow(
+def test_ema_swap_exchanges_parameters_and_buffers_with_shadow(
     model: MainTrunk,
 ) -> None:
-    """swap() moves the shadow's values onto the model and vice versa.
+    """After one ``swap``, model and shadow hold each other's prior values.
 
-    Arrange: build an EMA (shadow == initial weights), then perturb both a
-    parameter and a buffer (``time_fourier.freqs``) on the live model so
-    the model and the shadow diverge from each other and from their
-    pre-perturbation values.
-    Act: call ``ema.swap(model)`` once.
-    Assert: the model's parameter and buffer now hold what the shadow held
-    immediately before the swap; the shadow now holds what the model held
-    (the perturbed values) immediately before the swap.
+    Both a parameter and a buffer (``time_fourier.freqs``) are perturbed
+    first so the two sides differ. Not parametrized: one parameter and one
+    buffer cover both lists ``swap`` walks.
+
+    Args:
+        model: Trunk perturbed here after the EMA is built.
     """
     ema = EMA(model, decay=0.999)
-    param_name, param = next(model.named_parameters())
+    name, param = next(model.named_parameters())
     buffer_name = "time_fourier.freqs"
-    shadow_param_before = ema.shadow[param_name].clone()
-    shadow_buffer_before = ema.shadow[buffer_name].clone()
-
+    shadow_param = ema.shadow[name].clone()
+    shadow_buffer = ema.shadow[buffer_name].clone()
     with torch.no_grad():
         _ = param.add_(1.0)
         _ = model.time_fourier.freqs.add_(1.0)
-    perturbed_param = param.clone()
-    perturbed_buffer = model.time_fourier.freqs.clone()
-
+    live_param, live_buffer = param.clone(), model.time_fourier.freqs.clone()
     ema.swap(model)
-
-    assert torch.equal(
-        dict(model.named_parameters())[param_name],
-        shadow_param_before,
-    )
-    assert torch.equal(model.time_fourier.freqs, shadow_buffer_before)
-    assert torch.equal(ema.shadow[param_name], perturbed_param)
-    assert torch.equal(ema.shadow[buffer_name], perturbed_buffer)
+    assert torch.equal(param, shadow_param)
+    assert torch.equal(model.time_fourier.freqs, shadow_buffer)
+    assert torch.equal(ema.shadow[name], live_param)
+    assert torch.equal(ema.shadow[buffer_name], live_buffer)
 
 
-def test_ema_swap_twice_restores_original_state(model: MainTrunk) -> None:
-    """Calling swap() twice is a no-op: it's its own inverse.
+def test_ema_swap_twice_restores_both_sides(model: MainTrunk) -> None:
+    """``swap`` is its own inverse: two calls leave model and shadow as is.
 
-    Arrange: build an EMA, perturb the model's parameters and a buffer so
-    the model and shadow diverge, then snapshot both the model's and the
-    shadow's values at that divergent point.
-    Act: call ``ema.swap(model)`` twice in a row.
-    Assert: the model and the shadow both match their respective
-    snapshots exactly, confirming swap()/swap() round-trips losslessly.
+    Not parametrized: the round trip is the same for any divergence.
+
+    Args:
+        model: Trunk perturbed here after the EMA is built.
     """
     ema = EMA(model, decay=0.999)
     with torch.no_grad():
-        for p in model.parameters():
-            _ = p.add_(1.0)
-        _ = model.time_fourier.freqs.add_(1.0)
-
-    model_snapshot = {
-        name: tensor.clone()
-        for name, tensor in cast(
-            "dict[str, torch.Tensor]",
-            model.state_dict(),
-        ).items()
+        for param in model.parameters():
+            _ = param.add_(1.0)
+    model_before = {
+        k: v.clone() for k, v in cast(StateDict, model.state_dict()).items()
     }
-    shadow_snapshot = {
-        name: tensor.clone() for name, tensor in ema.shadow.items()
-    }
-
+    shadow_before = {k: v.clone() for k, v in ema.shadow.items()}
     ema.swap(model)
     ema.swap(model)
-
-    current_model_sd = cast("dict[str, torch.Tensor]", model.state_dict())
-    for name, tensor in model_snapshot.items():
-        assert torch.equal(current_model_sd[name], tensor)
-    for name, tensor in shadow_snapshot.items():
-        assert torch.equal(ema.shadow[name], tensor)
+    model_after = cast(StateDict, model.state_dict())
+    assert all(torch.equal(model_after[k], v) for k, v in model_before.items())
+    assert all(torch.equal(ema.shadow[k], v) for k, v in shadow_before.items())
 
 
-def test_ema_swap_preserves_parameter_object_identity(model: MainTrunk) -> None:
-    """swap() reassigns `.data` in place rather than replacing parameters.
-
-    Arrange: build an EMA and record the Python object identity (``id()``)
-    of every parameter the model currently holds.
-    Act: call ``ema.swap(model)``.
-    Assert: every parameter name still resolves to the exact same Python
-    object as before (``is``, not just equal-valued) -- this is the
-    property that keeps Adam's per-parameter state (keyed by object
-    identity) valid across the swap.
-    """
-    ema = EMA(model, decay=0.999)
-    params_before = dict(model.named_parameters())
-    ids_before = {name: id(param) for name, param in params_before.items()}
-
-    ema.swap(model)
-
-    params_after = dict(model.named_parameters())
-    for name, param in params_after.items():
-        assert id(param) == ids_before[name], f"Parameter '{name}' was replaced"
-
-
-def test_ema_swap_reuses_shadow_storage_without_copying(
+def test_ema_swap_reuses_storage_and_keeps_optimizer_state_valid(
     model: MainTrunk,
 ) -> None:
-    """swap() exchanges storage pointers rather than copying values.
+    """``swap`` moves storage pointers and keeps every Parameter object.
 
-    Arrange: build an EMA and record the shadow tensor's storage address
-    (``data_ptr()``) for one parameter before any swap happens.
-    Act: call ``ema.swap(model)``.
-    Assert: the model's parameter now shares that exact storage address --
-    proof the swap reused the shadow's existing memory rather than
-    allocating a new tensor and copying values into it.
-    """
-    ema = EMA(model, decay=0.999)
-    name, _ = next(model.named_parameters())
-    shadow_ptr_before = ema.shadow[name].data_ptr()
+    Adam keys its state by Parameter object, so after a swap the model's
+    current parameters must still be the keys of the optimizer's state,
+    and the parameter must now own the shadow's former storage, proving no
+    copy was made. Not parametrized: one optimizer step populates state for
+    every parameter.
 
-    ema.swap(model)
-
-    assert dict(model.named_parameters())[name].data_ptr() == shadow_ptr_before
-
-
-def test_ema_swap_preserves_optimizer_state_for_swapped_parameters(
-    model: MainTrunk,
-) -> None:
-    """swap() doesn't break Adam's per-parameter state (keyed by identity).
-
-    Arrange: attach an Adam optimizer to the model's parameters and run one
-    manual step so ``optimizer.state`` is populated per parameter object.
-    Act: build an EMA and call ``ema.swap(model)``.
-    Assert: every parameter object the optimizer already holds a state
-    entry for is still a valid key in ``optimizer.state`` after the swap --
-    confirming the swap only reassigns ``.data`` rather than replacing the
-    Parameter objects the optimizer references.
+    Args:
+        model: Trunk to optimize one step and then swap.
     """
     optimizer = Adam(model.parameters(), lr=1e-3)
-    for p in model.parameters():
-        p.grad = torch.ones_like(p)
+    for param in model.parameters():
+        param.grad = torch.ones_like(param)
     _ = optimizer.step()  # pyright: ignore[reportUnknownMemberType]
-    optimizer.zero_grad()
-    params_before = list(model.parameters())
-
     ema = EMA(model, decay=0.999)
+    name, param = next(model.named_parameters())
+    shadow_ptr = ema.shadow[name].data_ptr()
     ema.swap(model)
-
-    for p in params_before:
-        assert p in optimizer.state
-
-
-def test_ema_swap_unwraps_ddp(model: MainTrunk) -> None:
-    """swap() operates on the unwrapped .module when the model is DDP-wrapped.
-
-    Arrange: wrap the model in a single-process gloo DDP group, build an
-    EMA from the DDP-wrapped model, then perturb the underlying model's
-    parameters so the shadow and the live weights diverge.
-    Act: call ``ema.swap(ddp_model)``, passing the DDP wrapper directly.
-    Assert: shadow keys carry no "module." prefix, and the model's
-    parameters now hold the pre-swap shadow values -- confirming the swap
-    reached through the DDP wrapper to the real MainTrunk rather than
-    operating on wrapper-prefixed keys that would never match.
-    """
-    with _single_process_gloo_group():
-        ddp_model = DDP(model)
-        ema = EMA(ddp_model, decay=0.999)
-        assert not any(k.startswith("module.") for k in ema.shadow)
-
-        name, param = next(model.named_parameters())
-        shadow_before = ema.shadow[name].clone()
-        with torch.no_grad():
-            _ = param.add_(1.0)
-
-        ema.swap(ddp_model)
-
-        assert torch.equal(dict(model.named_parameters())[name], shadow_before)
+    assert param.data_ptr() == shadow_ptr
+    assert all(p in optimizer.state for p in model.parameters())
+    assert dict(model.named_parameters())[name] is param
