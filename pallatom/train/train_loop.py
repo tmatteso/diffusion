@@ -60,7 +60,7 @@ from torch.optim.lr_scheduler import LambdaLR
 from tqdm import tqdm
 from train.train_config import TrainArgs, TrainConfig
 
-_CUDA_DEVICE_TYPE = "cuda"
+CUDA_DEVICE_TYPE = "cuda"
 
 
 @dataclasses.dataclass
@@ -856,7 +856,7 @@ def train(
             model_params.model,
             device_ids=(
                 [local_rank]
-                if model_params.device.type == _CUDA_DEVICE_TYPE
+                if model_params.device.type == CUDA_DEVICE_TYPE
                 else None
             ),
             find_unused_parameters=False,
