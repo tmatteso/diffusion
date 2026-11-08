@@ -31,6 +31,7 @@ from helpers.alignment import (
 )
 from helpers.useful_objects import manual_seed
 from jaxtyping import Bool, Float, TypeCheckError
+from tests.conftest import CloudFactory
 
 type Coords = Float[torch.Tensor, "N 3"]
 type BatchCoords = Float[torch.Tensor, "B N 3"]
@@ -137,40 +138,7 @@ class AugmentResult:
 
 
 @pytest.fixture
-def make_cloud() -> Callable[[int, int], BatchCoords]:
-    """Return a factory for deterministic, non-planar, chiral point clouds.
-
-    ``make(b, n)`` places atom ``k`` (counted across the whole batch) at
-    ``(sin 0.37k, sin(0.91k + 1), cos 1.73k)``. Unrelated frequencies per
-    axis keep the points off any common plane; ``make_pattern`` would
-    not, since ``sin(a + 2f)`` is a linear combination of ``sin(a + f)``
-    and ``sin(a)``, which puts every point on one plane.
-
-    Returns:
-        The factory, giving ``(b, n, 3)`` coordinates in ``[-1, 1]``.
-    """
-
-    def make(b: int, n: int) -> BatchCoords:
-        """Build ``b`` clouds of ``n`` atoms.
-
-        Args:
-            b: Number of clouds.
-            n: Atoms per cloud.
-
-        Returns:
-            ``(b, n, 3)`` coordinates.
-        """
-        k = torch.arange(b * n, dtype=torch.float32)
-        axes = torch.stack(
-            [torch.sin(0.37 * k), torch.sin(0.91 * k + 1), torch.cos(1.73 * k)],
-        )
-        return rearrange(axes, "d (b n) -> b n d", b=b)
-
-    return make
-
-
-@pytest.fixture
-def cloud(make_cloud: Callable[[int, int], BatchCoords]) -> Coords:
+def cloud(make_cloud: CloudFactory) -> Coords:
     """Return a 12-atom chiral cloud spanning about 10 angstroms.
 
     Args:
@@ -275,7 +243,7 @@ def com_coords() -> BatchCoords:
 
 
 @pytest.fixture
-def aug_coords(make_cloud: Callable[[int, int], BatchCoords]) -> BatchCoords:
+def aug_coords(make_cloud: CloudFactory) -> BatchCoords:
     """Return four 12-atom structures far from the origin.
 
     The clouds are scaled by 10 and offset by 20 so that skipping the
