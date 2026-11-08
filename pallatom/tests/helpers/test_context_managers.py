@@ -1,12 +1,15 @@
 """Tests for context manager helpers.
 
-Covers StructlogConfig: file creation, JSON line writing, truncation, file
-handle lifecycle, rank-zero gating, processor chain composition, and exception
-propagation.
+Covers StructlogConfig end to end: which events reach the JSONL file and the
+console on each rank, truncation of a stale file, line buffering, and closing
+the file on both clean and exceptional exits.
 """
 
+import dataclasses
+import enum
 import json
 import pathlib
+from collections.abc import Callable
 from typing import cast
 
 import pytest
@@ -14,282 +17,303 @@ import structlog
 from helpers.context_managers import StructlogConfig
 from structlog.typing import FilteringBoundLogger
 
-_BELOW_THRESHOLD_EVENT = "below_threshold"
-_ABOVE_THRESHOLD_EVENT = "above_threshold"
 
+@dataclasses.dataclass(frozen=True)
+class LoggedRun:
+    """What one INFO and one WARNING event left behind after a logging run.
 
-def test_structlog_config_creates_log_file(tmp_path: pathlib.Path) -> None:
-    """StructlogConfig creates the log file on disk when entering the context.
+    The INFO event is named ``quiet`` and the WARNING event ``loud``; the
+    names avoid ``info`` and ``warning``, which ``ConsoleRenderer`` prints as
+    level labels and would match on every line.
 
-    Verifies that new JSONL file exists at the given path after ``with`` block
-    exits when ``is_rank_zero=True``.
+    Attributes:
+        file_events: ``event`` field of each JSON line in the log file, in
+            order, or ``None`` when no log file was created.
+        console_events: Which of ``quiet`` and ``loud`` appear
+            in captured stdout/stderr, in that order.
     """
-    path = tmp_path / "run.jsonl"
-    with StructlogConfig(is_rank_zero=True, log_file=path):
-        pass
-    assert path.exists()
+
+    file_events: tuple[str, ...] | None
+    console_events: tuple[str, ...]
 
 
-def test_structlog_config_write_log_line_returns_event_dict(
-    tmp_path: pathlib.Path,
+@dataclasses.dataclass(frozen=True)
+class RankCase:
+    """Global rank of the process and the output StructlogConfig must produce.
+
+    Attributes:
+        rank: Global rank; ``is_rank_zero`` is passed as ``rank == 0``.
+        expected: Output after logging ``quiet`` then ``loud``.
+    """
+
+    rank: int
+    expected: LoggedRun
+
+
+class RankScenario(enum.Enum):
+    """Ranks whose logging output StructlogConfig gates differently.
+
+    Members:
+        rank_zero: Writes every event to the file and shows INFO and above
+            on the console.
+        other_rank: Creates no file and shows only WARNING and above, so
+            failures on non-zero ranks stay visible.
+    """
+
+    rank_zero = RankCase(0, LoggedRun(("quiet", "loud"), ("quiet", "loud")))
+    other_rank = RankCase(1, LoggedRun(None, ("loud",)))
+
+
+@pytest.fixture
+def log_path(tmp_path: pathlib.Path) -> pathlib.Path:
+    """Return the JSONL path StructlogConfig writes to; not created yet.
+
+    Args:
+        tmp_path: Per-test temporary directory.
+
+    Returns:
+        Path to ``run.jsonl`` inside ``tmp_path``.
+    """
+    return tmp_path / "run.jsonl"
+
+
+@pytest.fixture
+def stale_log_path(log_path: pathlib.Path) -> pathlib.Path:
+    """Pre-populate ``log_path`` with five stale JSON lines.
+
+    Args:
+        log_path: Path to fill with stale content.
+
+    Returns:
+        The same path, now holding lines from an earlier run.
+    """
+    _ = log_path.write_text('{"event": "stale"}\n' * 5)
+    return log_path
+
+
+@pytest.fixture
+def rank_scenario(request: pytest.FixtureRequest) -> RankScenario:
+    """Return the ``RankScenario`` member routed in via indirect param.
+
+    Args:
+        request: Pytest request carrying the scenario in ``param``.
+
+    Returns:
+        The scenario under test.
+    """
+    return cast(RankScenario, request.param)
+
+
+@pytest.fixture
+def rank_config(
+    rank_scenario: RankScenario,
+    log_path: pathlib.Path,
+) -> StructlogConfig:
+    """Build an unentered StructlogConfig for the scenario's rank.
+
+    Args:
+        rank_scenario: Scenario supplying the rank.
+        log_path: Path the config writes to.
+
+    Returns:
+        The config, not yet entered.
+    """
+    return StructlogConfig(
+        is_rank_zero=rank_scenario.value.rank == 0,
+        log_file=log_path,
+    )
+
+
+@pytest.fixture
+def rank_zero_config(log_path: pathlib.Path) -> StructlogConfig:
+    """Build an unentered rank-zero StructlogConfig writing to ``log_path``.
+
+    Args:
+        log_path: Path the config writes to.
+
+    Returns:
+        The config, not yet entered.
+    """
+    return StructlogConfig(is_rank_zero=True, log_file=log_path)
+
+
+@pytest.fixture
+def run_logging(
+    log_path: pathlib.Path,
+    capsys: pytest.CaptureFixture[str],
+) -> Callable[[StructlogConfig], LoggedRun]:
+    """Factory that logs one INFO and one WARNING event through a config.
+
+    The returned callable enters the config, logs ``quiet`` at INFO and
+    ``loud`` at WARNING through ``structlog.get_logger()``, exits,
+    then reads back the log file and the captured console output.
+
+    Args:
+        log_path: Path the configs passed in write to.
+        capsys: Captures console output from ``ConsoleRenderer``.
+
+    Returns:
+        Callable mapping a config to the ``LoggedRun`` it produced.
+    """
+
+    def run(config: StructlogConfig) -> LoggedRun:
+        """Log through ``config`` and collect what it wrote.
+
+        Args:
+            config: Unentered config to log through.
+
+        Returns:
+            Events found in the file and on the console.
+        """
+        with config:
+            log = cast(FilteringBoundLogger, structlog.get_logger())
+            log.info("quiet")
+            log.warning("loud")
+        captured = capsys.readouterr()
+        console = captured.out + captured.err
+        file_events = (
+            tuple(
+                cast(str, json.loads(line)["event"])
+                for line in log_path.read_text().splitlines()
+            )
+            if log_path.exists()
+            else None
+        )
+        return LoggedRun(
+            file_events=file_events,
+            console_events=tuple(
+                event for event in ("quiet", "loud") if event in console
+            ),
+        )
+
+    return run
+
+
+@pytest.fixture
+def events_before_exit(
+    rank_zero_config: StructlogConfig,
+    log_path: pathlib.Path,
+) -> tuple[str, ...]:
+    """Log one event, then read the file while the config is still entered.
+
+    Args:
+        rank_zero_config: Config to log through.
+        log_path: File the config writes to.
+
+    Returns:
+        ``event`` field of each JSON line on disk before ``__exit__`` closes
+        the file.
+    """
+    with rank_zero_config:
+        cast(FilteringBoundLogger, structlog.get_logger()).info("quiet")
+        lines = log_path.read_text().splitlines()
+    return tuple(cast(str, json.loads(line)["event"]) for line in lines)
+
+
+@pytest.mark.parametrize(
+    "rank_scenario",
+    list(RankScenario),
+    ids=[case.name for case in RankScenario],
+    indirect=True,
+)
+def test_structlog_config_routes_events_by_rank(
+    rank_scenario: RankScenario,
+    rank_config: StructlogConfig,
+    run_logging: Callable[[StructlogConfig], LoggedRun],
 ) -> None:
-    """_write_log_line passes the event dict through unchanged.
+    """Each rank sends events to the file and console its scenario expects.
 
-    Verifies that ``write_log_line`` returns exact same dict object that was
-    passed in, satisfying the structlog processor protocol.
+    Rank zero writes every event as a JSON line and prints INFO and above;
+    any other rank creates no file and prints only WARNING and above.
+
+    Args:
+        rank_scenario: Scenario holding the expected output.
+        rank_config: Config built for the scenario's rank.
+        run_logging: Factory that logs through a config.
     """
-    path = tmp_path / "run.jsonl"
-    cfg = StructlogConfig(is_rank_zero=True, log_file=path)
-    with cfg:
-        event: dict[str, object] = {"event": "test", "value": 1}
-        returned = cfg.write_log_line(None, None, event)
-    assert returned is event
-
-
-def test_structlog_config_writes_json_line(tmp_path: pathlib.Path) -> None:
-    """_write_log_line serialises the event dict as a JSON line in log file.
-
-    Verifies that the written line round-trips through ``json.loads`` back to
-    original event dict.
-    """
-    path = tmp_path / "run.jsonl"
-    cfg = StructlogConfig(is_rank_zero=True, log_file=path)
-    with cfg:
-        event: dict[str, object] = {"event": "train", "loss": 0.5}
-        _ = cfg.write_log_line(None, None, event)
-    with path.open() as fh:
-        written = cast(dict[str, object], json.loads(fh.readline()))
-    assert written == event
-
-
-def test_structlog_config_writes_multiple_lines(tmp_path: pathlib.Path) -> None:
-    """_write_log_line writes one JSON line per call.
-
-    Verifies that two successive calls produce exactly two lines in log file,
-    each deserialising back to the corresponding event dict.
-    """
-    path = tmp_path / "run.jsonl"
-    cfg = StructlogConfig(is_rank_zero=True, log_file=path)
-    events: list[dict[str, object]] = [
-        {"event": "a", "x": 1},
-        {"event": "b", "x": 2},
-    ]
-    with cfg:
-        for ev in events:
-            _ = cfg.write_log_line(None, None, ev)
-    with path.open() as fh:
-        lines = fh.readlines()
-    assert len(lines) == len(events)
-    assert [json.loads(line) for line in lines] == events
+    assert run_logging(rank_config) == rank_scenario.value.expected
 
 
 def test_structlog_config_truncates_existing_file(
-    tmp_path: pathlib.Path,
+    stale_log_path: pathlib.Path,
+    run_logging: Callable[[StructlogConfig], LoggedRun],
 ) -> None:
-    """StructlogConfig truncates a pre-existing log file rather than appending.
+    """A pre-existing log file is truncated on entry rather than appended to.
 
-    Verifies that stale lines written before the context manager is entered are
-    discarded, leaving only the lines written inside the ``with`` block.
+    Only the rank-zero case applies, since no other rank opens the file.
+
+    Args:
+        stale_log_path: Log path already holding stale lines.
+        run_logging: Factory that logs through a config.
     """
-    path = tmp_path / "run.jsonl"
-    with path.open("w") as fh:
-        _ = fh.write('{"stale": true}\n' * 5)
-    cfg = StructlogConfig(is_rank_zero=True, log_file=path)
-    with cfg:
-        _ = cfg.write_log_line(None, None, {"event": "fresh"})
-    with path.open() as fh:
-        lines = fh.readlines()
-    assert len(lines) == 1
-    assert json.loads(lines[0]) == {"event": "fresh"}
+    config = StructlogConfig(is_rank_zero=True, log_file=stale_log_path)
+    logged = run_logging(config)
+    assert logged.file_events == ("quiet", "loud")
 
 
-def test_structlog_config_exit_closes_file(tmp_path: pathlib.Path) -> None:
-    """StructlogConfig.__exit__ closes the underlying file handle.
-
-    Verifies that ``cfg.f`` is not ``None`` after the context exits and that
-    file object reports ``closed == True``.
-    """
-    path = tmp_path / "run.jsonl"
-    cfg = StructlogConfig(is_rank_zero=True, log_file=path)
-    with cfg:
-        _ = cfg.write_log_line(None, None, {"event": "inside"})
-    assert cfg.f is not None
-    assert cfg.f.closed
-
-
-def test_structlog_config_no_file_when_not_rank_zero(
-    tmp_path: pathlib.Path,
+def test_structlog_config_file_is_line_buffered(
+    events_before_exit: tuple[str, ...],
 ) -> None:
-    """StructlogConfig does not open a log file when is_rank_zero is False.
+    """Each JSON line reaches disk as soon as it is logged, before exit.
 
-    Verifies that no file is created at given path when the context manager is
-    used by a non-rank-zero process.
+    A crashed run therefore keeps every line logged before the crash. The
+    single rank-zero case is the only one with a file to buffer.
+
+    Args:
+        events_before_exit: Events read while the config was entered.
     """
-    path = tmp_path / "run.jsonl"
-    with StructlogConfig(is_rank_zero=False, log_file=path):
+    assert events_before_exit == ("quiet",)
+
+
+def test_structlog_config_write_log_line_before_enter_is_passthrough(
+    rank_zero_config: StructlogConfig,
+    log_path: pathlib.Path,
+) -> None:
+    """``write_log_line`` with no open file returns the event dict as is.
+
+    The processor protocol requires it to return the same dict; with no file
+    open yet it must neither raise nor create one. No other state applies:
+    once entered, the end-to-end routing test covers the processor.
+
+    Args:
+        rank_zero_config: Config that has not been entered.
+        log_path: File the config would write to.
+    """
+    event: dict[str, object] = {"event": "no_file"}
+    assert rank_zero_config.write_log_line(None, None, event) is event
+    assert not log_path.exists()
+
+
+def test_structlog_config_closes_file_on_clean_exit(
+    rank_zero_config: StructlogConfig,
+) -> None:
+    """Leaving the block normally closes the log file handle.
+
+    Args:
+        rank_zero_config: Config to enter and exit.
+    """
+    with rank_zero_config:
         pass
-    assert not path.exists()
+    assert rank_zero_config.f is not None
+    assert rank_zero_config.f.closed
 
 
-def test_structlog_config_f_is_none_before_enter(
-    tmp_path: pathlib.Path,
+def test_structlog_config_closes_file_and_propagates_exception(
+    rank_zero_config: StructlogConfig,
 ) -> None:
-    """StructlogConfig.f is None after construction, before entering context.
+    """An exception inside the block propagates and the file is still closed.
 
-    Verifies file handle attribute is not opened during ``__init__``, only
-    during ``__enter__``.
+    ``__exit__`` must not swallow the error, and must release the handle on
+    the error path as well as the clean one.
+
+    Args:
+        rank_zero_config: Config to enter and exit.
+
+    Raises:
+        RuntimeError: Raised inside the block to exercise the error path;
+            caught by ``pytest.raises``.
     """
-    path = tmp_path / "run.jsonl"
-    cfg = StructlogConfig(is_rank_zero=True, log_file=path)
-    assert cfg.f is None
-
-
-def test_structlog_config_enter_returns_self(tmp_path: pathlib.Path) -> None:
-    """StructlogConfig.__enter__ returns instance itself enabling `as` binding.
-
-    Verifies that the object bound with ``with cfg as result`` is the identical
-    ``StructlogConfig`` instance, not a copy or wrapper.
-    """
-    path = tmp_path / "run.jsonl"
-    cfg = StructlogConfig(is_rank_zero=True, log_file=path)
-    with cfg as result:
-        assert result is cfg
-
-
-def test_structlog_config_write_log_line_safe_when_f_is_none(
-    tmp_path: pathlib.Path,
-) -> None:
-    """_write_log_line returns event dict without error when no file is open.
-
-    Verifies that calling ``write_log_line`` before entering context manager
-    (when ``cfg.f`` is ``None``) does not raise and still returns event dict.
-    """
-    cfg = StructlogConfig(is_rank_zero=True, log_file=tmp_path / "run.jsonl")
-    event: dict[str, object] = {"event": "no_file", "step": 0}
-    result = cfg.write_log_line(None, None, event)
-    assert result is event
-
-
-def test_structlog_config_exception_propagates(tmp_path: pathlib.Path) -> None:
-    """StructlogConfig.__exit__ does not suppress exceptions raised inside.
-
-    Verifies ``ValueError`` raised inside ``with`` block propagates to the
-    caller unchanged.
-    """
-    path = tmp_path / "run.jsonl"
-    with (
-        pytest.raises(ValueError),  # noqa: PT011
-        StructlogConfig(is_rank_zero=True, log_file=path),
-    ):
-        raise ValueError
-
-
-def test_structlog_config_file_closed_on_exception(
-    tmp_path: pathlib.Path,
-) -> None:
-    """StructlogConfig closes log file when exception is raised inside block.
-
-    Verifies that ``cfg.f`` is closed after ``RuntimeError`` propagates out of
-    ``with`` block, confirming file handle is properly released on error paths.
-    """
-    path = tmp_path / "run.jsonl"
-    cfg = StructlogConfig(is_rank_zero=True, log_file=path)
-    with pytest.raises(RuntimeError), cfg:
+    with pytest.raises(RuntimeError), rank_zero_config:
         raise RuntimeError
-    assert cfg.f is not None
-    assert cfg.f.closed
-
-
-def test_structlog_config_f_is_none_rank_zero_false(
-    tmp_path: pathlib.Path,
-) -> None:
-    """StructlogConfig.f stays None when is_rank_zero is False.
-
-    Verifies that a non-rank-zero process never opens the log file, leaving
-    ``cfg.f`` as ``None`` after the context exits.
-    """
-    cfg = StructlogConfig(is_rank_zero=False, log_file=tmp_path / "run.jsonl")
-    with cfg:
-        pass
-    assert cfg.f is None
-
-
-def test_structlog_config_processors_include_console_renderer_rank_zero(
-    tmp_path: pathlib.Path,
-) -> None:
-    """ConsoleRenderer in structlog processor chain when is_rank_zero is True.
-
-    Verifies ``structlog.dev.ConsoleRenderer`` appears among the configured
-    processors while inside the context manager on the rank-zero process.
-    """
-    path = tmp_path / "run.jsonl"
-    with StructlogConfig(is_rank_zero=True, log_file=path):
-        processor_types = [
-            type(p)
-            for p in cast(
-                list[object],
-                structlog.get_config()["processors"],
-            )
-        ]
-    assert structlog.dev.ConsoleRenderer in processor_types
-
-
-def test_structlog_config_processors_no_console_renderer_not_rank_zero(
-    tmp_path: pathlib.Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """Non-rank-zero suppresses INFO but emits WARNING and above.
-
-    Verifies the minimum log level is 30 (WARNING): an INFO event must produce
-    no output while a WARNING event must appear in the captured output.
-    """
-    with StructlogConfig(is_rank_zero=False, log_file=tmp_path / "run.jsonl"):
-        log = cast(FilteringBoundLogger, structlog.get_logger())
-        log.info(_BELOW_THRESHOLD_EVENT)
-        log.warning(_ABOVE_THRESHOLD_EVENT)
-    captured = capsys.readouterr()
-    assert _BELOW_THRESHOLD_EVENT not in captured.out + captured.err
-    assert _ABOVE_THRESHOLD_EVENT in captured.out + captured.err
-
-
-def test_structlog_config_write_log_line_in_processors_with_file(
-    tmp_path: pathlib.Path,
-) -> None:
-    """_write_log_line in processor chain when is_rank_zero=True.
-
-    Verifies that ``cfg.write_log_line`` is registered as a structlog
-    processor when both rank-zero status and a valid log path are provided.
-    """
-    path = tmp_path / "run.jsonl"
-    cfg = StructlogConfig(is_rank_zero=True, log_file=path)
-    with cfg:
-        processors = cast(list[object], structlog.get_config()["processors"])
-    assert cfg.write_log_line in processors
-
-
-def test_structlog_config_write_log_line_not_in_processors_not_rank_zero(
-    tmp_path: pathlib.Path,
-) -> None:
-    """_write_log_line is absent from processors when is_rank_zero is False.
-
-    Verifies that ``cfg.write_log_line`` is not added to the structlog processor
-    chain on non-rank-zero processes.
-    """
-    cfg = StructlogConfig(is_rank_zero=False, log_file=tmp_path / "run.jsonl")
-    with cfg:
-        processors = cast(list[object], structlog.get_config()["processors"])
-    assert cfg.write_log_line not in processors
-
-
-def test_structlog_config_file_is_line_buffered(tmp_path: pathlib.Path) -> None:
-    """StructlogConfig opens the log file with line buffering (buffering=1).
-
-    Verifies that ``cfg.f.line_buffering`` is ``True``, ensuring each written
-    JSON line is flushed to disk immediately without an explicit ``flush()``
-    call.
-    """
-    path = tmp_path / "run.jsonl"
-    cfg = StructlogConfig(is_rank_zero=True, log_file=path)
-    with cfg:
-        assert cfg.f is not None
-        assert cfg.f.line_buffering
+    assert rank_zero_config.f is not None
+    assert rank_zero_config.f.closed
