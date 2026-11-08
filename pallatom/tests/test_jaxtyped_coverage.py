@@ -7,33 +7,16 @@ name appears as an AST identifier in the corresponding test file under
 """
 
 import ast
+import dataclasses
+import enum
 import pathlib
-from typing import override
+from typing import cast, override
 
-_JAXTYPED_NAME = "jaxtyped"
-_TESTS_DIR = "tests"
-
-
-def _is_jaxtyped(decorator: ast.expr) -> bool:
-    """Return True if decorator node is @jaxtyped or @jaxtyped(...).
-
-    Handles both bare ``@jaxtyped`` name references and call forms such as
-    ``@jaxtyped(typechecker=beartype)``.
-
-    Args:
-        decorator: An AST expression node from a decorator list.
-
-    Returns:
-        True when the decorator resolves to the ``jaxtyped`` symbol.
-    """
-    if isinstance(decorator, ast.Name):
-        return decorator.id == _JAXTYPED_NAME
-    if isinstance(decorator, ast.Call) and isinstance(decorator.func, ast.Name):
-        return decorator.func.id == _JAXTYPED_NAME
-    return False
+import pytest
+from jaxtyping import jaxtyped
 
 
-class _JaxtypedCollector(ast.NodeVisitor):
+class JaxtypedCollector(ast.NodeVisitor):
     """Walk an AST and collect lookup name for every @jaxtyped-decorated node.
 
     Rules:
@@ -41,11 +24,31 @@ class _JaxtypedCollector(ast.NodeVisitor):
     - Decorated method inside ``ClassName`` → lookup name ``"ClassName"``.
     - Decorated class (dataclass) ``MyClass`` → lookup name ``"MyClass"``.
 
+    The decorator name is read from ``jaxtyped.__name__`` so the
+    gate follows the library rather than a hard-coded string.
     """
 
     def __init__(self) -> None:
         self._class_stack: list[str] = []
         self.lookup_names: set[str] = set()
+
+    @staticmethod
+    def is_jaxtyped(decorator: ast.expr) -> bool:
+        """Return True if decorator node is @jaxtyped or @jaxtyped(...).
+
+        Handles both bare ``@jaxtyped`` name references and call forms such
+        as ``@jaxtyped(typechecker=beartype)``.
+
+        Args:
+            decorator: An AST expression node from a decorator list.
+
+        Returns:
+            True when the decorator resolves to the ``jaxtyped`` symbol.
+        """
+        target = (
+            decorator.func if isinstance(decorator, ast.Call) else decorator
+        )
+        return isinstance(target, ast.Name) and target.id == jaxtyped.__name__
 
     @override
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
@@ -58,7 +61,7 @@ class _JaxtypedCollector(ast.NodeVisitor):
         Args:
             node: The AST node for the class definition.
         """
-        if any(_is_jaxtyped(d) for d in node.decorator_list):
+        if any(self.is_jaxtyped(d) for d in node.decorator_list):
             self.lookup_names.add(node.name)
         self._class_stack.append(node.name)
         self.generic_visit(node)
@@ -70,26 +73,20 @@ class _JaxtypedCollector(ast.NodeVisitor):
     ) -> None:
         """Record enclosing class for methods, name for module-level functions.
 
-        When inside a class body, the enclosing class name is recorded (so that
-        any ``@jaxtyped`` method maps back to its class). For top-level
+        When inside a class body, the enclosing class name is recorded (so
+        that any ``@jaxtyped`` method maps back to its class). For top-level
         functions the function's own name is recorded directly.
 
         Args:
             node: The AST node for either a sync or async function definition.
         """
-        if any(_is_jaxtyped(d) for d in node.decorator_list):
-            if self._class_stack:
-                self.lookup_names.add(self._class_stack[-1])
-            else:
-                self.lookup_names.add(node.name)
+        if any(self.is_jaxtyped(d) for d in node.decorator_list):
+            self.lookup_names.add((self._class_stack or [node.name])[-1])
         self.generic_visit(node)
 
     @override
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         """Handle sync function definitions.
-
-        Delegates to ``_visit_any_function`` to record any ``@jaxtyped``
-        decoration on synchronous ``def`` statements.
 
         Args:
             node: The AST node for the synchronous function definition.
@@ -100,79 +97,170 @@ class _JaxtypedCollector(ast.NodeVisitor):
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
         """Handle async function definitions.
 
-        Delegates to ``_visit_any_function`` to record any ``@jaxtyped``
-        decoration on asynchronous ``async def`` statements.
-
         Args:
             node: The AST node for the asynchronous function definition.
         """
         self._visit_any_function(node)
 
 
-def _names_referenced_in(test_path: pathlib.Path) -> set[str]:
-    """Return all identifiers referenced in a test file.
+@dataclasses.dataclass(frozen=True)
+class CollectorCase:
+    """Source snippet and the lookup names the collector should report.
 
-    Includes both ``ast.Name`` nodes (variables, calls, annotations in code)
-    and ``ast.alias`` names (import statements).  Comments and string literals
-    are excluded because they don't appear as AST nodes.
+    Attributes:
+        source: Python source to parse.
+        expected: Sorted lookup names the collector must record.
+    """
+
+    source: str
+    expected: tuple[str, ...]
+
+
+class CollectorScenario(enum.Enum):
+    """Decorator layouts the collector must map to lookup names.
+
+    Members:
+        bare_decorator: ``@jaxtyped`` with no call on a function.
+        called_decorator: ``@jaxtyped(typechecker=...)`` on a function.
+        method: A decorated method records its enclosing class name, not
+            the method name.
+        decorated_class: A decorated class records its own name.
+        async_function: A decorated ``async def`` is recorded too.
+        undecorated: Undecorated code, or another decorator, records nothing.
+    """
+
+    bare_decorator = CollectorCase("@jaxtyped\ndef f(): ...", ("f",))
+    called_decorator = CollectorCase("@jaxtyped(t=b)\ndef g(): ...", ("g",))
+    method = CollectorCase("class C:\n @jaxtyped\n def m(s): ...", ("C",))
+    decorated_class = CollectorCase("@jaxtyped(t=b)\nclass D: ...", ("D",))
+    async_function = CollectorCase("@jaxtyped\nasync def a(): ...", ("a",))
+    undecorated = CollectorCase("@other\ndef h(): ...\nclass E: ...", ())
+
+
+@dataclasses.dataclass(frozen=True)
+class CoverageReport:
+    """Result of scanning ``pallatom/`` for untested @jaxtyped symbols.
+
+    Attributes:
+        scanned_symbols: Number of @jaxtyped lookup names found in source.
+        missing: One line per lookup name absent from its test file.
+    """
+
+    scanned_symbols: int
+    missing: tuple[str, ...]
+
+
+@pytest.fixture
+def collector_scenario(request: pytest.FixtureRequest) -> CollectorScenario:
+    """Return the ``CollectorScenario`` member routed in via indirect param.
 
     Args:
-        test_path: Absolute path to the test file to scan.
+        request: Pytest request carrying the scenario in ``param``.
 
     Returns:
-        Set of identifier strings found in the file's AST.
+        The scenario under test.
     """
-    tree = ast.parse(test_path.read_text())
-    names: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Name):
-            names.add(node.id)
-        elif isinstance(node, ast.alias):
-            names.add(node.name.split(".")[-1])
-    return names
+    return cast(CollectorScenario, request.param)
 
 
-def test_every_jaxtyped_function_has_a_test() -> None:
-    """Every @jaxtyped-decorated function/class has corresponding test file.
+@pytest.fixture
+def collected_names(collector_scenario: CollectorScenario) -> tuple[str, ...]:
+    """Run ``JaxtypedCollector`` over the scenario's source snippet.
 
-    Scans all source files under ``pallatom/`` (excluding ``tests/``), collects
-    every @jaxtyped-decorated function or class, derives the expected test file
-    path (``pallatom/{pkg}/{mod}.py`` →
-    ``pallatom/tests/{pkg}/test_{mod}.py``), and asserts that the decorated
-    name appears as an AST identifier in that file. Fails with a complete list
-    of missing entries so all gaps can be fixed at once.
+    Args:
+        collector_scenario: Scenario supplying the source to parse.
+
+    Returns:
+        Sorted lookup names the collector recorded.
     """
-    pallatom_root = pathlib.Path(__file__).parent.parent
+    collector = JaxtypedCollector()
+    collector.visit(ast.parse(collector_scenario.value.source))
+    return tuple(sorted(collector.lookup_names))
+
+
+@pytest.fixture
+def tests_root() -> pathlib.Path:
+    """Return the ``pallatom/tests`` directory that holds this file.
+
+    Returns:
+        Absolute path to the tests package.
+    """
+    return pathlib.Path(__file__).parent
+
+
+@pytest.fixture
+def jaxtyped_coverage(tests_root: pathlib.Path) -> CoverageReport:
+    """Scan every non-test source file and report uncovered @jaxtyped names.
+
+    A source file ``pallatom/{pkg}/{mod}.py`` maps to the test file
+    ``pallatom/tests/{pkg}/test_{mod}.py``. A lookup name is covered when it
+    appears as an ``ast.Name`` or an import alias in that test file, so
+    mentions in comments and strings do not count.
+
+    Args:
+        tests_root: The ``pallatom/tests`` directory.
+
+    Returns:
+        Report with the number of scanned names and every missing entry.
+    """
+    pallatom_root = tests_root.parent
     missing: list[str] = []
-
+    scanned = 0
     for src_path in sorted(pallatom_root.rglob("*.py")):
-        if _TESTS_DIR in src_path.parts:
+        if src_path.is_relative_to(tests_root):
             continue
-
-        collector = _JaxtypedCollector()
+        collector = JaxtypedCollector()
         collector.visit(ast.parse(src_path.read_text()))
-        if not collector.lookup_names:
-            continue
-
+        scanned += len(collector.lookup_names)
         rel = src_path.relative_to(pallatom_root)
-        test_path = pallatom_root / "tests" / rel.parent / f"test_{rel.name}"
-
-        if not test_path.exists():
-            missing.extend(
-                f"{src_path.name}: '{name}' (test file {test_path} not found)"
-                for name in sorted(collector.lookup_names)
-            )
-            continue
-
-        referenced = _names_referenced_in(test_path)
+        test_path = tests_root / rel.parent / f"test_{rel.name}"
+        tree = ast.parse(test_path.read_text() if test_path.exists() else "")
+        referenced = {
+            node.id if isinstance(node, ast.Name) else node.name.split(".")[-1]
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Name | ast.alias)
+        }
         missing.extend(
-            f"{src_path.name}: '{name}'"
-            for name in sorted(collector.lookup_names)
-            if name not in referenced
+            f"{rel}: '{name}' not referenced in {test_path.name}"
+            for name in sorted(collector.lookup_names - referenced)
         )
+    return CoverageReport(scanned_symbols=scanned, missing=tuple(missing))
 
-    assert not missing, (
-        "The following @jaxtyped functions/classes"
-        + " have no reference in their test file:\n"
-        + "\n".join(f"  {m}" for m in missing)
-    )
+
+@pytest.mark.parametrize(
+    "collector_scenario",
+    list(CollectorScenario),
+    ids=[case.name for case in CollectorScenario],
+    indirect=True,
+)
+def test_collector_maps_decorators_to_lookup_names(
+    collector_scenario: CollectorScenario,
+    collected_names: tuple[str, ...],
+) -> None:
+    """The collector records the lookup name each decorator layout implies.
+
+    The coverage gate below is only as good as this mapping: a layout the
+    collector skips is a symbol the gate silently never checks.
+
+    Args:
+        collector_scenario: Scenario holding the expected names.
+        collected_names: Names the collector recorded for the scenario.
+    """
+    assert collected_names == collector_scenario.value.expected
+
+
+def test_every_jaxtyped_symbol_is_referenced_in_its_test_file(
+    jaxtyped_coverage: CoverageReport,
+) -> None:
+    """Every @jaxtyped function or class is referenced by its test file.
+
+    The scan is a single repository-wide check rather than a parametrized
+    one: the set of source files is discovered at run time, and one failure
+    listing every gap lets them all be fixed at once. The scanned count is
+    asserted too, so a scan that silently finds nothing cannot pass.
+
+    Args:
+        jaxtyped_coverage: Report from scanning ``pallatom/``.
+    """
+    assert jaxtyped_coverage.scanned_symbols > 0
+    assert not jaxtyped_coverage.missing, "\n".join(jaxtyped_coverage.missing)
