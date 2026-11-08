@@ -1,16 +1,20 @@
 """Tests for atom utility dataclasses and functions.
 
-Covers atom37_to_atom5, atom5_to_atom37, atom37_to_cb, the Protein
-dataclass, make_np_example, make_fixed_size, center_positions, chain_end,
-to_pdb, protein_from_pdb, truncate_to_length, and molecule-type constants.
+Covers the atom37/atom5 conversions and atom37_to_cb's pseudo-Cβ fallback,
+the Protein dataclass's shape contract, make_np_example, make_fixed_size,
+truncate_to_length, center_positions, chain_end, to_pdb, protein_from_pdb
+with its molecule-type classification, and the residue-type constants.
+
+Every input is deterministic and every scenario enum's value is a frozen
+dataclass, so each case reads as one row of named fields.
 """
 
+import dataclasses
 import enum
 import pathlib
 from collections.abc import Callable, Mapping
-from dataclasses import replace
 from types import MappingProxyType
-from typing import cast, override
+from typing import ClassVar, cast
 
 import einops
 import numpy as np
@@ -22,7 +26,6 @@ from helpers.atom_utils import (
     ATOM5_CA,
     ATOM5_CB,
     ATOM5_N,
-    ATOM5_NAMES,
     ATOM5_O,
     ATOM5_TO_ATOM37,
     ATOM37_C,
@@ -36,7 +39,6 @@ from helpers.atom_utils import (
     MOL_TYPE_DNA,
     MOL_TYPE_PROTEIN,
     MOL_TYPE_RNA,
-    PDB_CHAIN_IDS,
     PDB_MAX_CHAINS,
     PDB_REC_ATOM,
     PDB_REC_END,
@@ -60,44 +62,30 @@ from helpers.atom_utils import (
     make_fixed_size,
     make_np_example,
     protein_from_pdb,
-    restype_1to3,
+    restype_order,
     to_pdb,
     truncate_to_length,
 )
 from helpers.errors import InvalidAAtypesError
-from helpers.useful_objects import manual_seed
 from jaxtyping import Float, TypeCheckError
 
-_ = manual_seed(42)
-
-B = 2
-N_RES = 10
-PDB_ATOM_NAME_CUTOFF = 4
-PDB_LINE_LEN = 80
-PROT_LEN = 3
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
+type Array = npt.NDArray[np.float64] | npt.NDArray[np.intp]
+type Example = dict[str, Array]
+type AnyFloat = Float[torch.Tensor, "..."]
+type Convert = Callable[[AnyFloat, AnyFloat], object]
+type ProteinFactory = Callable[[tuple[int, ...], tuple[int, ...]], Protein]
 
 
 class TensorCase(enum.Enum):
-    """Enumeration of named test scenarios for atom position and mask tensors.
-
-    Each member selects a distinct structural configuration used to parametrize
-    fixtures via ``indirect=True``. The string value doubles as human-readable
-    label that appears in pytest output when a test fails.
+    """Backbone geometries the atom tensor factory can build.
 
     Members:
-        standard: A well-formed backbone with valid positions and a fully
-            populated mask — the happy-path baseline.
-        all_zeros: All atom positions set to the origin; exercises behaviour
-            when coordinates carry no geometric information.
-        no_beta_carbon: The beta-carbon slot is absent (masked out) for every
-            residue; validates that functions degrade gracefully without Cβ.
-        half_mask: Exactly half the residues are unmasked; probes boundary
-            handling and partial-visibility logic.
-        collinear: All atoms placed on a single line; tests robustness against
-            degenerate geometry where cross-products vanish.
+        standard: N, CA, C, O and CB at fixed points, all present.
+        all_zeros: Every atom at the origin, all present.
+        no_beta_carbon: As ``standard`` but with CB masked out, like Gly.
+        half_mask: All zeros, with the first half of residues masked out.
+        collinear: N, CA, C on the x axis and CB masked out, so the
+            pseudo-Cβ cross product vanishes.
     """
 
     standard = "standard"
@@ -107,38 +95,57 @@ class TensorCase(enum.Enum):
     collinear = "collinear"
 
 
-class AtomTensorScenario(enum.Enum):
-    """Base for per-test scenarios built by the atom tensor factory.
+@dataclasses.dataclass(frozen=True)
+class TensorSpec:
+    """Inputs of the atom tensor factory, shared by every conversion case.
 
-    Subclass members are one-line tuples that start with the tensor content,
-    batch size, and residue count; anything after that is the expectation
-    for that test, exposed through a property on the subclass. Tensors are
-    atom37 unless a subclass overrides ``representation``.
+    Attributes:
+        representation: Atom layout to build; atom37 unless overridden.
+        content: Backbone geometry to build.
+        batch: Batch size.
+        n_res: Residues per item.
     """
 
-    @property
-    def tensor_content(self) -> TensorCase:
-        """Structural configuration of the tensors to build."""
-        return cast(TensorCase, self.value[0])
-
-    @property
-    def batch_size(self) -> int:
-        """Batch dimension of the tensors to build."""
-        return cast(int, self.value[1])
-
-    @property
-    def residue_number(self) -> int:
-        """Residue dimension of the tensors to build."""
-        return cast(int, self.value[2])
-
-    @property
-    def representation(self) -> ResidueRepresentation:
-        """Atom layout of the tensors built for this scenario."""
-        return ResidueRepresentation.atom37
+    representation: ClassVar[ResidueRepresentation] = (
+        ResidueRepresentation.atom37
+    )
+    content: TensorCase
+    batch: int
+    n_res: int
 
 
-class Atom37ToAtom5Scenario(AtomTensorScenario):
-    """Scenarios for ``test_atom37_to_atom5``; the last value is the shape.
+@dataclasses.dataclass(frozen=True)
+class Atom5Spec(TensorSpec):
+    """Factory inputs in the atom5 layout, plus whether to pass the mask.
+
+    Attributes:
+        representation: The atom5 layout.
+        provide_mask: Pass the mask to ``atom5_to_atom37``, or omit it to
+            exercise the all-present default.
+    """
+
+    representation: ClassVar[ResidueRepresentation] = (
+        ResidueRepresentation.atom5
+    )
+    provide_mask: bool
+
+
+@dataclasses.dataclass(frozen=True)
+class CbSpec(TensorSpec):
+    """Factory inputs plus what ``atom37_to_cb`` must report for them.
+
+    Attributes:
+        present_from: Residue index from which CB is present.
+        distinct: Whether the fallback pseudo-Cβ must differ from both the
+            stored CB slot and CA; false where the backbone is degenerate.
+    """
+
+    present_from: int
+    distinct: bool
+
+
+class Atom37ToAtom5Scenario(enum.Enum):
+    """Inputs for ``atom37_to_atom5``.
 
     Members:
         batched_standard: Well-formed backbone across a batch of two.
@@ -147,776 +154,856 @@ class Atom37ToAtom5Scenario(AtomTensorScenario):
         batched_half_mask: First half of the residues masked out.
     """
 
-    batched_standard = (TensorCase.standard, 2, 10, (2, 10, 5, 3))
-    single_batch_zeros = (TensorCase.all_zeros, 1, 10, (1, 10, 5, 3))
-    batched_missing_cb = (TensorCase.no_beta_carbon, 2, 10, (2, 10, 5, 3))
-    batched_half_mask = (TensorCase.half_mask, 2, 10, (2, 10, 5, 3))
-
-    @property
-    def expected_pos_shape(self) -> tuple[int, ...]:
-        """Expected positions shape; the mask shape drops the last axis."""
-        return self.value[3]
+    batched_standard = TensorSpec(TensorCase.standard, 2, 10)
+    single_batch_zeros = TensorSpec(TensorCase.all_zeros, 1, 10)
+    batched_missing_cb = TensorSpec(TensorCase.no_beta_carbon, 2, 10)
+    batched_half_mask = TensorSpec(TensorCase.half_mask, 2, 10)
 
 
-class Atom5ToAtom37Scenario(AtomTensorScenario):
-    """Scenarios for ``test_atom5_to_atom37``; the last value is provide_mask.
+class Atom5ToAtom37Scenario(enum.Enum):
+    """Inputs for ``atom5_to_atom37``; all batched of two unless noted.
 
     Members:
-        batched_standard: Well-formed backbone with its mask passed through.
-        batched_missing_cb: CB masked out for every residue.
-        batched_half_mask: First half of the residues masked out.
+        standard: Well-formed backbone with its mask passed through.
+        missing_cb: CB masked out for every residue.
+        half_mask: First half of the residues masked out.
         single_batch: Well-formed backbone in a batch of one.
         single_residue: One residue in a batch of one, the smallest input.
-        mask_defaults_to_all_present: Mask omitted, so it must be synthesized
-            as all ones.
+        default_mask: Mask omitted, so it must be synthesized as all ones.
     """
 
-    batched_standard = (TensorCase.standard, 2, 10, True)
-    batched_missing_cb = (TensorCase.no_beta_carbon, 2, 10, True)
-    batched_half_mask = (TensorCase.half_mask, 2, 10, True)
-    single_batch = (TensorCase.standard, 1, 10, True)
-    single_residue = (TensorCase.standard, 1, 1, True)
-    mask_defaults_to_all_present = (TensorCase.standard, 2, 10, False)
-
-    @property
-    @override
-    def representation(self) -> ResidueRepresentation:
-        """Atom layout of the tensors built for this scenario."""
-        return ResidueRepresentation.atom5
-
-    @property
-    def provide_mask(self) -> bool:
-        """Whether to pass the mask or omit it to exercise the default."""
-        return self.value[3]
+    standard = Atom5Spec(TensorCase.standard, 2, 10, provide_mask=True)
+    missing_cb = Atom5Spec(TensorCase.no_beta_carbon, 2, 10, provide_mask=True)
+    half_mask = Atom5Spec(TensorCase.half_mask, 2, 10, provide_mask=True)
+    single_batch = Atom5Spec(TensorCase.standard, 1, 10, provide_mask=True)
+    single_residue = Atom5Spec(TensorCase.standard, 1, 1, provide_mask=True)
+    default_mask = Atom5Spec(TensorCase.standard, 2, 10, provide_mask=False)
 
 
-class Atom37ToCbScenario(AtomTensorScenario):
-    """Scenarios for ``test_atom37_to_cb``.
-
-    The last two values are where CB presence turns on and whether the
-    pseudo-Cβ fallback must be a distinct point from CB and CA. Members are
-    read via their properties rather than branched on, so adding a case
-    never adds a decision point to the test body.
+class Atom37ToCbScenario(enum.Enum):
+    """Inputs for ``atom37_to_cb`` and where CB must be reported present.
 
     Members:
-        standard_all_cb_present: All residues have CB present; the pseudo-Cβ
-            fallback path is never exercised.
-        no_beta_carbon_pseudo_cb: No residues have CB present; the fallback
-            must produce a finite pseudo-Cβ distinct from both CB and CA.
-        collinear_pseudo_cb_finite: No residues have CB present and N, CA, C
-            are collinear; the fallback must stay finite.
-        half_mask_mixed_cb: The first half of residues are CB-absent and the
-            second half CB-present. The backbone for this case is all zeros,
-            so the fallback pseudo-Cβ coincides with CB/CA by construction
-            and distinctness is not checked.
+        all_cb: Every residue has CB; the fallback is never used.
+        no_cb: No residue has CB; the fallback must give a finite point
+            distinct from both the empty CB slot and CA.
+        collinear: No CB and N, CA, C collinear; the fallback must still be
+            finite and off CA.
+        half_mask: The first half of residues lack CB. The backbone is all
+            zeros, so the fallback coincides with CA by construction.
     """
 
-    standard_all_cb_present = (TensorCase.standard, 2, 10, 0, False)
-    no_beta_carbon_pseudo_cb = (TensorCase.no_beta_carbon, 2, 10, N_RES, True)
-    collinear_pseudo_cb_finite = (TensorCase.collinear, 2, 10, N_RES, True)
-    half_mask_mixed_cb = (TensorCase.half_mask, 2, 10, N_RES // 2, False)
-
-    @property
-    def present_from(self) -> int:
-        """Residue index at which CB presence turns on."""
-        return self.value[3]
-
-    @property
-    def expect_distinct_pseudo_cb(self) -> bool:
-        """Whether the fallback pseudo-Cβ must differ from CB and CA."""
-        return self.value[4]
+    all_cb = CbSpec(TensorCase.standard, 2, 10, 0, distinct=False)
+    no_cb = CbSpec(TensorCase.no_beta_carbon, 2, 10, 10, distinct=True)
+    collinear = CbSpec(TensorCase.collinear, 2, 10, 10, distinct=True)
+    half_mask = CbSpec(TensorCase.half_mask, 2, 10, 5, distinct=False)
 
 
-@pytest.fixture
-def atom_scenario(request: pytest.FixtureRequest) -> AtomTensorScenario:
-    """Expose the indirect scenario to both the factory and the test.
+@dataclasses.dataclass(frozen=True)
+class AtomTensors:
+    """Positions and mask built by the atom tensor factory.
 
-    Args:
-        request: Pytest fixture request whose ``.param`` attribute is an
-            AtomTensorScenario member.
-
-    Returns:
-        The scenario member for the current test case.
+    Attributes:
+        positions: ``(B, N_res, n_atoms, 3)`` coordinates.
+        mask: ``(B, N_res, n_atoms)`` presence mask.
     """
-    return cast(AtomTensorScenario, request.param)
+
+    positions: Float[torch.Tensor, "B N_res atoms 3"]
+    mask: Float[torch.Tensor, "B N_res atoms"]
 
 
-@pytest.fixture
-def atom_position_and_mask_factory(
-    atom_scenario: AtomTensorScenario,
-) -> tuple[
-    Float[torch.Tensor, "B N_res atom_rep 3"],
-    Float[torch.Tensor, "B N_res atom_rep"],
-]:
-    """Construct atom position and mask tensors for a test scenario.
+@dataclasses.dataclass(frozen=True)
+class ProteinBreak:
+    """A Protein field replaced by an array with one axis wrong.
 
-    Args:
-        atom_scenario: Scenario naming the atom layout, tensor content,
-            batch size, and residue count to build.
-
-    Returns:
-        Tuple of (atom_positions, atom_mask) with shapes
-        ``(B, N_res, atom_rep, 3)`` and ``(B, N_res, atom_rep)``.
+    Attributes:
+        field: Name of the Protein field to replace.
+        malform: Maps the valid array to the malformed one.
     """
-    tensor_content = atom_scenario.tensor_content
-    batch_size = atom_scenario.batch_size
-    residue_number = atom_scenario.residue_number
-    n_atoms_per_residue: int = atom_scenario.representation.value
-    per_residue = torch.zeros(n_atoms_per_residue, 3)
 
-    if tensor_content in (
-        TensorCase.standard,
-        TensorCase.no_beta_carbon,
-    ):
-        per_residue[ATOM37_N] = torch.tensor([1.0, 0.0, 0.0])
-        per_residue[ATOM37_CA] = torch.tensor([0.0, 0.0, 0.0])
-        per_residue[ATOM37_C] = torch.tensor([0.0, 1.0, 0.0])
-        per_residue[ATOM37_O] = torch.tensor([1.0, 1.0, 0.0])
-        if tensor_content == TensorCase.standard:
-            per_residue[ATOM37_CB] = torch.tensor([0.0, 0.0, 1.0])
-    elif tensor_content == TensorCase.collinear:
-        # N, CA, C on the x-axis: cross(CA-N, C-CA) = [0,0,0]
-        per_residue[ATOM37_N] = torch.tensor([0.0, 0.0, 0.0])
-        per_residue[ATOM37_CA] = torch.tensor([1.0, 0.0, 0.0])
-        per_residue[ATOM37_C] = torch.tensor([2.0, 0.0, 0.0])
-        per_residue[ATOM37_O] = torch.tensor([2.0, 1.0, 0.0])
-        # CB slot stays zero; mask will be zeroed below
-
-    atom_positions = einops.repeat(
-        per_residue,
-        "atom_rep three -> B N_res atom_rep three",
-        B=batch_size,
-        N_res=residue_number,
-    )
-
-    atom_mask = torch.ones(batch_size, residue_number, n_atoms_per_residue)
-    if tensor_content == TensorCase.half_mask:
-        atom_mask[:, : residue_number // 2, :] = 0
-    if tensor_content in (TensorCase.no_beta_carbon, TensorCase.collinear):
-        atom_mask[:, :, ATOM37_CB] = 0
-
-    return atom_positions, atom_mask
-
-
-@pytest.mark.parametrize(
-    "atom_scenario",
-    list(Atom37ToAtom5Scenario),
-    ids=[case.name for case in Atom37ToAtom5Scenario],
-    indirect=True,
-)
-def test_atom37_to_atom5(
-    atom_position_and_mask_factory: tuple[
-        Float[torch.Tensor, "B N_res 37 3"],
-        Float[torch.Tensor, "B N_res 37"],
-    ],
-    atom_scenario: Atom37ToAtom5Scenario,
-) -> None:
-    """Verify atom37_to_atom5 behavior.
-
-    1. That it returns position and masks with correct shapes and data types.
-    2. That it places N, CA, C, O, CB into the expected atom5 slots.
-    3. That it propagates atom37 mask entries to correct atom5 slots.
-    4. That it verifies that backbone atoms present in atom37 are present in
-        atom5, and that absent CB atoms produce a zero mask in the CB slot.
-
-    Args:
-        atom_position_and_mask_factory: Fixture-produced (atom37_positions,
-            atom37_mask) pair built from atom_scenario.
-        atom_scenario: Scenario supplying the expected shape returned by
-            atom37_to_atom5(). The expected shape of the mask is the same
-            except for lacking the final dimension.
-    """
-    atom37_positions, atom37_mask = atom_position_and_mask_factory
-    expected_pos_shape = atom_scenario.expected_pos_shape
-
-    atom5_positions, atom5_mask = atom37_to_atom5(
-        atom37_positions,
-        atom37_mask,
-    )
-
-    # 1. Shape and dtype
-    assert atom5_positions.shape == expected_pos_shape
-    assert atom5_mask.shape == expected_pos_shape[:-1]
-    assert atom5_positions.dtype == atom37_positions.dtype
-    assert atom5_mask.dtype == atom37_mask.dtype
-
-    atom5_indices: list[int] = [ATOM5_N, ATOM5_CA, ATOM5_C, ATOM5_O, ATOM5_CB]
-    atom37_backbone_indices: list[int] = [
-        ATOM37_N,
-        ATOM37_CA,
-        ATOM37_C,
-        ATOM37_O,
-        ATOM37_CB,
-    ]
-
-    # 2. Slot placement: each atom5 channel equals the corresponding atom37
-    for a5, a37 in zip(atom5_indices, atom37_backbone_indices, strict=True):
-        assert torch.equal(
-            atom5_positions[:, :, a5, :],
-            atom37_positions[:, :, a37, :],
-        )
-
-    # 3 & 4. Mask propagation; the batched_missing_cb case exercises that
-    # atom5_mask[:, :, ATOM5_CB] is all-zero when atom37 CB slot is zero.
-    for a5, a37 in zip(atom5_indices, atom37_backbone_indices, strict=True):
-        assert torch.equal(
-            atom5_mask[:, :, a5],
-            atom37_mask[:, :, a37],
-        )
-
-
-@pytest.mark.parametrize(
-    "atom_scenario",
-    list(Atom5ToAtom37Scenario),
-    ids=[case.name for case in Atom5ToAtom37Scenario],
-    indirect=True,
-)
-def test_atom5_to_atom37(
-    atom_position_and_mask_factory: tuple[
-        Float[torch.Tensor, "B N_res 5 3"],
-        Float[torch.Tensor, "B N_res 5"],
-    ],
-    atom_scenario: Atom5ToAtom37Scenario,
-) -> None:
-    """Verify atom5_to_atom37 behavior.
-
-    1. That it returns positions and masks with the correct shapes and
-        data types.
-    2. That it scatters each atom5 slot into its fixed atom37 index.
-    3. That it propagates (or synthesizes, when mask_5 is None) the mask
-        into the matching atom37 slots.
-    4. That every atom37 slot outside the 5 backbone indices stays zero
-        in both the position and mask tensors, regardless of scenario.
-
-    Args:
-        atom_position_and_mask_factory: Fixture-produced (atom5_positions,
-            atom5_mask) pair built from atom_scenario.
-        atom_scenario: Scenario saying whether to pass the fixture mask
-            through to atom5_to_atom37 or omit it (None) to exercise the
-            all-slots-present default.
-    """
-    # Arrange
-    atom5_positions, atom5_mask = atom_position_and_mask_factory
-    mask_arg, expected_backbone_mask = (
-        (atom5_mask, atom5_mask)
-        if atom_scenario.provide_mask
-        else (None, torch.ones_like(atom5_mask))
-    )
-    batch_size, residue_number = atom5_positions.shape[:2]
-    expected_pos_shape = (
-        batch_size,
-        residue_number,
-        ResidueRepresentation.atom37.value,
-        3,
-    )
-    unpopulated = sorted(set(range(37)) - set(ATOM5_TO_ATOM37))
-
-    # Act
-    atom37_positions, atom37_mask = atom5_to_atom37(atom5_positions, mask_arg)
-
-    # Assert
-    # 1. Shape and dtype
-    assert (atom37_positions.shape, atom37_mask.shape) == (
-        expected_pos_shape,
-        expected_pos_shape[:-1],
-    )
-    assert (atom37_positions.dtype, atom37_mask.dtype) == (
-        atom5_positions.dtype,
-        atom5_mask.dtype,
-    )
-
-    # 2. Slot placement: each atom5 channel lands at its atom37 index.
-    assert torch.equal(
-        atom37_positions[:, :, ATOM5_TO_ATOM37, :],
-        atom5_positions,
-    )
-
-    # 3. Mask propagation, or synthesis of an all-ones mask when mask_5
-    # is None.
-    assert torch.equal(
-        atom37_mask[:, :, ATOM5_TO_ATOM37],
-        expected_backbone_mask,
-    )
-
-    # 4. Every non-backbone atom37 slot stays zero, independent of
-    # scenario content or masking.
-    assert torch.equal(
-        atom37_positions[:, :, unpopulated, :],
-        torch.zeros_like(atom37_positions[:, :, unpopulated, :]),
-    )
-    assert torch.equal(
-        atom37_mask[:, :, unpopulated],
-        torch.zeros_like(atom37_mask[:, :, unpopulated]),
-    )
-
-
-@pytest.mark.parametrize(
-    "atom_scenario",
-    list(Atom37ToCbScenario),
-    ids=[case.name for case in Atom37ToCbScenario],
-    indirect=True,
-)
-def test_atom37_to_cb(
-    atom_position_and_mask_factory: tuple[
-        Float[torch.Tensor, "B N_res 37 3"],
-        Float[torch.Tensor, "B N_res 37"],
-    ],
-    atom_scenario: Atom37ToCbScenario,
-) -> None:
-    """Verify atom37_to_cb output shapes, CB presence, and pseudo-CB fallback.
-
-    1. Returns Cβ positions (B, N_RES, 3) and a bool presence mask (B, N_RES)
-       for all input cases.
-    2. Marks all residues CB-present when the atom37 mask has CB set
-       (TensorCase.standard).
-    3. Falls back to finite pseudo-Cβ positions and marks every residue
-       CB-absent when CB is zeroed in the mask (TensorCase.no_beta_carbon,
-       matching glycine-like residues).
-    4. Verifies that the virtual Cβ position is not simply a copy of CA atom,
-       for cases with non-degenerate backbone geometry to fall back on.
-    5. Verifies that pseudo_cb is finite when N, CA, C are collinear
-        (cross product is zero). The epsilon guard in linalg.norm must prevent
-        NaN in the normalised output.
-
-    Args:
-        atom_position_and_mask_factory: Fixture-produced (atom37_positions,
-            atom37_mask) pair built from atom_scenario.
-        atom_scenario: Bundles where CB presence turns on and whether the
-            pseudo-Cβ fallback must be distinct from CB/CA for this case.
-    """
-    atom37_positions, atom37_mask = atom_position_and_mask_factory
-    cb, cb_present = atom37_to_cb(atom37_positions, atom37_mask)
-
-    assert cb.shape == (B, N_RES, 3)
-    assert cb_present.shape == (B, N_RES)
-    assert cb_present.dtype == torch.bool
-
-    expected_cb_present = torch.zeros(B, N_RES, dtype=torch.bool)
-    expected_cb_present[:, atom_scenario.present_from :] = True
-    assert torch.equal(cb_present, expected_cb_present)
-
-    reference_cb = atom37_positions[:, :, ATOM37_CB, :]
-    reference_ca = atom37_positions[:, :, ATOM37_CA, :]
-    present, absent = expected_cb_present, ~expected_cb_present
-
-    # Vacuously true when a mask is all-False, so no per-case branch needed.
-    assert torch.allclose(cb[present], reference_cb[present])
-    assert torch.isfinite(cb[absent]).all()
-
-    if atom_scenario.expect_distinct_pseudo_cb:
-        assert not torch.allclose(cb[absent], reference_cb[absent])
-        assert not torch.allclose(cb[absent], reference_ca[absent])
-
-
-# ---------------------------------------------------------------------------
-# Protein dataclass
-# ---------------------------------------------------------------------------
-
-N_ATOM_TYPE = len(atom_types)  # 37
+    field: str
+    malform: Callable[[Array], Array]
 
 
 class InvalidProteinShape(enum.Enum):
-    """Named Protein shape violations, each breaking one constructor field.
+    """Protein shape violations, each mirroring a plausible parser bug.
 
-    Each member bundles the field to break and the deliberately wrong shape
-    to allocate for it, and mirrors a plausible bug in ``protein_from_pdb``'s
-    array-assembly loop. The member name is the pytest id.
+    Protein's ``@jaxtyped`` check spans the whole dataclass, so each of the
+    three field signatures is broken once for rank, the coordinate width
+    once, and the residue and atom counts twice each, on two fields, so the
+    consistency checks are not tied to whichever field is checked first.
 
     Members:
-        positions_no_coord_axis: ``atom_positions`` lost its coordinate axis.
-        positions_extra_coord: ``atom_positions`` gained a stray fourth
-            coordinate component.
-        positions_res_drift: ``atom_positions`` residue count drifted, as
-            from insertion-code or altloc handling.
-        positions_atom_drift: ``atom_positions`` atom table grew out of sync
-            with a hardcoded dimension.
+        no_coord_axis: ``atom_positions`` lost its xyz axis.
+        extra_coord: ``atom_positions`` gained a fourth coordinate.
+        res_drift: ``atom_positions`` has one residue fewer, as from
+            insertion-code or altloc handling.
+        atom_drift: ``atom_positions`` has one atom type fewer than the
+            37-slot table.
         mask_no_atom_axis: ``atom_mask`` lost its atom axis.
-        mask_atom_drift: ``atom_mask`` atom table drifted independently of
-            ``atom_positions``.
+        mask_atom_drift: ``atom_mask`` atom count drifted on its own.
         aatype_column_vector: ``aatype`` became a column vector.
-        residue_index_drift: ``residue_index`` residue count drifted
-            independently of ``aatype``.
+        residue_index_drift: ``residue_index`` lost a residue on its own.
     """
 
-    positions_no_coord_axis = ("atom_positions", (N_RES, N_ATOM_TYPE))
-    positions_extra_coord = ("atom_positions", (N_RES, N_ATOM_TYPE, 4))
-    positions_res_drift = ("atom_positions", (N_RES + 1, N_ATOM_TYPE, 3))
-    positions_atom_drift = ("atom_positions", (N_RES, N_ATOM_TYPE + 1, 3))
-    mask_no_atom_axis = ("atom_mask", (N_RES,))
-    mask_atom_drift = ("atom_mask", (N_RES, N_ATOM_TYPE + 1))
-    aatype_column_vector = ("aatype", (N_RES, 1))
-    residue_index_drift = ("residue_index", (N_RES + 1,))
+    no_coord_axis = ProteinBreak("atom_positions", lambda a: a[..., 0])
+    extra_coord = ProteinBreak("atom_positions", lambda a: a[..., [0, 1, 2, 2]])
+    res_drift = ProteinBreak("atom_positions", lambda a: a[1:])
+    atom_drift = ProteinBreak("atom_positions", lambda a: a[:, 1:])
+    mask_no_atom_axis = ProteinBreak("atom_mask", lambda a: a[:, 0])
+    mask_atom_drift = ProteinBreak("atom_mask", lambda a: a[:, 1:])
+    aatype_column_vector = ProteinBreak("aatype", lambda a: a[:, None])
+    residue_index_drift = ProteinBreak("residue_index", lambda a: a[1:])
 
-    @property
-    def field_name(self) -> str:
-        """Name of the Protein constructor keyword to break."""
-        return self.value[0]
 
-    @property
-    def shape(self) -> tuple[int, ...]:
-        """The deliberately wrong shape to allocate for that field."""
-        return self.value[1]
+@dataclasses.dataclass(frozen=True)
+class CenterCase:
+    """A ``center_positions`` input and its hand-derived CA centre.
+
+    Positions count up across residue, atom and xyz, so residue ``r``'s CA
+    sits at ``111 r + (3, 4, 5)``; averaging over residues gives the centre.
+
+    Attributes:
+        n_res: Residues to build.
+        present_atoms: Atom37 slots marked present.
+        ca_center: Masked mean of the CA positions before centring.
+    """
+
+    n_res: int
+    present_atoms: tuple[int, ...]
+    ca_center: tuple[float, float, float]
+
+
+class CenterPositionsScenario(enum.Enum):
+    """Inputs for ``center_positions``.
+
+    Members:
+        full_mask: Eight residues with every atom present; CA centre is
+            ``111 * 3.5 + (3, 4, 5)``.
+        ca_only: Five residues with only CA present, so every other slot
+            must end at zero; CA centre is ``111 * 2 + (3, 4, 5)``.
+    """
+
+    full_mask = CenterCase(8, tuple(range(37)), (391.5, 392.5, 393.5))
+    ca_only = CenterCase(5, (ATOM37_CA,), (225.0, 226.0, 227.0))
+
+
+@dataclasses.dataclass(frozen=True)
+class WrongShape:
+    """An atom conversion and positions of a deliberately wrong shape.
+
+    Attributes:
+        convert: Conversion under test, called as ``convert(pos, mask)``.
+        positions_shape: Invalid shape for the positions.
+        mask_shape: Valid shape for the mask.
+    """
+
+    convert: Convert
+    positions_shape: tuple[int, ...]
+    mask_shape: tuple[int, ...]
+
+
+class WrongAtomShape(enum.Enum):
+    """Conversions given positions whose shape breaks their contract.
+
+    These are what would fail if ``@jaxtyped`` were removed from a
+    conversion; the coverage gate only checks names are referenced.
+
+    Members:
+        atom37_width: ``atom37_to_atom5`` given 4-component points.
+        atom5_count: ``atom5_to_atom37`` given 4 atoms instead of 5.
+        cb_width: ``atom37_to_cb`` given 4-component points.
+    """
+
+    atom37_width = WrongShape(atom37_to_atom5, (2, 10, 37, 4), (2, 10, 37))
+    atom5_count = WrongShape(atom5_to_atom37, (2, 10, 4, 3), (2, 10, 5))
+    cb_width = WrongShape(atom37_to_cb, (2, 10, 37, 4), (2, 10, 37))
+
+
+@dataclasses.dataclass(frozen=True)
+class PdbCase:
+    """ATOM records for a PDB file and what ``protein_from_pdb`` reads.
+
+    Attributes:
+        records: ``"atom resname <chain><resseq>"`` per ATOM line,
+            ``;``-joined, e.g. ``"N ALA A1"``.
+        mol_types: One letter per residue: ``p``rotein, ``d``na, ``r``na.
+        chains: Expected ``chain_index`` per residue.
+    """
+
+    records: str
+    mol_types: str
+    chains: tuple[int, ...]
+
+
+class PdbScenario(enum.Enum):
+    """PDB contents spanning the molecule types the parser tells apart.
+
+    Members:
+        protein: Two amino acids on chain A.
+        dna_prefixed: ``DA`` and ``DT``, unambiguous DNA names.
+        rna_with_ribose: ``A`` and ``U`` with an ``O2'`` ribose oxygen.
+        dna_bare_names: ``A`` and ``T`` without ``O2'``: DNA, no prefix.
+        protein_dna: A protein residue on chain A, a DNA one on chain B.
+        two_protein_chains: Two chains of two residues, indexed 0 and 1.
+    """
+
+    protein = PdbCase("N ALA A1;CA ALA A1;N GLY A2", "pp", (0, 0))
+    dna_prefixed = PdbCase("P DA A1;P DT A2", "dd", (0, 0))
+    rna_with_ribose = PdbCase("O2' A A1;O2' U A2", "rr", (0, 0))
+    dna_bare_names = PdbCase("C1' A A1;C1' T A2", "dd", (0, 0))
+    protein_dna = PdbCase("N ALA A1;P DA B1", "pd", (0, 1))
+    two_protein_chains = PdbCase("N ALA A1;N GLY A2;N ALA B1", "ppp", (0, 0, 1))
+
+
+@dataclasses.dataclass(frozen=True)
+class PdbProteinCase:
+    """A protein layout ``to_pdb`` writes and the records it must contain.
+
+    Attributes:
+        present_atoms: Atom37 slots present in every residue.
+        chains: Chain index per residue.
+        atom_lines: Expected number of ATOM records.
+        ter_lines: Expected number of TER records, one per chain.
+    """
+
+    present_atoms: tuple[int, ...]
+    chains: tuple[int, ...]
+    atom_lines: int
+    ter_lines: int
+
+
+class ToPdbScenario(enum.Enum):
+    """Protein layouts for ``to_pdb``.
+
+    Members:
+        backbone: Five residues, N CA C O present: 20 ATOM lines.
+        ca_only: Three residues, only CA present: one line per residue.
+        two_chains: Four residues over chains 0 and 1: a TER per chain.
+    """
+
+    backbone = PdbProteinCase((0, 1, 2, 4), (0, 0, 0, 0, 0), 20, 1)
+    ca_only = PdbProteinCase((1,), (0, 0, 0), 3, 1)
+    two_chains = PdbProteinCase((0, 1, 2, 4), (0, 0, 1, 1), 16, 2)
 
 
 @pytest.fixture
-def invalid_protein_factory(
-    request: pytest.FixtureRequest,
-) -> Callable[[], Protein]:
-    """Build a thunk that constructs a Protein with one field shape broken.
-
-    Receives an InvalidProteinShape via ``request.param`` when used with
-    ``indirect=True``.
+def atom_spec(request: pytest.FixtureRequest) -> TensorSpec:
+    """Return the spec of the scenario routed in via indirect param.
 
     Args:
-        request: Pytest fixture request whose ``.param`` attribute is a
-            InvalidProteinShape naming the field and shape to break.
+        request: Pytest request carrying an atom scenario member.
 
     Returns:
-        A zero-argument callable that constructs a Protein with that
-        field broken; invoking it raises TypeCheckError.
+        The member's ``TensorSpec`` (or subclass).
     """
-    invalid_shape = cast(InvalidProteinShape, request.param)
-    int_fields = frozenset({"aatype", "residue_index", "chain_index"})
-    dtype = np.intp if invalid_shape.field_name in int_fields else np.float64
-    base = Protein(
-        atom_positions=np.zeros((N_RES, N_ATOM_TYPE, 3), dtype=np.float64),
-        aatype=np.zeros(N_RES, dtype=np.intp),
-        atom_mask=np.ones((N_RES, N_ATOM_TYPE), dtype=np.float64),
-        residue_index=np.arange(N_RES, dtype=np.intp),
-        chain_index=np.zeros(N_RES, dtype=np.intp),
-        b_factors=np.zeros((N_RES, N_ATOM_TYPE), dtype=np.float64),
+    scenario = cast(
+        Atom37ToAtom5Scenario | Atom5ToAtom37Scenario | Atom37ToCbScenario,
+        request.param,
     )
-    broken = np.zeros(invalid_shape.shape, dtype=dtype)
-    return lambda: replace(base, **{invalid_shape.field_name: broken})
+    return scenario.value
 
 
-@pytest.mark.parametrize(
-    "invalid_protein_factory",
-    list(InvalidProteinShape),
-    ids=[case.name for case in InvalidProteinShape],
-    indirect=True,
-)
-def test_protein_rejects_invalid_shapes(
-    invalid_protein_factory: Callable[[], Protein],
-) -> None:
-    """Protein raises TypeCheckError for shape-contract violations.
+@pytest.fixture
+def atom_tensors(atom_spec: TensorSpec) -> AtomTensors:
+    """Build positions and mask for the spec's geometry and layout.
 
-    Protein is validated by a single ``jaxtyped(typechecker=beartype)``
-    check spanning the whole dataclass, so every field sharing a shape
-    signature exercises the identical enforcement code path. Rather than
-    breaking all six fields exhaustively, this covers each of the three
-    distinct signatures exactly once for rank ((num_res, num_atom_type, 3)
-    via atom_positions, (num_res, num_atom_type) via atom_mask, (num_res,)
-    via aatype), once for the atom_positions-only fixed coordinate-width
-    contract, and twice each (on two different fields) for the num_res and
-    num_atom_type named-dimension consistency checks, to confirm those
-    checks are not anchored to whichever field happens to be checked first.
-    ``chain_index`` and ``b_factors`` are intentionally not parametrized
-    here: they share the exact (num_res,) and (num_res, num_atom_type)
-    signatures already exercised by ``residue_index`` and ``atom_mask``
-    above, so adding them would restate the same mechanism rather than
-    cover new behavior.
-
-    Each case is also chosen to mirror a plausible bug in
-    ``protein_from_pdb``'s array-assembly loop (dropped coordinate axis,
-    a stray extra column, residue-count drift from insertion-code/altloc
-    handling, or an atom-type table that has grown out of sync with a
-    hardcoded dimension) rather than an arbitrary shape permutation.
+    Atom37 slot indices are used for both layouts: in atom5 the first five
+    slots are N, CA, C, CB, O, so ``ATOM37_*`` stays inside the five.
 
     Args:
-        invalid_protein_factory: Fixture-produced thunk parametrized via
-            indirect to construct a Protein with one field shape broken.
+        atom_spec: Geometry, batch size, residue count and layout.
+
+    Returns:
+        The built tensors.
     """
-    with pytest.raises(TypeCheckError):
-        _ = invalid_protein_factory()
+    n_atoms = atom_spec.representation.value
+    standard = {
+        ATOM37_N: (1.0, 0.0, 0.0),
+        ATOM37_CA: (0.0, 0.0, 0.0),
+        ATOM37_C: (0.0, 1.0, 0.0),
+        ATOM37_O: (1.0, 1.0, 0.0),
+    }
+    geometry = {
+        TensorCase.standard: standard | {ATOM37_CB: (0.0, 0.0, 1.0)},
+        TensorCase.no_beta_carbon: standard,
+        TensorCase.collinear: {
+            ATOM37_N: (0.0, 0.0, 0.0),
+            ATOM37_CA: (1.0, 0.0, 0.0),
+            ATOM37_C: (2.0, 0.0, 0.0),
+            ATOM37_O: (2.0, 1.0, 0.0),
+        },
+    }.get(atom_spec.content, {})
+    per_residue = torch.zeros(n_atoms, 3)
+    for slot, xyz in geometry.items():
+        per_residue[slot] = torch.tensor(xyz)
+    positions = einops.repeat(
+        per_residue,
+        "a d -> b n a d",
+        b=atom_spec.batch,
+        n=atom_spec.n_res,
+    )
+    mask = torch.ones(atom_spec.batch, atom_spec.n_res, n_atoms)
+    if atom_spec.content is TensorCase.half_mask:
+        mask[:, : atom_spec.n_res // 2] = 0
+    if atom_spec.content in {TensorCase.no_beta_carbon, TensorCase.collinear}:
+        mask[..., ATOM37_CB] = 0
+    return AtomTensors(positions=positions, mask=mask)
 
 
-# ---------------------------------------------------------------------------
-# make_np_example
-# ---------------------------------------------------------------------------
+@pytest.fixture
+def valid_protein() -> Protein:
+    """Return a valid 10-residue Protein in the atom37 layout.
 
-NP_NUM_RES = 6
+    Returns:
+        Protein of alanines with zero positions and every atom present.
+    """
+    n, a = 10, len(atom_types)
+    return Protein(
+        atom_positions=np.zeros((n, a, 3)),
+        aatype=np.zeros(n, dtype=np.intp),
+        atom_mask=np.ones((n, a)),
+        residue_index=np.arange(n, dtype=np.intp),
+        chain_index=np.zeros(n, dtype=np.intp),
+        b_factors=np.zeros((n, a)),
+    )
+
+
+@pytest.fixture
+def protein_break(request: pytest.FixtureRequest) -> ProteinBreak:
+    """Return the break of the ``InvalidProteinShape`` routed in via param.
+
+    Args:
+        request: Pytest request carrying the scenario in ``param``.
+
+    Returns:
+        Field and malformation to apply.
+    """
+    return cast(InvalidProteinShape, request.param).value
 
 
 @pytest.fixture
 def coords_dict() -> dict[str, list[list[float]]]:
-    """Provide a concrete backbone coordinate dict with N, CA, C, O keys.
+    """Return backbone coordinates for 6 residues, as JSONL entries hold them.
 
-    Mirrors the `dict[str, list[list[float]]]` shape that
-    `ProteinEntry.coords` yields when loaded from a JSONL record.
+    Atom ``k`` of residue ``r`` (N, CA, C, O for ``k`` = 0..3) has
+    coordinates ``(r + k, r + k + 1, r + k + 2)``.
 
     Returns:
-        A dict mapping atom name to an (NP_NUM_RES, 3) list of deterministic
-        Cartesian coordinates.
+        Mapping from atom name to a ``(6, 3)`` nested list.
     """
     return {
-        atom_name: [
-            [float(res_idx + atom_offset + xyz) for xyz in range(3)]
-            for res_idx in range(NP_NUM_RES)
-        ]
-        for atom_offset, atom_name in enumerate(("N", "CA", "C", "O"))
+        name: [[float(r + k + d) for d in range(3)] for r in range(6)]
+        for k, name in enumerate(("N", "CA", "C", "O"))
     }
 
 
 @pytest.fixture
-def np_example(
-    coords_dict: dict[str, list[list[float]]],
-) -> Mapping[str, npt.NDArray[np.float64] | npt.NDArray[np.intp]]:
-    """Provide the numpy example dict built from the coords_dict fixture."""
-    return make_np_example(coords_dict)
+def make_example() -> Callable[[int], Example]:
+    """Return a factory for ``n``-residue numpy feature mappings.
 
+    A mapping rather than a dataclass because ``make_fixed_size`` and
+    ``truncate_to_length`` take one and rewrite its entries in place.
+    Residue ``r`` holds the value ``r + 1`` everywhere, so padding (0) and
+    kept residues are told apart.
 
-def test_make_np_example_output_keys(
-    np_example: Mapping[str, npt.NDArray[np.float64] | npt.NDArray[np.intp]],
-) -> None:
-    """make_np_example returns atom_positions, atom_mask, residue_index."""
-    assert {"atom_positions", "atom_mask", "residue_index"} <= np_example.keys()
-
-
-def test_make_np_example_atom_positions_shape(
-    np_example: Mapping[str, npt.NDArray[np.float64] | npt.NDArray[np.intp]],
-) -> None:
-    """make_np_example packs backbone coords into (NP_NUM_RES, 37, 3)."""
-    assert np_example["atom_positions"].shape == (NP_NUM_RES, 37, 3)
-
-
-def test_make_np_example_atom_mask_shape(
-    np_example: Mapping[str, npt.NDArray[np.float64] | npt.NDArray[np.intp]],
-) -> None:
-    """make_np_example produces an atom_mask of shape (NP_NUM_RES, 37)."""
-    assert np_example["atom_mask"].shape == (NP_NUM_RES, 37)
-
-
-def test_make_np_example_residue_index_is_arange(
-    np_example: Mapping[str, npt.NDArray[np.float64] | npt.NDArray[np.intp]],
-) -> None:
-    """make_np_example sets residue_index to a 0-based integer range."""
-    np.testing.assert_array_equal(
-        np_example["residue_index"],
-        np.arange(NP_NUM_RES),
-    )
-
-
-def test_make_np_example_backbone_atoms_masked(
-    np_example: Mapping[str, npt.NDArray[np.float64] | npt.NDArray[np.intp]],
-) -> None:
-    """make_np_example sets atom_mask to 1.0 for backbone atom types."""
-    bb_atom_types = {"N", "CA", "C", "O"}
-    for i, atom_type in enumerate(atom_types):
-        if atom_type in bb_atom_types:
-            assert cast(
-                npt.NDArray[np.float64],
-                np_example["atom_mask"][:, i] == 1.0,
-            ).all()
-
-
-def test_make_np_example_nan_coords_zeroed(
-    coords_dict: dict[str, list[list[float]]],
-) -> None:
-    """make_np_example replaces NaN coords with zero to keep coords finite."""
-    coords_dict["N"][0] = [float("nan"), float("nan"), float("nan")]
-    batch = make_np_example(coords_dict)
-    assert np.isfinite(batch["atom_positions"]).all()
-
-
-def test_make_np_example_nan_coords_zero_mask(
-    coords_dict: dict[str, list[list[float]]],
-) -> None:
-    """make_np_example sets atom_mask to 0 for residues with NaN coords."""
-    coords_dict["N"][0] = [float("nan"), float("nan"), float("nan")]
-    batch = make_np_example(coords_dict)
-    n_idx = next(i for i, t in enumerate(atom_types) if t == ATOM5_NAMES[0])
-    assert batch["atom_mask"][0, n_idx] == 0.0
-
-
-# ---------------------------------------------------------------------------
-# make_fixed_size
-# ---------------------------------------------------------------------------
-
-NP_MAX_LEN = 10
-
-
-@pytest.fixture
-def short_np_example() -> (
-    Mapping[str, npt.NDArray[np.float64] | npt.NDArray[np.intp]]
-):
-    """Provide a numpy example dict with less residues than NP_MAX_LEN=10."""
-    return {
-        "atom_positions": np.zeros((5, 37, 3)),
-        "atom_mask": np.ones((5, 37)),
-        "residue_index": np.arange(5),
-    }
-
-
-@pytest.fixture
-def long_np_example() -> (
-    Mapping[str, npt.NDArray[np.float64] | npt.NDArray[np.intp]]
-):
-    """Provide numpy example dict with more residues than NP_MAX_LEN=10."""
-    rng = np.random.default_rng(3)
-    return {
-        "atom_positions": rng.standard_normal((20, 37, 3)),
-        "residue_index": np.arange(20),
-    }
-
-
-@pytest.fixture
-def exact_np_example() -> Mapping[str, npt.NDArray[np.intp]]:
-    """Provide a numpy example dict with exactly NP_MAX_LEN=10 residues."""
-    return {"residue_index": np.arange(NP_MAX_LEN)}
-
-
-@pytest.fixture
-def ones_np_example() -> Mapping[str, npt.NDArray[np.float64]]:
-    """Provide a numpy example dict with 3 residues set to residue index 1."""
-    return {"residue_index": np.ones(3)}
-
-
-def test_make_fixed_size_pads_shorter_sequence(
-    short_np_example: Mapping[
-        str,
-        npt.NDArray[np.float64] | npt.NDArray[np.intp],
-    ],
-) -> None:
-    """make_fixed_size zero-pads arrays to NP_MAX_LEN when input is shorter."""
-    make_fixed_size(short_np_example, max_seq_length=NP_MAX_LEN)
-    assert short_np_example["atom_positions"].shape[0] == NP_MAX_LEN
-    assert short_np_example["atom_mask"].shape[0] == NP_MAX_LEN
-    assert short_np_example["residue_index"].shape[0] == NP_MAX_LEN
-
-
-def test_make_fixed_size_truncates_longer_sequence(
-    long_np_example: Mapping[
-        str,
-        npt.NDArray[np.float64] | npt.NDArray[np.intp],
-    ],
-) -> None:
-    """make_fixed_size truncates arrays to NP_MAX_LEN when too long."""
-    make_fixed_size(long_np_example, max_seq_length=NP_MAX_LEN)
-    assert long_np_example["atom_positions"].shape[0] == NP_MAX_LEN
-    assert long_np_example["residue_index"].shape[0] == NP_MAX_LEN
-
-
-def test_make_fixed_size_no_change_when_exact(
-    exact_np_example: Mapping[str, npt.NDArray[np.intp]],
-) -> None:
-    """make_fixed_size leaves arrays unchanged when length is NP_MAX_LEN."""
-    make_fixed_size(exact_np_example, max_seq_length=NP_MAX_LEN)
-    assert exact_np_example["residue_index"].shape[0] == NP_MAX_LEN
-
-
-def test_make_fixed_size_padded_values_are_zero(
-    ones_np_example: Mapping[str, npt.NDArray[np.float64]],
-) -> None:
-    """make_fixed_size fills pad with zeros, not the original values."""
-    make_fixed_size(ones_np_example, max_seq_length=6)
-    assert cast(
-        npt.NDArray[np.float64],
-        ones_np_example["residue_index"][3:] == 0.0,
-    ).all()
-
-
-# ---------------------------------------------------------------------------
-# center_positions
-# ---------------------------------------------------------------------------
-
-
-class CenterPositionsScenario(enum.Enum):
-    """Scenarios for ``test_center_positions``.
-
-    Positions count up from zero across residue, atom, and xyz axes, so a
-    residue's CA coordinates are ``111 * res + (3, 4, 5)``. Averaging that
-    over residues gives each member's hand-derived CA center.
-
-    Members:
-        full_mask: Eight residues with every atom present.
-        ca_only: Five residues with only CA present, so every other slot
-            must end up at zero.
+    Returns:
+        ``make(n)`` with ``atom_positions``, ``atom_mask`` and
+        ``residue_index``.
     """
 
-    full_mask = (8, tuple(range(N_ATOM_TYPE)), (391.5, 392.5, 393.5))
-    ca_only = (5, (ATOM37_CA,), (225.0, 226.0, 227.0))
+    def make(n: int) -> Example:
+        """Build the mapping.
 
-    @property
-    def num_res(self) -> int:
-        """Number of residues to build."""
-        return self.value[0]
+        Args:
+            n: Residue count.
 
-    @property
-    def present_atoms(self) -> tuple[int, ...]:
-        """Atom37 slots marked present in the mask."""
-        return self.value[1]
+        Returns:
+            The feature mapping.
+        """
+        value = np.arange(1, n + 1, dtype=np.float64)
+        return {
+            "atom_positions": einops.repeat(value, "n -> n 37 3"),
+            "atom_mask": einops.repeat(value, "n -> n 37"),
+            "residue_index": np.arange(1, n + 1),
+        }
 
-    @property
-    def ca_center(self) -> tuple[float, float, float]:
-        """Expected masked mean of the CA positions before centering."""
-        return self.value[2]
+    return make
 
 
 @pytest.fixture
 def center_scenario(request: pytest.FixtureRequest) -> CenterPositionsScenario:
-    """Expose the indirect scenario to the input and expected fixtures.
+    """Return the ``CenterPositionsScenario`` routed in via indirect param.
 
     Args:
-        request: Pytest fixture request whose ``.param`` attribute is a
-            CenterPositionsScenario member.
+        request: Pytest request carrying the scenario in ``param``.
 
     Returns:
-        The scenario member for the current test case.
+        The scenario under test.
     """
     return cast(CenterPositionsScenario, request.param)
 
 
 @pytest.fixture
-def np_example_to_center(
-    center_scenario: CenterPositionsScenario,
-) -> dict[str, npt.NDArray[np.float64]]:
-    """Build the input mapping for a center_positions scenario.
+def np_example_to_center(center_scenario: CenterPositionsScenario) -> Example:
+    """Build the input mapping for a ``center_positions`` scenario.
 
-    Returns a dict rather than a dataclass because center_positions takes a
-    mapping and writes its result back to the ``atom_positions`` key.
+    A mapping because ``center_positions`` writes its result back to the
+    ``atom_positions`` key.
 
     Args:
-        center_scenario: Scenario naming the residue count and present atoms.
+        center_scenario: Residue count and present atoms.
 
     Returns:
-        A dict with deterministic "atom_positions" and "atom_mask" arrays.
+        Deterministic ``atom_positions`` and ``atom_mask``.
     """
-    num_res = center_scenario.num_res
-    atom_mask = np.zeros((num_res, N_ATOM_TYPE), dtype=np.float64)
-    atom_mask[:, list(center_scenario.present_atoms)] = 1.0
-    atom_positions = cast(
-        npt.NDArray[np.float64],
-        einops.rearrange(
-            np.arange(num_res * N_ATOM_TYPE * 3, dtype=np.float64),
-            "(res atom xyz) -> res atom xyz",
-            atom=N_ATOM_TYPE,
-            xyz=3,
-        ),
+    case = center_scenario.value
+    mask = np.zeros((case.n_res, 37))
+    mask[:, list(case.present_atoms)] = 1.0
+    positions = einops.rearrange(
+        np.arange(case.n_res * 37 * 3, dtype=np.float64),
+        "(r a d) -> r a d",
+        a=37,
+        d=3,
     )
-    return {"atom_positions": atom_positions, "atom_mask": atom_mask}
+    return {"atom_positions": positions, "atom_mask": mask}
 
 
 @pytest.fixture
 def expected_centered_positions(
     center_scenario: CenterPositionsScenario,
-    np_example_to_center: dict[str, npt.NDArray[np.float64]],
+    np_example_to_center: Example,
 ) -> npt.NDArray[np.float64]:
-    """Compute expected positions from the scenario's known CA center.
+    """Shift the input by the scenario's CA centre and zero absent atoms.
 
     Args:
-        center_scenario: Scenario supplying the hand-derived CA center.
-        np_example_to_center: Input mapping the expectation is derived from.
+        center_scenario: Supplies the hand-derived CA centre.
+        np_example_to_center: Input mapping.
 
     Returns:
-        Positions shifted by the CA center, with absent atoms at zero.
+        Positions ``center_positions`` must produce.
     """
-    atom_mask = einops.rearrange(
-        np_example_to_center["atom_mask"],
-        "res atom -> res atom 1",
+    positions = cast(
+        npt.NDArray[np.float64],
+        np_example_to_center["atom_positions"],
     )
-    ca_center = np.array(center_scenario.ca_center, dtype=np.float64)
-    return (np_example_to_center["atom_positions"] - ca_center) * atom_mask
+    mask = einops.rearrange(np_example_to_center["atom_mask"], "r a -> r a 1")
+    centre = np.array(center_scenario.value.ca_center)
+    return (positions - centre) * mask
+
+
+@pytest.fixture
+def make_protein() -> ProteinFactory:
+    """Return a factory for alanine proteins with chosen atoms and chains.
+
+    ``make(present_atoms, chains)`` builds one residue per chain entry with
+    those atom37 slots present at deterministic positions.
+
+    Returns:
+        The factory.
+    """
+
+    def make(present: tuple[int, ...], chains: tuple[int, ...]) -> Protein:
+        """Build the protein.
+
+        Args:
+            present: Atom37 slots present in every residue.
+            chains: Chain index per residue.
+
+        Returns:
+            The protein.
+        """
+        n = len(chains)
+        mask = np.zeros((n, 37))
+        mask[:, list(present)] = 1.0
+        positions = einops.rearrange(
+            np.arange(n * 37 * 3, dtype=np.float64) / 10,
+            "(r a d) -> r a d",
+            a=37,
+            d=3,
+        )
+        return Protein(
+            atom_positions=positions,
+            aatype=np.zeros(n, dtype=np.intp),
+            atom_mask=mask,
+            residue_index=np.arange(n, dtype=np.intp),
+            chain_index=np.array(chains, dtype=np.intp),
+            b_factors=np.zeros((n, 37)),
+        )
+
+    return make
+
+
+@pytest.fixture
+def roundtrip_protein() -> Protein:
+    """Return a 5-residue protein whose fields survive a PDB round trip.
+
+    Residues are A, R, S, V and G; the first four have N, CA, C, CB, O and
+    glycine has no CB. Present positions are multiples of 0.001, the PDB
+    column precision, and absent ones are zero.
+
+    Returns:
+        The protein.
+    """
+    aatype = np.array([restype_order[c] for c in "ARSVG"], dtype=np.intp)
+    present = np.zeros((5, 37))
+    present[:, [ATOM37_N, ATOM37_CA, ATOM37_C, ATOM37_CB, ATOM37_O]] = 1.0
+    present[4, ATOM37_CB] = 0.0
+    grid = einops.rearrange(np.arange(555.0), "(r a d) -> r a d", a=37, d=3)
+    mask = einops.rearrange(present, "r a -> r a 1")
+    return Protein(
+        atom_positions=np.round(grid * 0.123, 3) * mask,
+        aatype=aatype,
+        atom_mask=present,
+        residue_index=np.arange(5, dtype=np.intp),
+        chain_index=np.zeros(5, dtype=np.intp),
+        b_factors=np.zeros((5, 37)),
+    )
+
+
+@pytest.fixture
+def write_pdb(tmp_path: pathlib.Path) -> Callable[[str], pathlib.Path]:
+    """Return a writer turning ``"atom resname <chain><resseq>;..."`` to PDB.
+
+    Each entry becomes one 80-column ATOM record at ``(1, 2, 3)``; an entry
+    starting with ``HETATM`` becomes a HETATM record instead. Atom names
+    are written in the 3-character form, which every name used here fits.
+
+    Args:
+        tmp_path: Per-test directory.
+
+    Returns:
+        ``write(records)``, returning the file path.
+    """
+
+    def write(records: str) -> pathlib.Path:
+        """Write the records to ``model.pdb``.
+
+        Args:
+            records: ``;``-separated ``[HETATM] atom resname <chain><n>``.
+
+        Returns:
+            The file path.
+        """
+        lines: list[str] = []
+        for serial, entry in enumerate(records.split(";"), start=1):
+            record, atom, resname, where = [PDB_REC_ATOM, *entry.split()][-4:]
+            name = f" {atom:<3}"
+            lines.append(
+                (
+                    f"{record:<6}{serial:>5} {name} {resname:>3} "
+                    + f"{where[0]}{int(where[1:]):>4}    "
+                    + f"{1.0:8.3f}{2.0:8.3f}{3.0:8.3f}  1.00  0.00"
+                ).ljust(80),
+            )
+        path = tmp_path / "model.pdb"
+        _ = path.write_text("\n".join(lines) + "\n")
+        return path
+
+    return write
+
+
+@pytest.fixture
+def pdb_scenario(request: pytest.FixtureRequest) -> PdbScenario:
+    """Return the ``PdbScenario`` member routed in via indirect param.
+
+    Args:
+        request: Pytest request carrying the scenario in ``param``.
+
+    Returns:
+        The scenario under test.
+    """
+    return cast(PdbScenario, request.param)
+
+
+@pytest.fixture
+def to_pdb_scenario(request: pytest.FixtureRequest) -> ToPdbScenario:
+    """Return the ``ToPdbScenario`` member routed in via indirect param.
+
+    Args:
+        request: Pytest request carrying the scenario in ``param``.
+
+    Returns:
+        The scenario under test.
+    """
+    return cast(ToPdbScenario, request.param)
+
+
+@pytest.fixture
+def wrong_shape(request: pytest.FixtureRequest) -> WrongShape:
+    """Return the case of the ``WrongAtomShape`` routed in via param.
+
+    Args:
+        request: Pytest request carrying the scenario in ``param``.
+
+    Returns:
+        Conversion and shapes.
+    """
+    return cast(WrongAtomShape, request.param).value
+
+
+@pytest.mark.parametrize(
+    "atom_spec",
+    list(Atom37ToAtom5Scenario),
+    ids=[case.name for case in Atom37ToAtom5Scenario],
+    indirect=True,
+)
+def test_atom37_to_atom5_copies_the_five_backbone_slots(
+    atom_spec: TensorSpec,
+    atom_tensors: AtomTensors,
+) -> None:
+    """Each atom5 slot holds its atom37 atom's position and mask, same dtype.
+
+    A CB absent in atom37 stays absent in atom5.
+
+    Args:
+        atom_spec: Batch and residue counts.
+        atom_tensors: Atom37 positions and mask.
+    """
+    x = atom_tensors
+    positions, mask = atom37_to_atom5(x.positions, x.mask)
+    atom5 = [ATOM5_N, ATOM5_CA, ATOM5_C, ATOM5_O, ATOM5_CB]
+    atom37 = [ATOM37_N, ATOM37_CA, ATOM37_C, ATOM37_O, ATOM37_CB]
+    n_atoms = ResidueRepresentation.atom5.value
+    shape = (atom_spec.batch, atom_spec.n_res, n_atoms)
+    assert (positions.shape, mask.shape) == ((*shape, 3), shape)
+    assert (positions.dtype, mask.dtype) == (x.positions.dtype, x.mask.dtype)
+    assert torch.equal(positions[:, :, atom5], x.positions[:, :, atom37])
+    assert torch.equal(mask[:, :, atom5], x.mask[:, :, atom37])
+
+
+@pytest.mark.parametrize(
+    "atom_spec",
+    list(Atom5ToAtom37Scenario),
+    ids=[case.name for case in Atom5ToAtom37Scenario],
+    indirect=True,
+)
+def test_atom5_to_atom37_scatters_into_backbone_slots_only(
+    atom_spec: Atom5Spec,
+    atom_tensors: AtomTensors,
+) -> None:
+    """Each atom5 slot lands at its atom37 index; every other slot is zero.
+
+    With no mask passed, the backbone slots are marked present.
+
+    Args:
+        atom_spec: Sizes and whether to pass the mask.
+        atom_tensors: Atom5 positions and mask.
+    """
+    x = atom_tensors
+    mask_in = x.mask if atom_spec.provide_mask else None
+    expected_mask = (
+        x.mask if atom_spec.provide_mask else torch.ones_like(x.mask)
+    )
+    positions, mask = atom5_to_atom37(x.positions, mask_in)
+    other = sorted(set(range(37)) - set(ATOM5_TO_ATOM37))
+    n_atoms = ResidueRepresentation.atom37.value
+    shape = (atom_spec.batch, atom_spec.n_res, n_atoms)
+    assert (positions.shape, mask.shape) == ((*shape, 3), shape)
+    assert (positions.dtype, mask.dtype) == (x.positions.dtype, x.mask.dtype)
+    assert torch.equal(positions[:, :, ATOM5_TO_ATOM37], x.positions)
+    assert torch.equal(mask[:, :, ATOM5_TO_ATOM37], expected_mask)
+    assert torch.count_nonzero(positions[:, :, other]) == 0
+    assert torch.count_nonzero(mask[:, :, other]) == 0
+
+
+@pytest.mark.parametrize(
+    "atom_spec",
+    list(Atom37ToCbScenario),
+    ids=[case.name for case in Atom37ToCbScenario],
+    indirect=True,
+)
+def test_atom37_to_cb_uses_cb_when_present_and_a_pseudo_cb_otherwise(
+    atom_spec: CbSpec,
+    atom_tensors: AtomTensors,
+) -> None:
+    """Present CBs are copied; absent ones become a finite pseudo-Cβ.
+
+    Where the backbone is non-degenerate, the pseudo-Cβ is a new point,
+    neither the empty CB slot nor CA. Collinear N, CA, C make the cross
+    product vanish; the epsilon in the normalisation must keep it finite.
+
+    Args:
+        atom_spec: Where CB is present and whether the fallback is distinct.
+        atom_tensors: Atom37 positions and mask.
+    """
+    x = atom_tensors
+    cb, present = atom37_to_cb(x.positions, x.mask)
+    expected = torch.zeros(atom_spec.batch, atom_spec.n_res, dtype=torch.bool)
+    expected[:, atom_spec.present_from :] = True
+    absent = ~expected
+    stored_cb = x.positions[:, :, ATOM37_CB]
+    ca = x.positions[:, :, ATOM37_CA]
+    moved_off_cb = not torch.allclose(cb[absent], stored_cb[absent])
+    moved_off_ca = not torch.allclose(cb[absent], ca[absent])
+    assert cb.shape == (atom_spec.batch, atom_spec.n_res, 3)
+    assert torch.equal(present, expected)
+    assert torch.equal(cb[expected], stored_cb[expected])
+    assert torch.isfinite(cb[absent]).all()
+    assert (moved_off_cb, moved_off_ca) == (atom_spec.distinct,) * 2
+
+
+@pytest.mark.parametrize(
+    "wrong_shape",
+    list(WrongAtomShape),
+    ids=[case.name for case in WrongAtomShape],
+    indirect=True,
+)
+def test_atom_conversions_reject_wrong_shapes(wrong_shape: WrongShape) -> None:
+    """Each conversion's contract rejects positions of the wrong shape.
+
+    Args:
+        wrong_shape: Conversion and shapes.
+    """
+    positions = torch.zeros(wrong_shape.positions_shape)
+    mask = torch.ones(wrong_shape.mask_shape)
+    with pytest.raises(TypeCheckError):
+        _ = wrong_shape.convert(positions, mask)
+
+
+@pytest.mark.parametrize(
+    "protein_break",
+    list(InvalidProteinShape),
+    ids=[case.name for case in InvalidProteinShape],
+    indirect=True,
+)
+def test_protein_rejects_invalid_shapes(
+    valid_protein: Protein,
+    protein_break: ProteinBreak,
+) -> None:
+    """Rebuilding a valid Protein with one malformed field raises.
+
+    Every other field stays valid, so the error comes from the replaced
+    one.
+
+    Args:
+        valid_protein: Protein whose other fields stay valid.
+        protein_break: Field and malformation.
+    """
+    old = cast(Array, getattr(valid_protein, protein_break.field))
+    with pytest.raises(TypeCheckError):
+        _ = dataclasses.replace(
+            valid_protein,
+            **{protein_break.field: protein_break.malform(old)},
+        )
+
+
+def test_restype_x_is_the_index_after_the_canonical_twenty(
+    valid_protein: Protein,
+) -> None:
+    """The unknown token ``X`` sits at index 20, one past the canonicals.
+
+    The sequence loss ignores targets at or above ``RESTYPE_NUM_NO_X``, so
+    ``X`` must be exactly there, above every canonical residue such as the
+    fixture's alanines. Not parametrized: it is one constant.
+
+    Args:
+        valid_protein: Protein of alanines, index 0.
+    """
+    aatype = torch.tensor(valid_protein.aatype)
+    assert restype_order["X"] == RESTYPE_NUM_NO_X
+    assert bool((aatype < restype_order["X"]).all())
+
+
+def test_make_np_example_packs_backbone_into_atom37(
+    coords_dict: dict[str, list[list[float]]],
+) -> None:
+    """Backbone coordinates land in their atom37 slots, marked present.
+
+    All other slots are zero and absent, and ``residue_index`` counts from
+    0. Not parametrized: the NaN case is the next test.
+
+    Args:
+        coords_dict: Six residues of N, CA, C, O coordinates.
+    """
+    example = {
+        k: torch.tensor(v) for k, v in make_np_example(coords_dict).items()
+    }
+    names = ("N", "CA", "C", "O")
+    backbone = [atom_types.index(name) for name in names]
+    other = sorted(set(range(37)) - set(backbone))
+    expected = torch.tensor([coords_dict[a] for a in names]).transpose(0, 1)
+    assert torch.equal(example["atom_positions"][:, backbone], expected)
+    assert torch.count_nonzero(example["atom_positions"][:, other]) == 0
+    assert bool(example["atom_mask"][:, backbone].all())
+    assert torch.count_nonzero(example["atom_mask"][:, other]) == 0
+    assert torch.equal(example["residue_index"], torch.arange(6))
+
+
+@pytest.mark.parametrize("atom", ["N", "CA", "O"])
+def test_make_np_example_masks_and_zeroes_nan_coordinates(
+    coords_dict: dict[str, list[list[float]]],
+    atom: str,
+) -> None:
+    """A NaN coordinate is set to zero and its atom marked absent.
+
+    Other atoms of the same residue stay present.
+
+    Args:
+        coords_dict: Coordinates; residue 0's ``atom`` is set to NaN here.
+        atom: Backbone atom to corrupt.
+    """
+    coords_dict[atom][0] = [float("nan")] * 3
+    example = {
+        k: torch.tensor(v) for k, v in make_np_example(coords_dict).items()
+    }
+    slot = atom_types.index(atom)
+    assert bool(torch.isfinite(example["atom_positions"]).all())
+    assert torch.count_nonzero(example["atom_positions"][0, slot]) == 0
+    assert example["atom_mask"][0, slot].item() == 0
+    assert example["atom_mask"][0, atom_types.index("C")].item() == 1
+
+
+@pytest.mark.parametrize(
+    "n_res",
+    [5, 10, 20],
+    ids=["padded", "unchanged", "truncated"],
+)
+def test_make_fixed_size_pads_or_truncates_to_ten(
+    make_example: Callable[[int], Example],
+    n_res: int,
+) -> None:
+    """Every array ends with 10 residues: the first kept, the rest zero.
+
+    Args:
+        make_example: Feature-mapping factory; residue ``r`` holds ``r + 1``.
+        n_res: Residues before resizing.
+    """
+    example = make_example(n_res)
+    make_fixed_size(example, max_seq_length=10)
+    kept = min(n_res, 10)
+    out = {k: torch.tensor(v) for k, v in example.items()}
+    reference = {k: torch.tensor(v) for k, v in make_example(kept).items()}
+    assert {k: len(v) for k, v in out.items()} == dict.fromkeys(out, 10)
+    assert all(torch.equal(out[k][:kept], reference[k]) for k in out)
+    assert all(torch.count_nonzero(out[k][kept:]) == 0 for k in out)
+
+
+@pytest.mark.parametrize(
+    ("n_res", "expected"),
+    [
+        pytest.param(100, 50, id="truncated"),
+        pytest.param(50, 50, id="exact"),
+        pytest.param(30, 30, id="short_not_padded"),
+    ],
+)
+def test_truncate_to_length_cuts_but_never_pads(
+    make_example: Callable[[int], Example],
+    n_res: int,
+    expected: int,
+) -> None:
+    """Arrays longer than 50 residues are cut to 50; shorter ones are kept.
+
+    Args:
+        make_example: Feature-mapping factory.
+        n_res: Residues before truncation.
+        expected: Residues after.
+    """
+    example = make_example(n_res)
+    truncate_to_length(example, 50)
+    out = {k: torch.tensor(v) for k, v in example.items()}
+    reference = {k: torch.tensor(v) for k, v in make_example(expected).items()}
+    assert all(torch.equal(out[k], reference[k]) for k in out)
 
 
 @pytest.mark.parametrize(
@@ -926,23 +1013,19 @@ def expected_centered_positions(
     indirect=True,
 )
 def test_center_positions(
-    np_example_to_center: dict[str, npt.NDArray[np.float64]],
+    np_example_to_center: Example,
     expected_centered_positions: npt.NDArray[np.float64],
 ) -> None:
-    """center_positions writes CA-centered, masked positions to the mapping.
+    """``center_positions`` writes CA-centred, masked positions to the mapping.
 
-    Comparing exact values covers moving the CA center to the origin, keeping
-    absent atoms at zero, and updating the mapping the caller passed in. The
-    check does not depend on whether the array itself is mutated, because
-    the mapping entry is the function's contract with its callers.
+    Exact values cover moving the CA centre to the origin, keeping absent
+    atoms at zero, and updating the mapping the caller passed in.
 
     Args:
-        np_example_to_center: Fixture-produced input mapping.
-        expected_centered_positions: Positions the mapping should hold after
-            centering.
+        np_example_to_center: Input mapping.
+        expected_centered_positions: Positions it must hold afterwards.
     """
     center_positions(np_example_to_center)
-
     np.testing.assert_allclose(
         np_example_to_center["atom_positions"],
         expected_centered_positions,
@@ -950,668 +1033,298 @@ def test_center_positions(
     )
 
 
-# ---------------------------------------------------------------------------
-# chain_end
-# ---------------------------------------------------------------------------
-
-
-def testchain_end_starts_with_ter() -> None:
-    """chain_end returns PDB-formatted line beginning with TER record type."""
-    result = chain_end(100, "ALA", "A", 10)
-    assert result.startswith("TER")
-
-
-def testchain_end_contains_resname_and_chain() -> None:
-    """chain_end embeds residue name and chain ID in returned TER record."""
-    res_name = restype_1to3["G"]
-    chain_id = PDB_CHAIN_IDS[1]
-    result = chain_end(100, res_name, chain_id, 42)
-    assert res_name in result
-    assert chain_id in result
-
-
-# ---------------------------------------------------------------------------
-# to_pdb
-# ---------------------------------------------------------------------------
-
-
-@pytest.fixture
-def simple_protein() -> Protein:
-    """Provide 5-residue Protein with backbone atoms (N, CA, C, O) present."""
-    num_res = 5
-    atom_mask = np.zeros((num_res, 37), dtype=np.float64)
-    atom_mask[:, [0, 1, 2, 3]] = 1.0
-    return Protein(
-        atom_positions=np.random.default_rng(4)
-        .standard_normal((num_res, 37, 3))
-        .astype(np.float64),
-        aatype=np.zeros(num_res, dtype=np.intp),
-        atom_mask=atom_mask,
-        residue_index=np.arange(num_res, dtype=np.intp),
-        chain_index=np.zeros(num_res, dtype=np.intp),
-        b_factors=np.zeros((num_res, 37), dtype=np.float64),
-    )
-
-
-@pytest.fixture
-def ca_only_protein() -> Protein:
-    """Provide 3-residue Protein with only the CA atom present per residue."""
-    num_res = 3
-    atom_mask = np.zeros((num_res, 37), dtype=np.float64)
-    atom_mask[:, 1] = 1.0
-    return Protein(
-        atom_positions=np.random.default_rng(5)
-        .standard_normal((num_res, 37, 3))
-        .astype(np.float64),
-        aatype=np.zeros(num_res, dtype=np.intp),
-        atom_mask=atom_mask,
-        residue_index=np.arange(num_res, dtype=np.intp),
-        chain_index=np.zeros(num_res, dtype=np.intp),
-        b_factors=np.zeros((num_res, 37), dtype=np.float64),
-    )
-
-
-@pytest.fixture
-def two_chain_protein() -> Protein:
-    """Provide 4-residue Protein split across two chains (indices 0 and 1)."""
-    num_res = 4
-    atom_mask = np.zeros((num_res, 37), dtype=np.float64)
-    atom_mask[:, [0, 1, 2, 3]] = 1.0
-    return Protein(
-        atom_positions=np.random.default_rng(6)
-        .standard_normal((num_res, 37, 3))
-        .astype(np.float64),
-        aatype=np.zeros(num_res, dtype=np.intp),
-        atom_mask=atom_mask,
-        residue_index=np.arange(num_res, dtype=np.intp),
-        chain_index=np.array([0, 0, 1, 1], dtype=np.intp),
-        b_factors=np.zeros((num_res, 37), dtype=np.float64),
-    )
-
-
-@pytest.fixture
-def roundtrip_protein() -> Protein:
-    """Provide a 5-residue Protein for PDB serialisation roundtrip tests.
-
-    Positions are pre-rounded to 3 decimal places to match the PDB ATOM
-    column width (``%8.3f``), and absent-atom positions are zero so every
-    field can be compared directly after a ``to_pdb`` / ``protein_from_pdb``
-    cycle without masking.
-    """
-    # atom_types ordering in this repo: N=0, CA=1, C=2, CB=3, O=4
-    _bb_cb: list[int] = [0, 1, 2, 3, 4]  # N, CA, C, CB, O — non-GLY residues
-    _bb: list[int] = [0, 1, 2, 4]  # N, CA, C, O    — GLY has no CB
-
-    # ALA=0, ARG=1, SER=15, VAL=19, GLY=7  (indices into restypes list)
-    _aatype = np.array([0, 1, 15, 19, 7], dtype=np.intp)
-    _num_res = len(_aatype)
-
-    _atom_mask = np.zeros((_num_res, N_ATOM_TYPE), dtype=np.float64)
-    for _i in range(_num_res - 1):  # residues 0-3: non-GLY
-        _atom_mask[_i, _bb_cb] = 1.0
-    _atom_mask[_num_res - 1, _bb] = 1.0  # last residue: GLY, no CB
-
-    _rng = np.random.default_rng(7)
-    _atom_positions = np.zeros((_num_res, N_ATOM_TYPE, 3), dtype=np.float64)
-    for _i in range(_num_res):
-        _present = _bb_cb if _i < _num_res - 1 else _bb
-        for _j in _present:
-            _atom_positions[_i, _j] = np.round(_rng.standard_normal(3), 3)
-
-    return Protein(
-        atom_positions=_atom_positions,
-        aatype=_aatype,
-        atom_mask=_atom_mask,
-        residue_index=np.arange(_num_res, dtype=np.intp),
-        chain_index=np.zeros(_num_res, dtype=np.intp),
-        b_factors=np.zeros((_num_res, N_ATOM_TYPE), dtype=np.float64),
-    )
-
-
-def test_to_pdb_returns_string(simple_protein: Protein) -> None:
-    """to_pdb returns a plain str, not bytes or another type."""
-    assert isinstance(to_pdb(simple_protein), str)
-
-
-def test_to_pdb_contains_model_endmdl_end(simple_protein: Protein) -> None:
-    """to_pdb output contains mandatory MODEL, ENDMDL, and END PDB records."""
-    result = to_pdb(simple_protein)
-    assert PDB_REC_MODEL in result
-    assert PDB_REC_ENDMDL in result
-    assert PDB_REC_END in result
-
-
-def test_to_pdb_lines_padded_to_80(simple_protein: Protein) -> None:
-    """to_pdb right-pads every output line to exactly 80 characters."""
-    for line in to_pdb(simple_protein).splitlines():
-        assert len(line) == PDB_LINE_LEN
-
-
-def test_to_pdb_contains_atom_records(simple_protein: Protein) -> None:
-    """to_pdb includes at least one ATOM for a protein with masked atoms."""
-    assert PDB_REC_ATOM in to_pdb(simple_protein)
-
-
-def test_to_pdb_skips_unmasked_atoms(ca_only_protein: Protein) -> None:
-    """to_pdb emits one ATOM line per residue when only CA is unmasked."""
-    atom_lines = [
-        line
-        for line in to_pdb(ca_only_protein).splitlines()
-        if line.startswith(PDB_REC_ATOM)
-    ]
-    assert len(atom_lines) == ca_only_protein.atom_positions.shape[0]
-
-
-def test_to_pdb_multichain_has_ter(two_chain_protein: Protein) -> None:
-    """to_pdb inserts a TER record between chains in a multi-chain protein."""
-    assert PDB_REC_TER in to_pdb(two_chain_protein)
-
-
-def test_to_pdb_raises_on_invalid_aatype() -> None:
-    """to_pdb raises InvalidAAtypesError when aatype non-canonical residue."""
-    num_res = 3
-    prot = Protein(
-        atom_positions=np.zeros((num_res, 37, 3), dtype=np.float64),
-        aatype=np.full(num_res, RESTYPE_NUM + 1, dtype=np.intp),
-        atom_mask=np.ones((num_res, 37), dtype=np.float64),
-        residue_index=np.arange(num_res, dtype=np.intp),
-        chain_index=np.zeros(num_res, dtype=np.intp),
-        b_factors=np.zeros((num_res, 37), dtype=np.float64),
-    )
-    with pytest.raises(InvalidAAtypesError):
-        _ = to_pdb(prot)
-
-
-def test_to_pdb_raises_too_many_chains() -> None:
-    """to_pdb raises ValueError when more chain_indices than PDB allows."""
-    num_res = 2
-    prot = Protein(
-        atom_positions=np.zeros((num_res, 37, 3), dtype=np.float64),
-        aatype=np.zeros(num_res, dtype=np.intp),
-        atom_mask=np.ones((num_res, 37), dtype=np.float64),
-        residue_index=np.arange(num_res, dtype=np.intp),
-        chain_index=np.array([0, PDB_MAX_CHAINS], dtype=np.intp),
-        b_factors=np.zeros((num_res, 37), dtype=np.float64),
-    )
-    with pytest.raises(ValueError, match="chains"):
-        _ = to_pdb(prot)
-
-
-def test_to_pdb_protein_from_pdb_roundtrip(
-    roundtrip_protein: Protein,
-    tmp_path: pathlib.Path,
-) -> None:
-    """All Protein fields preserved through to_pdb / protein_from_pdb cycle."""
-    pdb_path = tmp_path / "roundtrip.pdb"
-    _ = pdb_path.write_text(to_pdb(roundtrip_protein))
-    recovered = protein_from_pdb(pdb_path)
-
-    assert np.array_equal(roundtrip_protein.aatype, recovered.aatype)
-    assert np.array_equal(
-        roundtrip_protein.residue_index,
-        recovered.residue_index,
-    )
-    assert np.array_equal(roundtrip_protein.chain_index, recovered.chain_index)
-    assert np.array_equal(roundtrip_protein.atom_mask, recovered.atom_mask)
-    assert np.array_equal(
-        roundtrip_protein.atom_positions,
-        recovered.atom_positions,
-    )
-    assert np.all(
-        cast(
-            npt.NDArray[np.bool_],
-            recovered.b_factors == float(MOL_TYPE_PROTEIN),
+@pytest.mark.parametrize(
+    ("args", "expected"),
+    [
+        pytest.param(
+            (100, "ALA", "A", 10),
+            "TER     100      ALA A  10",
+            id="a",
         ),
-    )
-
-
-# ---------------------------------------------------------------------------
-# Shape-contract enforcement — negative tests
-# ---------------------------------------------------------------------------
-
-
-class WrongAtomShape(enum.Enum):
-    """Atom conversions paired with positions of a deliberately wrong shape.
-
-    Each member holds the conversion, the invalid positions shape, and a
-    valid mask shape, so the positions are the only contract violation.
-
-    Members:
-        atom37_coord_width: ``atom37_to_atom5`` given 4-component coordinates.
-        atom5_atom_count: ``atom5_to_atom37`` given 4 atoms instead of 5.
-        cb_coord_width: ``atom37_to_cb`` given 4-component coordinates.
-    """
-
-    atom37_coord_width = (atom37_to_atom5, (B, N_RES, 37, 4), (B, N_RES, 37))
-    atom5_atom_count = (atom5_to_atom37, (B, N_RES, 4, 3), (B, N_RES, 5))
-    cb_coord_width = (atom37_to_cb, (B, N_RES, 37, 4), (B, N_RES, 37))
-
-    @property
-    def convert(
-        self,
-    ) -> Callable[
-        [Float[torch.Tensor, "..."], Float[torch.Tensor, "..."]],
-        object,
-    ]:
-        """Conversion function under test."""
-        return self.value[0]
-
-    @property
-    def positions_shape(self) -> tuple[int, ...]:
-        """Invalid shape to allocate for the positions argument."""
-        return self.value[1]
-
-    @property
-    def mask_shape(self) -> tuple[int, ...]:
-        """Valid shape to allocate for the mask argument."""
-        return self.value[2]
-
-
-@pytest.fixture
-def wrong_shape_conversion(
-    request: pytest.FixtureRequest,
-) -> Callable[[], object]:
-    """Build a thunk that calls a conversion with wrongly shaped positions.
+        pytest.param(
+            (7, "GLY", "B", 1234),
+            "TER       7      GLY B1234",
+            id="b",
+        ),
+    ],
+)
+def test_chain_end_formats_a_ter_record(
+    args: tuple[int, str, str, int],
+    expected: str,
+) -> None:
+    """``chain_end`` lays out serial, residue, chain and number in columns.
 
     Args:
-        request: Pytest fixture request whose ``.param`` attribute is a
-            WrongAtomShape member.
-
-    Returns:
-        A zero-argument callable that runs the conversion; invoking it
-        raises TypeCheckError.
+        args: ``(serial, resname, chain, resseq)``.
+        expected: The exact TER line.
     """
-    case = cast(WrongAtomShape, request.param)
-    positions = torch.zeros(case.positions_shape)
-    mask = torch.ones(case.mask_shape)
-    return lambda: case.convert(positions, mask)
+    assert chain_end(*args) == expected
 
 
 @pytest.mark.parametrize(
-    "wrong_shape_conversion",
-    list(WrongAtomShape),
-    ids=[case.name for case in WrongAtomShape],
+    "to_pdb_scenario",
+    list(ToPdbScenario),
+    ids=[case.name for case in ToPdbScenario],
     indirect=True,
 )
-def test_atom_conversions_reject_wrong_shapes(
-    wrong_shape_conversion: Callable[[], object],
+def test_to_pdb_writes_one_atom_line_per_present_atom(
+    to_pdb_scenario: ToPdbScenario,
+    make_protein: ProteinFactory,
 ) -> None:
-    """Atom conversions raise TypeCheckError for shape-contract violations.
+    """The PDB has a MODEL block, an ATOM per present atom, a TER per chain.
 
-    These cases are what would fail if ``@jaxtyped`` were removed from a
-    conversion; ``test_jaxtyped_coverage`` would not notice, because it only
-    checks that decorated names appear in the test file.
+    Every line is padded to 80 columns, and absent atoms are skipped.
 
     Args:
-        wrong_shape_conversion: Fixture-produced thunk parametrized via
-            indirect to run one conversion on wrongly shaped positions.
+        to_pdb_scenario: Protein layout and expected record counts.
+        make_protein: Protein factory.
     """
-    with pytest.raises(TypeCheckError):
-        _ = wrong_shape_conversion()
+    case = to_pdb_scenario.value
+    lines = to_pdb(make_protein(case.present_atoms, case.chains)).splitlines()
+    records = [line.split()[0] for line in lines if line.strip()]
+    assert {len(line) for line in lines} == {80}
+    assert records.count(PDB_REC_ATOM) == case.atom_lines
+    assert records.count(PDB_REC_TER) == case.ter_lines
+    assert records[0] == PDB_REC_MODEL
+    assert records[-2:] == [PDB_REC_ENDMDL, PDB_REC_END]
 
 
-# ---------------------------------------------------------------------------
-# Molecule-type and nucleotide constants
-# ---------------------------------------------------------------------------
-
-
-def test_dna_restype_constants() -> None:
-    """DNA_RESTYPE_* constants have the expected keys, values, and ordering."""
-    assert list(DNA_RESTYPES) == ["DA", "DC", "DG", "DT"]
-    assert isinstance(DNA_RESTYPE_ORDER, MappingProxyType)
-    assert dict(DNA_RESTYPE_ORDER) == {"DA": 0, "DC": 1, "DG": 2, "DT": 3}
-    assert isinstance(DNA_RESTYPE_3TO1, MappingProxyType)
-    assert dict(DNA_RESTYPE_3TO1) == {
-        "DA": "a",
-        "DC": "c",
-        "DG": "g",
-        "DT": "t",
-    }
-
-
-def test_rna_restype_constants() -> None:
-    """RNA_RESTYPE_* constants have the expected keys, values, and ordering."""
-    assert list(RNA_RESTYPES) == ["A", "C", "G", "U"]
-    assert isinstance(RNA_RESTYPE_ORDER, MappingProxyType)
-    assert dict(RNA_RESTYPE_ORDER) == {"A": 0, "C": 1, "G": 2, "U": 3}
-    assert isinstance(RNA_RESTYPE_3TO1, MappingProxyType)
-    assert dict(RNA_RESTYPE_3TO1) == {"A": "a", "C": "c", "G": "g", "U": "u"}
-
-
-def test_dna_restype_mappings_are_immutable() -> None:
-    """Verify that DNA mapping constants reject mutation at runtime."""
-    with pytest.raises(TypeError, match=r"does not support item assignment"):
-        DNA_RESTYPE_ORDER["DX"] = 99
-    with pytest.raises(TypeError, match=r"does not support item assignment"):
-        DNA_RESTYPE_3TO1["DX"] = "x"
-
-
-def test_rna_restype_mappings_are_immutable() -> None:
-    """Verify that RNA mapping constants reject mutation at runtime."""
-    with pytest.raises(TypeError, match=r"does not support item assignment"):
-        RNA_RESTYPE_ORDER["UX"] = 99
-    with pytest.raises(TypeError, match=r"does not support item assignment"):
-        RNA_RESTYPE_3TO1["UX"] = "x"
-
-
-# ---------------------------------------------------------------------------
-# classify_mol_type
-# ---------------------------------------------------------------------------
-
-
-def testclassify_mol_type_protein() -> None:
-    """classify_mol_type returns MOL_TYPE_PROTEIN for amino-acid residues."""
-    assert classify_mol_type("ALA", frozenset()) == MOL_TYPE_PROTEIN
-    assert classify_mol_type("GLY", frozenset()) == MOL_TYPE_PROTEIN
-    assert classify_mol_type("VAL", frozenset()) == MOL_TYPE_PROTEIN
-
-
-def testclassify_mol_type_dna_canonical() -> None:
-    """classify_mol_type returns MOL_TYPE_DNA for D-prefix nucleotide names."""
-    assert classify_mol_type("DA", frozenset()) == MOL_TYPE_DNA
-    assert classify_mol_type("DC", frozenset()) == MOL_TYPE_DNA
-    assert classify_mol_type("DG", frozenset()) == MOL_TYPE_DNA
-    assert classify_mol_type("DT", frozenset()) == MOL_TYPE_DNA
-
-
-def testclassify_mol_type_dna_bare_t() -> None:
-    """classify_mol_type returns MOL_TYPE_DNA for D-prefix-less thymine."""
-    assert classify_mol_type("T", frozenset()) == MOL_TYPE_DNA
-    assert classify_mol_type("T", frozenset({"C1'", "C2'"})) == MOL_TYPE_DNA
-
-
-def testclassify_mol_type_rna_u() -> None:
-    """classify_mol_type returns MOL_TYPE_RNA for U regardless of atoms."""
-    assert classify_mol_type("U", frozenset()) == MOL_TYPE_RNA
-    assert classify_mol_type("U", frozenset({"C1'"})) == MOL_TYPE_RNA
-
-
-def testclassify_mol_type_rna_via_o2prime() -> None:
-    """classify_mol_type returns MOL_TYPE_RNA for A/C/G when O2' atom."""
-    assert classify_mol_type("A", frozenset({"O2'", "C1'"})) == MOL_TYPE_RNA
-    assert classify_mol_type("C", frozenset({"O2'"})) == MOL_TYPE_RNA
-    assert classify_mol_type("G", frozenset({"O2'"})) == MOL_TYPE_RNA
-
-
-def testclassify_mol_type_dna_no_prefix_no_o2prime() -> None:
-    """classify_mol_type returns MOL_TYPE_DNA for A/C/G when no O2' atom."""
-    assert classify_mol_type("A", frozenset({"C1'", "C2'"})) == MOL_TYPE_DNA
-    assert classify_mol_type("C", frozenset()) == MOL_TYPE_DNA
-    assert classify_mol_type("G", frozenset({"P"})) == MOL_TYPE_DNA
-
-
-def testclassify_mol_type_unknown_defaults_protein() -> None:
-    """classify_mol_type returns MOL_TYPE_PROTEIN for unrecognised residues."""
-    assert classify_mol_type("UNK", frozenset()) == MOL_TYPE_PROTEIN
-    assert classify_mol_type("MSE", frozenset()) == MOL_TYPE_PROTEIN
-    assert classify_mol_type("", frozenset()) == MOL_TYPE_PROTEIN
-
-
-# ---------------------------------------------------------------------------
-# protein_from_pdb helpers
-# ---------------------------------------------------------------------------
-
-
-def _pdb_atom_line(
-    record: str,
-    serial: int,
-    atom_name: str,
-    residue: tuple[str, str, int],
-    coords: tuple[float, float, float] = (1.0, 2.0, 3.0),
-) -> str:
-    """Build an 80-character PDB ATOM or HETATM record for test fixtures.
+@pytest.mark.parametrize(
+    ("aatype", "chains", "error"),
+    [
+        pytest.param(RESTYPE_NUM + 1, (0, 0), InvalidAAtypesError, id="bad_aa"),
+        pytest.param(0, (0, PDB_MAX_CHAINS), ValueError, id="too_many_chains"),
+    ],
+)
+def test_to_pdb_rejects_unwritable_proteins(
+    make_protein: ProteinFactory,
+    aatype: int,
+    chains: tuple[int, ...],
+    error: type[Exception],
+) -> None:
+    """A residue type past the vocabulary, or too many chains, raises.
 
     Args:
-        record: Record type string, e.g. "ATOM" or "HETATM".
-        serial: Atom serial number.
-        atom_name: PDB atom name (e.g. "N", "CA", "O2'").
-        residue: Tuple of (resname, chain, resseq) identifying the residue.
-        coords: Cartesian (x, y, z) coordinates in Angstroms.
-
-    Returns:
-        An 80-character string formatted as a PDB record.
+        make_protein: Protein factory.
+        aatype: Residue type for every residue.
+        chains: Chain index per residue.
+        error: Exception expected.
     """
-    resname, chain, resseq = residue
-    x, y, z = coords
-    atom_field = (
-        f" {atom_name:<3}"
-        if len(atom_name) < PDB_ATOM_NAME_CUTOFF
-        else atom_name[:PDB_ATOM_NAME_CUTOFF]
+    protein = dataclasses.replace(
+        make_protein((1,), chains),
+        aatype=np.full(len(chains), aatype, dtype=np.intp),
     )
-    return (
-        f"{record:<6}{serial:>5} {atom_field} {resname:>3} "
-        f"{chain}{resseq:>4}    "
-        f"{x:8.3f}{y:8.3f}{z:8.3f}  1.00  0.00"
-    ).ljust(80)
+    with pytest.raises(error):
+        _ = to_pdb(protein)
 
 
-# ---------------------------------------------------------------------------
-# protein_from_pdb — integration tests
-# ---------------------------------------------------------------------------
-
-
-def test_protein_from_pdb_protein_only(tmp_path: pathlib.Path) -> None:
-    """protein_from_pdb sets b_factors to MOL_TYPE_PROTEIN for amino-acids."""
-    pdb = tmp_path / "prot.pdb"
-    _ = pdb.write_text(
-        _pdb_atom_line("ATOM", 1, "N", ("ALA", "A", 1))
-        + "\n"
-        + _pdb_atom_line("ATOM", 2, "CA", ("ALA", "A", 1))
-        + "\n"
-        + _pdb_atom_line("ATOM", 3, "N", ("GLY", "A", 2))
-        + "\n",
-    )
-    prot = protein_from_pdb(pdb)
-    assert prot.atom_positions.shape == (2, 37, 3)
-    assert np.all(
-        cast(npt.NDArray[np.bool_], prot.b_factors == float(MOL_TYPE_PROTEIN)),
-    )
-    assert prot.aatype[0] == 0  # ALA → index 0 in restypes
-
-
-def test_protein_from_pdb_dna_canonical(tmp_path: pathlib.Path) -> None:
-    """protein_from_pdb sets b_factors to MOL_TYPE_DNA for DA/DC/DG/DT."""
-    pdb = tmp_path / "dna.pdb"
-    _ = pdb.write_text(
-        _pdb_atom_line("ATOM", 1, "P", ("DA", "A", 1))
-        + "\n"
-        + _pdb_atom_line("ATOM", 2, "P", ("DT", "A", 2))
-        + "\n",
-    )
-    prot = protein_from_pdb(pdb)
-    assert prot.atom_positions.shape == (2, 37, 3)
-    assert np.all(
-        cast(npt.NDArray[np.bool_], prot.b_factors == float(MOL_TYPE_DNA)),
-    )
-    assert np.all(cast(npt.NDArray[np.bool_], prot.aatype == RESTYPE_NUM_NO_X))
-
-
-def test_protein_from_pdb_rna_canonical(tmp_path: pathlib.Path) -> None:
-    """protein_from_pdb classifies A/U residues as RNA when O2' atom."""
-    pdb = tmp_path / "rna.pdb"
-    _ = pdb.write_text(
-        _pdb_atom_line("ATOM", 1, "O2'", ("A", "A", 1))
-        + "\n"
-        + _pdb_atom_line("ATOM", 2, "O2'", ("U", "A", 2))
-        + "\n",
-    )
-    prot = protein_from_pdb(pdb)
-    assert prot.atom_positions.shape == (2, 37, 3)
-    assert np.all(
-        cast(npt.NDArray[np.bool_], prot.b_factors == float(MOL_TYPE_RNA)),
-    )
-    assert np.all(cast(npt.NDArray[np.bool_], prot.aatype == RESTYPE_NUM_NO_X))
-
-
-def test_protein_from_pdb_dna_no_prefix(tmp_path: pathlib.Path) -> None:
-    """protein_from_pdb classifies A/T residues as DNA when no O2' atom."""
-    pdb = tmp_path / "dna_noprefix.pdb"
-    _ = pdb.write_text(
-        _pdb_atom_line("ATOM", 1, "C1'", ("A", "A", 1))
-        + "\n"
-        + _pdb_atom_line("ATOM", 2, "C1'", ("T", "A", 2))
-        + "\n",
-    )
-    prot = protein_from_pdb(pdb)
-    assert prot.atom_positions.shape == (2, 37, 3)
-    assert np.all(
-        cast(npt.NDArray[np.bool_], prot.b_factors == float(MOL_TYPE_DNA)),
-    )
-
-
-def test_protein_from_pdb_protein_dna_multichain(
+def test_to_pdb_and_protein_from_pdb_round_trip(
+    roundtrip_protein: Protein,
     tmp_path: pathlib.Path,
 ) -> None:
-    """protein_from_pdb works correctly for protein+DNA complex."""
-    pdb = tmp_path / "complex.pdb"
-    _ = pdb.write_text(
-        _pdb_atom_line("ATOM", 1, "N", ("ALA", "A", 1))
-        + "\n"
-        + _pdb_atom_line("ATOM", 2, "N", ("GLY", "A", 2))
-        + "\n"
-        + _pdb_atom_line("ATOM", 3, "P", ("DA", "B", 1))
-        + "\n"
-        + _pdb_atom_line("ATOM", 4, "P", ("DT", "B", 2))
-        + "\n",
+    """Writing and re-reading a protein preserves every field.
+
+    ``b_factors`` come back as the protein molecule-type code. Not
+    parametrized: the protein mixes residues with and without CB.
+
+    Args:
+        roundtrip_protein: Protein at PDB precision.
+        tmp_path: Per-test directory.
+    """
+    path = tmp_path / "roundtrip.pdb"
+    _ = path.write_text(to_pdb(roundtrip_protein))
+    recovered = protein_from_pdb(path)
+    every_field = {f.name for f in dataclasses.fields(Protein)}
+    fields = sorted(every_field - {"b_factors"})
+    same = {
+        name: torch.equal(
+            torch.tensor(cast(Array, getattr(recovered, name))),
+            torch.tensor(cast(Array, getattr(roundtrip_protein, name))),
+        )
+        for name in fields
+    }
+    b_factors = torch.tensor(recovered.b_factors)
+    assert same == dict.fromkeys(fields, True)
+    assert bool((b_factors == MOL_TYPE_PROTEIN).all())
+
+
+@pytest.mark.parametrize(
+    "pdb_scenario",
+    list(PdbScenario),
+    ids=[case.name for case in PdbScenario],
+    indirect=True,
+)
+def test_protein_from_pdb_classifies_molecules_and_chains(
+    pdb_scenario: PdbScenario,
+    write_pdb: Callable[[str], pathlib.Path],
+) -> None:
+    """Each residue's molecule type goes to ``b_factors``; chains are indexed.
+
+    Nucleotides get the unknown residue type, ``RESTYPE_NUM_NO_X``.
+
+    Args:
+        pdb_scenario: Records and expected classification.
+        write_pdb: PDB writer.
+    """
+    case = pdb_scenario.value
+    codes = {"p": MOL_TYPE_PROTEIN, "d": MOL_TYPE_DNA, "r": MOL_TYPE_RNA}
+    is_nucleotide = {"p": False, "d": True, "r": True}
+    protein = protein_from_pdb(write_pdb(case.records))
+    b_factors = torch.tensor(protein.b_factors[:, 0])
+    aatype = torch.tensor(protein.aatype)
+    nucleotide = torch.tensor([is_nucleotide[c] for c in case.mol_types])
+    expected_types = torch.tensor([codes[c] for c in case.mol_types])
+    assert protein.atom_positions.shape == (len(case.mol_types), 37, 3)
+    assert torch.equal(b_factors, expected_types.double())
+    assert torch.equal(
+        torch.tensor(protein.chain_index),
+        torch.tensor(case.chains),
     )
-    prot = protein_from_pdb(pdb)
-    assert prot.atom_positions.shape == (4, 37, 3)
-    np.testing.assert_array_equal(prot.chain_index, [0, 0, 1, 1])
-    assert np.all(
-        cast(
-            npt.NDArray[np.bool_],
-            prot.b_factors[:2] == float(MOL_TYPE_PROTEIN),
-        ),
+    assert bool((aatype[nucleotide] == RESTYPE_NUM_NO_X).all())
+
+
+@pytest.mark.parametrize(
+    "hetatm",
+    ["HETATM O HOH A100", "HETATM MG MG A200", "HETATM N1 ATP A300"],
+    ids=["water", "ion", "ligand"],
+)
+def test_protein_from_pdb_skips_hetatm_records(
+    write_pdb: Callable[[str], pathlib.Path],
+    hetatm: str,
+) -> None:
+    """HETATM residues (water, ions, ligands) are left out of the protein.
+
+    Args:
+        write_pdb: PDB writer.
+        hetatm: The HETATM record added after two ATOM residues.
+    """
+    protein = protein_from_pdb(write_pdb(f"N ALA A1;N GLY A2;{hetatm}"))
+    assert protein.atom_positions.shape[0] == len(["ALA", "GLY"])
+
+
+def test_protein_from_pdb_keeps_pdb_residue_numbers(
+    write_pdb: Callable[[str], pathlib.Path],
+) -> None:
+    """``residue_index`` holds the RESSEQ column, gaps included.
+
+    Not parametrized: one gap shows the numbers are copied, not counted.
+
+    Args:
+        write_pdb: PDB writer.
+    """
+    protein = protein_from_pdb(write_pdb("N ALA A5;N ALA A10"))
+    assert torch.equal(
+        torch.tensor(protein.residue_index),
+        torch.tensor([5, 10]),
     )
-    assert np.all(
-        cast(npt.NDArray[np.bool_], prot.b_factors[2:] == float(MOL_TYPE_DNA)),
-    )
 
 
-def test_protein_from_pdb_multi_chain_protein(tmp_path: pathlib.Path) -> None:
-    """protein_from_pdb assigns distinct chain_index for each PDB chain ID."""
-    pdb = tmp_path / "twochains.pdb"
-    _ = pdb.write_text(
-        _pdb_atom_line("ATOM", 1, "N", ("ALA", "A", 1))
-        + "\n"
-        + _pdb_atom_line("ATOM", 2, "N", ("GLY", "A", 2))
-        + "\n"
-        + _pdb_atom_line("ATOM", 3, "N", ("ALA", "B", 1))
-        + "\n"
-        + _pdb_atom_line("ATOM", 4, "N", ("GLY", "B", 2))
-        + "\n",
-    )
-    prot = protein_from_pdb(pdb)
-    np.testing.assert_array_equal(prot.chain_index, [0, 0, 1, 1])
+def test_protein_from_pdb_rejects_a_file_without_atoms(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A PDB with only REMARK and HEADER lines raises ``ValueError``.
 
+    Not parametrized: any file without ATOM records takes this path.
 
-def test_protein_from_pdb_residue_index(tmp_path: pathlib.Path) -> None:
-    """protein_from_pdb sets residue_index to the PDB RESSEQ numbers."""
-    pdb = tmp_path / "resseq.pdb"
-    _ = pdb.write_text(
-        _pdb_atom_line("ATOM", 1, "N", ("ALA", "A", 5))
-        + "\n"
-        + _pdb_atom_line("ATOM", 2, "N", ("ALA", "A", 10))
-        + "\n",
-    )
-    prot = protein_from_pdb(pdb)
-    np.testing.assert_array_equal(prot.residue_index, [5, 10])
-
-
-def test_protein_from_pdb_no_atoms_raises(tmp_path: pathlib.Path) -> None:
-    """protein_from_pdb raises ValueError when PDB file has no ATOM records."""
-    pdb = tmp_path / "empty.pdb"
-    _ = pdb.write_text("REMARK empty structure\nHEADER test\n")
+    Args:
+        tmp_path: Per-test directory.
+    """
+    path = tmp_path / "empty.pdb"
+    _ = path.write_text("REMARK empty structure\nHEADER test\n")
     with pytest.raises(ValueError, match="No ATOM records"):
-        _ = protein_from_pdb(pdb)
+        _ = protein_from_pdb(path)
 
 
-def test_protein_from_pdb_ignores_water_hetatm(tmp_path: pathlib.Path) -> None:
-    """protein_from_pdb excludes HOH HETATM records from the output Protein."""
-    pdb = tmp_path / "water.pdb"
-    _ = pdb.write_text(
-        _pdb_atom_line("ATOM", 1, "N", ("ALA", "A", 1))
-        + "\n"
-        + _pdb_atom_line("HETATM", 2, "O", ("HOH", "A", 100))
-        + "\n",
-    )
-    prot = protein_from_pdb(pdb)
-    assert prot.atom_positions.shape[0] == 1
-
-
-def test_protein_from_pdb_ignores_ion_hetatm(tmp_path: pathlib.Path) -> None:
-    """protein_from_pdb excludes ion HETATM records (MG, ZN, etc.)."""
-    pdb = tmp_path / "ion.pdb"
-    _ = pdb.write_text(
-        _pdb_atom_line("ATOM", 1, "N", ("ALA", "A", 1))
-        + "\n"
-        + _pdb_atom_line("HETATM", 2, "MG", ("MG", "A", 200))
-        + "\n",
-    )
-    prot = protein_from_pdb(pdb)
-    assert prot.atom_positions.shape[0] == 1
-
-
-def test_protein_from_pdb_ignores_ligand_hetatm(tmp_path: pathlib.Path) -> None:
-    """protein_from_pdb excludes ligand HETATM records (ATP, HEM, etc.)."""
-    pdb = tmp_path / "ligand.pdb"
-    _ = pdb.write_text(
-        _pdb_atom_line("ATOM", 1, "N", ("ALA", "A", 1))
-        + "\n"
-        + _pdb_atom_line("HETATM", 2, "N1", ("ATP", "A", 300))
-        + "\n",
-    )
-    prot = protein_from_pdb(pdb)
-    assert prot.atom_positions.shape[0] == 1
-
-
-def test_protein_from_pdb_correct_residue_count_with_hetatm(
-    tmp_path: pathlib.Path,
+@pytest.mark.parametrize(
+    ("resname", "atoms", "expected"),
+    [
+        pytest.param("ALA", (), MOL_TYPE_PROTEIN, id="alanine"),
+        pytest.param("VAL", ("C1'",), MOL_TYPE_PROTEIN, id="valine"),
+        pytest.param("DA", (), MOL_TYPE_DNA, id="dna_prefixed"),
+        pytest.param("DT", ("O2'",), MOL_TYPE_DNA, id="dna_prefix_wins"),
+        pytest.param("T", (), MOL_TYPE_DNA, id="bare_thymine"),
+        pytest.param("U", (), MOL_TYPE_RNA, id="uracil"),
+        pytest.param("A", ("O2'", "C1'"), MOL_TYPE_RNA, id="a_with_ribose"),
+        pytest.param("G", ("O2'",), MOL_TYPE_RNA, id="g_with_ribose"),
+        pytest.param("C", (), MOL_TYPE_DNA, id="c_without_ribose"),
+        pytest.param("G", ("P",), MOL_TYPE_DNA, id="g_without_ribose"),
+        pytest.param("MSE", (), MOL_TYPE_PROTEIN, id="unknown_is_protein"),
+        pytest.param("", (), MOL_TYPE_PROTEIN, id="empty_is_protein"),
+    ],
+)
+def test_classify_mol_type(
+    resname: str,
+    atoms: tuple[str, ...],
+    expected: int,
 ) -> None:
-    """protein_from_pdb counts only ATOM-record when HETATM are present."""
-    pdb = tmp_path / "mixed.pdb"
-    _ = pdb.write_text(
-        _pdb_atom_line("ATOM", 1, "N", ("ALA", "A", 1))
-        + "\n"
-        + _pdb_atom_line("ATOM", 2, "N", ("GLY", "A", 2))
-        + "\n"
-        + _pdb_atom_line("ATOM", 3, "N", ("SER", "A", 3))
-        + "\n"
-        + _pdb_atom_line("HETATM", 4, "O", ("HOH", "A", 100))
-        + "\n"
-        + _pdb_atom_line("HETATM", 5, "O", ("HOH", "A", 101))
-        + "\n",
-    )
-    prot = protein_from_pdb(pdb)
-    assert prot.atom_positions.shape[0] == PROT_LEN
+    """Names decide when unambiguous; ``O2'`` decides for bare A, C, G.
+
+    Args:
+        resname: Residue name.
+        atoms: Atom names seen in the residue.
+        expected: Molecule-type code.
+    """
+    assert classify_mol_type(resname, frozenset(atoms)) == expected
 
 
-def test_truncate_to_length_shortens_all_arrays() -> None:
-    """truncate_to_length truncates all arrays to max_length along axis 0."""
-    long_example: dict[str, npt.NDArray[np.float64] | npt.NDArray[np.intp]] = {
-        "atom_positions": np.zeros((100, 37, 3)),
-        "atom_mask": np.zeros((100, 37)),
-        "residue_index": np.arange(100),
-    }
-    truncate_to_length(long_example, 50)
-    assert long_example["atom_positions"].shape == (50, 37, 3)
-    assert long_example["atom_mask"].shape == (50, 37)
-    assert long_example["residue_index"].shape == (50,)
+@pytest.mark.parametrize(
+    ("restypes", "order", "names"),
+    [
+        pytest.param(DNA_RESTYPES, DNA_RESTYPE_ORDER, "DA DC DG DT", id="dna"),
+        pytest.param(RNA_RESTYPES, RNA_RESTYPE_ORDER, "A C G U", id="rna"),
+    ],
+)
+def test_nucleotide_order_indexes_bases_canonically(
+    restypes: list[str],
+    order: Mapping[str, int],
+    names: str,
+) -> None:
+    """The base list and its order mapping both follow the canonical order.
+
+    Args:
+        restypes: The library's base list.
+        order: The library's base-to-index mapping.
+        names: Expected bases, space-separated, in order.
+    """
+    expected = names.split()
+    assert list(restypes) == expected
+    assert dict(order) == {name: i for i, name in enumerate(expected)}
 
 
-def test_truncate_to_length_noop_when_already_short() -> None:
-    """truncate_to_length leaves arrays unchanged when shorter than max_len."""
-    short_example: dict[str, npt.NDArray[np.float64] | npt.NDArray[np.intp]] = {
-        "atom_positions": np.zeros((30, 37, 3)),
-    }
-    truncate_to_length(short_example, 50)
-    assert short_example["atom_positions"].shape == (30, 37, 3)
+@pytest.mark.parametrize(
+    ("three_to_one", "names", "letters"),
+    [
+        pytest.param(DNA_RESTYPE_3TO1, "DA DC DG DT", "acgt", id="dna"),
+        pytest.param(RNA_RESTYPE_3TO1, "A C G U", "acgu", id="rna"),
+    ],
+)
+def test_nucleotide_three_to_one_gives_lower_case_letters(
+    three_to_one: Mapping[str, str],
+    names: str,
+    letters: str,
+) -> None:
+    """Each base maps to its lower-case one-letter code.
+
+    Args:
+        three_to_one: The library's mapping.
+        names: Bases, space-separated.
+        letters: Their codes, in order.
+    """
+    assert dict(three_to_one) == dict(zip(names.split(), letters, strict=True))
 
 
-def test_truncate_to_length_noop_when_exact() -> None:
-    """truncate_to_length leaves arrays unchanged when exactly max_len."""
-    exact_example: dict[str, npt.NDArray[np.float64] | npt.NDArray[np.intp]] = {
-        "atom_positions": np.zeros((50, 37, 3)),
-    }
-    truncate_to_length(exact_example, 50)
-    assert exact_example["atom_positions"].shape == (50, 37, 3)
+@pytest.mark.parametrize(
+    "table",
+    [DNA_RESTYPE_ORDER, DNA_RESTYPE_3TO1, RNA_RESTYPE_ORDER, RNA_RESTYPE_3TO1],
+    ids=["dna_order", "dna_3to1", "rna_order", "rna_3to1"],
+)
+def test_nucleotide_tables_are_read_only(table: Mapping[str, object]) -> None:
+    """Every exported nucleotide table rejects item assignment.
+
+    Args:
+        table: The library mapping.
+    """
+    writable = cast(dict[str, object], cast(object, table))
+    assert isinstance(table, MappingProxyType)
+    with pytest.raises(TypeError, match="does not support item assignment"):
+        writable["XX"] = 0
