@@ -52,6 +52,11 @@ def make_pattern() -> PatternFactory:
     unrelated to each other, with values in ``[-1, 1]``, so tests get
     varied, reproducible tensors without a random generator.
 
+    Consecutive elements are linearly related, ``sin(a + 2f) =
+    2 cos(f) sin(a + f) - sin(a)``, so a ``(..., 3)`` tensor from this
+    factory holds coplanar points. Use it for features, not for
+    coordinates whose geometry the test depends on.
+
     Returns:
         The factory.
     """
