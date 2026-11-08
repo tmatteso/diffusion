@@ -1,731 +1,694 @@
 """Tests for node update modules.
 
-Covers AdaLN, AttentionPairBias, and NodeUpdate: output shape, dtype,
-finiteness, gradient flow, stability, and sparse-path correctness.
+Covers AdaLN, AttentionPairBias and NodeUpdate: output shape, dtype and
+finiteness on the dense and sparse paths; which inputs condition the
+output; gradient flow to inputs and to every parameter; the ``beta`` bias
+and ``neighbor_idx`` sparse path; dropout; recycling stability; and the
+constructor and jaxtyping contracts.
+
+Inputs are deterministic sine patterns and every module is built under a
+fixed seed inside its fixture, so each test is reproducible on its own.
 """
+
+import dataclasses
+import enum
+from collections.abc import Callable
+from typing import cast
 
 import pytest
 import torch
-from architecture.node_update import AdaLN, AttentionPairBias, NodeUpdate
-from beartype import beartype
-from einops import reduce, repeat
+from architecture.node_update import (
+    AdaLN,
+    AttentionPairBias,
+    InvalidSingleHeadDimensionError,
+    NodeUpdate,
+)
+from einops import rearrange, reduce, repeat
 from helpers.useful_objects import manual_seed
-from jaxtyping import Float, Int, TypeCheckError, jaxtyped
+from jaxtyping import Float, Int, TypeCheckError
 
-_ = manual_seed(42)
-
-N_RES = 8
-C_RES = 32
-C_PAIR = 32
-N_HEADS = 4
-B = 2
-
-N_RES_LARGE = 20  # total atom / node count
-K_SPARSE = 6  # neighbour count strictly less than N_RES_LARGE
-
-RMS_GAIN = 5.0
-
-# ---------------------------------------------------------------------------
-# Typed helpers
-# ---------------------------------------------------------------------------
+type Single = Float[torch.Tensor, "B N_res c_res"]
+type Pair = Float[torch.Tensor, "B N_res N_j c_pair"]
+type ModuleCall = Callable[[Single, Single, Pair], Single]
+type PatternFactory = Callable[
+    [tuple[int, ...], float],
+    Float[torch.Tensor, "..."],
+]
 
 
-@jaxtyped(typechecker=beartype)
-def scalar_sum(
-    x: Float[torch.Tensor, "B N C"],
-) -> Float[torch.Tensor, ""]:
-    """Sum all elements of x to a scalar for use as a backward root.
+@dataclasses.dataclass(frozen=True)
+class NodeDims:
+    """Sizes shared by every module and input in this file.
 
-    Used as a differentiable scalar loss so that torch.autograd.grad can
-    propagate gradients through any module being tested.
+    Attributes:
+        batch: Batch size ``B``.
+        n_res: Residues ``N_res`` on the dense path.
+        c_res: Single embedding width; divisible by ``n_heads``.
+        c_pair: Pair embedding width.
+        n_heads: Attention heads.
     """
-    return reduce(x, "b n c -> ", "sum")
+
+    batch: int
+    n_res: int
+    c_res: int
+    c_pair: int
+    n_heads: int
 
 
-# ---------------------------------------------------------------------------
-# Model fixtures
-# ---------------------------------------------------------------------------
+@dataclasses.dataclass(frozen=True)
+class NodeModules:
+    """The three modules under test, built from the same ``NodeDims``.
+
+    Attributes:
+        adaln: ``AdaLN(c_res, c_res)``.
+        attn: ``AttentionPairBias`` in eval mode.
+        node: ``NodeUpdate`` with dropout 0, in eval mode.
+    """
+
+    adaln: AdaLN
+    attn: AttentionPairBias
+    node: NodeUpdate
+
+
+@dataclasses.dataclass(frozen=True)
+class NodeInputs:
+    """Dense-path inputs; ``z`` is ``(B, N_res, N_res, c_pair)``.
+
+    Attributes:
+        s: Single embedding ``(B, N_res, c_res)``.
+        t: Time conditioning ``(B, N_res, c_res)``.
+        z: Pair embedding.
+    """
+
+    s: Single
+    t: Single
+    z: Pair
+
+
+@dataclasses.dataclass(frozen=True)
+class SparseInputs:
+    """Sparse-path inputs where each query sees ``K < N_res`` neighbours.
+
+    This is the layout that once crashed with ``attn (B, H, N, N) +
+    pair_bias (B, H, N, K)``; ``K != N`` keeps that mismatch in play.
+
+    Attributes:
+        a: Node embedding ``(B, N_res, c_res)``.
+        s: Conditioning ``(B, N_res, c_res)``.
+        z: Pair embedding over neighbours ``(B, N_res, K, c_pair)``.
+        neighbor_idx: Key index for each query slot ``(B, N_res, K)``.
+    """
+
+    a: Single
+    s: Single
+    z: Pair
+    neighbor_idx: Int[torch.Tensor, "B N_res K"]
+
+
+@dataclasses.dataclass(frozen=True)
+class MalformedCall:
+    """A module call whose first argument has lost its channel axis.
+
+    Attributes:
+        call: Invokes one module with the malformed argument.
+    """
+
+    call: Callable[[NodeModules, NodeInputs], object]
+
+
+class MalformedScenario(enum.Enum):
+    """Calls that break a ``forward`` shape contract.
+
+    Members:
+        adaln: ``AdaLN(a, s)`` with ``a`` as ``(B, N_res)``.
+        attention: ``AttentionPairBias(a, None, z)`` with ``a`` 2-D.
+        node_update: ``NodeUpdate(s, t, z)`` with ``s`` 2-D.
+    """
+
+    adaln = MalformedCall(lambda m, x: m.adaln(x.s[..., 0], x.t))
+    attention = MalformedCall(lambda m, x: m.attn(x.s[..., 0], None, x.z))
+    node_update = MalformedCall(lambda m, x: m.node(x.s[..., 0], x.t, x.z))
 
 
 @pytest.fixture
-def attn() -> AttentionPairBias:
-    """Provide an AttentionPairBias module in eval mode.
+def dims() -> NodeDims:
+    """Return the small sizes every dense-path test uses.
 
-    Constructed with the shared C_RES, C_PAIR, and N_HEADS constants used
-    across the small-N test suite.
+    Returns:
+        Sizes with ``c_res`` divisible by ``n_heads``.
     """
-    return AttentionPairBias(C_RES, C_PAIR, n_heads=N_HEADS).eval()
+    return NodeDims(batch=2, n_res=8, c_res=32, c_pair=32, n_heads=4)
 
 
 @pytest.fixture
-def node_update() -> NodeUpdate:
-    """Provide a NodeUpdate module (no dropout) in eval mode.
+def modules(dims: NodeDims) -> NodeModules:
+    """Build AdaLN, AttentionPairBias and NodeUpdate under a fixed seed.
 
-    Dropout is set to 0.0 so that determinism tests can compare two forward
-    passes without stochastic variation.
+    Args:
+        dims: Module sizes.
+
+    Returns:
+        The three modules, attention and node update in eval mode.
     """
-    return NodeUpdate(C_RES, C_PAIR, n_heads=N_HEADS, dropout=0.0).eval()
-
-
-# ---------------------------------------------------------------------------
-# Input tensor fixtures
-# ---------------------------------------------------------------------------
-
-
-@pytest.fixture
-def s() -> Float[torch.Tensor, "B N_res C_res"]:
-    """Provide a random single-embedding tensor (B, N_RES, C_RES).
-
-    Serves as the primary node feature input across all small-N tests.
-    """
-    return torch.randn(B, N_RES, C_RES)
-
-
-@pytest.fixture
-def t() -> Float[torch.Tensor, "B N_res C_res"]:
-    """Provide a random time-conditioning tensor (B, N_RES, C_RES).
-
-    Used by AdaLN inside AttentionPairBias to condition the layer norm on
-    the current diffusion timestep.
-    """
-    return torch.randn(B, N_RES, C_RES)
-
-
-@pytest.fixture
-def z() -> Float[torch.Tensor, "B N_res N_res C_pair"]:
-    """Provide a random pair-embedding tensor (B, N_RES, N_RES, C_PAIR).
-
-    Supplies the pairwise bias that AttentionPairBias projects into attention
-    logits via z_to_b.
-    """
-    return torch.randn(B, N_RES, N_RES, C_PAIR)
-
-
-# ---------------------------------------------------------------------------
-# AttentionPairBias
-# ---------------------------------------------------------------------------
-
-
-def test_attn_pair_bias_output_shape(
-    attn: AttentionPairBias,
-    s: Float[torch.Tensor, "B N_res C_res"],
-    t: Float[torch.Tensor, "B N_res C_res"],
-    z: Float[torch.Tensor, "B N_res N_res C_pair"],
-) -> None:
-    """AttentionPairBias output shape matches (B, N_RES, C_RES).
-
-    Verifies that the module preserves the spatial and channel dimensions of
-    the input single embedding without unexpected squeezing or broadcasting.
-    """
-    with torch.no_grad():
-        out = attn(s, t, z)
-    assert out.shape == (B, N_RES, C_RES)
-
-
-def test_attn_pair_bias_output_finite(
-    attn: AttentionPairBias,
-    s: Float[torch.Tensor, "B N_res C_res"],
-    t: Float[torch.Tensor, "B N_res C_res"],
-    z: Float[torch.Tensor, "B N_res N_res C_pair"],
-) -> None:
-    """AttentionPairBias output contains only finite values.
-
-    Verifies that the module does not produce NaN or Inf for standard
-    random inputs, catching numerical instabilities in the attention path.
-    """
-    with torch.no_grad():
-        out = attn(s, t, z)
-    assert torch.isfinite(out).all()
-
-
-def test_attn_pair_bias_output_dtype(
-    attn: AttentionPairBias,
-    s: Float[torch.Tensor, "B N_res C_res"],
-    t: Float[torch.Tensor, "B N_res C_res"],
-    z: Float[torch.Tensor, "B N_res N_res C_pair"],
-) -> None:
-    """AttentionPairBias output dtype matches the input single-embedding dtype.
-
-    Ensures the module does not silently upcast or downcast tensors, which
-    would break mixed-precision training assumptions.
-    """
-    with torch.no_grad():
-        out = attn(s, t, z)
-    assert out.dtype == s.dtype
-
-
-def test_attn_pair_bias_gradient_flows_to_s(
-    attn: AttentionPairBias,
-    s: Float[torch.Tensor, "B N_res C_res"],
-    t: Float[torch.Tensor, "B N_res C_res"],
-    z: Float[torch.Tensor, "B N_res N_res C_pair"],
-) -> None:
-    """Gradient propagates from AttentionPairBias output back to s.
-
-    Checks that the autograd graph is connected through the query projection
-    and AdaLN gate so that s receives finite, non-zero gradients.
-    """
-    s_g = s.clone().requires_grad_(True)  # noqa: FBT003
-    (grad,) = torch.autograd.grad(scalar_sum(attn(s_g, t, z)), s_g)
-    assert torch.isfinite(grad).all()
-
-
-def test_attn_pair_bias_time_conditioning_affects_output(
-    attn: AttentionPairBias,
-    s: Float[torch.Tensor, "B N_res C_res"],
-    z: Float[torch.Tensor, "B N_res N_res C_pair"],
-) -> None:
-    """Different time-conditioning inputs produce different AttentionPairBias.
-
-    Confirms that AdaLN conditioning on t is actually applied and not a no-op.
-    """
-    t1 = torch.randn(B, N_RES, C_RES)
-    t2 = torch.randn(B, N_RES, C_RES)
-    with torch.no_grad():
-        out1 = attn(s, t1, z)
-        out2 = attn(s, t2, z)
-    assert not torch.allclose(out1, out2)
-
-
-def test_attn_pair_bias_pair_bias_affects_output(
-    attn: AttentionPairBias,
-    s: Float[torch.Tensor, "B N_res C_res"],
-    t: Float[torch.Tensor, "B N_res C_res"],
-) -> None:
-    """Different pair-embedding inputs produce different attn-weighted out.
-
-    Confirms that z is actually read by z_to_b and affects the attention logits.
-    """
-    z1 = torch.randn(B, N_RES, N_RES, C_PAIR)
-    z2 = torch.randn(B, N_RES, N_RES, C_PAIR)
-    with torch.no_grad():
-        out1 = attn(s, t, z1)
-        out2 = attn(s, t, z2)
-    assert not torch.allclose(out1, out2)
-
-
-def test_attn_pair_bias_norm_a_has_no_learnable_params() -> None:
-    """norm_a must be non-learnable (elementwise_affine=False).
-
-    All callers that exist in the current model (NodeUpdate,
-    DiffusionTransformer) always supply a real conditioning tensor, so the
-    s=None fallback path through norm_a is never taken.  If norm_a had
-    learnable parameters they would never receive gradients, triggering a DDP
-    "unused parameter" crash at runtime.
-    """
-    module = AttentionPairBias(C_RES, C_PAIR, n_heads=N_HEADS)
-    assert not list(module.norm_a.parameters()), (
-        "norm_a must have no learnable parameters (elementwise_affine=False); "
-        "making it learnable causes DDP to crash because norm_a is never "
-        "called when s is always provided"
+    _ = manual_seed(0)
+    return NodeModules(
+        adaln=AdaLN(c_a=dims.c_res, c_s=dims.c_res),
+        attn=AttentionPairBias(dims.c_res, dims.c_pair, dims.n_heads).eval(),
+        node=NodeUpdate(
+            dims.c_res,
+            dims.c_pair,
+            n_heads=dims.n_heads,
+            dropout=0.0,
+        ).eval(),
     )
 
 
-def test_attn_pair_bias_all_params_receive_gradients(
-    s: Float[torch.Tensor, "B N_res C_res"],
-    t: Float[torch.Tensor, "B N_res C_res"],
-    z: Float[torch.Tensor, "B N_res N_res C_pair"],
-) -> None:
-    """Every learnable parameter in AttentionPairBias receives finite gradient.
+@pytest.fixture
+def dropout_node(dims: NodeDims) -> NodeUpdate:
+    """Build a NodeUpdate with dropout 0.5 under a fixed seed.
 
-    Regression test for the DDP unused-parameter bug: ensures no parameter
-    silently skips the forward pass when the module is called with real s.
+    Args:
+        dims: Module sizes.
+
+    Returns:
+        The module, in eval mode.
     """
-    module = AttentionPairBias(C_RES, C_PAIR, n_heads=N_HEADS)
-    torch.autograd.backward([scalar_sum(module(s, t, z))])
-    for name, param in module.named_parameters():
-        assert param.grad is not None, f"parameter {name!r} has no gradient"
-        assert torch.isfinite(
-            param.grad,
-        ).all(), f"parameter {name!r} has non-finite gradient"
+    _ = manual_seed(0)
+    return NodeUpdate(dims.c_res, dims.c_pair, dims.n_heads, 0.5).eval()
 
 
-def test_node_update_all_params_receive_gradients(
-    s: Float[torch.Tensor, "B N_res C_res"],
-    t: Float[torch.Tensor, "B N_res C_res"],
-    z: Float[torch.Tensor, "B N_res N_res C_pair"],
-) -> None:
-    """Every learnable parameter in NodeUpdate receives a finite gradient.
+@pytest.fixture
+def make_pattern() -> PatternFactory:
+    """Return a factory for deterministic sine-pattern tensors.
 
-    Regression test for the DDP unused-parameter bug.
+    ``make(shape, freq)`` fills ``shape`` with ``sin(freq * k)`` over the
+    flat element index ``k``. Distinct frequencies give inputs that are
+    unrelated to each other, with values in ``[-1, 1]``.
+
+    Returns:
+        The factory.
     """
-    node = NodeUpdate(C_RES, C_PAIR, n_heads=N_HEADS, dropout=0.0)
-    torch.autograd.backward([scalar_sum(node(s, t, z))])
-    for name, param in node.named_parameters():
-        assert param.grad is not None, f"parameter {name!r} has no gradient"
-        assert torch.isfinite(
-            param.grad,
-        ).all(), f"parameter {name!r} has non-finite gradient"
+
+    def make(shape: tuple[int, ...], freq: float) -> Float[torch.Tensor, "..."]:
+        """Build one sine-pattern tensor.
+
+        Args:
+            shape: Output shape.
+            freq: Angular step between consecutive elements.
+
+        Returns:
+            Float32 tensor of ``shape``.
+        """
+        names = [f"d{axis}" for axis in range(len(shape))]
+        axes = " ".join(names)
+        flat = torch.sin(freq * torch.arange(torch.Size(shape).numel()))
+        return rearrange(
+            flat.float(),
+            f"({axes}) -> {axes}",
+            **dict(zip(names, shape, strict=True)),
+        )
+
+    return make
 
 
-# ---------------------------------------------------------------------------
-# NodeUpdate
-# ---------------------------------------------------------------------------
+@pytest.fixture
+def inputs(
+    dims: NodeDims,
+    make_pattern: PatternFactory,
+) -> NodeInputs:
+    """Build dense-path inputs from three unrelated sine patterns.
 
+    Args:
+        dims: Input sizes.
+        make_pattern: Sine-pattern factory.
 
-def test_node_update_output_shape(
-    node_update: NodeUpdate,
-    s: Float[torch.Tensor, "B N_res C_res"],
-    t: Float[torch.Tensor, "B N_res C_res"],
-    z: Float[torch.Tensor, "B N_res N_res C_pair"],
-) -> None:
-    """NodeUpdate returns single embedding of the same [B, N_res, C_res] shape.
-
-    Verifies that the residual addition and internal projections do not alter
-    tensor's spatial or channel dimensions.
+    Returns:
+        ``s``, ``t`` and ``z`` for ``N_j = N_res``.
     """
-    with torch.no_grad():
-        out = node_update(s, t, z)
-    assert out.shape == (B, N_RES, C_RES)
-
-
-def test_node_update_output_finite(
-    node_update: NodeUpdate,
-    s: Float[torch.Tensor, "B N_res C_res"],
-    t: Float[torch.Tensor, "B N_res C_res"],
-    z: Float[torch.Tensor, "B N_res N_res C_pair"],
-) -> None:
-    """NodeUpdate produces no NaN or Inf values for random valid inputs.
-
-    Catches numerical instability in the SwiGLU feed-forward or the
-    attention path under random initialisation.
-    """
-    with torch.no_grad():
-        out = node_update(s, t, z)
-    assert torch.isfinite(out).all()
-
-
-def test_node_update_changes_input(
-    node_update: NodeUpdate,
-    s: Float[torch.Tensor, "B N_res C_res"],
-    t: Float[torch.Tensor, "B N_res C_res"],
-    z: Float[torch.Tensor, "B N_res N_res C_pair"],
-) -> None:
-    """NodeUpdate is not an identity, out differs from input single embedding.
-
-    Guards against degenerate weight initialisation that would leave every
-    residual update at zero, causing the module to be a pass-through.
-    """
-    with torch.no_grad():
-        out = node_update(s, t, z)
-    assert not torch.allclose(out, s)
-
-
-def test_node_update_gradient_flows_to_s(
-    node_update: NodeUpdate,
-    s: Float[torch.Tensor, "B N_res C_res"],
-    t: Float[torch.Tensor, "B N_res C_res"],
-    z: Float[torch.Tensor, "B N_res N_res C_pair"],
-) -> None:
-    """Gradients flow back through NodeUpdate to the input single embedding s.
-
-    Ensures the residual path and attention layers are differentiable with
-    respect to the node feature input.
-    """
-    s_g = s.clone().requires_grad_(True)  # noqa: FBT003
-    (grad,) = torch.autograd.grad(scalar_sum(node_update(s_g, t, z)), s_g)
-    assert torch.isfinite(grad).all()
-
-
-def test_node_update_gradient_flows_to_t(
-    node_update: NodeUpdate,
-    s: Float[torch.Tensor, "B N_res C_res"],
-    t: Float[torch.Tensor, "B N_res C_res"],
-    z: Float[torch.Tensor, "B N_res N_res C_pair"],
-) -> None:
-    """Gradients flow back through NodeUpdate to the time-conditioning input t.
-
-    Ensures the AdaLN scale/shift path is differentiable so that the noise
-    schedule can be learned from downstream losses.
-    """
-    t_g = t.clone().requires_grad_(True)  # noqa: FBT003
-    (grad,) = torch.autograd.grad(scalar_sum(node_update(s, t_g, z)), t_g)
-    assert torch.isfinite(grad).all()
-
-
-def test_node_update_gradient_flows_to_z(
-    node_update: NodeUpdate,
-    s: Float[torch.Tensor, "B N_res C_res"],
-    t: Float[torch.Tensor, "B N_res C_res"],
-    z: Float[torch.Tensor, "B N_res N_res C_pair"],
-) -> None:
-    """Gradients flow through NodeUpdate to pair embedding z.
-
-    Verifies that z_to_b is in the autograd graph so pair-embedding parameters
-    receive gradients during training.
-    """
-    z_g = z.clone().requires_grad_(True)  # noqa: FBT003
-    (grad,) = torch.autograd.grad(scalar_sum(node_update(s, t, z_g)), z_g)
-    assert torch.isfinite(grad).all()
-
-
-def test_node_update_eval_is_deterministic(
-    node_update: NodeUpdate,
-    s: Float[torch.Tensor, "B N_res C_res"],
-    t: Float[torch.Tensor, "B N_res C_res"],
-    z: Float[torch.Tensor, "B N_res N_res C_pair"],
-) -> None:
-    """In eval mode DropoutRowwise is identity, repeated calls return same out.
-
-    Checks that no stochastic operation (e.g. dropout) remains active in eval
-    mode, which would make outputs non-reproducible.
-    """
-    # DropoutRowwise is identity in eval mode, so repeated calls must match.
-    with torch.no_grad():
-        out1 = node_update(s, t, z)
-        out2 = node_update(s, t, z)
-    assert torch.equal(out1, out2)
-
-
-def test_node_update_train_dropout_preserves_shape_and_finite(
-    s: Float[torch.Tensor, "B N_res C_res"],
-    t: Float[torch.Tensor, "B N_res C_res"],
-    z: Float[torch.Tensor, "B N_res N_res C_pair"],
-) -> None:
-    """With dropout in train mode, produces finite tensor of correct shape.
-
-    Ensures that DropoutRowwise does not alter the output shape or introduce
-    NaN/Inf when active during training.
-    """
-    model = NodeUpdate(C_RES, C_PAIR, n_heads=N_HEADS, dropout=0.5).train()
-    with torch.no_grad():
-        out = model(s, t, z)
-    assert out.shape == (B, N_RES, C_RES)
-    assert torch.isfinite(out).all()
-
-
-def test_attn_pair_bias_all_masked_beta_no_nan(
-    attn: AttentionPairBias,
-    s: Float[torch.Tensor, "B N_res C_res"],
-    t: Float[torch.Tensor, "B N_res C_res"],
-    z: Float[torch.Tensor, "B N_res N_res C_pair"],
-) -> None:
-    """Output is finite when beta suppresses every key position with -1e10.
-
-    Guards against the softmax([-inf, ...]) = NaN failure that arises in
-    float16 mixed-precision when -1e10 overflows to -inf.
-    """
-    beta = torch.full((B, N_RES, N_RES), -1e10)
-    with torch.no_grad():
-        out = attn(s, t, z, beta=beta)
-    assert torch.isfinite(out).all()
-
-
-def test_attn_pair_bias_single_unmasked_neighbor_dominates(
-    attn: AttentionPairBias,
-    s: Float[torch.Tensor, "B N_res C_res"],
-    t: Float[torch.Tensor, "B N_res C_res"],
-    z: Float[torch.Tensor, "B N_res N_res C_pair"],
-) -> None:
-    """Masking all keys except one changes the output from the all-open case.
-
-    Confirms that the beta mask is functional and that forcing all attention
-    weight onto a single key position measurably alters the output.
-    """
-    beta_one_open = torch.full((B, N_RES, N_RES), -1e10)
-    beta_one_open[:, :, 0] = 0.0
-    beta_all_open = torch.zeros(B, N_RES, N_RES)
-    with torch.no_grad():
-        out_one = attn(s, t, z, beta=beta_one_open)
-        out_all = attn(s, t, z, beta=beta_all_open)
-    assert not torch.allclose(out_one, out_all)
-
-
-def test_attn_pair_bias_beta_constant_shift_invariant(
-    attn: AttentionPairBias,
-    s: Float[torch.Tensor, "B N_res C_res"],
-    t: Float[torch.Tensor, "B N_res C_res"],
-    z: Float[torch.Tensor, "B N_res N_res C_pair"],
-) -> None:
-    """Adding a uniform constant to all beta entries leaves output unchanged.
-
-    Softmax is shift-invariant: exp(x+c)/sum(exp(x+c)) = exp(x)/sum(exp(x)).
-    """
-    beta_base = torch.randn(B, N_RES, N_RES)
-    beta_shifted = beta_base + 5.0
-    with torch.no_grad():
-        out_base = attn(s, t, z, beta=beta_base)
-        out_shifted = attn(s, t, z, beta=beta_shifted)
-    assert torch.allclose(out_base, out_shifted, atol=1e-5)
-
-
-def test_attn_pair_bias_sparse_equals_dense(
-    attn: AttentionPairBias,
-    s: Float[torch.Tensor, "B N_res C_res"],
-    t: Float[torch.Tensor, "B N_res C_res"],
-    z: Float[torch.Tensor, "B N_res N_res C_pair"],
-) -> None:
-    """Sparse path with neighbor_idx=[0..N-1] per query matches dense path.
-
-    When every query attends to every key in order, the sparse indexing path
-    must produce numerically identical results to the dense (no-index) path.
-    """
-    # neighbor_idx[b, i, j] = j — each query sees all N_RES keys in order
-    neighbor_idx: Int[torch.Tensor, "B N_res N_res"] = repeat(
-        torch.arange(N_RES),
-        "k -> b n k",
-        b=B,
-        n=N_RES,
+    b, n = dims.batch, dims.n_res
+    return NodeInputs(
+        s=make_pattern((b, n, dims.c_res), 0.37),
+        t=make_pattern((b, n, dims.c_res), 0.53),
+        z=make_pattern((b, n, n, dims.c_pair), 0.71),
     )
-    with torch.no_grad():
-        out_dense = attn(s, t, z)
-        out_sparse = attn(s, t, z, neighbor_idx=neighbor_idx)
-    assert torch.allclose(out_dense, out_sparse, atol=1e-5)
 
 
-def test_attn_pair_bias_zero_pair_bias_weights_no_effect(
-    s: Float[torch.Tensor, "B N_res C_res"],
-    t: Float[torch.Tensor, "B N_res C_res"],
-) -> None:
-    """With z_to_b.weight zeroed, different pair embeddings z produce same out.
+@pytest.fixture
+def sparse_inputs(
+    dims: NodeDims,
+    make_pattern: PatternFactory,
+) -> SparseInputs:
+    """Build sparse-path inputs with 20 nodes and 6 neighbours each.
 
-    Confirms that the pair-bias contribution is fully mediated by z_to_b and
-    that zeroing its weights completely disables the pair channel.
+    Query ``i`` attends to keys ``i, i+1, ..., i+5`` modulo 20.
+
+    Args:
+        dims: Channel sizes and batch.
+        make_pattern: Sine-pattern factory.
+
+    Returns:
+        Inputs for ``AttentionPairBias`` with ``neighbor_idx``.
     """
-    module = AttentionPairBias(C_RES, C_PAIR, n_heads=N_HEADS).eval()
-    _ = torch.nn.init.zeros_(module.z_to_b.weight)
-    z1 = torch.randn(B, N_RES, N_RES, C_PAIR)
-    z2 = torch.randn(B, N_RES, N_RES, C_PAIR) * 10.0
-    with torch.no_grad():
-        out1 = module(s, t, z1)
-        out2 = module(s, t, z2)
-    assert torch.allclose(out1, out2, atol=1e-6)
-
-
-# ---------------------------------------------------------------------------
-# AttentionPairBias — sparse path (K < N_res regression tests)
-#
-# Production crash: attn (B, n_heads, N, N) + pair_bias (B, n_heads, N, K)
-# with N != K.  These tests use K_SPARSE < N_RES_LARGE to guarantee the
-# mismatch that caused the RuntimeError.
-# ---------------------------------------------------------------------------
+    b, n, k = dims.batch, 20, 6
+    window = (
+        rearrange(torch.arange(n), "n -> n 1")
+        + rearrange(torch.arange(k), "k -> 1 k")
+    ) % n
+    return SparseInputs(
+        a=make_pattern((b, n, dims.c_res), 0.37),
+        s=make_pattern((b, n, dims.c_res), 0.53),
+        z=make_pattern((b, n, k, dims.c_pair), 0.71),
+        neighbor_idx=repeat(window, "n k -> b n k", b=b),
+    )
 
 
 @pytest.fixture
-def attn_large() -> AttentionPairBias:
-    """AttentionPairBias sized for the large-N sparse tests.
+def module_call(
+    request: pytest.FixtureRequest,
+    modules: NodeModules,
+) -> ModuleCall:
+    """Return the ``(s, t, z)`` module named by the indirect param.
 
-    Uses the same channel dims as the small-N fixture but is shared only by
-    the sparse-regression test group.
+    Args:
+        request: Pytest request carrying ``"attn"`` or ``"node"``.
+        modules: Modules to pick from.
+
+    Returns:
+        The chosen module as a callable.
     """
-    return AttentionPairBias(C_RES, C_PAIR, n_heads=N_HEADS).eval()
+    return cast(ModuleCall, getattr(modules, cast(str, request.param)))
 
 
 @pytest.fixture
-def a_large() -> Float[torch.Tensor, "B N_res_large C_res"]:
-    """Node embeddings for large sparse scenario [B, N_RES_LARGE, C_RES]."""
-    return torch.randn(B, N_RES_LARGE, C_RES)
+def malformed_scenario(request: pytest.FixtureRequest) -> MalformedScenario:
+    """Return the ``MalformedScenario`` member routed in via indirect param.
+
+    Args:
+        request: Pytest request carrying the scenario in ``param``.
+
+    Returns:
+        The scenario under test.
+    """
+    return cast(MalformedScenario, request.param)
 
 
-@pytest.fixture
-def s_large() -> Float[torch.Tensor, "B N_res_large C_res"]:
-    """Conditioning embeddings for the large sparse scenario."""
-    return torch.randn(B, N_RES_LARGE, C_RES)
-
-
-@pytest.fixture
-def z_sparse() -> Float[torch.Tensor, "B N_res_large K_sparse C_pair"]:
-    """Sparse pair embeddings with K_SPARSE < N_RES_LARGE."""
-    return torch.randn(B, N_RES_LARGE, K_SPARSE, C_PAIR)
-
-
-@pytest.fixture
-def neighbor_idx_sparse() -> Int[torch.Tensor, "B N_res_large K_sparse"]:
-    """Neighbour index— each node's K_SPARSE nearest neighbours."""
-    idx = torch.zeros(N_RES_LARGE, K_SPARSE, dtype=torch.long)
-    for i in range(N_RES_LARGE):
-        neighbours = torch.arange(
-            max(0, i - K_SPARSE // 2),
-            max(K_SPARSE, i + K_SPARSE // 2 + 1),
-        )[:K_SPARSE]
-        idx[i] = neighbours.clamp(0, N_RES_LARGE - 1)
-    return repeat(idx, "n k -> b n k", b=B)
-
-
-@pytest.fixture
-def beta_sparse() -> Float[torch.Tensor, "B N_res_large K_sparse"]:
-    """Sparse attention bias aligned with z_sparse."""
-    return torch.zeros(B, N_RES_LARGE, K_SPARSE)
-
-
-def test_attn_pair_bias_sparse_output_shape(
-    attn_large: AttentionPairBias,
-    a_large: Float[torch.Tensor, "B N_res_large C_res"],
-    s_large: Float[torch.Tensor, "B N_res_large C_res"],
-    z_sparse: Float[torch.Tensor, "B N_res_large K_sparse C_pair"],
-    neighbor_idx_sparse: Int[torch.Tensor, "B N_res_large K_sparse"],
+@pytest.mark.parametrize(
+    "module_call",
+    ["attn", "node"],
+    ids=["attention_pair_bias", "node_update"],
+    indirect=True,
+)
+def test_dense_output_shape_dtype_and_finite(
+    dims: NodeDims,
+    inputs: NodeInputs,
+    module_call: ModuleCall,
 ) -> None:
-    """Sparse attention (K < N) returns correct shape without RuntimeError."""
-    with torch.no_grad():
-        out = attn_large(
-            a_large,
-            s_large,
-            z_sparse,
-            neighbor_idx=neighbor_idx_sparse,
-        )
-    assert out.shape == (B, N_RES_LARGE, C_RES)
+    """Each module returns a finite float32 ``(B, N_res, c_res)`` tensor.
 
-
-def test_attn_pair_bias_sparse_output_finite(
-    attn_large: AttentionPairBias,
-    a_large: Float[torch.Tensor, "B N_res_large C_res"],
-    s_large: Float[torch.Tensor, "B N_res_large C_res"],
-    z_sparse: Float[torch.Tensor, "B N_res_large K_sparse C_pair"],
-    neighbor_idx_sparse: Int[torch.Tensor, "B N_res_large K_sparse"],
-) -> None:
-    """Sparse attention output contains no NaN or Inf values."""
+    Args:
+        dims: Expected sizes.
+        inputs: Dense inputs.
+        module_call: Module under test.
+    """
     with torch.no_grad():
-        out = attn_large(
-            a_large,
-            s_large,
-            z_sparse,
-            neighbor_idx=neighbor_idx_sparse,
-        )
+        out = module_call(inputs.s, inputs.t, inputs.z)
+    assert out.shape == (dims.batch, dims.n_res, dims.c_res)
+    assert out.dtype == torch.float32
     assert torch.isfinite(out).all()
 
 
-def test_attn_pair_bias_sparse_with_beta(
-    attn_large: AttentionPairBias,
-    a_large: Float[torch.Tensor, "B N_res_large C_res"],
-    s_large: Float[torch.Tensor, "B N_res_large C_res"],
-    z_sparse: Float[torch.Tensor, "B N_res_large K_sparse C_pair"],
-    beta_sparse: Float[torch.Tensor, "B N_res_large K_sparse"],
-    neighbor_idx_sparse: Int[torch.Tensor, "B N_res_large K_sparse"],
+@pytest.mark.parametrize("with_beta", [False, True], ids=["no_beta", "beta"])
+def test_sparse_output_shape_and_finite(
+    dims: NodeDims,
+    modules: NodeModules,
+    sparse_inputs: SparseInputs,
+    with_beta: bool,  # noqa: FBT001
 ) -> None:
-    """Sparse attention works when both beta and neighbor_idx are provided."""
+    """Sparse attention with ``K < N_res`` returns finite ``(B, N, c_res)``.
+
+    Covers both the bare sparse path and the path that also adds a
+    ``beta`` bias aligned with the neighbour axis.
+
+    Args:
+        dims: Channel sizes.
+        modules: Holds the attention module.
+        sparse_inputs: Inputs with 6 of 20 neighbours per query.
+        with_beta: Whether to pass a zero ``beta`` of shape ``(B, N, K)``.
+    """
+    x = sparse_inputs
+    beta = torch.zeros(x.neighbor_idx.shape) if with_beta else None
     with torch.no_grad():
-        out = attn_large(
-            a_large,
-            s_large,
-            z_sparse,
-            beta=beta_sparse,
-            neighbor_idx=neighbor_idx_sparse,
-        )
-    assert out.shape == (B, N_RES_LARGE, C_RES)
+        out = modules.attn(x.a, x.s, x.z, beta, x.neighbor_idx)
+    assert out.shape == (dims.batch, x.a.shape[1], dims.c_res)
     assert torch.isfinite(out).all()
 
 
-def test_attn_pair_bias_sparse_gradient_flows(
-    attn_large: AttentionPairBias,
-    a_large: Float[torch.Tensor, "B N_res_large C_res"],
-    s_large: Float[torch.Tensor, "B N_res_large C_res"],
-    z_sparse: Float[torch.Tensor, "B N_res_large K_sparse C_pair"],
-    neighbor_idx_sparse: Int[torch.Tensor, "B N_res_large K_sparse"],
+@pytest.mark.parametrize("field", ["t", "z"], ids=["time", "pair"])
+def test_attention_output_depends_on_conditioning(
+    modules: NodeModules,
+    inputs: NodeInputs,
+    field: str,
 ) -> None:
-    """Gradients flow through sparse attention back to node embedding input."""
-    a_g = a_large.clone().requires_grad_(True)  # noqa: FBT003
-    out = attn_large(a_g, s_large, z_sparse, neighbor_idx=neighbor_idx_sparse)
-    (grad,) = torch.autograd.grad(reduce(out, "b n c -> ", "sum"), a_g)
+    """Negating ``t`` or ``z``, all else fixed, changes the attention output.
+
+    ``s`` is left out: ``test_node_update_is_not_identity`` and the gradient
+    tests already show the output depends on it.
+
+    Args:
+        modules: Holds the attention module.
+        inputs: Dense inputs.
+        field: Input to negate.
+    """
+    old = cast(Float[torch.Tensor, "..."], getattr(inputs, field))
+    edited = dataclasses.replace(inputs, **{field: -old})
+    with torch.no_grad():
+        base = modules.attn(inputs.s, inputs.t, inputs.z)
+        changed = modules.attn(edited.s, edited.t, edited.z)
+    assert not torch.allclose(base, changed)
+
+
+def test_node_update_is_not_identity(
+    modules: NodeModules,
+    inputs: NodeInputs,
+) -> None:
+    """NodeUpdate's residual update is nonzero at initialisation.
+
+    Not parametrized: a degenerate initialisation would zero the update for
+    every input, so one input exposes it.
+
+    Args:
+        modules: Holds the node update.
+        inputs: Dense inputs.
+    """
+    with torch.no_grad():
+        out = modules.node(inputs.s, inputs.t, inputs.z)
+    assert not torch.allclose(out, inputs.s)
+
+
+@pytest.mark.parametrize("field", ["s", "t", "z"])
+def test_node_update_gradient_reaches_input(
+    modules: NodeModules,
+    inputs: NodeInputs,
+    field: str,
+) -> None:
+    """The summed NodeUpdate output has a finite, nonzero gradient per input.
+
+    Args:
+        modules: Holds the node update.
+        inputs: Dense inputs.
+        field: Input to differentiate with respect to.
+    """
+    leaf = cast(torch.Tensor, getattr(inputs, field)).clone().requires_grad_()
+    x = dataclasses.replace(inputs, **{field: leaf})
+    out = reduce(modules.node(x.s, x.t, x.z), "b n c -> ", "sum")
+    (grad,) = torch.autograd.grad(out, leaf)
     assert torch.isfinite(grad).all()
+    assert torch.count_nonzero(grad) > 0
 
 
-# ---------------------------------------------------------------------------
-# Shape-contract enforcement — negative tests
-# ---------------------------------------------------------------------------
-
-
-def test_adaln_forward_wrong_shape() -> None:
-    """Wrong a ndim (2-D instead of 3-D) triggers TypeCheckError."""
-    adaln = AdaLN(c_a=C_RES, c_s=C_RES).eval()
-    a_bad = torch.zeros(B, N_RES)  # missing c_a dim
-    s_good = torch.zeros(B, N_RES, C_RES)
-    with pytest.raises(TypeCheckError):
-        _ = adaln(a_bad, s_good)
-
-
-def test_attention_pair_bias_forward_wrong_shape(
-    attn: AttentionPairBias,
-    z: Float[torch.Tensor, "B N_res N_res C_pair"],
+def test_sparse_gradient_reaches_node_embedding(
+    modules: NodeModules,
+    sparse_inputs: SparseInputs,
 ) -> None:
-    """Wrong a ndim (2-D instead of 3-D) triggers TypeCheckError."""
-    a_bad = torch.zeros(B, N_RES)  # missing c_res dim
-    with pytest.raises(TypeCheckError):
-        _ = attn(a_bad, None, z)
+    """Gradients flow through the sparse gather back to ``a``.
 
+    Not parametrized: the gather on ``neighbor_idx`` is the only part of
+    the sparse path that differs from the dense one the input-gradient
+    test already covers.
 
-def test_node_update_forward_wrong_shape(
-    node_update: NodeUpdate,
-    t: Float[torch.Tensor, "B N_res C_res"],
-    z: Float[torch.Tensor, "B N_res N_res C_pair"],
-) -> None:
-    """Wrong s ndim (2-D instead of 3-D) triggers TypeCheckError."""
-    s_bad = torch.zeros(B, N_RES)  # missing c_res dim
-    with pytest.raises(TypeCheckError):
-        _ = node_update(s_bad, t, z)
-
-
-# ---------------------------------------------------------------------------
-# AttentionPairBias — stability (residual gain, recycling, gradient scaling)
-# ---------------------------------------------------------------------------
-
-
-def test_attn_pair_bias_residual_gain_contractive(
-    s: Float[torch.Tensor, "B N_res C_res"],
-    t: Float[torch.Tensor, "B N_res C_res"],
-    z: Float[torch.Tensor, "B N_res N_res C_pair"],
-) -> None:
-    """Attention delta is contractive at random init: ||delta|| / ||s|| < 1.0.
-
-    AttentionPairBias.forward returns the additive update that NodeUpdate
-    applies as s = s + attn(s, t, z). A gain >= 1.0 at init predicts
-    compounding norm explosions across 8 decoder recycling blocks in late
-    training.
+    Args:
+        modules: Holds the attention module.
+        sparse_inputs: Inputs with 6 of 20 neighbours per query.
     """
-    module = AttentionPairBias(C_RES, C_PAIR, n_heads=N_HEADS).eval()
+    x = sparse_inputs
+    a = x.a.clone().requires_grad_()
+    out = modules.attn(a, x.s, x.z, neighbor_idx=x.neighbor_idx)
+    (grad,) = torch.autograd.grad(reduce(out, "b n c -> ", "sum"), a)
+    assert torch.isfinite(grad).all()
+    assert torch.count_nonzero(grad) > 0
+
+
+@pytest.mark.parametrize(
+    "module_call",
+    ["attn", "node"],
+    ids=["attention_pair_bias", "node_update"],
+    indirect=True,
+)
+def test_every_parameter_receives_a_finite_gradient(
+    inputs: NodeInputs,
+    module_call: ModuleCall,
+) -> None:
+    """No parameter is skipped by the forward pass when ``s`` is provided.
+
+    Regression test for the DDP unused-parameter crash: DDP fails when any
+    parameter gets no gradient.
+
+    Args:
+        inputs: Dense inputs.
+        module_call: Module under test.
+    """
+    module = cast(torch.nn.Module, module_call)
+    out = reduce(module_call(inputs.s, inputs.t, inputs.z), "... -> ", "sum")
+    torch.autograd.backward([out])
+    missing = [
+        name
+        for name, param in module.named_parameters()
+        if param.grad is None or not torch.isfinite(param.grad).all()
+    ]
+    assert not missing
+
+
+def test_attention_norm_a_has_no_learnable_parameters(
+    modules: NodeModules,
+) -> None:
+    """``norm_a`` is non-affine, so it holds no parameters for DDP to miss.
+
+    Every caller passes a real ``s``, so the ``s=None`` path through
+    ``norm_a`` never runs in training. Learnable parameters there would
+    never receive gradients, and DDP would crash on them. Not parametrized:
+    this is a fixed structural property of the module.
+
+    Args:
+        modules: Holds the attention module.
+    """
+    assert not list(modules.attn.norm_a.parameters())
+
+
+def test_node_update_dropout_is_active_only_in_train(
+    dropout_node: NodeUpdate,
+    inputs: NodeInputs,
+) -> None:
+    """With dropout 0.5, eval output is repeatable and train output differs.
+
+    Eval mode must turn ``DropoutRowwise`` into the identity; train mode
+    must actually drop rows, while keeping the output finite.
+
+    Args:
+        dropout_node: NodeUpdate with dropout 0.5, in eval mode.
+        inputs: Dense inputs.
+    """
+    x = inputs
     with torch.no_grad():
-        delta = module(s, t, z)
-    delta_norm = float(torch.sqrt(reduce(delta**2, "... -> ", "sum")))
-    s_norm = float(torch.sqrt(reduce(s**2, "... -> ", "sum")))
-    gain = delta_norm / s_norm
-    assert gain < 1.0
+        first = dropout_node(x.s, x.t, x.z)
+        second = dropout_node(x.s, x.t, x.z)
+        trained = dropout_node.train()(x.s, x.t, x.z)
+    assert torch.equal(first, second)
+    assert torch.isfinite(trained).all()
+    assert not torch.allclose(first, trained)
 
 
-def test_attn_pair_bias_repeated_application_bounded(
-    s: Float[torch.Tensor, "B N_res C_res"],
-    t: Float[torch.Tensor, "B N_res C_res"],
-    z: Float[torch.Tensor, "B N_res N_res C_pair"],
+def test_attention_beta_fully_masked_stays_finite(
+    modules: NodeModules,
+    inputs: NodeInputs,
 ) -> None:
-    """RMS stays bounded after 20 rounds of s = s + attn(s, t, z) with fixed z.
+    """A ``beta`` of -1e10 on every key does not produce NaN.
 
-    Simulates the decoder recycling loop. An intrinsically expansive operator
-    shows exponential RMS growth even without training; a contractive one stays
-    near the initial scale. Threshold 5.0 allows healthy growth while catching
-    explosions.
+    Guards against ``softmax([-inf, ...]) = NaN`` when -1e10 overflows to
+    -inf under float16 autocast. Not parametrized: masking every key is the
+    extreme case; any partial mask is less severe.
+
+    Args:
+        modules: Holds the attention module.
+        inputs: Dense inputs.
     """
-    module = AttentionPairBias(C_RES, C_PAIR, n_heads=N_HEADS).eval()
-    s_cycle = s.clone()
-    rms_initial = float(torch.sqrt(reduce(s_cycle**2, "... -> ", "mean")))
+    beta = torch.full(inputs.z.shape[:-1], -1e10)
     with torch.no_grad():
-        for _ in range(20):
-            s_cycle = s_cycle + module(s_cycle, t, z)
-    rms_final = float(torch.sqrt(reduce(s_cycle**2, "... -> ", "mean")))
-    assert rms_final / rms_initial < RMS_GAIN
+        out = modules.attn(inputs.s, inputs.t, inputs.z, beta=beta)
+    assert torch.isfinite(out).all()
 
 
-def test_attn_pair_bias_param_grads_finite_after_recycling(
-    s: Float[torch.Tensor, "B N_res C_res"],
-    t: Float[torch.Tensor, "B N_res C_res"],
-    z: Float[torch.Tensor, "B N_res N_res C_pair"],
+def test_attention_beta_single_open_key_changes_output(
+    modules: NodeModules,
+    inputs: NodeInputs,
 ) -> None:
-    """All parameter gradients remain finite after 20 recycling steps.
+    """Masking every key but key 0 changes the output from an open ``beta``.
 
-    An expansive operator causes gradient norms to grow with recycling depth
-    via backpropagation-through-time. Finite gradients after the full 20-step
-    unrolled loop is a necessary condition for stable training in an 8-block
-    decoder.
+    Not parametrized: which key is left open does not matter, only that
+    ``beta`` reaches the softmax.
+
+    Args:
+        modules: Holds the attention module.
+        inputs: Dense inputs.
     """
-    module = AttentionPairBias(C_RES, C_PAIR, n_heads=N_HEADS)
-    s_cycle = s.clone()
+    open_beta = torch.zeros(inputs.z.shape[:-1])
+    one_key = torch.full_like(open_beta, -1e10)
+    one_key[..., 0] = 0.0
+    with torch.no_grad():
+        out_open = modules.attn(inputs.s, inputs.t, inputs.z, beta=open_beta)
+        out_one = modules.attn(inputs.s, inputs.t, inputs.z, beta=one_key)
+    assert not torch.allclose(out_open, out_one)
+
+
+@pytest.mark.parametrize("shift", [-3.0, 5.0], ids=["negative", "positive"])
+def test_attention_beta_constant_shift_is_invariant(
+    modules: NodeModules,
+    inputs: NodeInputs,
+    make_pattern: PatternFactory,
+    shift: float,
+) -> None:
+    """Adding a constant to every ``beta`` entry leaves the output unchanged.
+
+    Softmax is shift-invariant: ``exp(x+c)/sum(exp(x+c)) = exp(x)/sum(exp(x))``.
+
+    Args:
+        modules: Holds the attention module.
+        inputs: Dense inputs.
+        make_pattern: Builds a non-uniform base ``beta``.
+        shift: Constant added to ``beta``.
+    """
+    beta = make_pattern(inputs.z.shape[:-1], 0.29)
+    x = inputs
+    with torch.no_grad():
+        base = modules.attn(x.s, x.t, x.z, beta=beta)
+        shifted = modules.attn(x.s, x.t, x.z, beta=beta + shift)
+    torch.testing.assert_close(base, shifted, atol=1e-5, rtol=0)
+
+
+def test_attention_sparse_with_all_keys_matches_dense(
+    modules: NodeModules,
+    inputs: NodeInputs,
+) -> None:
+    """``neighbor_idx`` listing every key in order equals the dense path.
+
+    Not parametrized: the identity neighbour list is the one layout for
+    which the sparse and dense paths must agree exactly.
+
+    Args:
+        modules: Holds the attention module.
+        inputs: Dense inputs.
+    """
+    b, n = inputs.s.shape[:2]
+    every_key = repeat(torch.arange(n), "k -> b n k", b=b, n=n)
+    x = inputs
+    with torch.no_grad():
+        dense = modules.attn(x.s, x.t, x.z)
+        sparse = modules.attn(x.s, x.t, x.z, neighbor_idx=every_key)
+    torch.testing.assert_close(dense, sparse, atol=1e-5, rtol=0)
+
+
+def test_attention_zero_pair_projection_ignores_z(
+    modules: NodeModules,
+    inputs: NodeInputs,
+) -> None:
+    """With ``z_to_b`` zeroed, scaling ``z`` tenfold leaves the output alone.
+
+    Shows the pair channel reaches the output only through ``z_to_b``. Not
+    parametrized: zero weights make every ``z`` equivalent, so one change
+    to ``z`` suffices.
+
+    Args:
+        modules: Holds the attention module; its weights are zeroed here.
+        inputs: Dense inputs.
+    """
+    _ = torch.nn.init.zeros_(modules.attn.z_to_b.weight)
+    x = inputs
+    with torch.no_grad():
+        base = modules.attn(x.s, x.t, x.z)
+        scaled = modules.attn(x.s, x.t, x.z * 10.0)
+    torch.testing.assert_close(base, scaled, atol=1e-6, rtol=0)
+
+
+def test_attention_residual_update_is_contractive(
+    modules: NodeModules,
+    inputs: NodeInputs,
+) -> None:
+    """At init the attention update is smaller in norm than ``s`` itself.
+
+    NodeUpdate applies ``s = s + attn(s, t, z)``; a gain of 1 or more at
+    init predicts norm blow-up across the decoder's recycling blocks. Not
+    parametrized: the gain is a property of the initialisation.
+
+    Args:
+        modules: Holds the attention module.
+        inputs: Dense inputs.
+    """
+    with torch.no_grad():
+        delta = modules.attn(inputs.s, inputs.t, inputs.z)
+    delta_norm = torch.sqrt(reduce(delta**2, "... -> ", "sum"))
+    s_norm = torch.sqrt(reduce(inputs.s**2, "... -> ", "sum"))
+    assert delta_norm < s_norm
+
+
+def test_attention_recycling_stays_bounded_with_finite_gradients(
+    modules: NodeModules,
+    inputs: NodeInputs,
+) -> None:
+    """Twenty rounds of ``s = s + attn(s, t, z)`` stay bounded and trainable.
+
+    Simulates the decoder recycling loop. RMS may grow, but by less than 5x;
+    an expansive operator grows exponentially. Backpropagating through all
+    twenty rounds must leave every parameter gradient finite. Not
+    parametrized: twenty rounds is well past the decoder's eight blocks.
+
+    Args:
+        modules: Holds the attention module.
+        inputs: Dense inputs.
+    """
+    s = inputs.s
     for _ in range(20):
-        s_cycle = s_cycle + module(s_cycle, t, z)
-    loss = reduce(s_cycle**2, "... -> ", "mean")
-    torch.autograd.backward([loss])
-    for name, param in module.named_parameters():
-        assert (
-            param.grad is not None
-        ), f"param {name!r} has no gradient after recycling"
-        assert torch.isfinite(
-            param.grad,
-        ).all(), (
-            f"param {name!r} has non-finite gradient after 20 recycling steps"
-        )
+        s = s + modules.attn(s, inputs.t, inputs.z)
+    rms_before = torch.sqrt(reduce(inputs.s**2, "... -> ", "mean"))
+    rms_after = torch.sqrt(reduce(s**2, "... -> ", "mean"))
+    torch.autograd.backward([reduce(s**2, "... -> ", "mean")])
+    assert rms_after < 5 * rms_before
+    assert all(
+        p.grad is not None and torch.isfinite(p.grad).all()
+        for p in modules.attn.parameters()
+    )
+
+
+def test_attention_rejects_heads_that_do_not_divide_width(
+    dims: NodeDims,
+) -> None:
+    """``c_res`` not divisible by ``n_heads`` raises at construction.
+
+    Not parametrized: the check is a single modulus, so one indivisible
+    pair covers it.
+
+    Args:
+        dims: Supplies a valid ``c_pair`` and ``n_heads``.
+    """
+    with pytest.raises(InvalidSingleHeadDimensionError, match="divisible"):
+        _ = AttentionPairBias(dims.n_heads + 1, dims.c_pair, dims.n_heads)
+
+
+@pytest.mark.parametrize(
+    "malformed_scenario",
+    list(MalformedScenario),
+    ids=[case.name for case in MalformedScenario],
+    indirect=True,
+)
+def test_forward_rejects_input_missing_channel_axis(
+    malformed_scenario: MalformedScenario,
+    modules: NodeModules,
+    inputs: NodeInputs,
+) -> None:
+    """Each module's jaxtyping contract rejects a 2-D first argument.
+
+    Args:
+        malformed_scenario: Call with a malformed argument.
+        modules: Modules to call.
+        inputs: Dense inputs the malformed argument is cut from.
+    """
+    with pytest.raises(TypeCheckError):
+        _ = malformed_scenario.value.call(modules, inputs)
