@@ -2419,6 +2419,37 @@ def train_one_rank(
 
 
 @dataclasses.dataclass(frozen=True)
+class RankResidues:
+    """Residue count of each one-protein batch on each rank of a 2-rank run.
+
+    Each rank gets its own named field, so a case such as
+    ``RankResidues((8, 8), (16, 16))`` reads as "rank 0 holds two 8-residue
+    batches and rank 1 holds two 16-residue batches". Each field lists that
+    rank's batches in the order its DataLoader yields them, which is the
+    order the flush rule accumulates tokens in. Every rank holds the same
+    number of batches, as ``DistributedSampler`` guarantees in real
+    training.
+
+    Attributes:
+        rank_0: Residue count of each batch rank 0 trains on, in order.
+        rank_1: Residue count of each batch rank 1 trains on, in order.
+    """
+
+    rank_0: tuple[int, ...]
+    rank_1: tuple[int, ...]
+
+    @property
+    def by_rank(self) -> tuple[tuple[int, ...], tuple[int, ...]]:
+        """Each rank's batch lengths, indexed by rank number.
+
+        Returns:
+            ``(rank_0, rank_1)``, so ``by_rank[r]`` is rank ``r``'s batch
+            lengths and ``len(by_rank)`` is the world size.
+        """
+        return (self.rank_0, self.rank_1)
+
+
+@dataclasses.dataclass(frozen=True)
 class LockstepCase:
     """Inputs and expected outcome of one DDP lockstep scenario.
 
@@ -2429,17 +2460,14 @@ class LockstepCase:
     8-residue batches does not (8 + 8 <= 24).
 
     Attributes:
-        residues_by_rank: Residue count of each one-protein batch, indexed
-            by rank. The number of ranks and of batches per rank are both
-            visible here. Every rank holds the same number of batches, as
-            ``DistributedSampler`` guarantees in real training.
+        residues: Residue count of each one-protein batch on each rank.
         budget_per_rank: Tokens one rank may accumulate before it wants to
             flush.
         expected_steps: Optimizer steps every rank must take in the epoch,
             including the epoch-end flush of the buffered micro-batches.
     """
 
-    residues_by_rank: tuple[tuple[int, ...], ...]
+    residues: RankResidues
     budget_per_rank: int
     expected_steps: int
 
@@ -2457,10 +2485,10 @@ class LockstepScenario(Enum):
         both_over_budget: Both ranks want to flush at the same batch.
     """
 
-    rank_1_over_budget = LockstepCase(((8, 8), (16, 16)), 24, 2)
-    rank_0_over_budget = LockstepCase(((16, 16), (8, 8)), 24, 2)
-    neither_over_budget = LockstepCase(((8, 8), (8, 8)), 24, 1)
-    both_over_budget = LockstepCase(((16, 16), (16, 16)), 24, 2)
+    rank_1_over_budget = LockstepCase(RankResidues((8, 8), (16, 16)), 24, 2)
+    rank_0_over_budget = LockstepCase(RankResidues((16, 16), (8, 8)), 24, 2)
+    neither_over_budget = LockstepCase(RankResidues((8, 8), (8, 8)), 24, 1)
+    both_over_budget = LockstepCase(RankResidues((16, 16), (16, 16)), 24, 2)
 
 
 @pytest.fixture
@@ -2490,7 +2518,7 @@ def lockstep_setup(
 
     Args:
         lockstep_scenario: Scenario naming the per-rank budget and, through
-            the length of ``residues_by_rank``, the number of ranks.
+            the length of ``residues.by_rank``, the number of ranks.
         model_params: Fixture providing the small model, optimizer,
             scheduler, EMA and base TrainConfig.
 
@@ -2499,7 +2527,7 @@ def lockstep_setup(
         TrainConfig, whose token budget is replaced.
     """
     base = model_params.tcfg
-    world_size = len(lockstep_scenario.value.residues_by_rank)
+    world_size = len(lockstep_scenario.value.residues.by_rank)
     return dataclasses.replace(
         model_params,
         tcfg=base.model_copy(
@@ -2525,7 +2553,7 @@ def lockstep_run(
 
     Factory fixture: rank ``r`` trains on one one-protein batch of
     ``straight_chain_protein(n_res)`` for each ``n_res`` in
-    ``lockstep_scenario.value.residues_by_rank[r]``.
+    ``lockstep_scenario.value.residues.by_rank[r]``.
 
     Args:
         lockstep_scenario: Scenario naming each rank's batch lengths.
@@ -2550,7 +2578,7 @@ def lockstep_run(
                 )
                 for n_res in rank_residues
             )
-            for rank_residues in lockstep_scenario.value.residues_by_rank
+            for rank_residues in lockstep_scenario.value.residues.by_rank
         ),
         store_path=tmp_path / "gloo_store",
     )
