@@ -87,7 +87,6 @@ class TemplateContext:
 
 
 @jaxtyped(typechecker=beartype)
-@jaxtyped(typechecker=beartype)
 def backbone_cb_positions(
     atom37_positions: Float[torch.Tensor, "B N_res 37 3"],
     atom37_mask: Float[torch.Tensor, "B N_res 37"],
@@ -152,6 +151,7 @@ def sampled_structure_to_pdb(
     return to_pdb(prot)
 
 
+@jaxtyped(typechecker=beartype)
 def build_aa_context(
     prot: Protein,
     atom_distogram_fn: Distogram,
