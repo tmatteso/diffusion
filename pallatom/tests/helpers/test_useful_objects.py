@@ -1,7 +1,8 @@
 """Tests for TensorAccumulatorMixin and the metric dataclasses built on it.
 
 Covers the mixin's field-wise arithmetic, ``weighted_avg``, ``zero_init`` and
-``to_float_dict`` with exact values; the scalar shape contract that
+``to_float_dict`` with exact values on ThroughputStatistics, whose four
+fields hold distinct values; the scalar shape contract that
 ``@jaxtyped`` enforces on LossMetrics, ThroughputStatistics and
 ComponentNorms; and ``all_reduce_mean`` with no process group, a one-rank
 group, and three real processes.
@@ -11,6 +12,7 @@ compared with ``==`` rather than a tolerance.
 """
 
 import dataclasses
+import enum
 import multiprocessing as mp
 import os
 import socket
@@ -26,24 +28,35 @@ from helpers.useful_objects import (
     TensorAccumulatorMixin,
     ThroughputStatistics,
 )
-from jaxtyping import Float, TypeCheckError
+from jaxtyping import TypeCheckError
 
 
-@dataclasses.dataclass
-class PairMetrics(TensorAccumulatorMixin):
-    """Two-field accumulator so mixin arithmetic can be checked by hand.
-
-    The mixin's behaviour does not depend on which fields a subclass
-    declares, so two fields holding distinct values are enough to catch a
-    field mix-up.
+@dataclasses.dataclass(frozen=True)
+class ScalarCase:
+    """A mixin operator with a scalar operand and the values it must give.
 
     Attributes:
-        first: First scalar field.
-        second: Second scalar field.
+        operation: Unbound operator, called as ``operation(left, scalar)``
+            with ``left = (1, 2, 3, 4)``.
+        scalar: Scalar operand.
+        expected: Field values of the result, in field order.
     """
 
-    first: Float[torch.Tensor, ""]
-    second: Float[torch.Tensor, ""]
+    operation: Callable[[ThroughputStatistics, float], ThroughputStatistics]
+    scalar: float
+    expected: tuple[float, ...]
+
+
+class ScalarScenario(enum.Enum):
+    """Scalar operators of TensorAccumulatorMixin.
+
+    Members:
+        divide: ``left /= 2`` halves every field in place.
+        multiply: ``left * 3`` scales every field into a new instance.
+    """
+
+    divide = ScalarCase(ThroughputStatistics.__itruediv__, 2, (0.5, 1, 1.5, 2))
+    multiply = ScalarCase(ThroughputStatistics.__mul__, 3, (3, 6, 9, 12))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -184,23 +197,78 @@ def process_group_active(request: pytest.FixtureRequest) -> bool:
 
 
 @pytest.fixture
-def pair_left() -> PairMetrics:
-    """Return the left operand ``(first=1, second=2)``.
+def make_throughput() -> (
+    Callable[[float, float, float, float], ThroughputStatistics]
+):
+    """Return a factory for ThroughputStatistics from four field values.
+
+    ``make(a, b, c, d)`` sets ``avg_batch_size``, ``token_pack_rate``,
+    ``residues_per_sec`` and ``atoms_per_sec`` in that order, the class's
+    field order.
 
     Returns:
-        Fresh PairMetrics; operations may mutate it in place.
+        The factory.
     """
-    return PairMetrics(first=torch.tensor(1.0), second=torch.tensor(2.0))
+
+    def make(a: float, b: float, c: float, d: float) -> ThroughputStatistics:
+        """Build the metrics; each value becomes a 0-D float32 tensor.
+
+        Args:
+            a: ``avg_batch_size``.
+            b: ``token_pack_rate``.
+            c: ``residues_per_sec``.
+            d: ``atoms_per_sec``.
+
+        Returns:
+            The metrics, shape-checked by the class's ``@jaxtyped``.
+        """
+        return ThroughputStatistics(
+            avg_batch_size=torch.tensor(a),
+            token_pack_rate=torch.tensor(b),
+            residues_per_sec=torch.tensor(c),
+            atoms_per_sec=torch.tensor(d),
+        )
+
+    return make
 
 
 @pytest.fixture
-def pair_right() -> PairMetrics:
-    """Return the right operand ``(first=10, second=20)``.
+def left(
+    make_throughput: Callable[
+        [float, float, float, float],
+        ThroughputStatistics,
+    ],
+) -> ThroughputStatistics:
+    """Return the left operand ``(1, 2, 3, 4)``.
+
+    Distinct values per field catch an operation applied to the wrong
+    field.
+
+    Args:
+        make_throughput: Metrics factory.
 
     Returns:
-        Fresh PairMetrics.
+        Fresh metrics; operations may mutate them in place.
     """
-    return PairMetrics(first=torch.tensor(10.0), second=torch.tensor(20.0))
+    return make_throughput(1.0, 2.0, 3.0, 4.0)
+
+
+@pytest.fixture
+def right(
+    make_throughput: Callable[
+        [float, float, float, float],
+        ThroughputStatistics,
+    ],
+) -> ThroughputStatistics:
+    """Return the right operand ``(10, 20, 30, 40)``.
+
+    Args:
+        make_throughput: Metrics factory.
+
+    Returns:
+        Fresh metrics.
+    """
+    return make_throughput(10.0, 20.0, 30.0, 40.0)
 
 
 @pytest.fixture
@@ -253,96 +321,86 @@ def all_reduce_run(free_port: int) -> AllReduceRun:
 
 
 def test_in_place_add_sums_field_wise(
-    pair_left: PairMetrics,
-    pair_right: PairMetrics,
+    left: ThroughputStatistics,
+    right: ThroughputStatistics,
 ) -> None:
     """``left += right`` adds each field of ``right`` to the same field.
 
-    Not parametrized: the two operands already hold distinct values in each
-    field, so a field mix-up or a non-additive result would both show.
+    Not parametrized: every field holds a distinct value, so a field
+    mix-up or a non-additive result would both show.
 
     Args:
-        pair_left: Left operand ``(1, 2)``, updated in place.
-        pair_right: Right operand ``(10, 20)``.
+        left: Left operand ``(1, 2, 3, 4)``, updated in place.
+        right: Right operand ``(10, 20, 30, 40)``.
     """
-    pair_left += pair_right
-    assert tuple(pair_left.to_float_dict().values()) == (11.0, 22.0)
+    left += right
+    assert tuple(left.to_float_dict().values()) == (11.0, 22.0, 33.0, 44.0)
 
 
 @pytest.mark.parametrize(
-    ("operation", "scalar", "expected"),
-    [
-        pytest.param(PairMetrics.__itruediv__, 2.0, (0.5, 1.0), id="divide"),
-        pytest.param(PairMetrics.__mul__, 3.0, (3.0, 6.0), id="multiply"),
-    ],
+    "scalar_scenario",
+    list(ScalarScenario),
+    ids=[case.name for case in ScalarScenario],
 )
 def test_scalar_operations_scale_every_field(
-    pair_left: PairMetrics,
-    operation: Callable[[PairMetrics, float], PairMetrics],
-    scalar: float,
-    expected: tuple[float, float],
+    left: ThroughputStatistics,
+    scalar_scenario: ScalarScenario,
 ) -> None:
     """``/= scalar`` and ``* scalar`` apply the scalar to every field.
 
     Args:
-        pair_left: Operand ``(1, 2)``.
-        operation: Unbound mixin operator, called as ``operation(left, s)``.
-        scalar: Scalar operand.
-        expected: ``(first, second)`` of the result.
+        left: Operand ``(1, 2, 3, 4)``.
+        scalar_scenario: Operator, scalar and expected field values.
     """
-    result = operation(pair_left, scalar)
-    assert tuple(result.to_float_dict().values()) == expected
+    case = scalar_scenario.value
+    result = case.operation(left, case.scalar)
+    assert tuple(result.to_float_dict().values()) == case.expected
 
 
 @pytest.mark.parametrize(
     ("weights", "expected"),
     [
-        pytest.param([1, 1], (5.5, 11.0), id="equal_weights"),
-        pytest.param([2, 1], (4.0, 8.0), id="left_weighted_twice"),
-        pytest.param([0, 1], (10.0, 20.0), id="left_weight_zero"),
+        pytest.param([1, 1], (5.5, 11.0, 16.5, 22.0), id="equal_weights"),
+        pytest.param([2, 1], (4.0, 8.0, 12.0, 16.0), id="left_weighted_twice"),
+        pytest.param([0, 1], (10.0, 20.0, 30.0, 40.0), id="left_weight_zero"),
     ],
 )
 def test_weighted_avg_weights_each_instance_by_protein_count(
-    pair_left: PairMetrics,
-    pair_right: PairMetrics,
+    left: ThroughputStatistics,
+    right: ThroughputStatistics,
     weights: list[int],
-    expected: tuple[float, float],
+    expected: tuple[float, float, float, float],
 ) -> None:
     """``weighted_avg`` returns the protein-count-weighted mean per field.
 
-    With left ``(1, 2)`` and right ``(10, 20)``, weights 2 and 1 give
-    ``(2*1 + 10) / 3 = 4``; a zero weight drops that instance entirely.
+    With left ``(1, 2, 3, 4)`` and right ``(10, 20, 30, 40)``, weights 2
+    and 1 give ``(2 * 1 + 10) / 3 = 4`` in the first field; a zero weight
+    drops that instance entirely. The result is built through the class's
+    ``@jaxtyped`` constructor, so a wrongly shaped field would raise.
 
     Args:
-        pair_left: First instance ``(1, 2)``.
-        pair_right: Second instance ``(10, 20)``.
+        left: First instance ``(1, 2, 3, 4)``.
+        right: Second instance ``(10, 20, 30, 40)``.
         weights: Protein count for each instance.
-        expected: ``(first, second)`` of the weighted mean.
+        expected: Field values of the weighted mean, in field order.
     """
-    result = PairMetrics.weighted_avg([pair_left, pair_right], weights)
+    result = ThroughputStatistics.weighted_avg([left, right], weights)
     assert tuple(result.to_float_dict().values()) == expected
 
 
-@pytest.mark.parametrize(
-    ("prefix", "expected_keys"),
-    [
-        pytest.param("", ["first", "second"], id="no_prefix"),
-        pytest.param("train/", ["train/first", "train/second"], id="train"),
-    ],
-)
+@pytest.mark.parametrize("prefix", ["", "train/"], ids=["no_prefix", "train"])
 def test_to_float_dict_prefixes_every_key(
-    pair_left: PairMetrics,
+    left: ThroughputStatistics,
     prefix: str,
-    expected_keys: list[str],
 ) -> None:
-    """``to_float_dict(prefix)`` namespaces every key, in field order.
+    """``to_float_dict(prefix)`` keys each field ``prefix + name``, in order.
 
     Args:
-        pair_left: Instance to convert.
+        left: Instance to convert.
         prefix: String prepended to each field name.
-        expected_keys: Keys the dict must have, in order.
     """
-    assert list(pair_left.to_float_dict(prefix)) == expected_keys
+    names = [f.name for f in dataclasses.fields(ThroughputStatistics)]
+    assert list(left.to_float_dict(prefix)) == [prefix + n for n in names]
 
 
 def test_metrics_zero_init_fields_are_float32_scalars(
