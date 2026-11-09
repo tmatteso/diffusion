@@ -7,7 +7,7 @@ distogram binning, loss weights, checkpointing, logging, and data-loading.
 
 import dataclasses
 import pathlib
-from typing import ClassVar
+from typing import Annotated, ClassVar, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -30,25 +30,6 @@ class InvalidSigmaRangeError(ValueError):
         )
 
 
-class ConflictingCheckpointSourcesError(ValueError):
-    """Raised when both pretrained_weights and resume_checkpoint are set.
-
-    Resuming restores the optimizer, scheduler, EMA and best validation loss
-    from one checkpoint, while pretrained weights start a fresh run from
-    another checkpoint's model weights. The two cannot both apply.
-    """
-
-    def __init__(
-        self,
-        pretrained_weights: pathlib.Path,
-        resume_checkpoint: pathlib.Path,
-    ) -> None:
-        super().__init__(
-            f"set only one of pretrained_weights ({pretrained_weights}) "
-            + f"and resume_checkpoint ({resume_checkpoint})",
-        )
-
-
 class InsufficientShardsError(ValueError):
     """Raised when num_workers exceeds n_shards.
 
@@ -64,23 +45,56 @@ class InsufficientShardsError(ValueError):
         )
 
 
+class ResumeFrom(BaseModel):
+    """Continue a run from a full training checkpoint.
+
+    Restores model weights, optimizer, LR schedule, EMA and best validation
+    loss, so training picks up where the checkpoint left off.
+
+    Attributes:
+        model_config: Pydantic config — frozen, and unknown keys rejected.
+        kind: Discriminator tag; always ``"resume"``.
+        path: Checkpoint file written by ``save_checkpoint``.
+    """
+
+    model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True, extra="forbid")
+
+    kind: Literal["resume"] = "resume"
+    path: pathlib.Path
+
+
+class PretrainedFrom(BaseModel):
+    """Start a fresh run from a checkpoint's model weights.
+
+    Loads only the model weights, into the model and its EMA. The optimizer,
+    LR schedule and best validation loss start from scratch.
+
+    Attributes:
+        model_config: Pydantic config — frozen, and unknown keys rejected.
+        kind: Discriminator tag; always ``"pretrained"``.
+        path: Checkpoint file written by ``save_checkpoint``.
+    """
+
+    model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True, extra="forbid")
+
+    kind: Literal["pretrained"] = "pretrained"
+    path: pathlib.Path
+
+
 class TrainingParams(BaseModel):
     """Optimizer and training loop hyperparameters.
 
     Attributes:
-        model_config: Pydantic config — frozen to prevent mutation after init.
+        model_config: Pydantic config — frozen to prevent mutation after init,
+            with unknown keys rejected.
         num_epochs: Total number of training epochs.
         lr: Peak learning rate for the optimizer.
         weight_decay: L2 regularization coefficient applied by the optimizer.
         grad_clip: Maximum gradient norm for clipping; disabled when ``None``.
-        pretrained_weights: Path to a checkpoint whose model weights seed a
-            fresh run: the model and EMA start from those weights, while the
-            optimizer, LR schedule and best validation loss start from
-            scratch. Skipped when ``None``.
-        resume_checkpoint: Path to a full training checkpoint to continue
-            from: model, optimizer, LR schedule, EMA and best validation loss
-            are all restored. Skipped when ``None``. Cannot be combined with
-            ``pretrained_weights``.
+        init_from: Checkpoint to start from: ``ResumeFrom`` continues a run,
+            ``PretrainedFrom`` starts a fresh run from a checkpoint's model
+            weights, and ``None`` starts from random initialisation. Being
+            a single field, at most one source can ever be set.
         accumulated_token_budget: Target token count across
             gradient-accumulation steps before a parameter update is applied.
         lr_warmup_steps: Number of initial optimizer steps over which the LR
@@ -98,47 +112,29 @@ class TrainingParams(BaseModel):
             inference, matching AlphaFold2/3 convention.
     """
 
-    model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True)
+    model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True, extra="forbid")
 
     num_epochs: int = 50
     lr: float = Field(default=1e-3, gt=0)
     weight_decay: float = Field(default=1e-4, ge=0)
     grad_clip: float | None = Field(default=10.0, gt=0)
-    pretrained_weights: pathlib.Path | None = None
-    resume_checkpoint: pathlib.Path | None = None
+    init_from: (
+        Annotated[ResumeFrom | PretrainedFrom, Field(discriminator="kind")]
+        | None
+    ) = None
     accumulated_token_budget: int = Field(default=4096, gt=0)
     lr_warmup_steps: int = Field(default=1_000, ge=0)
     lr_decay_steps: int = Field(default=50_000, gt=0)
     lr_decay_factor: float = Field(default=0.95, gt=0, lt=1)
     ema_decay: float = Field(default=0.999, gt=0, lt=1)
 
-    @model_validator(mode="after")
-    def one_checkpoint_source(self) -> "TrainingParams":
-        """Validate that at most one checkpoint source is set.
-
-        Returns:
-            The validated model instance.
-
-        Raises:
-            ConflictingCheckpointSourcesError: If both ``pretrained_weights``
-                and ``resume_checkpoint`` are set.
-        """
-        if (
-            self.pretrained_weights is not None
-            and self.resume_checkpoint is not None
-        ):
-            raise ConflictingCheckpointSourcesError(
-                self.pretrained_weights,
-                self.resume_checkpoint,
-            )
-        return self
-
 
 class ModelParams(BaseModel):
     """Architecture channel dimensions and capacity parameters.
 
     Attributes:
-        model_config: Pydantic config — frozen to prevent mutation after init.
+        model_config: Pydantic config — frozen to prevent mutation after init,
+            with unknown keys rejected.
         window_size: Residue-level neighbour window used by the atom transformer
             to build sparse pairs (default 32).
         f_ref_dim: Dimensionality of the reference atom feature vector
@@ -160,7 +156,7 @@ class ModelParams(BaseModel):
             template embedder pairformer (16, as per AlphaFold 3).
     """
 
-    model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True)
+    model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True, extra="forbid")
 
     window_size: int = Field(default=32, gt=0)
     f_ref_dim: int = Field(default=35, gt=0)  # 5 atoms by 7 features
@@ -186,7 +182,8 @@ class NoiseScheduleParams(BaseModel):
     """EDM noise schedule params (sigma bounds, data scale and distribution).
 
     Attributes:
-        model_config: Pydantic config — frozen to prevent mutation after init.
+        model_config: Pydantic config — frozen to prevent mutation after init,
+            with unknown keys rejected.
         sigma_data: Expected standard deviation of the clean data distribution,
             used to scale the preconditioning factors.
         sigma_max: Maximum noise level; denoising starts from this sigma.
@@ -197,7 +194,7 @@ class NoiseScheduleParams(BaseModel):
             training sigmas.
     """
 
-    model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True)
+    model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True, extra="forbid")
 
     sigma_data: float = Field(default=16.0, gt=0)
     sigma_max: float = Field(default=160, gt=0)
@@ -229,7 +226,8 @@ class DistogramParams(BaseModel):
     its own distance range, bin count, and overflow behaviour.
 
     Attributes:
-        model_config: Pydantic config — frozen to prevent mutation after init.
+        model_config: Pydantic config — frozen to prevent mutation after init,
+            with unknown keys rejected.
         min_dist: Lower edge of the first distance bin in ångströms.
         max_dist: Upper edge of the last distance bin in ångströms.
         n_bins: Total number of distance bins, including the overflow bin
@@ -238,7 +236,7 @@ class DistogramParams(BaseModel):
             ``max_dist`` instead of being dropped from the valid-pair mask.
     """
 
-    model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True)
+    model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True, extra="forbid")
 
     min_dist: float = Field(default=2.0, ge=0)
     max_dist: float = Field(default=22.0, gt=0)
@@ -334,7 +332,8 @@ class LossParams(BaseModel):
     """Weights and thresholds for the composite training loss.
 
     Attributes:
-        model_config: Pydantic config — frozen to prevent mutation after init.
+        model_config: Pydantic config — frozen to prevent mutation after init,
+            with unknown keys rejected.
         lam: Scale factor applied to the diffusion denoising loss term.
         alpha_0: Weight for the sequence cross-entropy loss term.
         alpha_1: Weight for the smooth lDDT structural quality loss.
@@ -349,7 +348,7 @@ class LossParams(BaseModel):
             smooth lDDT score.
     """
 
-    model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True)
+    model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True, extra="forbid")
 
     # polar residues get weight 2.0, others 1.0 in the basic L0 loss
     lam: float = Field(default=1.0, gt=0)
@@ -366,13 +365,14 @@ class CheckpointParams(BaseModel):
     """Checkpoint file path and save frequency.
 
     Attributes:
-        model_config: Pydantic config — frozen to prevent mutation after init.
+        model_config: Pydantic config — frozen to prevent mutation after init,
+            with unknown keys rejected.
         checkpoint_path: File path where the best model checkpoint is written.
         save_every: Save a checkpoint every this many epochs; set to 0 to
             disable periodic saving (best-model saving is unaffected).
     """
 
-    model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True)
+    model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True, extra="forbid")
 
     checkpoint_path: pathlib.Path = pathlib.Path("pallatom_best.pt")
     save_every: int = Field(default=1, ge=0)
@@ -382,12 +382,13 @@ class LoggingParams(BaseModel):
     """Logging frequency and W&B project configuration.
 
     Attributes:
-        model_config: Pydantic config — frozen to prevent mutation after init.
+        model_config: Pydantic config — frozen to prevent mutation after init,
+            with unknown keys rejected.
         use_wandb: When ``True``, metrics are streamed to Weights & Biases.
         wandb_project: Name of the W&B project to log runs under.
     """
 
-    model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True)
+    model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True, extra="forbid")
     use_wandb: bool = True
     wandb_project: str = "pallatom-training"
 
@@ -396,14 +397,15 @@ class LoaderConfig(BaseModel):
     """Base DataLoader configuration shared across dataset splits.
 
     Attributes:
-        model_config: Pydantic config — frozen to prevent mutation after init.
+        model_config: Pydantic config — frozen to prevent mutation after init,
+            with unknown keys rejected.
         max_seq_length: Maximum number of residues per sample; longer chains
             are truncated or excluded.
         batch_size: Number of samples per batch.
         num_workers: Number of DataLoader worker processes.
     """
 
-    model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True)
+    model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True, extra="forbid")
 
     max_seq_length: int = Field(default=128, gt=0)  # was 256
     batch_size: int = Field(default=8, gt=0)  # was 2
@@ -416,7 +418,8 @@ class TrainLoaderConfig(LoaderConfig):
     Extends `LoaderConfig` with training-specific data-pipeline settings.
 
     Attributes:
-        model_config: Pydantic config — frozen to prevent mutation after init.
+        model_config: Pydantic config — frozen to prevent mutation after init,
+            with unknown keys rejected.
         num_workers: Number of DataLoader worker processes for the training
             split.
         token_budget: Upper bound on the total number of residues across all
@@ -433,7 +436,7 @@ class TrainLoaderConfig(LoaderConfig):
             length before sorting; controls cross-epoch FFD batch diversity.
     """
 
-    model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True)
+    model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True, extra="forbid")
     num_workers: int = Field(default=1, gt=0)
     token_budget: int = Field(default=256, gt=0)
     batch_prefetch_depth: int = Field(default=4, gt=0)
@@ -467,7 +470,8 @@ class TrainConfig(BaseModel):
     hyperparameters across all components.
 
     Attributes:
-        model_config: Pydantic config — frozen to prevent mutation after init.
+        model_config: Pydantic config — frozen to prevent mutation after init,
+            with unknown keys rejected.
         training: Optimizer and training loop settings.
         model: Architecture channel dimensions and capacity.
         noise: EDM noise schedule parameters.
@@ -483,7 +487,7 @@ class TrainConfig(BaseModel):
         test_loader: DataLoader settings used for the evaluation split.
     """
 
-    model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True)
+    model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True, extra="forbid")
 
     training: TrainingParams = Field(default_factory=TrainingParams)
     model: ModelParams = Field(default_factory=ModelParams)

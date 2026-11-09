@@ -58,7 +58,12 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import Adam
 from torch.optim.lr_scheduler import LambdaLR
 from tqdm import tqdm
-from train.train_config import TrainArgs, TrainConfig
+from train.train_config import (
+    PretrainedFrom,
+    ResumeFrom,
+    TrainArgs,
+    TrainConfig,
+)
 
 CUDA_DEVICE_TYPE = "cuda"
 
@@ -176,12 +181,12 @@ def restore_training_state(
     rank: int,
     log: FilteringBoundLogger,
 ) -> tuple[ModelSetup, Float[torch.Tensor, ""]]:
-    """Apply the checkpoint source named in the training config, if any.
+    """Apply the checkpoint source named in ``tcfg.training.init_from``.
 
-    ``resume_checkpoint`` restores the full training state from its path.
-    ``pretrained_weights`` loads only model weights from its path and
-    starts with no best validation loss. With neither set, the freshly
-    initialised state is returned unchanged.
+    ``ResumeFrom`` restores the full training state from its path.
+    ``PretrainedFrom`` loads only model weights from its path and starts
+    with no best validation loss. With ``None``, the freshly initialised
+    state is returned unchanged.
 
     Args:
         model_params: ModelSetup to restore into.
@@ -192,18 +197,18 @@ def restore_training_state(
         The (possibly restored) ``model_params`` and the best validation
         loss to start from: the checkpoint's when resuming, else infinity.
     """
-    training = model_params.tcfg.training
-    if training.resume_checkpoint is not None:
+    init_from = model_params.tcfg.training.init_from
+    if isinstance(init_from, ResumeFrom):
         return load_checkpoint(
             model_params=model_params,
-            path=training.resume_checkpoint,
+            path=init_from.path,
             rank=rank,
             log=log,
         )
-    if training.pretrained_weights is not None:
+    if isinstance(init_from, PretrainedFrom):
         model_params = load_pretrained_weights(
             model_params=model_params,
-            path=training.pretrained_weights,
+            path=init_from.path,
             rank=rank,
             log=log,
         )
@@ -670,7 +675,7 @@ def log_epoch(
 
     Checkpoints include model weights, optimizer state, scheduler state, and
     epoch number so training can be resumed exactly via
-    ``TrainingParams.resume_checkpoint``.
+    ``ResumeFrom`` in ``TrainingParams.init_from``.
 
     Args:
         epoch_metrics: Aggregated metrics for this epoch, including epoch

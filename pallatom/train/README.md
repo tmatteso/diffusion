@@ -16,8 +16,7 @@ metric logging, checkpointing, and optional multi-GPU (DDP) training.
 ```
 main(args, tcfg)
   │  build data loaders, MainTrunk, Adam, StepLR, Distogram heads
-  │  optionally resume a checkpoint (resume_checkpoint) or load
-  │  pretrained weights (pretrained_weights)
+  │  optionally resume a checkpoint or load pretrained weights (init_from)
   ▼
 train(best_val_loss, train_loader, test_loader, model_params, log)
   │  optionally wrap model in DDP
@@ -61,13 +60,13 @@ train(best_val_loss, train_loader, test_loader, model_params, log)
      `[min_dist, max_dist]`.
 7. Bundles everything into a `ModelSetup` (model, `TrainConfig`, both
    distogram heads, device, optimizer, scheduler).
-8. Calls `restore_training_state`. If `tcfg.training.resume_checkpoint` is
-   set, `load_checkpoint` restores model, optimizer, scheduler, and EMA state
-   from that path and returns its `best_val_loss`. If
-   `tcfg.training.pretrained_weights` is set instead,
-   `load_pretrained_weights` loads only the model weights (into the model
-   and its EMA) from that path. Otherwise, and in the pretrained case,
-   training starts from `best_val_loss = inf`.
+8. Calls `restore_training_state`, which reads `tcfg.training.init_from`.
+   For `ResumeFrom`, `load_checkpoint` restores model, optimizer,
+   scheduler, and EMA state from its `path` and returns its
+   `best_val_loss`. For `PretrainedFrom`, `load_pretrained_weights` loads
+   only the model weights (into the model and its EMA) from its `path`.
+   Otherwise, and in the pretrained case, training starts from
+   `best_val_loss = inf`.
 9. On rank 0, if `tcfg.logging.use_wandb`, calls `wandb.init` with the full
    config dumped as run metadata.
 10. Calls `train(...)`.
@@ -198,7 +197,8 @@ non-rank-0 worker to avoid duplicate I/O under DDP.
 `save_checkpoint`/`load_checkpoint` (de)serialise a `Checkpoint` — model,
 optimizer, and scheduler state dicts plus `best_val_loss`. Saving writes
 to `tcfg.checkpoint.checkpoint_path`; loading reads the path it is given,
-which is `tcfg.training.resume_checkpoint` during training. Saving is a no-op on non-rank-0 workers,
+which is `tcfg.training.init_from.path` when resuming. Saving is a no-op
+on non-rank-0 workers,
 and the DDP wrapper (if any) is stripped via `.module` before calling
 `state_dict()` so a checkpoint saved under DDP loads correctly into a plain
 `MainTrunk` and vice versa.
@@ -225,7 +225,9 @@ world_size=1` and no `DDP` wrapper.
 ## Parameters (`train_config.py`)
 
 `TrainConfig` is the top-level frozen Pydantic model, loaded from the JSON
-path passed via `--config`. It aggregates:
+path passed via `--config`. Every model here rejects unknown keys
+(`extra="forbid"`), so a misspelled or removed field fails validation
+instead of being silently ignored. It aggregates:
 
 ### `training` — `TrainingParams`
 
@@ -235,8 +237,7 @@ path passed via `--config`. It aggregates:
 | `lr` | `1e-3` | Peak learning rate passed to `Adam`. |
 | `weight_decay` | `1e-4` | L2 regularisation coefficient in `Adam`. |
 | `grad_clip` | `10.0` | Max gradient norm passed to `clip_grad_norm_` in `optimizer_step`; `None` disables clipping (`float("inf")` is used instead). |
-| `pretrained_weights` | `None` | Checkpoint whose model weights seed the model and EMA via `load_pretrained_weights`; optimizer, LR schedule and best val loss start fresh. |
-| `resume_checkpoint` | `None` | Checkpoint to continue from via `load_checkpoint`: restores model, optimizer, LR schedule, EMA and best val loss. Setting both this and `pretrained_weights` raises `ConflictingCheckpointSourcesError`. |
+| `init_from` | `None` | Checkpoint to start from, as one tagged value so only one source can be set. `ResumeFrom(path=...)` (JSON `{"kind": "resume", "path": ...}`) continues a run via `load_checkpoint`, restoring model, optimizer, LR schedule, EMA and best val loss. `PretrainedFrom(path=...)` (JSON `{"kind": "pretrained", "path": ...}`) loads only model weights into the model and EMA via `load_pretrained_weights`; optimizer, LR schedule and best val loss start fresh. `None` trains from random initialisation. |
 | `accumulated_token_budget` | `4096` | Global (pre-`world_size`-division) token budget per optimizer step — see [Gradient accumulation](#gradient-accumulation-under-a-token-budget). |
 | `lr_decay_steps` | `50_000` | Optimizer steps between each `StepLR` decay. |
 | `lr_decay_factor` | `0.95` | Multiplicative LR decay applied every `lr_decay_steps` steps. |
@@ -280,7 +281,7 @@ directly.
 
 | Field | Default | Role |
 |---|---|---|
-| `checkpoint_path` | `pallatom_best.pt` | Where `save_checkpoint` writes. Loading reads `resume_checkpoint` or `pretrained_weights` instead. |
+| `checkpoint_path` | `pallatom_best.pt` | Where `save_checkpoint` writes. Loading reads `init_from.path` instead. |
 | `save_every` | `1` | Documented as a periodic-checkpoint cadence (see the note in [Logging and checkpointing](#logging-and-checkpointing)); not currently consumed by any code path. |
 
 ### `logging` — `LoggingParams`

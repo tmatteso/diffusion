@@ -62,7 +62,9 @@ from train.train_config import (
     LoggingParams,
     ModelParams,
     NoiseScheduleParams,
+    PretrainedFrom,
     ResidueDistogramParams,
+    ResumeFrom,
     TemplateDistogramParams,
     TrainArgs,
     TrainConfig,
@@ -1571,9 +1573,9 @@ class RestoreCase:
     """Checkpoint source for one restore scenario and the state it yields.
 
     Attributes:
-        config_field: ``TrainingParams`` field that points at the saved
-            checkpoint (``"resume_checkpoint"`` or ``"pretrained_weights"``),
-            or ``None`` to set neither.
+        init_kind: ``TrainingParams.init_from`` type pointed at the saved
+            checkpoint (``ResumeFrom`` or ``PretrainedFrom``), or ``None`` to
+            start from the fresh state.
         weight_fill: Value every model parameter and its EMA shadow should
             hold after restoring: ``1.0`` is the saved checkpoint's value and
             ``0.0`` is the fresh model's.
@@ -1585,7 +1587,7 @@ class RestoreCase:
             is exact in float32, so it survives the round trip unchanged.
     """
 
-    config_field: str | None
+    init_kind: type[ResumeFrom] | type[PretrainedFrom] | None
     weight_fill: float
     scheduler_steps: int
     best_val_loss: float
@@ -1595,16 +1597,16 @@ class RestoreScenario(Enum):
     """Checkpoint sources that ``restore_training_state`` must honour.
 
     Members:
-        resume: ``resume_checkpoint`` set; restores weights, EMA, scheduler
-            and best validation loss from that file.
-        pretrained: ``pretrained_weights`` set; loads weights into the model
-            and EMA only, keeping the fresh scheduler and an infinite best
+        resume: ``ResumeFrom``; restores weights, EMA, scheduler and best
+            validation loss from the checkpoint.
+        pretrained: ``PretrainedFrom``; loads weights into the model and EMA
+            only, keeping the fresh scheduler and an infinite best
             validation loss.
-        neither: no checkpoint source; the fresh state is left untouched.
+        neither: ``init_from`` is ``None``; the fresh state is untouched.
     """
 
-    resume = RestoreCase("resume_checkpoint", 1.0, 1, 0.5)
-    pretrained = RestoreCase("pretrained_weights", 1.0, 0, float("inf"))
+    resume = RestoreCase(ResumeFrom, 1.0, 1, 0.5)
+    pretrained = RestoreCase(PretrainedFrom, 1.0, 0, float("inf"))
     neither = RestoreCase(None, 0.0, 0, float("inf"))
 
 
@@ -1686,19 +1688,23 @@ def restore_setup(
 
     The fresh model's parameters and EMA shadow are zeroed so they can be
     told apart from the saved checkpoint's ``1.0`` values, and the
-    scenario's ``config_field`` (if any) is pointed at ``saved_checkpoint``.
+    scenario's ``init_kind`` (if any) is pointed at ``saved_checkpoint``.
 
     Args:
         model_params: Fixture providing a fresh ModelSetup.
         saved_checkpoint: Fixture providing the saved checkpoint path.
-        restore_scenario: Scenario naming which config field to set.
+        restore_scenario: Scenario naming which ``init_from`` type to set.
 
     Returns:
         The fresh ModelSetup with the scenario's checkpoint source set.
     """
-    field = restore_scenario.value.config_field
+    init_kind = restore_scenario.value.init_kind
     training = model_params.tcfg.training.model_copy(
-        update={} if field is None else {field: saved_checkpoint},
+        update={
+            "init_from": (
+                None if init_kind is None else init_kind(path=saved_checkpoint)
+            ),
+        },
     )
     with torch.no_grad():
         for parameter in model_params.model.parameters():
@@ -1729,7 +1735,7 @@ def test_restore_training_state_reads_configured_source(
     position and returned best validation loss come from the saved
     checkpoint or from the fresh state as ``RestoreCase`` describes. The
     checkpoint lives at a different path from ``checkpoint_path``, so this
-    also checks that loading reads the configured path.
+    also checks that loading reads the path in ``init_from``.
     """
     restored, best_val_loss = restore_training_state(
         model_params=restore_setup,

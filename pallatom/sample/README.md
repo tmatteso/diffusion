@@ -196,7 +196,8 @@ a single JSON list at `scfg.output.output_path`.
 ## Parameters (`sample_config.py`)
 
 `SampleConfig` is the top-level, frozen Pydantic model validated from the
-JSON file passed via `--config`. It aggregates the model architecture
+JSON file passed via `--config`. Like the training configs, every model
+here rejects unknown keys (`extra="forbid"`). It aggregates the model architecture
 parameters shared with training (`model`, `distogram_res`, `distogram_atom`
 — see `train/train_config.py`) plus four sampling-specific groups:
 

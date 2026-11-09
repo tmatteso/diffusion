@@ -21,7 +21,8 @@ class SamplerParams(BaseModel):
     """Hyperparameters for the stochastic DDIM sampler.
 
     Attributes:
-        model_config: Pydantic config — frozen to prevent mutation after init.
+        model_config: Pydantic config — frozen to prevent mutation after init,
+            with unknown keys rejected.
         rho: Exponent controlling the non-linear time-step spacing; higher
             values concentrate steps near low noise levels.
         S_churn: Amount of stochasticity injected at each step; 0 recovers
@@ -41,7 +42,7 @@ class SamplerParams(BaseModel):
             tokens from the sequence logits.
     """
 
-    model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True)
+    model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True, extra="forbid")
 
     rho: float = Field(default=7.0, gt=0)
     S_churn: float = Field(default=0.2, ge=0)
@@ -57,12 +58,13 @@ class GenerationParams(BaseModel):
     """Parameters controlling the size and count of generated structures.
 
     Attributes:
-        model_config: Pydantic config — frozen to prevent mutation after init.
+        model_config: Pydantic config — frozen to prevent mutation after init,
+            with unknown keys rejected.
         n_res: Number of residues in each generated protein structure.
         n_samples: Number of independent structures to generate per run.
     """
 
-    model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True)
+    model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True, extra="forbid")
 
     n_res: int = Field(default=100, gt=0)
     n_samples: int = Field(default=1, gt=0)
@@ -72,12 +74,13 @@ class SampleCheckpointParams(BaseModel):
     """Path configuration for loading a model checkpoint during sampling.
 
     Attributes:
-        model_config: Pydantic config — frozen to prevent mutation after init.
+        model_config: Pydantic config — frozen to prevent mutation after init,
+            with unknown keys rejected.
         checkpoint_path: Filesystem path to the saved model checkpoint file
             (``.pt``) that will be loaded before the sampling loop begins.
     """
 
-    model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True)
+    model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True, extra="forbid")
 
     checkpoint_path: str = "pallatom_best.pt"
 
@@ -86,12 +89,13 @@ class SampleOutputParams(BaseModel):
     """Path configuration for writing sampling results to disk.
 
     Attributes:
-        model_config: Pydantic config — frozen to prevent mutation after init.
+        model_config: Pydantic config — frozen to prevent mutation after init,
+            with unknown keys rejected.
         output_path: Filesystem path where the JSON file containing generated
             structures and sequences will be written.
     """
 
-    model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True)
+    model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True, extra="forbid")
 
     output_path: str = "samples.json"
 
@@ -105,7 +109,8 @@ class SampleConfig(BaseModel):
     destination.
 
     Attributes:
-        model_config: Pydantic config — frozen to prevent mutation after init.
+        model_config: Pydantic config — frozen to prevent mutation after init,
+            with unknown keys rejected.
         model: Architecture hyperparameters for the denoising model.
         distogram_template: Self-conditioning template distogram parameters.
         distogram_residue: Residue-level distogram head parameters.
@@ -117,7 +122,7 @@ class SampleConfig(BaseModel):
         output: Path where generated results are written.
     """
 
-    model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True)
+    model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True, extra="forbid")
 
     model: ModelParams = Field(default_factory=ModelParams)
     distogram_template: TemplateDistogramParams = Field(
