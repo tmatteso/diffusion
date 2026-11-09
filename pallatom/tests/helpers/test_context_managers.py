@@ -18,50 +18,73 @@ from helpers.context_managers import StructlogConfig
 from structlog.typing import FilteringBoundLogger
 
 
-@dataclasses.dataclass(frozen=True)
-class LoggedRun:
-    """What one INFO and one WARNING event left behind after a logging run.
+class Reach(enum.Flag):
+    """Where one logged event ended up.
 
-    The INFO event is named ``quiet`` and the WARNING event ``loud``; the
-    names avoid ``info`` and ``warning``, which ``ConsoleRenderer`` prints as
-    level labels and would match on every line.
-
-    Attributes:
-        file_events: ``event`` field of each JSON line in the log file, in
-            order, or ``None`` when no log file was created.
-        console_events: Which of ``quiet`` and ``loud`` appear
-            in captured stdout/stderr, in that order.
+    Members:
+        nowhere: Dropped: not in the log file and not printed.
+        file: Written to the log file as a JSON line.
+        console: Printed to stdout by ``ConsoleRenderer``.
+        both: Written to the log file and printed.
     """
 
-    file_events: tuple[str, ...] | None
-    console_events: tuple[str, ...]
+    nowhere = 0
+    file = enum.auto()
+    console = enum.auto()
+    both = file | console
+
+
+@dataclasses.dataclass(frozen=True)
+class LoggedRun:
+    """Where the two events logged through a StructlogConfig ended up.
+
+    ``run_logging`` logs ``info_event`` at INFO level and then
+    ``warning_event`` at WARNING level, exits the config, and reads back
+    both the log file and the captured console output.
+
+    Attributes:
+        info: Where the INFO event ended up.
+        warning: Where the WARNING event ended up.
+        file_created: Whether the log file exists after the run.
+        file_lines: Number of JSON lines in the log file; 0 when there is
+            no file.
+    """
+
+    info: Reach
+    warning: Reach
+    file_created: bool
+    file_lines: int
 
 
 @dataclasses.dataclass(frozen=True)
 class RankCase:
-    """Global rank of the process and the output StructlogConfig must produce.
+    """A process rank and where StructlogConfig must send each event.
 
     Attributes:
-        rank: Global rank; ``is_rank_zero`` is passed as ``rank == 0``.
-        expected: Output after logging ``quiet`` then ``loud``.
+        rank: Global rank; the config gets ``is_rank_zero=(rank == 0)``.
+        info: Where the INFO event must end up.
+        warning: Where the WARNING event must end up.
+        file_created: Whether the rank must create the log file.
     """
 
     rank: int
-    expected: LoggedRun
+    info: Reach
+    warning: Reach
+    file_created: bool
 
 
 class RankScenario(enum.Enum):
     """Ranks whose logging output StructlogConfig gates differently.
 
     Members:
-        rank_zero: Writes every event to the file and shows INFO and above
-            on the console.
-        other_rank: Creates no file and shows only WARNING and above, so
+        rank_zero: Writes every event to the file and prints INFO and
+            above.
+        other_rank: Creates no file and prints only WARNING and above, so
             failures on non-zero ranks stay visible.
     """
 
-    rank_zero = RankCase(0, LoggedRun(("quiet", "loud"), ("quiet", "loud")))
-    other_rank = RankCase(1, LoggedRun(None, ("loud",)))
+    rank_zero = RankCase(0, Reach.both, Reach.both, file_created=True)
+    other_rank = RankCase(1, Reach.nowhere, Reach.console, file_created=False)
 
 
 @pytest.fixture
@@ -144,9 +167,9 @@ def run_logging(
 ) -> Callable[[StructlogConfig], LoggedRun]:
     """Factory that logs one INFO and one WARNING event through a config.
 
-    The returned callable enters the config, logs ``quiet`` at INFO and
-    ``loud`` at WARNING through ``structlog.get_logger()``, exits,
-    then reads back the log file and the captured console output.
+    The returned callable enters the config, logs ``info_event`` at INFO
+    and ``warning_event`` at WARNING through ``structlog.get_logger()``,
+    exits, then reads back the log file and the captured console output.
 
     Args:
         log_path: Path the configs passed in write to.
@@ -163,51 +186,58 @@ def run_logging(
             config: Unentered config to log through.
 
         Returns:
-            Events found in the file and on the console.
+            Where each event ended up, and what the file holds.
         """
         with config:
             log = cast(FilteringBoundLogger, structlog.get_logger())
-            log.info("quiet")
-            log.warning("loud")
+            log.info("info_event")
+            log.warning("warning_event")
         captured = capsys.readouterr()
         console = captured.out + captured.err
-        file_events = (
-            tuple(
-                cast(str, json.loads(line)["event"])
-                for line in log_path.read_text().splitlines()
-            )
-            if log_path.exists()
-            else None
-        )
+        created = log_path.exists()
+        lines = log_path.read_text().splitlines() if created else []
+        in_file = {cast(str, json.loads(line)["event"]) for line in lines}
+
+        def reach(event: str) -> Reach:
+            """Combine where ``event`` was found.
+
+            Args:
+                event: Event name to look for.
+
+            Returns:
+                The file and console flags the event earned.
+            """
+            file = Reach.file if event in in_file else Reach.nowhere
+            shown = Reach.console if event in console else Reach.nowhere
+            return file | shown
+
         return LoggedRun(
-            file_events=file_events,
-            console_events=tuple(
-                event for event in ("quiet", "loud") if event in console
-            ),
+            info=reach("info_event"),
+            warning=reach("warning_event"),
+            file_created=created,
+            file_lines=len(lines),
         )
 
     return run
 
 
 @pytest.fixture
-def events_before_exit(
+def lines_before_exit(
     rank_zero_config: StructlogConfig,
     log_path: pathlib.Path,
-) -> tuple[str, ...]:
-    """Log one event, then read the file while the config is still entered.
+) -> int:
+    """Log one event, then count the file's lines while still entered.
 
     Args:
         rank_zero_config: Config to log through.
         log_path: File the config writes to.
 
     Returns:
-        ``event`` field of each JSON line on disk before ``__exit__`` closes
-        the file.
+        Number of JSON lines on disk before ``__exit__`` closes the file.
     """
     with rank_zero_config:
-        cast(FilteringBoundLogger, structlog.get_logger()).info("quiet")
-        lines = log_path.read_text().splitlines()
-    return tuple(cast(str, json.loads(line)["event"]) for line in lines)
+        cast(FilteringBoundLogger, structlog.get_logger()).info("info_event")
+        return len(log_path.read_text().splitlines())
 
 
 @pytest.mark.parametrize(
@@ -227,11 +257,15 @@ def test_structlog_config_routes_events_by_rank(
     any other rank creates no file and prints only WARNING and above.
 
     Args:
-        rank_scenario: Scenario holding the expected output.
+        rank_scenario: Scenario holding where each event must end up.
         rank_config: Config built for the scenario's rank.
         run_logging: Factory that logs through a config.
     """
-    assert run_logging(rank_config) == rank_scenario.value.expected
+    case = rank_scenario.value
+    logged = run_logging(rank_config)
+    assert logged.info == case.info
+    assert logged.warning == case.warning
+    assert logged.file_created == case.file_created
 
 
 def test_structlog_config_truncates_existing_file(
@@ -240,7 +274,9 @@ def test_structlog_config_truncates_existing_file(
 ) -> None:
     """A pre-existing log file is truncated on entry rather than appended to.
 
-    Only the rank-zero case applies, since no other rank opens the file.
+    The file starts with five stale lines; afterwards it must hold exactly
+    one line per event just logged, and nothing else. Only the rank-zero case applies, since no other
+    rank opens the file.
 
     Args:
         stale_log_path: Log path already holding stale lines.
@@ -248,11 +284,13 @@ def test_structlog_config_truncates_existing_file(
     """
     config = StructlogConfig(is_rank_zero=True, log_file=stale_log_path)
     logged = run_logging(config)
-    assert logged.file_events == ("quiet", "loud")
+    in_file = [Reach.file in reach for reach in (logged.info, logged.warning)]
+    assert all(in_file)
+    assert logged.file_lines == sum(in_file)
 
 
 def test_structlog_config_file_is_line_buffered(
-    events_before_exit: tuple[str, ...],
+    lines_before_exit: int,
 ) -> None:
     """Each JSON line reaches disk as soon as it is logged, before exit.
 
@@ -260,9 +298,9 @@ def test_structlog_config_file_is_line_buffered(
     single rank-zero case is the only one with a file to buffer.
 
     Args:
-        events_before_exit: Events read while the config was entered.
+        lines_before_exit: JSON lines on disk while the config was entered.
     """
-    assert events_before_exit == ("quiet",)
+    assert lines_before_exit == 1
 
 
 def test_structlog_config_write_log_line_before_enter_is_passthrough(
