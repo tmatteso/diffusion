@@ -60,24 +60,55 @@ class ScalarScenario(enum.Enum):
 
 
 @dataclasses.dataclass(frozen=True)
-class AllReduceRun:
-    """Field values every spawned rank reported after reducing.
+class RankReport:
+    """Reduced field values one spawned rank sent back, by reduction.
+
+    Each field maps metric names to values, as ``to_float_dict`` returns
+    them.
 
     Attributes:
-        world_size: Number of ranks spawned; rank ``r`` started at ``r``.
-        rank_reports: One tuple of reduced field values per rank.
+        rank: Rank that sent the report; every field it reduced started
+            at ``float(rank)``.
+        fresh_loss: LossMetrics reduced on the freshly created group.
+        loss: LossMetrics reduced after the scratch ``all_reduce`` calls.
+        throughput: ThroughputStatistics reduced after the scratch calls.
+        norms: ComponentNorms reduced after the scratch calls.
+    """
+
+    rank: int
+    fresh_loss: dict[str, float]
+    loss: dict[str, float]
+    throughput: dict[str, float]
+    norms: dict[str, float]
+
+    def values(self) -> set[float]:
+        """Return every reduced value in the report.
+
+        Returns:
+            The values of all four reductions, merged into one set.
+        """
+        reductions = (self.fresh_loss, self.loss, self.throughput, self.norms)
+        return {v for reduction in reductions for v in reduction.values()}
+
+
+@dataclasses.dataclass(frozen=True)
+class AllReduceRun:
+    """Reports from every spawned rank after reducing.
+
+    Attributes:
+        world_size: Number of ranks spawned.
+        reports: One report per rank, in the order they reached the queue.
     """
 
     world_size: int
-    rank_reports: tuple[tuple[float, ...], ...]
+    reports: tuple[RankReport, ...]
 
 
 def all_reduce_mean_worker(
     rank: int,
     world_size: int,
     port: int,
-    metric_classes: tuple[type[TensorAccumulatorMixin], ...],
-    result_queue: "mp.Queue[tuple[float, ...]]",
+    result_queue: "mp.Queue[RankReport]",
 ) -> None:
     """Spawned rank for ``test_all_reduce_mean_averages_across_real_ranks``.
 
@@ -85,43 +116,46 @@ def all_reduce_mean_worker(
     the target by its qualified name. The rank first reduces a LossMetrics
     on the fresh group, then runs three plain ``all_reduce`` calls on
     scratch tensors, as gradient syncs would during backward, and then
-    reduces one instance of each class in ``metric_classes``. Every field
-    of every instance starts at this rank's own value. The same sequence
-    of collectives runs on every rank, as collectives require.
+    reduces a LossMetrics, a ThroughputStatistics and a ComponentNorms.
+    Every field of every instance starts at this rank's own value. The
+    same sequence of collectives runs on every rank, as collectives
+    require.
 
     Args:
         rank: This process's rank.
         world_size: Total number of ranks in the process group.
         port: TCP port used for process-group rendezvous.
-        metric_classes: Classes to build and reduce after the scratch calls.
-        result_queue: Receives every reduced field value from this rank.
+        result_queue: Receives this rank's report.
     """
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(port)
     dist.init_process_group(backend="gloo", rank=rank, world_size=world_size)
-    reduced: list[float] = []
 
-    def reduce_fields(metric_class: type[TensorAccumulatorMixin]) -> None:
-        """Build ``metric_class`` at this rank's value, reduce, record fields.
+    def reduced(metric_class: type[TensorAccumulatorMixin]) -> dict[str, float]:
+        """Build ``metric_class`` at this rank's value and reduce it.
 
         Args:
             metric_class: Metric dataclass to build and reduce.
+
+        Returns:
+            The reduced instance's ``to_float_dict``.
         """
         constructor: Callable[..., TensorAccumulatorMixin] = metric_class
         names = [f.name for f in dataclasses.fields(metric_class)]
         metrics = constructor(**{n: torch.tensor(float(rank)) for n in names})
         metrics.all_reduce_mean()
-        reduced.extend(metrics.to_float_dict().values())
+        return metrics.to_float_dict()
 
-    reduce_fields(LossMetrics)
+    fresh_loss = reduced(LossMetrics)
     for _ in range(3):
         _ = dist.all_reduce(  # pyright: ignore[reportUnknownMemberType]
             torch.tensor(float(rank)),
             op=dist.ReduceOp.SUM,
         )
-    for metric_class in metric_classes:
-        reduce_fields(metric_class)
-    result_queue.put(tuple(reduced))
+    loss = reduced(LossMetrics)
+    throughput = reduced(ThroughputStatistics)
+    norms = reduced(ComponentNorms)
+    result_queue.put(RankReport(rank, fresh_loss, loss, throughput, norms))
     dist.destroy_process_group()
 
 
@@ -295,16 +329,15 @@ def all_reduce_run(free_port: int) -> AllReduceRun:
         free_port: Port for the ranks' rendezvous.
 
     Returns:
-        Every rank's reported field values.
+        Every rank's report.
     """
     world_size = 3
     ctx = mp.get_context("spawn")
-    result_queue: "mp.Queue[tuple[float, ...]]" = ctx.Queue()
-    classes = (LossMetrics, ThroughputStatistics, ComponentNorms)
+    result_queue: "mp.Queue[RankReport]" = ctx.Queue()
     processes = [
         ctx.Process(
             target=all_reduce_mean_worker,
-            args=(rank, world_size, free_port, classes, result_queue),
+            args=(rank, world_size, free_port, result_queue),
         )
         for rank in range(world_size)
     ]
@@ -317,7 +350,7 @@ def all_reduce_run(free_port: int) -> AllReduceRun:
             process.join(timeout=60)
             if process.is_alive():
                 process.terminate()
-    return AllReduceRun(world_size=world_size, rank_reports=reports)
+    return AllReduceRun(world_size=world_size, reports=reports)
 
 
 def test_in_place_add_sums_field_wise(
@@ -476,5 +509,6 @@ def test_all_reduce_mean_averages_across_real_ranks(
     """
     world_size = all_reduce_run.world_size
     expected = sum(range(world_size)) / world_size
-    assert len(all_reduce_run.rank_reports) == world_size
-    assert {v for r in all_reduce_run.rank_reports for v in r} == {expected}
+    reports = all_reduce_run.reports
+    assert sorted(report.rank for report in reports) == list(range(world_size))
+    assert {v for report in reports for v in report.values()} == {expected}
