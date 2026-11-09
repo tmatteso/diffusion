@@ -275,8 +275,8 @@ def test_structlog_config_truncates_existing_file(
     """A pre-existing log file is truncated on entry rather than appended to.
 
     The file starts with five stale lines; afterwards it must hold exactly
-    one line per event just logged, and nothing else. Only the rank-zero case applies, since no other
-    rank opens the file.
+    one line per event just logged, and nothing else. Only the rank-zero
+    case applies, since no other rank opens the file.
 
     Args:
         stale_log_path: Log path already holding stale lines.
