@@ -30,6 +30,25 @@ class InvalidSigmaRangeError(ValueError):
         )
 
 
+class ConflictingCheckpointSourcesError(ValueError):
+    """Raised when both pretrained_weights and resume_checkpoint are set.
+
+    Resuming restores the optimizer, scheduler, EMA and best validation loss
+    from one checkpoint, while pretrained weights start a fresh run from
+    another checkpoint's model weights. The two cannot both apply.
+    """
+
+    def __init__(
+        self,
+        pretrained_weights: pathlib.Path,
+        resume_checkpoint: pathlib.Path,
+    ) -> None:
+        super().__init__(
+            f"set only one of pretrained_weights ({pretrained_weights}) "
+            + f"and resume_checkpoint ({resume_checkpoint})",
+        )
+
+
 class InsufficientShardsError(ValueError):
     """Raised when num_workers exceeds n_shards.
 
@@ -54,10 +73,14 @@ class TrainingParams(BaseModel):
         lr: Peak learning rate for the optimizer.
         weight_decay: L2 regularization coefficient applied by the optimizer.
         grad_clip: Maximum gradient norm for clipping; disabled when ``None``.
-        pretrained_weights: Path to a pretrained checkpoint to load weights from
-            before training begins; skipped when ``None``.
-        resume_checkpoint: Path to a full training checkpoint (weights +
-            optimizer state) to resume from; skipped when ``None``.
+        pretrained_weights: Path to a checkpoint whose model weights seed a
+            fresh run: the model and EMA start from those weights, while the
+            optimizer, LR schedule and best validation loss start from
+            scratch. Skipped when ``None``.
+        resume_checkpoint: Path to a full training checkpoint to continue
+            from: model, optimizer, LR schedule, EMA and best validation loss
+            are all restored. Skipped when ``None``. Cannot be combined with
+            ``pretrained_weights``.
         accumulated_token_budget: Target token count across
             gradient-accumulation steps before a parameter update is applied.
         lr_warmup_steps: Number of initial optimizer steps over which the LR
@@ -88,6 +111,27 @@ class TrainingParams(BaseModel):
     lr_decay_steps: int = Field(default=50_000, gt=0)
     lr_decay_factor: float = Field(default=0.95, gt=0, lt=1)
     ema_decay: float = Field(default=0.999, gt=0, lt=1)
+
+    @model_validator(mode="after")
+    def one_checkpoint_source(self) -> "TrainingParams":
+        """Validate that at most one checkpoint source is set.
+
+        Returns:
+            The validated model instance.
+
+        Raises:
+            ConflictingCheckpointSourcesError: If both ``pretrained_weights``
+                and ``resume_checkpoint`` are set.
+        """
+        if (
+            self.pretrained_weights is not None
+            and self.resume_checkpoint is not None
+        ):
+            raise ConflictingCheckpointSourcesError(
+                self.pretrained_weights,
+                self.resume_checkpoint,
+            )
+        return self
 
 
 class ModelParams(BaseModel):

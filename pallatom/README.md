@@ -24,7 +24,6 @@ configure, train, sample, visualise — against the toy checkpoint
    tcfg = TrainConfig(
        training=TrainingParams(
            num_epochs=50,
-           pretrained_weights="pallatom_toy_best.pt",
            resume_checkpoint="pallatom_toy_best.pt",
        ),
        checkpoint=CheckpointParams(checkpoint_path="pallatom_toy_best.pt"),

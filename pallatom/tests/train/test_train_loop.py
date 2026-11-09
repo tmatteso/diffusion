@@ -77,6 +77,7 @@ from train.train_loop import (
     log_epoch,
     optimizer_step,
     process_accum_window,
+    restore_training_state,
     save_checkpoint,
     swapped_in_ema_weights,
     take_step,
@@ -1264,7 +1265,12 @@ def test_load_checkpoint_restores_model_state(
     )
     for p in model_params.model.parameters():
         _ = nn.init.zeros_(p)
-    restored, _ = load_checkpoint(model_params=model_params, rank=0, log=log)
+    restored, _ = load_checkpoint(
+        model_params=model_params,
+        path=model_params.tcfg.checkpoint.checkpoint_path,
+        rank=0,
+        log=log,
+    )
     restored_sd = cast(dict[str, torch.Tensor], restored.model.state_dict())
     for k, v in restored_sd.items():
         assert torch.allclose(v, original_sd[k]), f"Param '{k}' not restored"
@@ -1299,7 +1305,12 @@ def test_load_checkpoint_restores_ema_state(
     for tensor in model_params.ema.shadow.values():
         _ = tensor.zero_()
 
-    restored, _ = load_checkpoint(model_params=model_params, rank=0, log=log)
+    restored, _ = load_checkpoint(
+        model_params=model_params,
+        path=model_params.tcfg.checkpoint.checkpoint_path,
+        rank=0,
+        log=log,
+    )
     for k, v in restored.ema.state_dict().items():
         assert torch.allclose(
             v,
@@ -1334,6 +1345,7 @@ def test_checkpoint_round_trip_preserves_weights_and_loss(
 
     restored, loaded_loss = load_checkpoint(
         model_params=model_params,
+        path=model_params.tcfg.checkpoint.checkpoint_path,
         rank=0,
         log=log,
     )
@@ -1392,6 +1404,7 @@ def test_checkpoint_round_trip_preserves_ema_state(
 
     restored, loaded_loss = load_checkpoint(
         model_params=model_params,
+        path=model_params.tcfg.checkpoint.checkpoint_path,
         rank=0,
         log=log,
     )
@@ -1464,7 +1477,12 @@ def test_checkpoint_round_trip_preserves_optimizer_and_scheduler_state(
         _ = state[_ADAM_EXP_AVG_KEY].zero_()
     model_params.scheduler.last_epoch = -1
 
-    restored, _ = load_checkpoint(model_params=model_params, rank=0, log=log)
+    restored, _ = load_checkpoint(
+        model_params=model_params,
+        path=model_params.tcfg.checkpoint.checkpoint_path,
+        rank=0,
+        log=log,
+    )
 
     restored_opt_state = cast(
         dict[int, dict[str, torch.Tensor]],
@@ -1541,6 +1559,195 @@ def test_save_checkpoint_strips_ddp_wrapper_prefix(
     model_sd = cast(dict[str, torch.Tensor], ckpt["model"])
     assert not any(k.startswith("module.") for k in model_sd)
     assert model_sd.keys() == plain_keys
+
+
+# ---------------------------------------------------------------------------
+# restore_training_state
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class RestoreCase:
+    """Checkpoint source for one restore scenario and the state it yields.
+
+    Attributes:
+        config_field: ``TrainingParams`` field that points at the saved
+            checkpoint (``"resume_checkpoint"`` or ``"pretrained_weights"``),
+            or ``None`` to set neither.
+        weight_fill: Value every model parameter and its EMA shadow should
+            hold after restoring: ``1.0`` is the saved checkpoint's value and
+            ``0.0`` is the fresh model's.
+        scheduler_steps: Expected ``scheduler.last_epoch`` after restoring:
+            ``1`` when the saved scheduler state was loaded, ``0`` when the
+            fresh scheduler was kept.
+        best_val_loss: Expected best validation loss returned: the saved
+            checkpoint's ``0.5`` when resuming, otherwise infinity. ``0.5``
+            is exact in float32, so it survives the round trip unchanged.
+    """
+
+    config_field: str | None
+    weight_fill: float
+    scheduler_steps: int
+    best_val_loss: float
+
+
+class RestoreScenario(Enum):
+    """Checkpoint sources that ``restore_training_state`` must honour.
+
+    Members:
+        resume: ``resume_checkpoint`` set; restores weights, EMA, scheduler
+            and best validation loss from that file.
+        pretrained: ``pretrained_weights`` set; loads weights into the model
+            and EMA only, keeping the fresh scheduler and an infinite best
+            validation loss.
+        neither: no checkpoint source; the fresh state is left untouched.
+    """
+
+    resume = RestoreCase("resume_checkpoint", 1.0, 1, 0.5)
+    pretrained = RestoreCase("pretrained_weights", 1.0, 0, float("inf"))
+    neither = RestoreCase(None, 0.0, 0, float("inf"))
+
+
+@pytest.fixture
+def restore_scenario(request: pytest.FixtureRequest) -> RestoreScenario:
+    """Expose the indirect scenario to the factory and the test.
+
+    Args:
+        request: Pytest fixture request whose ``.param`` attribute is a
+            RestoreScenario member.
+
+    Returns:
+        The scenario member for the current test case.
+    """
+    return cast(RestoreScenario, request.param)
+
+
+@pytest.fixture
+def saved_checkpoint(
+    tmp_path: pathlib.Path,
+    distogram_template: Distogram,
+    distogram_residue: Distogram,
+    distogram_atom: Distogram,
+    log: FilteringBoundLogger,
+) -> pathlib.Path:
+    """Write a checkpoint whose contents are easy to recognise after loading.
+
+    A separate model takes one Adam step and one scheduler step, so its
+    optimizer and scheduler hold non-initial state. Every parameter and EMA
+    shadow tensor is then set to ``1.0`` and the checkpoint is saved with a
+    best validation loss of ``0.5`` to ``saved.pt``. That is deliberately
+    not the ``checkpoint_path`` of the ``model_params`` fixture, so a loader
+    that ignores the configured source and reads ``checkpoint_path`` instead
+    finds no file.
+
+    Args:
+        tmp_path: Pytest-provided temporary directory for the checkpoint.
+        distogram_template: Self-conditioning template distogram head.
+        distogram_residue: Residue-level distogram head.
+        distogram_atom: Atom-level distogram head.
+        log: Bound structlog logger.
+
+    Returns:
+        Path of the saved checkpoint file.
+    """
+    source = _make_model_params(
+        _make_model(),
+        _make_tcfg(tmp_path / "saved.pt"),
+        distogram_template,
+        distogram_residue,
+        distogram_atom,
+    )
+    for parameter in source.model.parameters():
+        parameter.grad = torch.ones_like(parameter)
+    _ = source.optimizer.step()  # pyright: ignore[reportUnknownMemberType]
+    source.scheduler.step()
+    with torch.no_grad():
+        for parameter in source.model.parameters():
+            _ = parameter.fill_(1.0)
+    source.ema.load_state_dict(
+        cast(dict[str, torch.Tensor], source.model.state_dict()),
+    )
+    save_checkpoint(
+        model_params=source,
+        rank=0,
+        log=log,
+        best_val_loss=torch.tensor(0.5),
+    )
+    return source.tcfg.checkpoint.checkpoint_path
+
+
+@pytest.fixture
+def restore_setup(
+    model_params: ModelSetup,
+    saved_checkpoint: pathlib.Path,
+    restore_scenario: RestoreScenario,
+) -> ModelSetup:
+    """Build a fresh ModelSetup whose config names the scenario's source.
+
+    The fresh model's parameters and EMA shadow are zeroed so they can be
+    told apart from the saved checkpoint's ``1.0`` values, and the
+    scenario's ``config_field`` (if any) is pointed at ``saved_checkpoint``.
+
+    Args:
+        model_params: Fixture providing a fresh ModelSetup.
+        saved_checkpoint: Fixture providing the saved checkpoint path.
+        restore_scenario: Scenario naming which config field to set.
+
+    Returns:
+        The fresh ModelSetup with the scenario's checkpoint source set.
+    """
+    field = restore_scenario.value.config_field
+    training = model_params.tcfg.training.model_copy(
+        update={} if field is None else {field: saved_checkpoint},
+    )
+    with torch.no_grad():
+        for parameter in model_params.model.parameters():
+            _ = parameter.zero_()
+    model_params.ema.load_state_dict(
+        cast(dict[str, torch.Tensor], model_params.model.state_dict()),
+    )
+    return dataclasses.replace(
+        model_params,
+        tcfg=model_params.tcfg.model_copy(update={"training": training}),
+    )
+
+
+@pytest.mark.parametrize(
+    "restore_scenario",
+    list(RestoreScenario),
+    ids=[case.name for case in RestoreScenario],
+    indirect=True,
+)
+def test_restore_training_state_reads_configured_source(
+    restore_setup: ModelSetup,
+    restore_scenario: RestoreScenario,
+    log: FilteringBoundLogger,
+) -> None:
+    """restore_training_state loads exactly what the configured source names.
+
+    Checks, per scenario, that the model weights, EMA shadow, scheduler
+    position and returned best validation loss come from the saved
+    checkpoint or from the fresh state as ``RestoreCase`` describes. The
+    checkpoint lives at a different path from ``checkpoint_path``, so this
+    also checks that loading reads the configured path.
+    """
+    restored, best_val_loss = restore_training_state(
+        model_params=restore_setup,
+        rank=0,
+        log=log,
+    )
+    case = restore_scenario.value
+    shadow = restored.ema.state_dict()
+    assert all(
+        bool(torch.all(parameter == case.weight_fill))
+        for parameter in restored.model.parameters()
+    )
+    assert all(
+        bool(torch.all(shadow[name] == case.weight_fill))
+        for name, _ in restored.model.named_parameters()
+    )
+    assert restored.scheduler.last_epoch == case.scheduler_steps
+    assert best_val_loss.item() == case.best_val_loss
 
 
 # ---------------------------------------------------------------------------
