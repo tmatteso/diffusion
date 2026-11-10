@@ -8,14 +8,14 @@ DiffusionTransformer, AtomTransformer, AtomFeatureEncoder and
 AtomAttentionDecoder, including the sparse ``K < N`` layout that once
 crashed with a pair-bias shape mismatch.
 
-Float inputs come from the shared ``make_pattern`` fixture and every module
+Float inputs come from ``tests.patterns.sine_pattern`` and every module
 is built under a fixed seed, so each test is reproducible on its own.
 """
 
+import abc
 import dataclasses
 import enum
-from collections.abc import Callable
-from typing import cast
+from typing import cast, override
 
 import pytest
 import torch
@@ -33,7 +33,7 @@ from architecture.atom_transformers import (
 from einops import rearrange, reduce, repeat
 from helpers.useful_objects import manual_seed
 from jaxtyping import Bool, Float, Int, TypeCheckError
-from tests.conftest import PatternFactory
+from tests.patterns import sine_pattern
 from train.train_config import ModelParams
 
 type AnyFloat = Float[torch.Tensor, "..."]
@@ -131,19 +131,197 @@ class NeighbourSets:
 
 
 @dataclasses.dataclass(frozen=True)
-class ModuleProbe:
+class ModuleProbe(abc.ABC):
     """One module call reduced to a single differentiable input and output.
+
+    Each subclass holds a module and every input it needs except the one
+    under test, and ``run`` calls the module with that one input swapped
+    in. Every fixed input is a named field, so nothing is captured.
 
     Attributes:
         first: The input the gradient and malformed-shape tests act on.
-        call: Runs the module with ``first`` replaced by its argument and
-            every other input fixed.
         out_shape: Shape the probed output must have.
     """
 
     first: AnyFloat
-    call: Callable[[AnyFloat], AnyFloat]
     out_shape: tuple[int, ...]
+
+    @abc.abstractmethod
+    def run(self, first: AnyFloat) -> AnyFloat:
+        """Call the module with ``first`` in place of the probed input.
+
+        Args:
+            first: Value for the probed input.
+
+        Returns:
+            The probed output.
+        """
+
+
+@dataclasses.dataclass(frozen=True)
+class TransitionProbe(ModuleProbe):
+    """ConditionedTransitionBlock probed over its atom embedding ``a``.
+
+    Attributes:
+        block: Module under test.
+        s: Fixed conditioning embedding.
+    """
+
+    block: ConditionedTransitionBlock
+    s: AnyFloat
+
+    @override
+    def run(self, first: AnyFloat) -> AnyFloat:
+        """Run ``block(first, s)``.
+
+        Args:
+            first: Atom embedding ``a``.
+
+        Returns:
+            The block's output.
+        """
+        return self.block(first, self.s)
+
+
+@dataclasses.dataclass(frozen=True)
+class DiffusionProbe(ModuleProbe):
+    """DiffusionTransformer probed over its atom embedding ``a``.
+
+    Attributes:
+        model: Module under test.
+        s: Fixed conditioning embedding.
+        z: Fixed pair embedding, dense or sparse.
+        beta: Fixed attention bias aligned with ``z``.
+        neighbor_idx: Neighbour index for the sparse layout, or ``None``
+            for dense pairs.
+    """
+
+    model: DiffusionTransformer
+    s: AnyFloat
+    z: AnyFloat
+    beta: AnyFloat
+    neighbor_idx: Int[torch.Tensor, "B N K"] | None
+
+    @override
+    def run(self, first: AnyFloat) -> AnyFloat:
+        """Run the transformer with ``first`` as ``a``.
+
+        Args:
+            first: Atom embedding ``a``.
+
+        Returns:
+            The transformer's output.
+        """
+        return self.model(
+            first,
+            self.s,
+            self.z,
+            self.beta,
+            neighbor_idx=self.neighbor_idx,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class AtomTransformerProbe(ModuleProbe):
+    """AtomTransformer probed over its queries ``q``.
+
+    Attributes:
+        model: Module under test.
+        inputs: Fixed context, pairs and neighbour layout.
+    """
+
+    model: AtomTransformer
+    inputs: AtomInputs
+
+    @override
+    def run(self, first: AnyFloat) -> AnyFloat:
+        """Run the transformer with ``first`` as ``q``.
+
+        Args:
+            first: Atom queries ``q``.
+
+        Returns:
+            The transformer's output.
+        """
+        x = self.inputs
+        return self.model(
+            first,
+            x.c,
+            x.p,
+            x.pairs.neighbor_idx,
+            x.pairs.valid_mask,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class EncoderProbe(ModuleProbe):
+    """AtomFeatureEncoder probed from ``r_scaled`` to ``q_skip``.
+
+    Attributes:
+        encoder: Module under test.
+        inputs: Every other encoder input.
+    """
+
+    encoder: AtomFeatureEncoder
+    inputs: AtomInputs
+
+    @override
+    def run(self, first: AnyFloat) -> AnyFloat:
+        """Run the encoder with ``first`` as ``r_scaled``.
+
+        Args:
+            first: Scaled noisy positions.
+
+        Returns:
+            The encoder's ``q_skip`` output.
+        """
+        x = self.inputs
+        _, q_skip, *_ = self.encoder(
+            x.ref_pos,
+            x.ref_element,
+            x.ref_space_uid,
+            x.s_input,
+            x.z_input,
+            first,
+            x.tok_idx,
+        )
+        return q_skip
+
+
+@dataclasses.dataclass(frozen=True)
+class DecoderProbe(ModuleProbe):
+    """AtomAttentionDecoder probed from ``q_skip`` to its position update.
+
+    Attributes:
+        decoder: Module under test.
+        inputs: Atom-level inputs; ``q``, ``p`` and ``c`` stand in for the
+            encoder's skip outputs.
+    """
+
+    decoder: AtomAttentionDecoder
+    inputs: AtomInputs
+
+    @override
+    def run(self, first: AnyFloat) -> AnyFloat:
+        """Run the decoder with ``first`` as ``q_skip``.
+
+        Args:
+            first: Atom skip queries.
+
+        Returns:
+            The decoder's ``r_update`` output.
+        """
+        x = self.inputs
+        _, _, r_update, _ = self.decoder(
+            first,
+            x.p,
+            x.c,
+            x.c,
+            x.s_input,
+            x.z_input,
+            x.tok_idx,
+        )
+        return r_update
 
 
 @dataclasses.dataclass(frozen=True)
@@ -310,7 +488,7 @@ def model_params(dims: AtomDims) -> ModelParams:
 
 
 @pytest.fixture
-def atom_inputs(dims: AtomDims, make_pattern: PatternFactory) -> AtomInputs:
+def atom_inputs(dims: AtomDims) -> AtomInputs:
     """Build every atom-level input from deterministic patterns.
 
     Atoms are grouped ``atoms_per_res`` to a residue, atom ``l`` has element
@@ -319,7 +497,6 @@ def atom_inputs(dims: AtomDims, make_pattern: PatternFactory) -> AtomInputs:
 
     Args:
         dims: Input sizes.
-        make_pattern: Sine-pattern factory.
 
     Returns:
         The bundled inputs.
@@ -335,24 +512,24 @@ def atom_inputs(dims: AtomDims, make_pattern: PatternFactory) -> AtomInputs:
             neighbor_idx=repeat(nbrs, "n k -> b n k", b=b),
             valid_mask=repeat(mask, "n k -> b n k", b=b),
         ),
-        q=make_pattern((b, n, dims.c_atom), 0.31),
-        c=make_pattern((b, n, dims.c_atom), 0.43),
-        p=make_pattern((b, n, k, dims.c_atompair), 0.59),
-        ref_pos=make_pattern((b, n, 3), 0.67),
+        q=sine_pattern((b, n, dims.c_atom), 0.31),
+        c=sine_pattern((b, n, dims.c_atom), 0.43),
+        p=sine_pattern((b, n, k, dims.c_atompair), 0.59),
+        ref_pos=sine_pattern((b, n, 3), 0.67),
         ref_element=repeat(
             F.one_hot(elements, dims.n_elements).float(),
             "n e -> b n e",
             b=b,
         ),
         ref_space_uid=torch.zeros(b, n, dtype=torch.long),
-        r_scaled=make_pattern((b, n, 3), 0.79),
-        s_input=make_pattern((b, r, dims.c_token), 0.83),
-        z_input=make_pattern((b, r, r, dims.c_pair), 0.97),
+        r_scaled=sine_pattern((b, n, 3), 0.79),
+        s_input=sine_pattern((b, r, dims.c_token), 0.83),
+        z_input=sine_pattern((b, r, r, dims.c_pair), 0.97),
     )
 
 
 @pytest.fixture
-def sparse_inputs(dims: AtomDims, make_pattern: PatternFactory) -> AtomInputs:
+def sparse_inputs(dims: AtomDims) -> AtomInputs:
     """Build atom inputs on 20 two-atom residues with a window of 4.
 
     Each atom then has ``K = 6`` neighbours out of ``N = 40``, the layout
@@ -362,7 +539,6 @@ def sparse_inputs(dims: AtomDims, make_pattern: PatternFactory) -> AtomInputs:
 
     Args:
         dims: Channel sizes.
-        make_pattern: Sine-pattern factory.
 
     Returns:
         The bundled inputs.
@@ -378,70 +554,65 @@ def sparse_inputs(dims: AtomDims, make_pattern: PatternFactory) -> AtomInputs:
             neighbor_idx=repeat(nbrs, "n k -> b n k", b=b),
             valid_mask=repeat(mask, "n k -> b n k", b=b),
         ),
-        q=make_pattern((b, n, dims.c_atom), 0.31),
-        c=make_pattern((b, n, dims.c_atom), 0.43),
-        p=make_pattern((b, n, k, dims.c_atompair), 0.59),
-        ref_pos=make_pattern((b, n, 3), 0.67),
+        q=sine_pattern((b, n, dims.c_atom), 0.31),
+        c=sine_pattern((b, n, dims.c_atom), 0.43),
+        p=sine_pattern((b, n, k, dims.c_atompair), 0.59),
+        ref_pos=sine_pattern((b, n, 3), 0.67),
         ref_element=torch.zeros(b, n, dims.n_elements),
         ref_space_uid=torch.zeros(b, n, dtype=torch.long),
-        r_scaled=make_pattern((b, n, 3), 0.79),
-        s_input=make_pattern((b, r, dims.c_token), 0.83),
-        z_input=make_pattern((b, r, r, dims.c_pair), 0.97),
+        r_scaled=sine_pattern((b, n, 3), 0.79),
+        s_input=sine_pattern((b, r, dims.c_token), 0.83),
+        z_input=sine_pattern((b, r, r, dims.c_pair), 0.97),
     )
 
 
 @pytest.fixture
-def transition_probe(
-    dims: AtomDims,
-    make_pattern: PatternFactory,
-) -> ModuleProbe:
+def transition_probe(dims: AtomDims) -> TransitionProbe:
     """Probe ConditionedTransitionBlock on residue-level inputs.
 
     Args:
         dims: Module and input sizes.
-        make_pattern: Sine-pattern factory.
 
     Returns:
         Probe over the atom embedding ``a``.
     """
     _ = manual_seed(0)
-    block = ConditionedTransitionBlock(dims.c_atom, dims.c_atom).eval()
     shape = (dims.batch, dims.n_res, dims.c_atom)
-    s = make_pattern(shape, 0.53)
-    return ModuleProbe(make_pattern(shape, 0.37), lambda a: block(a, s), shape)
+    return TransitionProbe(
+        first=sine_pattern(shape, 0.37),
+        out_shape=shape,
+        block=ConditionedTransitionBlock(dims.c_atom, dims.c_atom).eval(),
+        s=sine_pattern(shape, 0.53),
+    )
 
 
 @pytest.fixture
-def diffusion_dense_probe(
-    dims: AtomDims,
-    make_pattern: PatternFactory,
-) -> ModuleProbe:
+def diffusion_dense_probe(dims: AtomDims) -> DiffusionProbe:
     """Probe a two-block DiffusionTransformer on dense residue pairs.
 
     Args:
         dims: Module and input sizes.
-        make_pattern: Sine-pattern factory.
 
     Returns:
         Probe over the atom embedding ``a``.
     """
     _ = manual_seed(0)
-    model = DiffusionTransformer(
-        dims.c_atom,
-        dims.c_atom,
-        dims.c_pair,
-        N_block=2,
-        N_head=dims.n_heads,
-    ).eval()
     b, n = dims.batch, dims.n_res
     shape = (b, n, dims.c_atom)
-    s = make_pattern(shape, 0.53)
-    z = make_pattern((b, n, n, dims.c_pair), 0.71)
-    beta = torch.zeros(b, n, n)
-    return ModuleProbe(
-        make_pattern(shape, 0.37),
-        lambda a: model(a, s, z, beta),
-        shape,
+    return DiffusionProbe(
+        first=sine_pattern(shape, 0.37),
+        out_shape=shape,
+        model=DiffusionTransformer(
+            dims.c_atom,
+            dims.c_atom,
+            dims.c_pair,
+            N_block=2,
+            N_head=dims.n_heads,
+        ).eval(),
+        s=sine_pattern(shape, 0.53),
+        z=sine_pattern((b, n, n, dims.c_pair), 0.71),
+        beta=torch.zeros(b, n, n),
+        neighbor_idx=None,
     )
 
 
@@ -449,7 +620,7 @@ def diffusion_dense_probe(
 def diffusion_sparse_probe(
     dims: AtomDims,
     sparse_inputs: AtomInputs,
-) -> ModuleProbe:
+) -> DiffusionProbe:
     """Probe DiffusionTransformer on the ``K < N`` sparse layout.
 
     Args:
@@ -461,19 +632,20 @@ def diffusion_sparse_probe(
     """
     _ = manual_seed(0)
     x = sparse_inputs
-    model = DiffusionTransformer(
-        dims.c_atom,
-        dims.c_atom,
-        dims.c_atompair,
-        N_block=1,
-        N_head=dims.n_heads,
-    ).eval()
-    beta = torch.zeros(x.pairs.neighbor_idx.shape)
-    idx = x.pairs.neighbor_idx
-    return ModuleProbe(
-        x.q,
-        lambda a: model(a, x.c, x.p, beta, neighbor_idx=idx),
-        tuple(x.q.shape),
+    return DiffusionProbe(
+        first=x.q,
+        out_shape=tuple(x.q.shape),
+        model=DiffusionTransformer(
+            dims.c_atom,
+            dims.c_atom,
+            dims.c_atompair,
+            N_block=1,
+            N_head=dims.n_heads,
+        ).eval(),
+        s=x.c,
+        z=x.p,
+        beta=torch.zeros(x.pairs.neighbor_idx.shape),
+        neighbor_idx=x.pairs.neighbor_idx,
     )
 
 
@@ -481,7 +653,7 @@ def diffusion_sparse_probe(
 def atom_transformer_probe(
     dims: AtomDims,
     atom_inputs: AtomInputs,
-) -> ModuleProbe:
+) -> AtomTransformerProbe:
     """Probe a two-block AtomTransformer on the 24-atom layout.
 
     Args:
@@ -492,20 +664,12 @@ def atom_transformer_probe(
         Probe over the queries ``q``.
     """
     _ = manual_seed(0)
-    x = atom_inputs
     model = AtomTransformer(dims.c_atom, dims.c_atompair, 2, dims.n_heads)
-    _ = model.eval()
-    pairs = x.pairs
-    return ModuleProbe(
-        x.q,
-        lambda q: model(
-            q,
-            x.c,
-            x.p,
-            pairs.neighbor_idx,
-            pairs.valid_mask,
-        ),
-        tuple(x.q.shape),
+    return AtomTransformerProbe(
+        first=atom_inputs.q,
+        out_shape=tuple(atom_inputs.q.shape),
+        model=model.eval(),
+        inputs=atom_inputs,
     )
 
 
@@ -513,7 +677,7 @@ def atom_transformer_probe(
 def atom_transformer_sparse_probe(
     dims: AtomDims,
     sparse_inputs: AtomInputs,
-) -> ModuleProbe:
+) -> AtomTransformerProbe:
     """Probe AtomTransformer on the ``K < N`` sparse layout.
 
     Args:
@@ -524,20 +688,12 @@ def atom_transformer_sparse_probe(
         Probe over the queries ``q``.
     """
     _ = manual_seed(0)
-    x = sparse_inputs
     model = AtomTransformer(dims.c_atom, dims.c_atompair, 1, dims.n_heads)
-    _ = model.eval()
-    pairs = x.pairs
-    return ModuleProbe(
-        x.q,
-        lambda q: model(
-            q,
-            x.c,
-            x.p,
-            pairs.neighbor_idx,
-            pairs.valid_mask,
-        ),
-        tuple(x.q.shape),
+    return AtomTransformerProbe(
+        first=sparse_inputs.q,
+        out_shape=tuple(sparse_inputs.q.shape),
+        model=model.eval(),
+        inputs=sparse_inputs,
     )
 
 
@@ -579,7 +735,7 @@ def decoder(model_params: ModelParams) -> AtomAttentionDecoder:
 def encoder_probe(
     encoder: AtomFeatureEncoder,
     atom_inputs: AtomInputs,
-) -> ModuleProbe:
+) -> EncoderProbe:
     """Probe the encoder from ``r_scaled`` to its ``q_skip`` output.
 
     Args:
@@ -589,36 +745,19 @@ def encoder_probe(
     Returns:
         Probe over the scaled noisy positions.
     """
-    x = atom_inputs
-
-    def run(r_scaled: AnyFloat) -> AnyFloat:
-        """Run the encoder with ``r_scaled`` swapped in.
-
-        Args:
-            r_scaled: Scaled noisy positions.
-
-        Returns:
-            The encoder's ``q_skip`` output.
-        """
-        _, q_skip, *_ = encoder(
-            x.ref_pos,
-            x.ref_element,
-            x.ref_space_uid,
-            x.s_input,
-            x.z_input,
-            r_scaled,
-            x.tok_idx,
-        )
-        return q_skip
-
-    return ModuleProbe(x.r_scaled, run, tuple(x.q.shape))
+    return EncoderProbe(
+        first=atom_inputs.r_scaled,
+        out_shape=tuple(atom_inputs.q.shape),
+        encoder=encoder,
+        inputs=atom_inputs,
+    )
 
 
 @pytest.fixture
 def decoder_probe(
     decoder: AtomAttentionDecoder,
     atom_inputs: AtomInputs,
-) -> ModuleProbe:
+) -> DecoderProbe:
     """Probe the decoder from ``q_skip`` to its position update.
 
     Args:
@@ -629,29 +768,12 @@ def decoder_probe(
     Returns:
         Probe over the skip queries.
     """
-    x = atom_inputs
-
-    def run(q_skip: AnyFloat) -> AnyFloat:
-        """Run the decoder with ``q_skip`` swapped in.
-
-        Args:
-            q_skip: Atom skip queries.
-
-        Returns:
-            The decoder's ``r_update`` output.
-        """
-        _, _, r_update, _ = decoder(
-            q_skip,
-            x.p,
-            x.c,
-            x.c,
-            x.s_input,
-            x.z_input,
-            x.tok_idx,
-        )
-        return r_update
-
-    return ModuleProbe(x.q, run, tuple(x.r_scaled.shape))
+    return DecoderProbe(
+        first=atom_inputs.q,
+        out_shape=tuple(atom_inputs.r_scaled.shape),
+        decoder=decoder,
+        inputs=atom_inputs,
+    )
 
 
 @pytest.fixture
@@ -791,14 +913,12 @@ def windowed_transformer(dims: AtomDims) -> AtomTransformer:
 def windowed_inputs(
     dims: AtomDims,
     dense_pairs: SparsePairs,
-    make_pattern: PatternFactory,
 ) -> AtomInputs:
     """Build one-item inputs on the 8-atom dense layout.
 
     Args:
         dims: Channel sizes.
         dense_pairs: Identity layout; only batch item 0 is used.
-        make_pattern: Sine-pattern factory.
 
     Returns:
         Inputs whose atom-level fields drive ``windowed_transformer``.
@@ -811,9 +931,9 @@ def windowed_inputs(
     return AtomInputs(
         tok_idx=rearrange(torch.arange(n), "n -> 1 n"),
         pairs=pairs,
-        q=make_pattern((1, n, dims.c_atom), 0.31),
-        c=make_pattern((1, n, dims.c_atom), 0.43),
-        p=make_pattern((1, n, n, dims.c_atompair), 0.59),
+        q=sine_pattern((1, n, dims.c_atom), 0.31),
+        c=sine_pattern((1, n, dims.c_atom), 0.43),
+        p=sine_pattern((1, n, n, dims.c_atompair), 0.59),
         ref_pos=torch.zeros(1, n, 3),
         ref_element=torch.zeros(1, n, dims.n_elements),
         ref_space_uid=torch.zeros(1, n, dtype=torch.long),
@@ -1013,8 +1133,18 @@ def test_scatter_mean_averages_each_segment(
     torch.testing.assert_close(out, rearrange(expected, "b n -> b n 1"))
 
 
+@pytest.fixture
+def channel_source() -> Float[torch.Tensor, "1 12 5"]:
+    """Return a 12-atom, 5-channel source whose channels all differ.
+
+    Returns:
+        A sine pattern of shape ``(1, 12, 5)``.
+    """
+    return sine_pattern((1, 12, 5), 0.41)
+
+
 def test_scatter_mean_averages_every_channel_independently(
-    make_pattern: PatternFactory,
+    channel_source: Float[torch.Tensor, "1 12 5"],
 ) -> None:
     """With 5 channels, each channel's segment mean matches a grouped mean.
 
@@ -1023,9 +1153,9 @@ def test_scatter_mean_averages_every_channel_independently(
     one-channel scenarios already vary the segment layout.
 
     Args:
-        make_pattern: Builds the ``(1, 12, 5)`` source.
+        channel_source: Source with five distinct channels.
     """
-    src = make_pattern((1, 12, 5), 0.41)
+    src = channel_source
     index = rearrange(torch.repeat_interleave(torch.arange(3), 4), "n -> 1 n")
     grouped = rearrange(src, "b (n a) c -> b n a c", a=4)
     expected = reduce(grouped, "b n a c -> b n c", "mean")
@@ -1071,7 +1201,7 @@ def test_probed_output_shape_and_finite(module_probe: ModuleProbe) -> None:
         module_probe: Module call under test.
     """
     with torch.no_grad():
-        out = module_probe.call(module_probe.first)
+        out = module_probe.run(module_probe.first)
     assert tuple(out.shape) == module_probe.out_shape
     assert torch.isfinite(out).all()
 
@@ -1096,7 +1226,7 @@ def test_probed_gradient_reaches_first_input(module_probe: ModuleProbe) -> None:
         module_probe: Module call under test.
     """
     leaf = module_probe.first.clone().requires_grad_()
-    out = reduce(module_probe.call(leaf), "... -> ", "sum")
+    out = reduce(module_probe.run(leaf), "... -> ", "sum")
     (grad,) = torch.autograd.grad(out, leaf)
     assert torch.isfinite(grad).all()
     assert torch.count_nonzero(grad) > 0
@@ -1125,7 +1255,7 @@ def test_probed_input_missing_last_axis_is_rejected(
     """
     malformed = module_probe.first[..., 0]
     with pytest.raises(TypeCheckError):
-        _ = module_probe.call(malformed)
+        _ = module_probe.run(malformed)
 
 
 def test_atom_feature_encoder_output_shapes_and_finite(

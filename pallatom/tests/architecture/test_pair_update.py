@@ -6,15 +6,15 @@ PairUpdate; which axis each triangle attention keeps independent and that
 it reads its bias; the masks DropoutRowwise and DropoutColumnwise draw; and
 PairUpdate's invariance to rigid motions of the centre-atom coordinates.
 
-Inputs come from the shared ``make_pattern`` fixture and every module is
+Inputs come from ``tests.patterns.sine_pattern`` and every module is
 built under a fixed seed, so each test is reproducible on its own.
 """
 
+import abc
 import dataclasses
 import enum
 import math
-from collections.abc import Callable
-from typing import cast
+from typing import cast, override
 
 import pytest
 import torch
@@ -31,7 +31,7 @@ from architecture.pair_update import (
 from einops import einsum, rearrange, reduce
 from helpers.useful_objects import manual_seed
 from jaxtyping import Float, TypeCheckError
-from tests.conftest import PatternFactory
+from tests.patterns import sine_pattern
 
 type AnyFloat = Float[torch.Tensor, "..."]
 type Pair = Float[torch.Tensor, "B N_res N_res c"]
@@ -58,14 +58,130 @@ class PairDims:
 
 
 @dataclasses.dataclass(frozen=True)
-class PairProbe:
+class PairProbe(abc.ABC):
     """One module reduced to a call on the pair embedding ``z``.
 
-    Attributes:
-        call: Runs the module with ``z`` replaced by its argument.
+    Each subclass holds a module and its fixed inputs as named fields, and
+    ``run`` calls the module with ``z`` swapped in, so nothing is
+    captured.
     """
 
-    call: Callable[[Pair], Pair]
+    @abc.abstractmethod
+    def run(self, pair: AnyFloat) -> AnyFloat:
+        """Call the module on ``pair`` with every other input fixed.
+
+        Args:
+            pair: Pair embedding, or any tensor the module accepts.
+
+        Returns:
+            The module's output.
+        """
+
+
+@dataclasses.dataclass(frozen=True)
+class TriangleProbe(PairProbe):
+    """A triangle attention probed over ``z`` with a fixed bias.
+
+    Attributes:
+        module: Module under test, in eval mode.
+        bias: Fixed attention bias.
+    """
+
+    module: TriangleAttention
+    bias: Pair
+
+    @override
+    def run(self, pair: AnyFloat) -> AnyFloat:
+        """Run ``module(pair, bias)``.
+
+        Args:
+            pair: Pair embedding.
+
+        Returns:
+            The attention output.
+        """
+        return self.module(pair, self.bias)
+
+
+@dataclasses.dataclass(frozen=True)
+class TransitionProbe(PairProbe):
+    """The Transition block, which takes ``z`` alone.
+
+    Attributes:
+        module: Module under test, in eval mode.
+    """
+
+    module: Transition
+
+    @override
+    def run(self, pair: AnyFloat) -> AnyFloat:
+        """Run ``module(pair)``.
+
+        Args:
+            pair: Pair or single embedding.
+
+        Returns:
+            The block's output.
+        """
+        return self.module(pair)
+
+
+@dataclasses.dataclass(frozen=True)
+class PairUpdateProbe(PairProbe):
+    """PairUpdate probed over ``z`` with fixed centre-atom coordinates.
+
+    Attributes:
+        module: Module under test, in eval mode.
+        r_center: Fixed centre-atom coordinates.
+    """
+
+    module: PairUpdate
+    r_center: Float[torch.Tensor, "B N_res 3"]
+
+    @override
+    def run(self, pair: AnyFloat) -> AnyFloat:
+        """Run ``module(pair, r_center)``.
+
+        Args:
+            pair: Pair embedding.
+
+        Returns:
+            The updated pair embedding.
+        """
+        return self.module(pair, self.r_center)
+
+
+@dataclasses.dataclass(frozen=True)
+class RbfCase:
+    """A distance from the first RBF centre and that centre's feature.
+
+    Attributes:
+        offset_in_sigmas: Distance from the first centre, in sigmas.
+        expected: Value of the first centre's feature.
+        formula_bug: Whether the case hits the known precedence bug in
+            ``TransformRBF``, so the ``rbf_scenario`` fixture marks it
+            strict ``xfail``.
+    """
+
+    offset_in_sigmas: float
+    expected: float
+    formula_bug: bool
+
+
+class RbfScenario(enum.Enum):
+    """Distances at which the RBF feature has a known value.
+
+    Members:
+        at_centre: On the centre, the feature is 1.
+        one_sigma: One ``sigma`` away, the feature is ``exp(-1/2)``. Fails
+            today: ``TransformRBF`` computes
+            ``exp(-(d - c)**2 / 2 * sigma**2)``, so operator precedence
+            multiplies by ``sigma**2`` instead of dividing by
+            ``2 * sigma**2``.
+    """
+
+    at_centre = RbfCase(0.0, 1.0, formula_bug=False)
+    one_sigma = RbfCase(1.0, math.exp(-0.5), formula_bug=True)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -165,37 +281,34 @@ def dims() -> PairDims:
 
 
 @pytest.fixture
-def z(dims: PairDims, make_pattern: PatternFactory) -> Pair:
+def z(dims: PairDims) -> Pair:
     """Return a deterministic pair embedding.
 
     Args:
         dims: Tensor sizes.
-        make_pattern: Sine-pattern factory.
 
     Returns:
         ``(B, N_res, N_res, c)`` tensor.
     """
-    return make_pattern((dims.batch, dims.n_res, dims.n_res, dims.c), 0.37)
+    return sine_pattern((dims.batch, dims.n_res, dims.n_res, dims.c), 0.37)
 
 
 @pytest.fixture
-def bias(dims: PairDims, make_pattern: PatternFactory) -> Pair:
+def bias(dims: PairDims) -> Pair:
     """Return a deterministic triangle attention bias, unrelated to ``z``.
 
     Args:
         dims: Tensor sizes.
-        make_pattern: Sine-pattern factory.
 
     Returns:
         ``(B, N_res, N_res, c)`` tensor.
     """
-    return make_pattern((dims.batch, dims.n_res, dims.n_res, dims.c), 0.53)
+    return sine_pattern((dims.batch, dims.n_res, dims.n_res, dims.c), 0.53)
 
 
 @pytest.fixture
 def r_center(
     dims: PairDims,
-    make_pattern: PatternFactory,
 ) -> Float[torch.Tensor, "B N_res 3"]:
     """Return centre-atom coordinates spread over tens of angstroms.
 
@@ -204,12 +317,11 @@ def r_center(
 
     Args:
         dims: Tensor sizes.
-        make_pattern: Sine-pattern factory.
 
     Returns:
         ``(B, N_res, 3)`` coordinates.
     """
-    return 10 * make_pattern((dims.batch, dims.n_res, 3), 0.71)
+    return 10 * sine_pattern((dims.batch, dims.n_res, 3), 0.71)
 
 
 @pytest.fixture
@@ -259,7 +371,7 @@ def triangle(
 
 
 @pytest.fixture
-def starting_probe(dims: PairDims, bias: Pair) -> PairProbe:
+def starting_probe(dims: PairDims, bias: Pair) -> TriangleProbe:
     """Probe the starting-node triangle attention with a fixed bias.
 
     Args:
@@ -271,11 +383,11 @@ def starting_probe(dims: PairDims, bias: Pair) -> PairProbe:
     """
     _ = manual_seed(0)
     module = TriangleAttentionStartingNodeWithBias(dims.c, dims.n_heads)
-    return PairProbe(lambda z: module.eval()(z, bias))
+    return TriangleProbe(module=module.eval(), bias=bias)
 
 
 @pytest.fixture
-def ending_probe(dims: PairDims, bias: Pair) -> PairProbe:
+def ending_probe(dims: PairDims, bias: Pair) -> TriangleProbe:
     """Probe the ending-node triangle attention with a fixed bias.
 
     Args:
@@ -287,11 +399,11 @@ def ending_probe(dims: PairDims, bias: Pair) -> PairProbe:
     """
     _ = manual_seed(0)
     module = TriangleAttentionEndingNodeWithBias(dims.c, dims.n_heads)
-    return PairProbe(lambda z: module.eval()(z, bias))
+    return TriangleProbe(module=module.eval(), bias=bias)
 
 
 @pytest.fixture
-def transition_probe(dims: PairDims) -> PairProbe:
+def transition_probe(dims: PairDims) -> TransitionProbe:
     """Probe the Transition feed-forward block.
 
     Args:
@@ -301,15 +413,14 @@ def transition_probe(dims: PairDims) -> PairProbe:
         Probe over ``z``.
     """
     _ = manual_seed(0)
-    module = Transition(dims.c).eval()
-    return PairProbe(module)
+    return TransitionProbe(module=Transition(dims.c).eval())
 
 
 @pytest.fixture
 def pair_update_probe(
     pair_update: PairUpdate,
     r_center: Float[torch.Tensor, "B N_res 3"],
-) -> PairProbe:
+) -> PairUpdateProbe:
     """Probe PairUpdate with fixed centre-atom coordinates.
 
     Args:
@@ -319,7 +430,46 @@ def pair_update_probe(
     Returns:
         Probe over ``z``.
     """
-    return PairProbe(lambda z: pair_update(z, r_center))
+    return PairUpdateProbe(module=pair_update, r_center=r_center)
+
+
+@pytest.fixture
+def flat_input(dims: PairDims) -> Float[torch.Tensor, "N_res c"]:
+    """Return a 2-D ``(N_res, c)`` input with no pair layout.
+
+    Args:
+        dims: Tensor sizes.
+
+    Returns:
+        A sine pattern of shape ``(N_res, c)``.
+    """
+    return sine_pattern((dims.n_res, dims.c), 0.41)
+
+
+@pytest.fixture
+def rbf_scenario(request: pytest.FixtureRequest) -> RbfScenario:
+    """Return the ``RbfScenario`` member, marking known failures ``xfail``.
+
+    A case flagged ``formula_bug`` gets a strict ``xfail`` marker, so it
+    must fail today and the marker must come off once ``TransformRBF``
+    is fixed. Marks cannot ride on enum members, so the fixture applies
+    the marker.
+
+    Args:
+        request: Pytest request carrying the scenario in ``param``.
+
+    Returns:
+        The scenario under test.
+    """
+    scenario = cast(RbfScenario, request.param)
+    if scenario.value.formula_bug:
+        request.applymarker(
+            pytest.mark.xfail(
+                strict=True,
+                reason="TransformRBF precedence bug, see RbfScenario",
+            ),
+        )
+    return scenario
 
 
 @pytest.fixture
@@ -362,44 +512,31 @@ def rigid_scenario(request: pytest.FixtureRequest) -> RigidScenario:
 
 
 @pytest.mark.parametrize(
-    ("offset_in_sigmas", "expected"),
-    [
-        pytest.param(0.0, 1.0, id="at_centre"),
-        pytest.param(
-            1.0,
-            math.exp(-0.5),
-            id="one_sigma",
-            marks=pytest.mark.xfail(
-                strict=True,
-                reason=(
-                    "TransformRBF computes exp(-(d - c)**2 / 2 * sigma**2): "
-                    "operator precedence multiplies by sigma**2 instead of "
-                    "dividing by 2 * sigma**2"
-                ),
-            ),
-        ),
-    ],
+    "rbf_scenario",
+    list(RbfScenario),
+    ids=[case.name for case in RbfScenario],
+    indirect=True,
 )
 def test_transform_rbf_is_a_gaussian_of_width_sigma(
-    offset_in_sigmas: float,
-    expected: float,
+    rbf_scenario: RbfScenario,
 ) -> None:
     """At ``sigma`` from a centre, that centre's feature is ``exp(-1/2)``.
 
     The documented basis is ``exp(-(d - c)**2 / (2 * sigma**2))``, so a
     distance on a centre gives 1 and one ``sigma`` away gives
-    ``exp(-0.5)``. The second case fails today; it is marked strict so the
-    marker must be removed once the formula is fixed.
+    ``exp(-0.5)``. The second case fails today; ``rbf_scenario`` marks it
+    strict ``xfail`` so the marker must be removed once the formula is
+    fixed.
 
     Args:
-        offset_in_sigmas: Distance from the first centre, in sigmas.
-        expected: Value of the first centre's feature.
+        rbf_scenario: Distance from the first centre and expected value.
     """
+    case = rbf_scenario.value
     params = ParamsForRBF()
-    distance = params.d_min + offset_in_sigmas * params.sigma
+    distance = params.d_min + case.offset_in_sigmas * params.sigma
     out = TransformRBF(params)(torch.full((1, 1, 1), distance))
     assert out.shape == (1, 1, 1, params.n_rbf)
-    torch.testing.assert_close(out[0, 0, 0, 0], torch.tensor(expected))
+    torch.testing.assert_close(out[0, 0, 0, 0], torch.tensor(case.expected))
 
 
 def test_transform_rbf_rejects_distances_missing_an_axis(
@@ -429,7 +566,7 @@ def test_output_shape_and_finite(z: Pair, pair_probe: PairProbe) -> None:
         pair_probe: Module call under test.
     """
     with torch.no_grad():
-        out = pair_probe.call(z)
+        out = pair_probe.run(z)
     assert out.shape == z.shape
     assert torch.isfinite(out).all()
 
@@ -450,7 +587,7 @@ def test_gradient_reaches_pair_embedding(
         pair_probe: Module call under test.
     """
     leaf = z.clone().requires_grad_()
-    out = reduce(pair_probe.call(leaf), "b i j c -> ", "sum")
+    out = reduce(pair_probe.run(leaf), "b i j c -> ", "sum")
     (grad,) = torch.autograd.grad(out, leaf)
     assert torch.isfinite(grad).all()
     assert torch.count_nonzero(grad) > 0
@@ -476,13 +613,12 @@ def test_forward_rejects_pair_missing_channel_axis(
     """
     malformed = z[..., 0]
     with pytest.raises(TypeCheckError):
-        _ = pair_probe.call(malformed)
+        _ = pair_probe.run(malformed)
 
 
 def test_transition_accepts_any_leading_shape(
-    dims: PairDims,
-    make_pattern: PatternFactory,
-    transition_probe: PairProbe,
+    flat_input: Float[torch.Tensor, "N_res c"],
+    transition_probe: TransitionProbe,
 ) -> None:
     """Transition maps an ``(N, c)`` tensor to the same shape.
 
@@ -491,14 +627,12 @@ def test_transition_accepts_any_leading_shape(
     shape test above.
 
     Args:
-        dims: Tensor sizes.
-        make_pattern: Builds the 2-D input.
+        flat_input: Input without a pair layout.
         transition_probe: Transition under test.
     """
-    x = make_pattern((dims.n_res, dims.c), 0.41)
     with torch.no_grad():
-        out = transition_probe.call(x)
-    assert out.shape == x.shape
+        out = transition_probe.run(flat_input)
+    assert out.shape == flat_input.shape
 
 
 @pytest.mark.parametrize(
@@ -614,7 +748,7 @@ def test_dropout_drops_whole_slices_and_rescales(
 
 
 def test_pair_update_is_not_identity(
-    pair_update_probe: PairProbe,
+    pair_update_probe: PairUpdateProbe,
     z: Pair,
 ) -> None:
     """PairUpdate's residual updates are nonzero at initialisation.
@@ -627,7 +761,7 @@ def test_pair_update_is_not_identity(
         z: Valid pair embedding.
     """
     with torch.no_grad():
-        out = pair_update_probe.call(z)
+        out = pair_update_probe.run(z)
     assert not torch.allclose(out, z)
 
 
