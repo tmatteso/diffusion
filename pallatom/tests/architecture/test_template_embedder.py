@@ -242,34 +242,6 @@ def first_item_inputs(base_inputs: EmbedderInputs) -> EmbedderInputs:
     )
 
 
-@pytest.fixture
-def scenario_edit(request: pytest.FixtureRequest) -> InputEdit:
-    """Return the edit carried by the scenario routed in via indirect param.
-
-    Args:
-        request: Pytest request carrying a ``ConditioningScenario`` or
-            ``MalformedScenario`` member in ``param``.
-
-    Returns:
-        The member's ``InputEdit``.
-    """
-    scenario = cast(ConditioningScenario | MalformedScenario, request.param)
-    return scenario.value
-
-
-@pytest.fixture
-def grad_input_name(request: pytest.FixtureRequest) -> str:
-    """Return the name of the input the gradient test differentiates.
-
-    Args:
-        request: Pytest request carrying an ``EmbedderInputs`` field name.
-
-    Returns:
-        Field name to mark as requiring grad.
-    """
-    return cast(str, request.param)
-
-
 def test_template_embedder_output_shape_and_dtype(
     dims: EmbedderDims,
     base_inputs: EmbedderInputs,
@@ -293,14 +265,13 @@ def test_template_embedder_output_shape_and_dtype(
 
 
 @pytest.mark.parametrize(
-    "scenario_edit",
+    "conditioning_scenario",
     list(ConditioningScenario),
     ids=[case.name for case in ConditioningScenario],
-    indirect=True,
 )
 def test_template_embedder_output_depends_on_each_input(
     base_inputs: EmbedderInputs,
-    scenario_edit: InputEdit,
+    conditioning_scenario: ConditioningScenario,
     embedder: TemplateEmbedder,
 ) -> None:
     """Changing any one input, all else fixed, changes the embedding.
@@ -309,12 +280,12 @@ def test_template_embedder_output_depends_on_each_input(
 
     Args:
         base_inputs: Valid forward inputs.
-        scenario_edit: Change applied to one input.
+        conditioning_scenario: Change applied to one input.
         embedder: Model under test.
     """
     with torch.no_grad():
         base = embed(embedder, base_inputs)
-        edited = embed(embedder, scenario_edit.apply(base_inputs))
+        edited = embed(embedder, conditioning_scenario.value.apply(base_inputs))
     assert not torch.allclose(base, edited)
 
 
@@ -342,7 +313,6 @@ def test_template_embedder_batch_items_are_independent(
 @pytest.mark.parametrize(
     "grad_input_name",
     ["f_distogram", "f_pseudo_beta_mask", "z_ij"],
-    indirect=True,
 )
 def test_template_embedder_gradient_reaches_input(
     base_inputs: EmbedderInputs,
@@ -370,23 +340,22 @@ def test_template_embedder_gradient_reaches_input(
 
 
 @pytest.mark.parametrize(
-    "scenario_edit",
+    "malformed_scenario",
     list(MalformedScenario),
     ids=[case.name for case in MalformedScenario],
-    indirect=True,
 )
 def test_template_embedder_rejects_malformed_input(
     base_inputs: EmbedderInputs,
-    scenario_edit: InputEdit,
+    malformed_scenario: MalformedScenario,
     embedder: TemplateEmbedder,
 ) -> None:
     """A wrongly shaped input fails the jaxtyping contract on ``forward``.
 
     Args:
         base_inputs: Valid forward inputs.
-        scenario_edit: Edit that breaks one input's shape.
+        malformed_scenario: Edit that breaks one input's shape.
         embedder: Model under test.
     """
-    malformed = scenario_edit.apply(base_inputs)
+    malformed = malformed_scenario.value.apply(base_inputs)
     with pytest.raises(TypeCheckError):
         _ = embed(embedder, malformed)
