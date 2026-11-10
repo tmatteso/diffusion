@@ -11,9 +11,10 @@ Coordinates come from ``tests.patterns.chiral_cloud`` and rotations
 are exact integer matrices, so every expected value is hand-checkable.
 """
 
+import abc
 import dataclasses
 import enum
-from collections.abc import Callable
+from typing import override
 
 import pytest
 import torch
@@ -34,7 +35,6 @@ from tests.patterns import chiral_cloud
 type Coords = Float[torch.Tensor, "N 3"]
 type BatchCoords = Float[torch.Tensor, "B N 3"]
 type Keep = Bool[torch.Tensor, "N"]
-type Scalar = Float[torch.Tensor, ""]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -81,14 +81,38 @@ class RigidScenario(enum.Enum):
 
 @dataclasses.dataclass(frozen=True)
 class SelectCase:
-    """A ``kabsch_rmsd`` call that restricts which atoms count.
+    """How a call is told which atoms count.
 
     Attributes:
-        call: ``call(mobile, target, keep)`` with ``keep`` True for atoms
-            that count.
+        by_weights: Pass ``keep`` as float ``weights``, zero on ignored
+            atoms.
+        by_mask: Pass ``keep`` as the boolean ``mask``.
     """
 
-    call: Callable[[Coords, Coords, Keep], Scalar]
+    by_weights: bool
+    by_mask: bool
+
+    def weights(self, kept: Keep) -> Float[torch.Tensor, " N"] | None:
+        """Return the ``weights`` argument for this case.
+
+        Args:
+            kept: True for atoms that count.
+
+        Returns:
+            ``kept`` as floats, or ``None`` when weights are not passed.
+        """
+        return kept.float() if self.by_weights else None
+
+    def mask(self, kept: Keep) -> Keep | None:
+        """Return the ``mask`` argument for this case.
+
+        Args:
+            kept: True for atoms that count.
+
+        Returns:
+            ``kept`` itself, or ``None`` when no mask is passed.
+        """
+        return kept if self.by_mask else None
 
 
 class SelectScenario(enum.Enum):
@@ -100,21 +124,19 @@ class SelectScenario(enum.Enum):
         both: Weights and mask together, combined by the function.
     """
 
-    weights = SelectCase(lambda m, t, k: kabsch_rmsd(m, t, weights=k.float()))
-    mask = SelectCase(lambda m, t, k: kabsch_rmsd(m, t, mask=k))
-    both = SelectCase(lambda m, t, k: kabsch_rmsd(m, t, k.float(), k))
+    weights = SelectCase(by_weights=True, by_mask=False)
+    mask = SelectCase(by_weights=False, by_mask=True)
+    both = SelectCase(by_weights=True, by_mask=True)
 
 
 @dataclasses.dataclass(frozen=True)
-class RmsdCase:
-    """An ``rmsd`` call and its value on the shifted test structure.
+class RmsdCase(SelectCase):
+    """An ``rmsd`` selection and its value on the shifted test structure.
 
     Attributes:
-        call: ``call(predicted, reference, keep)``.
         expected: RMSD in angstroms.
     """
 
-    call: Callable[[Coords, Coords, Keep], Scalar]
     expected: float
 
 
@@ -127,9 +149,174 @@ class RmsdScenario(enum.Enum):
         weights: Zero weights on the 3 dropped atoms, same as the mask.
     """
 
-    unweighted = RmsdCase(lambda p, r, _: rmsd(p, r), 7.0)
-    mask = RmsdCase(lambda p, r, k: rmsd(p, r, mask=k), 5.0)
-    weights = RmsdCase(lambda p, r, k: rmsd(p, r, weights=k.float()), 5.0)
+    unweighted = RmsdCase(by_weights=False, by_mask=False, expected=7.0)
+    mask = RmsdCase(by_weights=False, by_mask=True, expected=5.0)
+    weights = RmsdCase(by_weights=True, by_mask=False, expected=5.0)
+
+
+@dataclasses.dataclass(frozen=True)
+class FourCoordCall(abc.ABC):
+    """A call to one alignment function with ``(N, 4)`` coordinates first."""
+
+    @abc.abstractmethod
+    def call(self, bad: Float[torch.Tensor, "N 4"], other: Coords) -> object:
+        """Call the function with ``bad`` as its first argument.
+
+        Args:
+            bad: Coordinates with a fourth column.
+            other: Valid second argument.
+
+        Returns:
+            The function's result; the test expects it to raise.
+        """
+
+
+@dataclasses.dataclass(frozen=True)
+class KabschRotationCall(FourCoordCall):
+    """Calls ``kabsch_rotation(bad, other)``."""
+
+    @override
+    def call(self, bad: Float[torch.Tensor, "N 4"], other: Coords) -> object:
+        """Call ``kabsch_rotation``.
+
+        Args:
+            bad: Coordinates with a fourth column.
+            other: Valid reference.
+
+        Returns:
+            The rotation.
+        """
+        return kabsch_rotation(bad, other)
+
+
+@dataclasses.dataclass(frozen=True)
+class RmsdCall(FourCoordCall):
+    """Calls ``rmsd(bad, other)``."""
+
+    @override
+    def call(self, bad: Float[torch.Tensor, "N 4"], other: Coords) -> object:
+        """Call ``rmsd``.
+
+        Args:
+            bad: Coordinates with a fourth column.
+            other: Valid reference.
+
+        Returns:
+            The RMSD.
+        """
+        return rmsd(bad, other)
+
+
+@dataclasses.dataclass(frozen=True)
+class KabschRmsdCall(FourCoordCall):
+    """Calls ``kabsch_rmsd(bad, other)``."""
+
+    @override
+    def call(self, bad: Float[torch.Tensor, "N 4"], other: Coords) -> object:
+        """Call ``kabsch_rmsd``.
+
+        Args:
+            bad: Coordinates with a fourth column.
+            other: Valid target.
+
+        Returns:
+            The aligned RMSD.
+        """
+        return kabsch_rmsd(bad, other)
+
+
+class FourCoordFunction(enum.Enum):
+    """Alignment functions sharing a ``(coords, reference)`` signature.
+
+    ``kabsch_align`` has its own test: its ``return_transform`` keyword is
+    required, so it does not share this signature.
+
+    Members:
+        kabsch_rotation: ``kabsch_rotation``.
+        rmsd: ``rmsd``.
+        kabsch_rmsd: ``kabsch_rmsd``.
+    """
+
+    kabsch_rotation = KabschRotationCall()
+    rmsd = RmsdCall()
+    kabsch_rmsd = KabschRmsdCall()
+
+
+@dataclasses.dataclass(frozen=True)
+class MaskedCall(abc.ABC):
+    """A call to one batched function that takes ``mask=``."""
+
+    @abc.abstractmethod
+    def call(
+        self,
+        coords: BatchCoords,
+        atom_mask: Bool[torch.Tensor, "B M"],
+    ) -> object:
+        """Call the function with ``atom_mask`` as its mask.
+
+        Args:
+            coords: Batched coordinates.
+            atom_mask: Mask to pass.
+
+        Returns:
+            The function's result.
+        """
+
+
+@dataclasses.dataclass(frozen=True)
+class MaskedComCall(MaskedCall):
+    """Calls ``masked_com(coords, mask=atom_mask)``."""
+
+    @override
+    def call(
+        self,
+        coords: BatchCoords,
+        atom_mask: Bool[torch.Tensor, "B M"],
+    ) -> object:
+        """Call ``masked_com``.
+
+        Args:
+            coords: Batched coordinates.
+            atom_mask: Mask to pass.
+
+        Returns:
+            The masked centre of mass.
+        """
+        return masked_com(coords, mask=atom_mask)
+
+
+@dataclasses.dataclass(frozen=True)
+class AugmentCall(MaskedCall):
+    """Calls ``centre_random_augment(coords, mask=atom_mask)``."""
+
+    @override
+    def call(
+        self,
+        coords: BatchCoords,
+        atom_mask: Bool[torch.Tensor, "B M"],
+    ) -> object:
+        """Call ``centre_random_augment``.
+
+        Args:
+            coords: Batched coordinates.
+            atom_mask: Mask to pass.
+
+        Returns:
+            The augmented coordinates.
+        """
+        return centre_random_augment(coords, mask=atom_mask)
+
+
+class MaskedFunction(enum.Enum):
+    """Batched functions that take an optional ``mask=``.
+
+    Members:
+        masked_com: ``masked_com``.
+        centre_random_augment: ``centre_random_augment``.
+    """
+
+    masked_com = MaskedComCall()
+    centre_random_augment = AugmentCall()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -402,7 +589,13 @@ def test_kabsch_rmsd_ignores_deselected_atoms(
     """
     mobile = RigidScenario.screw.value.apply(cloud)
     mobile[~keep] += 10
-    value = select_scenario.value.call(mobile, cloud, keep)
+    case = select_scenario.value
+    value = kabsch_rmsd(
+        mobile,
+        cloud,
+        weights=case.weights(keep),
+        mask=case.mask(keep),
+    )
     assert kabsch_rmsd(mobile, cloud).item() > 1
     torch.testing.assert_close(value, torch.zeros(()), atol=1e-3, rtol=0)
 
@@ -429,7 +622,13 @@ def test_rmsd_matches_hand_computed_value(
         torch.tensor([0.0, 3.0, 4.0]),
         torch.tensor([0.0, 0.0, 11.0]),
     )
-    value = rmsd_scenario.value.call(shifted, cloud, keep)
+    case = rmsd_scenario.value
+    value = rmsd(
+        shifted,
+        cloud,
+        weights=case.weights(keep),
+        mask=case.mask(keep),
+    )
     torch.testing.assert_close(
         value,
         torch.tensor(rmsd_scenario.value.expected),
@@ -437,17 +636,14 @@ def test_rmsd_matches_hand_computed_value(
 
 
 @pytest.mark.parametrize(
-    "function",
-    [
-        pytest.param(kabsch_rotation, id="kabsch_rotation"),
-        pytest.param(rmsd, id="rmsd"),
-        pytest.param(kabsch_rmsd, id="kabsch_rmsd"),
-    ],
+    "four_coord_function",
+    list(FourCoordFunction),
+    ids=[case.name for case in FourCoordFunction],
 )
 def test_alignment_functions_reject_four_coordinate_atoms(
     cloud: Coords,
     four_coord_cloud: Float[torch.Tensor, "N 4"],
-    function: Callable[[Float[torch.Tensor, "N 4"], Coords], object],
+    four_coord_function: FourCoordFunction,
 ) -> None:
     """Each function's contract rejects coordinates of shape ``(N, 4)``.
 
@@ -457,11 +653,11 @@ def test_alignment_functions_reject_four_coordinate_atoms(
     Args:
         cloud: Valid second argument.
         four_coord_cloud: Bad first argument.
-        function: Function under test, called with the bad coordinates
-            first.
+        four_coord_function: Function under test, called with the bad
+            coordinates first.
     """
     with pytest.raises(TypeCheckError):
-        _ = function(four_coord_cloud, cloud)
+        _ = four_coord_function.value.call(four_coord_cloud, cloud)
 
 
 def test_kabsch_align_rejects_four_coordinate_atoms(
@@ -733,27 +929,25 @@ def test_centre_random_augment_is_seeded_and_fresh_per_call(
 
 
 @pytest.mark.parametrize(
-    "function",
-    [
-        pytest.param(masked_com, id="masked_com"),
-        pytest.param(centre_random_augment, id="centre_random_augment"),
-    ],
+    "masked_function",
+    list(MaskedFunction),
+    ids=[case.name for case in MaskedFunction],
 )
 def test_batched_functions_reject_mismatched_mask(
     aug_coords: BatchCoords,
     padding: Bool[torch.Tensor, "B N"],
-    function: Callable[..., object],
+    masked_function: MaskedFunction,
 ) -> None:
     """A mask with one atom more than the coordinates fails the contract.
 
     Args:
         aug_coords: Valid coordinates.
         padding: Valid mask to extend.
-        function: Function under test, called with ``mask=``.
+        masked_function: Function under test, called with ``mask=``.
     """
     longer = torch.cat([padding, padding[:, :1]], dim=1)
     with pytest.raises(TypeCheckError):
-        _ = function(aug_coords, mask=longer)
+        _ = masked_function.value.call(aug_coords, longer)
 
 
 def test_centre_random_augment_rejects_four_coordinate_atoms(
