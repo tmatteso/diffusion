@@ -17,12 +17,12 @@ is seeded in its fixtures.
 import dataclasses
 import enum
 import json
-import math
 import pathlib
 import pickle
 from collections.abc import Callable, Mapping
 from concurrent.futures import Executor
-from typing import Protocol, cast
+from math import cos, sin
+from typing import cast
 
 import numpy as np
 import pytest
@@ -48,31 +48,123 @@ from helpers.data import (
     sinusoidal_encoding,
 )
 from helpers.useful_objects import manual_seed
-from jaxtyping import TypeCheckError
-from tests.conftest import PatternFactory
+from jaxtyping import Float, TypeCheckError
+from tests.patterns import sine_pattern
 from train.train_config import LoaderConfig as EvalLoaderConfig
 from train.train_config import TrainArgs, TrainConfig, TrainLoaderConfig
 
 type Entry = dict[str, object]
-type EntryFactory = Callable[[str, int], Entry]
-type JsonlWriter = Callable[[pathlib.Path, list[Entry]], pathlib.Path]
-type ShardFactory = Callable[[list[str], list[int]], ProteinShardDataset]
 
 
-class ArgsFactory(Protocol):
-    """Builds TrainArgs over a fresh dataset of ``n`` proteins."""
+def protein_entry(name: str, n: int) -> Entry:
+    """Build an all-alanine JSONL protein entry with fixed coordinates.
 
-    def __call__(self, n: int, *, debug_run: bool) -> TrainArgs:
-        """Write the dataset and return arguments pointing at it.
+    Residue ``i`` has its CA at ``(3.8 i, 0, 0)`` and N, C and O at fixed
+    offsets from it.
 
-        Args:
-            n: Number of proteins.
-            debug_run: Value of ``TrainArgs.debug_run``.
+    Args:
+        name: Entry name.
+        n: Residue count.
 
-        Returns:
-            Arguments pointing at the new dataset.
-        """
-        ...  # pylint: disable=unnecessary-ellipsis
+    Returns:
+        Entry with ``name``, ``seq`` and ``coords``.
+    """
+    offsets = {
+        "N": (-1.2, 0.6, 0.0),
+        "CA": (0.0, 0.0, 0.0),
+        "C": (1.2, 0.6, 0.0),
+        "O": (1.4, 1.8, 0.0),
+    }
+    coords = {
+        atom: [[3.8 * i + dx, dy, dz] for i in range(n)]
+        for atom, (dx, dy, dz) in offsets.items()
+    }
+    return {"name": name, "seq": "A" * n, "coords": coords}
+
+
+def write_jsonl(path: pathlib.Path, entries: list[Entry]) -> pathlib.Path:
+    """Write one JSON object per line.
+
+    Args:
+        path: Destination file.
+        entries: Objects to serialise.
+
+    Returns:
+        The path written.
+    """
+    _ = path.write_text("".join(json.dumps(e) + "\n" for e in entries))
+    return path
+
+
+def build_shard_dataset(
+    work_dir: pathlib.Path,
+    budget: ShardBudgetParameters,
+    names: list[str],
+    lengths: list[int],
+) -> ProteinShardDataset:
+    """Write one entry per name under ``work_dir`` and shard them there.
+
+    Args:
+        work_dir: Directory for the JSONL file and the shards; give each
+            build its own.
+        budget: Base shard parameters; the shard directory is replaced.
+        names: Entry names.
+        lengths: Residue count per entry.
+
+    Returns:
+        The dataset.
+    """
+    work_dir.mkdir(parents=True, exist_ok=True)
+    entries = [protein_entry(n, k) for n, k in zip(names, lengths, strict=True)]
+    jsonl = write_jsonl(work_dir / "p.jsonl", entries)
+    return ProteinShardDataset(
+        budget_parameters=dataclasses.replace(
+            budget,
+            shard_dir=work_dir / "shards",
+        ),
+        names=names,
+        dataset_jsonl=jsonl,
+    )
+
+
+def write_train_args(
+    work_dir: pathlib.Path,
+    n: int,
+    *,
+    debug_run: bool,
+) -> TrainArgs:
+    """Write a dataset of ``n`` proteins and point TrainArgs at it.
+
+    Every protein goes in the train split, and the first also in
+    validation and test. All calls share ``work_dir / "shards"``, as
+    successive runs on one machine do.
+
+    Args:
+        work_dir: Directory for the dataset, splits and shards.
+        n: Number of 6-residue proteins.
+        debug_run: Value of ``TrainArgs.debug_run``.
+
+    Returns:
+        The arguments.
+    """
+    names = [f"{i:04d}p.A" for i in range(n)]
+    jsonl = work_dir / f"proteins_{n}.jsonl"
+    _ = write_jsonl(jsonl, [protein_entry(name, 6) for name in names])
+    splits = work_dir / f"splits_{n}.json"
+    _ = splits.write_text(
+        json.dumps(
+            {"train": names, "validation": names[:1], "test": names[:1]},
+        ),
+    )
+    return TrainArgs(
+        dataset_jsonl=jsonl,
+        shard_dir=work_dir / "shards",
+        keys_for_splits_json=splits,
+        config=work_dir / "config.json",
+        structlog_jsonl=work_dir / "train.jsonl",
+        ddp=False,
+        debug_run=debug_run,
+    )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -172,6 +264,183 @@ class BinScenario(enum.Enum):
     top_edge = BinCase(22.0, 15, overflow=False, valid=True)
     far_overflow = BinCase(1000.0, 16, overflow=True, valid=True)
     far_clipped = BinCase(1000.0, 15, overflow=False, valid=False)
+
+
+@dataclasses.dataclass(frozen=True)
+class OverflowCase:
+    """A Distogram's overflow setting and the classes it then has.
+
+    Attributes:
+        overflow_bin: Whether the Distogram has an overflow bin.
+        n_classes: Length of the one-hot axis: 16 bins, plus one for
+            overflow.
+    """
+
+    overflow_bin: bool
+    n_classes: int
+
+
+class OverflowScenario(enum.Enum):
+    """A 16-bin Distogram with and without an overflow bin.
+
+    Members:
+        clipped: No overflow bin; far pairs clip to the last bin.
+        overflow: An extra bin for pairs past the last edge.
+    """
+
+    clipped = OverflowCase(overflow_bin=False, n_classes=16)
+    overflow = OverflowCase(overflow_bin=True, n_classes=17)
+
+
+@dataclasses.dataclass(frozen=True)
+class SinusoidCase:
+    """One position, an embedding width, and its closed-form encoding.
+
+    Attributes:
+        position: Residue position ``p``.
+        dim: Embedding width; ``4`` gives frequencies ``1`` and ``1e-4``.
+        expected: ``sin(p f)`` then ``cos(p f)`` per frequency.
+    """
+
+    position: float
+    dim: int
+    expected: tuple[float, ...]
+
+
+class SinusoidScenario(enum.Enum):
+    """Positions whose four-wide encoding is checked against its formula.
+
+    Members:
+        origin: Position 0 gives sines of 0 and cosines of 1.
+        position_one: Position 1.
+        two_freqs: Position 2, so both frequencies move.
+    """
+
+    origin = SinusoidCase(0.0, 4, (0.0, 0.0, 1.0, 1.0))
+    position_one = SinusoidCase(1.0, 4, (sin(1), sin(1e-4), cos(1), cos(1e-4)))
+    two_freqs = SinusoidCase(2.0, 4, (sin(2), sin(2e-4), cos(2), cos(2e-4)))
+
+
+@dataclasses.dataclass(frozen=True)
+class CbCase:
+    """A residue and whether its reference frame has a CB atom.
+
+    Attributes:
+        resname: Three-letter residue name.
+        has_cb: Whether the residue has a CB, so its CB row is nonzero.
+    """
+
+    resname: str
+    has_cb: bool
+
+
+class CbScenario(enum.Enum):
+    """Residues with and without a CB.
+
+    Members:
+        alanine: Smallest residue with a CB.
+        glycine_has_no_cb: The only canonical residue without one.
+        tryptophan: Largest residue.
+    """
+
+    alanine = CbCase("ALA", has_cb=True)
+    glycine_has_no_cb = CbCase("GLY", has_cb=False)
+    tryptophan = CbCase("TRP", has_cb=True)
+
+
+@dataclasses.dataclass(frozen=True)
+class JsonFormCase:
+    """How webdataset hands a protein's JSON to ``parse_protein``.
+
+    Attributes:
+        as_bytes: Encoded JSON bytes when true, a decoded dict when false.
+    """
+
+    as_bytes: bool
+
+
+class JsonForm(enum.Enum):
+    """The two forms ``parse_protein`` must accept.
+
+    Members:
+        dict: Already decoded.
+        bytes: Raw JSON bytes.
+    """
+
+    dict = JsonFormCase(as_bytes=False)
+    bytes = JsonFormCase(as_bytes=True)
+
+
+@dataclasses.dataclass(frozen=True)
+class NamesHashCase:
+    """Two shard builds and whether their names hashes must match.
+
+    Attributes:
+        names_a: Names of the first build.
+        names_b: Names of the second build.
+        same_hash: Whether the two builds share a names hash; true exactly
+            when they shard the same set of names.
+    """
+
+    names_a: tuple[str, ...]
+    names_b: tuple[str, ...]
+    same_hash: bool
+
+
+class NamesHashScenario(enum.Enum):
+    """Pairs of name lists for the shard names hash.
+
+    Members:
+        same_names: Identical lists.
+        reordered: The same names in another order, so the hash, taken
+            over the sorted names, still matches.
+        different_names: The first build lacks ``p2``.
+    """
+
+    same_names = NamesHashCase(("p1", "p2"), ("p1", "p2"), same_hash=True)
+    reordered = NamesHashCase(("p2", "p1"), ("p1", "p2"), same_hash=True)
+    different_names = NamesHashCase(("p1",), ("p1", "p2"), same_hash=False)
+
+
+@dataclasses.dataclass(frozen=True)
+class NamesHashes:
+    """The names hashes of two shard builds.
+
+    Attributes:
+        first: Hash of the first build.
+        second: Hash of the second build.
+    """
+
+    first: str
+    second: str
+
+
+@dataclasses.dataclass(frozen=True)
+class ManifestCase:
+    """A splits manifest's optional fields and the ``cath_nodes`` it parses.
+
+    Attributes:
+        cath_nodes: ``cath_nodes`` written to the manifest, omitted when
+            empty; also the value the parsed manifest must hold.
+        extra: Any further fields written to the manifest.
+    """
+
+    cath_nodes: dict[str, list[str]]
+    extra: dict[str, object]
+
+
+class ManifestScenario(enum.Enum):
+    """Optional manifest fields beyond the three splits.
+
+    Members:
+        cath_nodes_default_empty: No ``cath_nodes``, so it defaults empty.
+        cath_nodes_populated: ``cath_nodes`` given for one protein.
+        unknown_field_dropped: An unknown field is ignored.
+    """
+
+    cath_nodes_default_empty = ManifestCase({}, {})
+    cath_nodes_populated = ManifestCase({"p1": ["1.20.5"]}, {})
+    unknown_field_dropped = ManifestCase({}, {"unknown_field": 42})
 
 
 @pytest.fixture
@@ -310,89 +579,18 @@ def bin_scenario(request: pytest.FixtureRequest) -> BinScenario:
     return cast(BinScenario, request.param)
 
 
-@pytest.fixture(scope="module")
-def make_entry() -> EntryFactory:
-    """Return a factory for JSONL protein entries with fixed coordinates.
-
-    ``make(name, n)`` gives an all-alanine entry whose residue ``i`` has its
-    CA at ``(3.8 i, 0, 0)`` and N, C and O at fixed offsets from it.
-
-    Module-scoped so the module-scoped loader lifecycle can use it; it
-    holds no state.
-
-    Returns:
-        The factory.
-    """
-    offsets = {
-        "N": (-1.2, 0.6, 0.0),
-        "CA": (0.0, 0.0, 0.0),
-        "C": (1.2, 0.6, 0.0),
-        "O": (1.4, 1.8, 0.0),
-    }
-
-    def make(name: str, n: int) -> Entry:
-        """Build one entry.
-
-        Args:
-            name: Entry name.
-            n: Residue count.
-
-        Returns:
-            Entry with ``name``, ``seq`` and ``coords``.
-        """
-        coords = {
-            atom: [[3.8 * i + dx, dy, dz] for i in range(n)]
-            for atom, (dx, dy, dz) in offsets.items()
-        }
-        return {"name": name, "seq": "A" * n, "coords": coords}
-
-    return make
-
-
-@pytest.fixture(scope="module")
-def write_jsonl() -> JsonlWriter:
-    """Return a function that writes entries as JSON lines.
-
-    Module-scoped for the same reason as ``make_entry``.
-
-    Returns:
-        ``write(path, entries)``, which returns ``path``.
-    """
-
-    def write(path: pathlib.Path, entries: list[Entry]) -> pathlib.Path:
-        """Write one JSON object per line.
-
-        Args:
-            path: Destination file.
-            entries: Objects to serialise.
-
-        Returns:
-            The path written.
-        """
-        _ = path.write_text("".join(json.dumps(e) + "\n" for e in entries))
-        return path
-
-    return write
-
-
 @pytest.fixture
-def dataset_jsonl(
-    tmp_path: pathlib.Path,
-    make_entry: EntryFactory,
-    write_jsonl: JsonlWriter,
-) -> pathlib.Path:
+def dataset_jsonl(tmp_path: pathlib.Path) -> pathlib.Path:
     """Write five 6-residue entries named ``1aa.A`` to ``5ee.A``.
 
     Args:
         tmp_path: Per-test directory.
-        make_entry: Entry factory.
-        write_jsonl: JSONL writer.
 
     Returns:
         Path of the JSONL file.
     """
     names = ["1aa.A", "2bb.A", "3cc.A", "4dd.A", "5ee.A"]
-    entries = [make_entry(name, 6) for name in names]
+    entries = [protein_entry(name, 6) for name in names]
     return write_jsonl(tmp_path / "proteins.jsonl", entries)
 
 
@@ -436,54 +634,217 @@ def shard_budget(tmp_path: pathlib.Path) -> ShardBudgetParameters:
 
 
 @pytest.fixture
-def make_shard_dataset(
+def shard_dataset(
     tmp_path: pathlib.Path,
     shard_budget: ShardBudgetParameters,
-    make_entry: EntryFactory,
-    write_jsonl: JsonlWriter,
-) -> ShardFactory:
-    """Return a factory for ProteinShardDatasets over fresh JSONL files.
-
-    ``make(names, lengths)`` writes one entry per name, then builds a
-    dataset sharding them into a directory unique to that call.
+) -> ProteinShardDataset:
+    """Shard two entries, ``p1`` with 10 residues and ``p2`` with 20.
 
     Args:
         tmp_path: Per-test directory.
         shard_budget: Base shard parameters.
-        make_entry: Entry factory.
-        write_jsonl: JSONL writer.
 
     Returns:
-        The factory.
+        The dataset.
     """
-    calls: list[int] = []
+    return build_shard_dataset(tmp_path, shard_budget, ["p1", "p2"], [10, 20])
 
-    def make(names: list[str], lengths: list[int]) -> ProteinShardDataset:
-        """Write the entries and shard them.
 
-        Args:
-            names: Entry names.
-            lengths: Residue count per entry.
+@pytest.fixture
+def names_hash_scenario(request: pytest.FixtureRequest) -> NamesHashScenario:
+    """Return the ``NamesHashScenario`` member routed in via indirect param.
 
-        Returns:
-            The dataset.
-        """
-        calls.append(len(calls))
-        entries = [
-            make_entry(n, k) for n, k in zip(names, lengths, strict=True)
-        ]
-        jsonl = write_jsonl(tmp_path / f"p{len(calls)}.jsonl", entries)
-        budget = dataclasses.replace(
-            shard_budget,
-            shard_dir=tmp_path / f"shards{len(calls)}",
-        )
-        return ProteinShardDataset(
-            budget_parameters=budget,
-            names=names,
-            dataset_jsonl=jsonl,
-        )
+    Args:
+        request: Pytest request carrying the scenario in ``param``.
 
-    return make
+    Returns:
+        The scenario under test.
+    """
+    return cast(NamesHashScenario, request.param)
+
+
+@pytest.fixture
+def names_hashes(
+    names_hash_scenario: NamesHashScenario,
+    tmp_path: pathlib.Path,
+    shard_budget: ShardBudgetParameters,
+) -> NamesHashes:
+    """Build the scenario's two shard datasets and read their names hashes.
+
+    Each build gets its own directory, so neither reuses the other's cache.
+
+    Args:
+        names_hash_scenario: Names of the two builds.
+        tmp_path: Per-test directory.
+        shard_budget: Base shard parameters.
+
+    Returns:
+        Both builds' names hashes.
+    """
+    case = names_hash_scenario.value
+    hashes = [
+        ShardMetadata.model_validate_json(
+            build_shard_dataset(
+                tmp_path / tag,
+                shard_budget,
+                list(names),
+                [10] * len(names),
+            ).shard_metadata_path.read_text(),
+        ).names_hash
+        for tag, names in (("a", case.names_a), ("b", case.names_b))
+    ]
+    return NamesHashes(first=hashes[0], second=hashes[1])
+
+
+@pytest.fixture
+def long_entry_jsonl(tmp_path: pathlib.Path) -> pathlib.Path:
+    """Write one 100-residue entry named ``long.A``.
+
+    Args:
+        tmp_path: Per-test directory.
+
+    Returns:
+        Path of the JSONL file.
+    """
+    return write_jsonl(tmp_path / "long.jsonl", [protein_entry("long.A", 100)])
+
+
+@pytest.fixture
+def single_entry_jsonl(tmp_path: pathlib.Path) -> pathlib.Path:
+    """Write one 10-residue entry named ``p1``.
+
+    Args:
+        tmp_path: Per-test directory.
+
+    Returns:
+        Path of the JSONL file.
+    """
+    return write_jsonl(tmp_path / "p.jsonl", [protein_entry("p1", 10)])
+
+
+@pytest.fixture
+def json_form(request: pytest.FixtureRequest) -> JsonForm:
+    """Return the ``JsonForm`` member routed in via indirect param.
+
+    Args:
+        request: Pytest request carrying the form in ``param``.
+
+    Returns:
+        The form under test.
+    """
+    return cast(JsonForm, request.param)
+
+
+@pytest.fixture
+def unknown_residue_json(json_form: JsonForm) -> object:
+    """Return entry ``p1`` with five unknown codes, in the scenario's form.
+
+    The sequence is ``ZZZZZAAAAA``: five codes outside the alphabet, then
+    five alanines.
+
+    Args:
+        json_form: Dict or bytes.
+
+    Returns:
+        The entry as a dict or as encoded JSON bytes.
+    """
+    entry = protein_entry("p1", 10) | {"seq": "ZZZZZAAAAA"}
+    if json_form.value.as_bytes:
+        return json.dumps(entry).encode()
+    return entry
+
+
+@pytest.fixture
+def overflow_scenario(request: pytest.FixtureRequest) -> OverflowScenario:
+    """Return the ``OverflowScenario`` member routed in via indirect param.
+
+    Args:
+        request: Pytest request carrying the scenario in ``param``.
+
+    Returns:
+        The scenario under test.
+    """
+    return cast(OverflowScenario, request.param)
+
+
+@pytest.fixture
+def spread_coords() -> Float[torch.Tensor, "12 3"]:
+    """Return 12 coordinates spread over about 20 angstroms.
+
+    Returns:
+        A sine pattern of shape ``(12, 3)`` scaled by 20.
+    """
+    return 20 * sine_pattern((12, 3), 0.37)
+
+
+@pytest.fixture
+def near_coords() -> Float[torch.Tensor, "12 3"]:
+    """Return 12 coordinates all within 2 angstroms of each other.
+
+    Returns:
+        A sine pattern of shape ``(12, 3)`` in ``[-1, 1]``.
+    """
+    return sine_pattern((12, 3), 0.37)
+
+
+@pytest.fixture
+def sinusoid_scenario(request: pytest.FixtureRequest) -> SinusoidScenario:
+    """Return the ``SinusoidScenario`` member routed in via indirect param.
+
+    Args:
+        request: Pytest request carrying the scenario in ``param``.
+
+    Returns:
+        The scenario under test.
+    """
+    return cast(SinusoidScenario, request.param)
+
+
+@pytest.fixture
+def cb_scenario(request: pytest.FixtureRequest) -> CbScenario:
+    """Return the ``CbScenario`` member routed in via indirect param.
+
+    Args:
+        request: Pytest request carrying the scenario in ``param``.
+
+    Returns:
+        The scenario under test.
+    """
+    return cast(CbScenario, request.param)
+
+
+@pytest.fixture
+def manifest_scenario(request: pytest.FixtureRequest) -> ManifestScenario:
+    """Return the ``ManifestScenario`` member routed in via indirect param.
+
+    Args:
+        request: Pytest request carrying the scenario in ``param``.
+
+    Returns:
+        The scenario under test.
+    """
+    return cast(ManifestScenario, request.param)
+
+
+@pytest.fixture
+def manifest(manifest_scenario: ManifestScenario) -> DatasetSplitsManifest:
+    """Parse a manifest of one protein per split plus the scenario's fields.
+
+    Args:
+        manifest_scenario: Optional fields to add.
+
+    Returns:
+        The parsed manifest.
+    """
+    case = manifest_scenario.value
+    data: dict[str, object] = {
+        "train": ["p1"],
+        "validation": ["p2"],
+        "test": ["p3"],
+    }
+    if case.cath_nodes:
+        data["cath_nodes"] = case.cath_nodes
+    return DatasetSplitsManifest.model_validate(data | case.extra)
 
 
 @pytest.fixture(scope="module")
@@ -510,63 +871,23 @@ def bucketed_cfg() -> TrainConfig:
 
 
 @pytest.fixture
-def make_train_args(
-    tmp_path: pathlib.Path,
-    make_entry: EntryFactory,
-    write_jsonl: JsonlWriter,
-) -> ArgsFactory:
-    """Return a factory for TrainArgs over a dataset of ``n`` proteins.
-
-    ``make(n, debug_run)`` writes ``n`` 6-residue entries, puts them all in
-    the train split (and the first in validation and test), and shares one
-    shard directory across calls, as successive runs on one machine do.
+def bucketed_train_args(tmp_path: pathlib.Path) -> TrainArgs:
+    """Return TrainArgs over a fresh five-protein dataset.
 
     Args:
         tmp_path: Per-test directory.
-        make_entry: Entry factory.
-        write_jsonl: JSONL writer.
 
     Returns:
-        The factory.
+        Non-debug arguments.
     """
-
-    def make(n: int, *, debug_run: bool) -> TrainArgs:
-        """Write a dataset of ``n`` proteins and point TrainArgs at it.
-
-        Args:
-            n: Number of proteins.
-            debug_run: Value of ``TrainArgs.debug_run``.
-
-        Returns:
-            The arguments.
-        """
-        names = [f"{i:04d}p.A" for i in range(n)]
-        jsonl = tmp_path / f"proteins_{n}.jsonl"
-        _ = write_jsonl(jsonl, [make_entry(name, 6) for name in names])
-        splits = tmp_path / f"splits_{n}.json"
-        _ = splits.write_text(
-            json.dumps(
-                {"train": names, "validation": names[:1], "test": names[:1]},
-            ),
-        )
-        return TrainArgs(
-            dataset_jsonl=jsonl,
-            shard_dir=tmp_path / "shards",
-            keys_for_splits_json=splits,
-            config=tmp_path / "config.json",
-            structlog_jsonl=tmp_path / "train.jsonl",
-            ddp=False,
-            debug_run=debug_run,
-        )
-
-    return make
+    return write_train_args(tmp_path, 5, debug_run=False)
 
 
 @pytest.fixture
 def debug_train_size(
     request: pytest.FixtureRequest,
     bucketed_cfg: TrainConfig,
-    make_train_args: ArgsFactory,
+    tmp_path: pathlib.Path,
 ) -> int:
     """Build a debug-run loader over 300 proteins and return its train size.
 
@@ -576,7 +897,7 @@ def debug_train_size(
     Args:
         request: Pytest request carrying whether to build the full loader.
         bucketed_cfg: Loader configuration.
-        make_train_args: TrainArgs factory.
+        tmp_path: Per-test directory shared by both loaders.
 
     Returns:
         Number of proteins in the debug-run train dataset.
@@ -584,11 +905,11 @@ def debug_train_size(
     if cast(bool, request.param):
         _ = make_bucketed_data_loaders(
             cfg=bucketed_cfg,
-            extra_train_args=make_train_args(300, debug_run=False),
+            extra_train_args=write_train_args(tmp_path, 300, debug_run=False),
         )
     train_loader, _, _ = make_bucketed_data_loaders(
         cfg=bucketed_cfg,
-        extra_train_args=make_train_args(300, debug_run=True),
+        extra_train_args=write_train_args(tmp_path, 300, debug_run=True),
     )
     return len(cast(ProteinDataset, train_loader.dataset))
 
@@ -660,8 +981,6 @@ def refuses_new_work(executor: Executor) -> bool:
 def shard_loader_lifecycle(
     tmp_path_factory: pytest.TempPathFactory,
     bucketed_cfg: TrainConfig,
-    make_entry: EntryFactory,
-    write_jsonl: JsonlWriter,
 ) -> ShardLoaderLifecycle:
     """Take one ShardDataLoader through its whole life and record the result.
 
@@ -676,8 +995,6 @@ def shard_loader_lifecycle(
     Args:
         tmp_path_factory: Factory for the run's temporary directory.
         bucketed_cfg: Loader configuration.
-        make_entry: Entry factory.
-        write_jsonl: JSONL writer.
 
     Returns:
         ShardLoaderLifecycle recorded across construction, one iteration,
@@ -697,7 +1014,7 @@ def shard_loader_lifecycle(
         noise_magnitude=0,
         num_workers=1,
     )
-    entries = [make_entry("p1", 10), make_entry("p2", 20)]
+    entries = [protein_entry("p1", 10), protein_entry("p2", 20)]
     jsonl = write_jsonl(work / "p.jsonl", entries)
     loader = ShardDataLoader(
         dataset=ProteinShardDataset(
@@ -808,24 +1125,29 @@ def test_distogram_assigns_each_distance_its_bin(
     assert bool(mask[0, 1]) == case.valid
 
 
-@pytest.mark.parametrize("overflow", [False, True], ids=["clipped", "overflow"])
+@pytest.mark.parametrize(
+    "overflow_scenario",
+    list(OverflowScenario),
+    ids=[case.name for case in OverflowScenario],
+    indirect=True,
+)
 def test_distogram_is_a_symmetric_one_hot_over_its_bins(
-    overflow: bool,  # noqa: FBT001
-    make_pattern: PatternFactory,
+    overflow_scenario: OverflowScenario,
+    spread_coords: Float[torch.Tensor, "12 3"],
 ) -> None:
     """Every pair gets exactly one bin, and ``(i, j)`` matches ``(j, i)``.
 
     The overflow bin adds one class to the last axis.
 
     Args:
-        overflow: Whether the Distogram has an overflow bin.
-        make_pattern: Builds 12 coordinates spread over about 20 angstroms.
+        overflow_scenario: Overflow setting and the class count it gives.
+        spread_coords: 12 coordinates spread over about 20 angstroms.
     """
-    disto = Distogram(n_bins=16, overflow_bin=overflow).eval()
-    coords = 20 * make_pattern((12, 3), 0.37)
+    case = overflow_scenario.value
+    disto = Distogram(n_bins=16, overflow_bin=case.overflow_bin).eval()
     with torch.no_grad():
-        onehot, mask = disto(coords)
-    assert onehot.shape == (12, 12, 16 + overflow)
+        onehot, mask = disto(spread_coords)
+    assert onehot.shape == (12, 12, case.n_classes)
     assert torch.equal(
         reduce(onehot, "i j b -> i j", "sum"),
         torch.ones(12, 12),
@@ -835,7 +1157,7 @@ def test_distogram_is_a_symmetric_one_hot_over_its_bins(
 
 
 def test_distogram_masks_every_pair_of_an_invalid_atom(
-    make_pattern: PatternFactory,
+    near_coords: Float[torch.Tensor, "12 3"],
 ) -> None:
     """An atom marked invalid drops its whole row and column of pairs.
 
@@ -844,39 +1166,25 @@ def test_distogram_masks_every_pair_of_an_invalid_atom(
     atom is invalid does not matter.
 
     Args:
-        make_pattern: Builds 12 nearby coordinates.
+        near_coords: 12 coordinates within 2 angstroms of each other.
     """
     disto = Distogram(n_bins=16, overflow_bin=False).eval()
     valid = torch.ones(12, dtype=torch.bool)
     valid[0] = False
     with torch.no_grad():
-        _, mask = disto(make_pattern((12, 3), 0.37), valid)
+        _, mask = disto(near_coords, valid)
     expected = rearrange(valid, "i -> i 1") & rearrange(valid, "j -> 1 j")
     assert torch.equal(mask, expected)
 
 
 @pytest.mark.parametrize(
-    ("positions", "dim", "expected"),
-    [
-        pytest.param((0.0,), 4, (0.0, 0.0, 1.0, 1.0), id="origin"),
-        pytest.param(
-            (1.0,),
-            4,
-            (math.sin(1), math.sin(1e-4), math.cos(1), math.cos(1e-4)),
-            id="position_one",
-        ),
-        pytest.param(
-            (2.0,),
-            4,
-            (math.sin(2), math.sin(2e-4), math.cos(2), math.cos(2e-4)),
-            id="two_freqs",
-        ),
-    ],
+    "sinusoid_scenario",
+    list(SinusoidScenario),
+    ids=[case.name for case in SinusoidScenario],
+    indirect=True,
 )
 def test_sinusoidal_encoding_matches_its_closed_form(
-    positions: tuple[float, ...],
-    dim: int,
-    expected: tuple[float, ...],
+    sinusoid_scenario: SinusoidScenario,
 ) -> None:
     """Position ``p`` maps to ``sin(p f)`` then ``cos(p f)`` per frequency.
 
@@ -884,25 +1192,21 @@ def test_sinusoidal_encoding_matches_its_closed_form(
     ``1`` and ``1e-4``.
 
     Args:
-        positions: One residue position.
-        dim: Embedding width.
-        expected: The ``dim`` encoded values.
+        sinusoid_scenario: Position, width and expected encoding.
     """
-    out = sinusoidal_encoding(torch.tensor([positions]), dim=dim)
-    torch.testing.assert_close(out, torch.tensor([[expected]]))
+    case = sinusoid_scenario.value
+    out = sinusoidal_encoding(torch.tensor([[case.position]]), dim=case.dim)
+    torch.testing.assert_close(out, torch.tensor([[case.expected]]))
 
 
 @pytest.mark.parametrize(
-    ("resname", "has_cb"),
-    [
-        pytest.param("ALA", True, id="alanine"),
-        pytest.param("GLY", False, id="glycine_has_no_cb"),
-        pytest.param("TRP", True, id="tryptophan"),
-    ],
+    "cb_scenario",
+    list(CbScenario),
+    ids=[case.name for case in CbScenario],
+    indirect=True,
 )
 def test_ref_pos_for_residue_puts_ca_at_the_origin(
-    resname: str,
-    has_cb: bool,  # noqa: FBT001
+    cb_scenario: CbScenario,
 ) -> None:
     """CA is at the origin, N and C are off it, and a missing CB is zero.
 
@@ -910,14 +1214,14 @@ def test_ref_pos_for_residue_puts_ca_at_the_origin(
     falls back to ``(0, 0, 0)``.
 
     Args:
-        resname: Three-letter residue name.
-        has_cb: Whether the residue has a CB atom.
+        cb_scenario: Residue name and whether it has a CB.
     """
-    pos = ref_pos_for_residue(resname)
+    case = cb_scenario.value
+    pos = ref_pos_for_residue(case.resname)
     assert pos.shape == (ATOMS_PER_RES, 3)
     assert torch.equal(pos[1], torch.zeros(3))
     assert bool((pos[[0, 2]].abs().sum(-1) > 1).all())
-    assert bool(pos[4].abs().sum() > 0) == has_cb
+    assert bool(pos[4].abs().sum() > 0) == case.has_cb
 
 
 def test_featurize_single_item_shapes_ranges_and_index_maps(
@@ -1066,21 +1370,17 @@ def test_protein_dataset_pads_samples_to_max_length(
 
 
 def test_protein_dataset_truncates_long_entries(
-    tmp_path: pathlib.Path,
-    make_entry: EntryFactory,
-    write_jsonl: JsonlWriter,
+    long_entry_jsonl: pathlib.Path,
 ) -> None:
     """A 100-residue entry comes back cut to ``max_seq_length = 8``.
 
     Not parametrized: padding is the test above.
 
     Args:
-        tmp_path: Per-test directory.
-        make_entry: Entry factory.
-        write_jsonl: JSONL writer.
+        long_entry_jsonl: JSONL holding one 100-residue entry.
     """
-    path = write_jsonl(tmp_path / "long.jsonl", [make_entry("long.A", 100)])
-    sample = ProteinDataset(path, ["long.A"], max_seq_length=8)[0]
+    dataset = ProteinDataset(long_entry_jsonl, ["long.A"], max_seq_length=8)
+    sample = dataset[0]
     assert sample.aatype.shape == (8,)
     assert sample.atom_positions.shape == (8, 37, 3)
 
@@ -1113,16 +1413,16 @@ def test_protein_dataset_survives_pickling(
 
 
 def test_shard_metadata_records_the_build_parameters(
-    make_shard_dataset: ShardFactory,
+    shard_dataset: ProteinShardDataset,
 ) -> None:
     """The metadata sidecar records the token budget and shard size used.
 
     Not parametrized: the fields are copied from the budget as is.
 
     Args:
-        make_shard_dataset: Shard dataset factory.
+        shard_dataset: Two-entry shard dataset.
     """
-    dataset = make_shard_dataset(["p1", "p2"], [10, 20])
+    dataset = shard_dataset
     meta = ShardMetadata.model_validate_json(
         dataset.shard_metadata_path.read_text(),
     )
@@ -1132,44 +1432,30 @@ def test_shard_metadata_records_the_build_parameters(
 
 
 @pytest.mark.parametrize(
-    ("names_a", "names_b"),
-    [
-        pytest.param(["p1", "p2"], ["p1", "p2"], id="same_names"),
-        pytest.param(["p2", "p1"], ["p1", "p2"], id="same_names_reordered"),
-        pytest.param(["p1"], ["p1", "p2"], id="different_names"),
-    ],
+    "names_hash_scenario",
+    list(NamesHashScenario),
+    ids=[case.name for case in NamesHashScenario],
+    indirect=True,
 )
 def test_shard_metadata_names_hash_identifies_the_name_set(
-    make_shard_dataset: ShardFactory,
-    names_a: list[str],
-    names_b: list[str],
+    names_hash_scenario: NamesHashScenario,
+    names_hashes: NamesHashes,
 ) -> None:
     """Two builds share a names hash exactly when they shard the same names.
 
     The hash is over the sorted names, so order does not matter.
 
     Args:
-        make_shard_dataset: Shard dataset factory.
-        names_a: Names of the first build.
-        names_b: Names of the second build.
+        names_hash_scenario: The two builds' names and whether they match.
+        names_hashes: Both builds' hashes.
     """
-    hashes = [
-        ShardMetadata.model_validate_json(
-            make_shard_dataset(
-                names,
-                [10] * len(names),
-            ).shard_metadata_path.read_text(),
-        ).names_hash
-        for names in (names_a, names_b)
-    ]
-    assert (hashes[0] == hashes[1]) == (sorted(names_a) == sorted(names_b))
+    same = names_hashes.first == names_hashes.second
+    assert same == names_hash_scenario.value.same_hash
 
 
 def test_shard_dataset_reuses_existing_metadata(
-    tmp_path: pathlib.Path,
     shard_budget: ShardBudgetParameters,
-    make_entry: EntryFactory,
-    write_jsonl: JsonlWriter,
+    single_entry_jsonl: pathlib.Path,
 ) -> None:
     """A second dataset in the same shard directory leaves the shards alone.
 
@@ -1177,12 +1463,10 @@ def test_shard_dataset_reuses_existing_metadata(
     parametrized: the cache check reads one file.
 
     Args:
-        tmp_path: Per-test directory.
         shard_budget: Shard parameters, shared by both builds.
-        make_entry: Entry factory.
-        write_jsonl: JSONL writer.
+        single_entry_jsonl: JSONL holding entry ``p1``.
     """
-    jsonl = write_jsonl(tmp_path / "p.jsonl", [make_entry("p1", 10)])
+    jsonl = single_entry_jsonl
     first = ProteinShardDataset(
         budget_parameters=shard_budget,
         names=["p1"],
@@ -1197,11 +1481,15 @@ def test_shard_dataset_reuses_existing_metadata(
     assert first.shard_metadata_path.stat().st_mtime_ns == before
 
 
-@pytest.mark.parametrize("encoded", [False, True], ids=["dict", "bytes"])
+@pytest.mark.parametrize(
+    "json_form",
+    list(JsonForm),
+    ids=[case.name for case in JsonForm],
+    indirect=True,
+)
 def test_parse_protein_centres_ca_and_maps_unknown_residues_to_x(
-    make_shard_dataset: ShardFactory,
-    make_entry: EntryFactory,
-    encoded: bool,  # noqa: FBT001
+    shard_dataset: ProteinShardDataset,
+    unknown_residue_json: object,
 ) -> None:
     """Parsing gives a CA centroid at the origin and ``X`` for unknown codes.
 
@@ -1209,14 +1497,11 @@ def test_parse_protein_centres_ca_and_maps_unknown_residues_to_x(
     over either; both must parse the same way.
 
     Args:
-        make_shard_dataset: Shard dataset factory.
-        make_entry: Entry factory.
-        encoded: Whether to pass the entry as JSON bytes.
+        shard_dataset: Shard dataset to parse with.
+        unknown_residue_json: Entry ``p1`` with five unknown codes, as a
+            dict or as bytes.
     """
-    dataset = make_shard_dataset(["p1"], [10])
-    entry = make_entry("p1", 10) | {"seq": "ZZZZZAAAAA"}
-    raw: object = json.dumps(entry).encode() if encoded else entry
-    parsed = dataset.parse_protein({"json": raw})
+    parsed = shard_dataset.parse_protein({"json": unknown_residue_json})
     ca = torch.tensor(parsed.atom_positions[:, 1])
     ca_mask = rearrange(torch.tensor(parsed.atom_mask[:, 1]), "n -> n 1")
     centroid = reduce(ca * ca_mask, "n d -> d", "sum") / ca_mask.sum()
@@ -1259,7 +1544,7 @@ def test_shard_data_loader_del_shuts_down_executors(
 
 def test_bucketed_train_loader_yields_featurized_batches(
     bucketed_cfg: TrainConfig,
-    make_train_args: ArgsFactory,
+    bucketed_train_args: TrainArgs,
 ) -> None:
     """The bucketed training loader yields FeaturizedBatch, not raw proteins.
 
@@ -1267,11 +1552,11 @@ def test_bucketed_train_loader_yields_featurized_batches(
 
     Args:
         bucketed_cfg: Loader configuration.
-        make_train_args: TrainArgs factory.
+        bucketed_train_args: Arguments over a five-protein dataset.
     """
     train_loader, _, _ = make_bucketed_data_loaders(
         cfg=bucketed_cfg,
-        extra_train_args=make_train_args(5, debug_run=False),
+        extra_train_args=bucketed_train_args,
     )
     assert isinstance(next(iter(train_loader)), FeaturizedBatch)
 
@@ -1302,32 +1587,24 @@ def test_bucketed_debug_run_caps_train_split_at_252(
 
 
 @pytest.mark.parametrize(
-    ("extra", "cath_nodes"),
-    [
-        pytest.param({}, {}, id="cath_nodes_default_empty"),
-        pytest.param(
-            {"cath_nodes": {"p1": ["1.20.5"]}},
-            {"p1": ["1.20.5"]},
-            id="cath_nodes_populated",
-        ),
-        pytest.param({"unknown_field": 42}, {}, id="unknown_field_dropped"),
-    ],
+    "manifest_scenario",
+    list(ManifestScenario),
+    ids=[case.name for case in ManifestScenario],
+    indirect=True,
 )
 def test_dataset_splits_manifest_parses_splits_and_cath_nodes(
-    extra: dict[str, object],
-    cath_nodes: dict[str, list[str]],
+    manifest_scenario: ManifestScenario,
+    manifest: DatasetSplitsManifest,
 ) -> None:
     """The manifest reads the three splits, ``cath_nodes``, and ignores extras.
 
     Args:
-        extra: Fields added to the three splits.
-        cath_nodes: Expected ``cath_nodes``.
+        manifest_scenario: Fields added to the three splits.
+        manifest: The parsed manifest.
     """
-    data = {"train": ["p1"], "validation": ["p2"], "test": ["p3"]} | extra
-    manifest = DatasetSplitsManifest.model_validate(data)
     assert (manifest.train, manifest.validation, manifest.test) == (
         ["p1"],
         ["p2"],
         ["p3"],
     )
-    assert manifest.cath_nodes == cath_nodes
+    assert manifest.cath_nodes == manifest_scenario.value.cath_nodes
