@@ -6,6 +6,13 @@ on:
   pull_request:
   workflow_dispatch:
 
+# A new push to a pull request cancels that PR's older run in this workflow,
+# which is stale once the branch has moved. Pushes to main and manual runs
+# get a group of their own (the run id), so every one of them completes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   checks-cuda:
     uses: ./.github/workflows/devcontainer-checks.yml

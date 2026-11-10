@@ -17,7 +17,6 @@ import dataclasses
 import enum
 import math
 from collections.abc import Callable
-from typing import cast
 
 import numpy as np
 import pytest
@@ -356,19 +355,6 @@ def ones_weight(dims: LossDims) -> Float[torch.Tensor, " B"]:
 
 
 @pytest.fixture
-def target_form(request: pytest.FixtureRequest) -> TargetForm:
-    """Return the ``TargetForm`` member routed in via indirect param.
-
-    Args:
-        request: Pytest request carrying the member in ``param``.
-
-    Returns:
-        The target encoding under test.
-    """
-    return cast(TargetForm, request.param)
-
-
-@pytest.fixture
 def residue_target(
     target_form: TargetForm,
     dims: LossDims,
@@ -379,7 +365,8 @@ def residue_target(
     """Return ``residue_bins`` in the scenario's encoding.
 
     Args:
-        target_form: Index or one-hot.
+        target_form: Index or one-hot; the requesting test parametrizes
+            it.
         dims: Supplies ``n_bins``.
         residue_bins: Target bins.
 
@@ -400,7 +387,8 @@ def atom_target(
     """Return ``atom_bins`` in the scenario's encoding.
 
     Args:
-        target_form: Index or one-hot.
+        target_form: Index or one-hot; the requesting test parametrizes
+            it.
         dims: Supplies ``n_bins``.
         atom_bins: Target bins.
 
@@ -414,20 +402,20 @@ def atom_target(
 
 @pytest.fixture
 def residue_mask(
-    request: pytest.FixtureRequest,
+    residue_mask_case: ResidueMask,
     dims: LossDims,
 ) -> Float[torch.Tensor, "B N_res"] | None:
-    """Return the residue mask the routed-in ``ResidueMask`` asks for.
+    """Return the residue mask that ``residue_mask_case`` asks for.
 
     Args:
-        request: Pytest request carrying a ``ResidueMask`` member.
+        residue_mask_case: Whether to mask; the requesting test
+            parametrizes it.
         dims: Supplies the batch and residue counts.
 
     Returns:
         A mask hiding the last residue, or ``None``.
     """
-    scenario = cast(ResidueMask, request.param)
-    if not scenario.value.masked:
+    if not residue_mask_case.value.masked:
         return None
     mask = torch.ones(dims.batch, dims.n_res)
     mask[:, -1] = 0
@@ -437,58 +425,34 @@ def residue_mask(
 @pytest.fixture
 def atom_mask(
     request: pytest.FixtureRequest,
+    atom_mask_case: AtomMask,
     atom_bins: Int[torch.Tensor, "B N_atom K"],
 ) -> Bool[torch.Tensor, "B N_atom K"] | None:
-    """Return the slot mask the routed-in ``AtomMask`` asks for.
+    """Return the slot mask that ``atom_mask_case`` asks for.
 
     A case flagged ``divisor_bug`` gets a strict ``xfail`` marker, so it
     must fail today and the marker must come off once the loss is fixed.
     Marks cannot ride on enum members, so the fixture applies it.
 
     Args:
-        request: Pytest request carrying an ``AtomMask`` member.
+        request: Pytest request that receives the ``xfail`` marker.
+        atom_mask_case: Whether to mask, and whether the case hits the
+            known divisor bug; the requesting test parametrizes it.
         atom_bins: Supplies the slot layout.
 
     Returns:
         An all-valid slot mask, or ``None``.
     """
-    scenario = cast(AtomMask, request.param)
-    if scenario.value.divisor_bug:
+    if atom_mask_case.value.divisor_bug:
         request.applymarker(
             pytest.mark.xfail(
                 strict=True,
                 reason="unmasked distogram_loss_atom divides by K**2",
             ),
         )
-    if not scenario.value.masked:
+    if not atom_mask_case.value.masked:
         return None
     return torch.ones(atom_bins.shape, dtype=torch.bool)
-
-
-@pytest.fixture
-def rigid_scenario(request: pytest.FixtureRequest) -> RigidScenario:
-    """Return the ``RigidScenario`` member routed in via indirect param.
-
-    Args:
-        request: Pytest request carrying the scenario in ``param``.
-
-    Returns:
-        The scenario under test.
-    """
-    return cast(RigidScenario, request.param)
-
-
-@pytest.fixture
-def med_scenario(request: pytest.FixtureRequest) -> MedScenario:
-    """Return the ``MedScenario`` member routed in via indirect param.
-
-    Args:
-        request: Pytest request carrying the scenario in ``param``.
-
-    Returns:
-        The scenario under test.
-    """
-    return cast(MedScenario, request.param)
 
 
 @pytest.fixture
@@ -625,24 +589,10 @@ def lddt_floor() -> Float[torch.Tensor, ""]:
     return 1 - torch.sigmoid(thresholds).mean()
 
 
-@pytest.fixture
-def malformed_scenario(request: pytest.FixtureRequest) -> MalformedScenario:
-    """Return the ``MalformedScenario`` member routed in via indirect param.
-
-    Args:
-        request: Pytest request carrying the scenario in ``param``.
-
-    Returns:
-        The scenario under test.
-    """
-    return cast(MalformedScenario, request.param)
-
-
 @pytest.mark.parametrize(
     "rigid_scenario",
     list(RigidScenario),
     ids=[case.name for case in RigidScenario],
-    indirect=True,
 )
 def test_atom_loss_is_zero_for_a_rigid_copy(
     rigid_scenario: RigidScenario,
@@ -672,7 +622,6 @@ def test_atom_loss_is_zero_for_a_rigid_copy(
     "rigid_scenario",
     list(RigidScenario),
     ids=[case.name for case in RigidScenario],
-    indirect=True,
 )
 def test_atom_loss_ignores_rigid_motion_of_the_target(
     rigid_scenario: RigidScenario,
@@ -990,7 +939,6 @@ def test_residue_type_weight_classifies_every_canonical_residue(
     "med_scenario",
     list(MedScenario),
     ids=[case.name for case in MedScenario],
-    indirect=True,
 )
 def test_med_loss_matches_closed_form(
     med_scenario: MedScenario,
@@ -1196,13 +1144,11 @@ def test_pairwise_dist_on_a_3_4_5_triangle(
     "target_form",
     list(TargetForm),
     ids=[case.name for case in TargetForm],
-    indirect=True,
 )
 @pytest.mark.parametrize(
-    "residue_mask",
+    "residue_mask_case",
     list(ResidueMask),
     ids=[case.name for case in ResidueMask],
-    indirect=True,
 )
 def test_distogram_loss_residue_uniform_logits_give_log_bins(
     dims: LossDims,
@@ -1263,13 +1209,11 @@ def test_distogram_loss_residue_mask_hides_wrong_pairs(
     "target_form",
     list(TargetForm),
     ids=[case.name for case in TargetForm],
-    indirect=True,
 )
 @pytest.mark.parametrize(
-    "atom_mask",
+    "atom_mask_case",
     list(AtomMask),
     ids=[case.name for case in AtomMask],
-    indirect=True,
 )
 def test_distogram_loss_atom_uniform_logits_give_log_bins(
     dims: LossDims,
@@ -1452,7 +1396,6 @@ def test_featurize_keeps_pdb_x_at_the_ignored_index(
     "malformed_scenario",
     list(MalformedScenario),
     ids=[case.name for case in MalformedScenario],
-    indirect=True,
 )
 def test_losses_reject_malformed_inputs(
     malformed_scenario: MalformedScenario,

@@ -777,29 +777,21 @@ def decoder_probe(
 
 
 @pytest.fixture
-def module_probe(request: pytest.FixtureRequest) -> ModuleProbe:
-    """Return the probe fixture named by the indirect param.
+def module_probe(
+    request: pytest.FixtureRequest,
+    module_probe_name: str,
+) -> ModuleProbe:
+    """Return the probe fixture named by ``module_probe_name``.
 
     Args:
-        request: Pytest request carrying a ``*_probe`` fixture name.
+        request: Pytest request used to look up the named fixture.
+        module_probe_name: A ``*_probe`` fixture name; the requesting test
+            parametrizes it.
 
     Returns:
         The named probe.
     """
-    return cast(ModuleProbe, request.getfixturevalue(cast(str, request.param)))
-
-
-@pytest.fixture
-def layout_scenario(request: pytest.FixtureRequest) -> LayoutScenario:
-    """Return the ``LayoutScenario`` member routed in via indirect param.
-
-    Args:
-        request: Pytest request carrying the scenario in ``param``.
-
-    Returns:
-        The scenario under test.
-    """
-    return cast(LayoutScenario, request.param)
+    return cast(ModuleProbe, request.getfixturevalue(module_probe_name))
 
 
 @pytest.fixture
@@ -807,7 +799,8 @@ def layout_tok_idx(layout_scenario: LayoutScenario) -> Int[torch.Tensor, "N"]:
     """Build the scenario's residue index per atom.
 
     Args:
-        layout_scenario: Layout to build.
+        layout_scenario: Layout to build; the requesting test
+            parametrizes it.
 
     Returns:
         ``(N,)`` residue index, ``atoms_per_res`` atoms to a residue.
@@ -827,7 +820,8 @@ def window_neighbours(
     ``|tok[l] - tok[m]| < window_size // 2``.
 
     Args:
-        layout_scenario: Supplies the window size.
+        layout_scenario: Supplies the window size; the requesting test
+            parametrizes it.
         layout_tok_idx: Residue index per atom.
 
     Returns:
@@ -841,19 +835,6 @@ def window_neighbours(
             for t_l in tok
         ),
     )
-
-
-@pytest.fixture
-def beta_point_scenario(request: pytest.FixtureRequest) -> BetaPointScenario:
-    """Return the ``BetaPointScenario`` member routed in via indirect param.
-
-    Args:
-        request: Pytest request carrying the scenario in ``param``.
-
-    Returns:
-        The scenario under test.
-    """
-    return cast(BetaPointScenario, request.param)
 
 
 @pytest.fixture
@@ -871,19 +852,6 @@ def dense_pairs() -> SparsePairs:
         neighbor_idx=repeat(torch.arange(n), "k -> b n k", b=2, n=n),
         valid_mask=torch.ones(2, n, n, dtype=torch.bool),
     )
-
-
-@pytest.fixture
-def scatter_scenario(request: pytest.FixtureRequest) -> ScatterScenario:
-    """Return the ``ScatterScenario`` member routed in via indirect param.
-
-    Args:
-        request: Pytest request carrying the scenario in ``param``.
-
-    Returns:
-        The scenario under test.
-    """
-    return cast(ScatterScenario, request.param)
 
 
 @pytest.fixture
@@ -947,7 +915,6 @@ def windowed_inputs(
     "layout_scenario",
     list(LayoutScenario),
     ids=[case.name for case in LayoutScenario],
-    indirect=True,
 )
 def test_build_sparse_pairs_matches_window_definition(
     layout_scenario: LayoutScenario,
@@ -982,7 +949,6 @@ def test_build_sparse_pairs_matches_window_definition(
     "beta_point_scenario",
     list(BetaPointScenario),
     ids=[case.name for case in BetaPointScenario],
-    indirect=True,
 )
 def test_compute_beta_admits_pairs_sharing_a_window_centre(
     beta_point_scenario: BetaPointScenario,
@@ -1114,7 +1080,6 @@ def test_compute_beta_rejects_unbatched_neighbor_index(
     "scatter_scenario",
     list(ScatterScenario),
     ids=[case.name for case in ScatterScenario],
-    indirect=True,
 )
 def test_scatter_mean_averages_each_segment(
     scatter_scenario: ScatterScenario,
@@ -1179,7 +1144,7 @@ def test_scatter_mean_rejects_source_without_channel_axis(
 
 
 @pytest.mark.parametrize(
-    "module_probe",
+    "module_probe_name",
     [
         "transition_probe",
         "diffusion_dense_probe",
@@ -1189,7 +1154,6 @@ def test_scatter_mean_rejects_source_without_channel_axis(
         "encoder_probe",
         "decoder_probe",
     ],
-    indirect=True,
 )
 def test_probed_output_shape_and_finite(module_probe: ModuleProbe) -> None:
     """Each module's probed output has its expected shape and is finite.
@@ -1207,7 +1171,7 @@ def test_probed_output_shape_and_finite(module_probe: ModuleProbe) -> None:
 
 
 @pytest.mark.parametrize(
-    "module_probe",
+    "module_probe_name",
     [
         "transition_probe",
         "diffusion_dense_probe",
@@ -1217,7 +1181,6 @@ def test_probed_output_shape_and_finite(module_probe: ModuleProbe) -> None:
         "encoder_probe",
         "decoder_probe",
     ],
-    indirect=True,
 )
 def test_probed_gradient_reaches_first_input(module_probe: ModuleProbe) -> None:
     """The summed probed output has a finite, nonzero input gradient.
@@ -1233,7 +1196,7 @@ def test_probed_gradient_reaches_first_input(module_probe: ModuleProbe) -> None:
 
 
 @pytest.mark.parametrize(
-    "module_probe",
+    "module_probe_name",
     [
         "transition_probe",
         "diffusion_dense_probe",
@@ -1243,7 +1206,6 @@ def test_probed_gradient_reaches_first_input(module_probe: ModuleProbe) -> None:
         "encoder_probe",
         "decoder_probe",
     ],
-    indirect=True,
 )
 def test_probed_input_missing_last_axis_is_rejected(
     module_probe: ModuleProbe,
