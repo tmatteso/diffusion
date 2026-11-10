@@ -13,7 +13,6 @@ fixed seed inside its fixture, so each test is reproducible on its own.
 import abc
 import dataclasses
 import enum
-from collections.abc import Callable
 from typing import cast, override
 
 import pytest
@@ -31,7 +30,7 @@ from tests.patterns import sine_pattern
 
 type Single = Float[torch.Tensor, "B N_res c_res"]
 type Pair = Float[torch.Tensor, "B N_res N_j c_pair"]
-type ModuleCall = Callable[[Single, Single, Pair], Single]
+type DenseModule = AttentionPairBias | NodeUpdate
 
 
 @dataclasses.dataclass(frozen=True)
@@ -327,7 +326,7 @@ def sparse_inputs(
 
 
 @pytest.fixture
-def module_call(module_name: str, modules: NodeModules) -> ModuleCall:
+def module_call(module_name: str, modules: NodeModules) -> DenseModule:
     """Return the ``(s, t, z)`` module named by ``module_name``.
 
     Args:
@@ -336,9 +335,9 @@ def module_call(module_name: str, modules: NodeModules) -> ModuleCall:
         modules: Modules to pick from.
 
     Returns:
-        The chosen module as a callable.
+        The chosen module.
     """
-    return cast(ModuleCall, getattr(modules, module_name))
+    return cast(DenseModule, getattr(modules, module_name))
 
 
 @pytest.fixture
@@ -370,7 +369,7 @@ def sparse_beta(
 def test_dense_output_shape_dtype_and_finite(
     dims: NodeDims,
     inputs: NodeInputs,
-    module_call: ModuleCall,
+    module_call: DenseModule,
 ) -> None:
     """Each module returns a finite float32 ``(B, N_res, c_res)`` tensor.
 
@@ -507,7 +506,7 @@ def test_sparse_gradient_reaches_node_embedding(
 )
 def test_every_parameter_receives_a_finite_gradient(
     inputs: NodeInputs,
-    module_call: ModuleCall,
+    module_call: DenseModule,
 ) -> None:
     """No parameter is skipped by the forward pass when ``s`` is provided.
 
@@ -518,12 +517,11 @@ def test_every_parameter_receives_a_finite_gradient(
         inputs: Dense inputs.
         module_call: Module under test.
     """
-    module = cast(torch.nn.Module, module_call)
     out = reduce(module_call(inputs.s, inputs.t, inputs.z), "... -> ", "sum")
     torch.autograd.backward([out])
     missing = [
         name
-        for name, param in module.named_parameters()
+        for name, param in module_call.named_parameters()
         if param.grad is None or not torch.isfinite(param.grad).all()
     ]
     assert not missing
