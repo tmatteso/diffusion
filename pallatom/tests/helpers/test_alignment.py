@@ -7,13 +7,12 @@ with and without padding, the rotation-plus-translation contract and
 randomness of ``centre_random_augment``, and every function's shape
 contract.
 
-Coordinates come from the shared ``make_pattern`` fixture and rotations
+Coordinates come from ``tests.patterns.chiral_cloud`` and rotations
 are exact integer matrices, so every expected value is hand-checkable.
 """
 
 import dataclasses
 import enum
-import functools
 from collections.abc import Callable
 from typing import cast
 
@@ -31,7 +30,7 @@ from helpers.alignment import (
 )
 from helpers.useful_objects import manual_seed
 from jaxtyping import Bool, Float, TypeCheckError
-from tests.conftest import CloudFactory
+from tests.patterns import chiral_cloud
 
 type Coords = Float[torch.Tensor, "N 3"]
 type BatchCoords = Float[torch.Tensor, "B N 3"]
@@ -50,6 +49,19 @@ class RigidCase:
 
     rotation: tuple[tuple[int, int, int], ...]
     translation: tuple[float, float, float]
+
+    def apply(self, x: Coords) -> Coords:
+        """Rotate then translate ``x``.
+
+        Args:
+            x: Coordinates to move.
+
+        Returns:
+            ``x R + t``.
+        """
+        rotation = torch.tensor(self.rotation, dtype=torch.float32)
+        moved = einsum(x, rotation, "n d, d e -> n e")
+        return moved + torch.tensor(self.translation)
 
 
 class RigidScenario(enum.Enum):
@@ -122,6 +134,30 @@ class RmsdScenario(enum.Enum):
 
 
 @dataclasses.dataclass(frozen=True)
+class MaskCase:
+    """Whether ``centre_random_augment`` is told which atoms are padding.
+
+    Attributes:
+        pad: Zero the last 4 of every 12 atoms and pass the padding mask
+            when true; pass an all-true mask when false.
+    """
+
+    pad: bool
+
+
+class MaskScenario(enum.Enum):
+    """Masks for the centre-before-rotate test.
+
+    Members:
+        no_mask: Every atom counts.
+        padding_mask: The last 4 of every 12 atoms are zeroed padding.
+    """
+
+    no_mask = MaskCase(pad=False)
+    padding_mask = MaskCase(pad=True)
+
+
+@dataclasses.dataclass(frozen=True)
 class AugmentResult:
     """One ``centre_random_augment`` call, split into rotation and shift.
 
@@ -138,16 +174,13 @@ class AugmentResult:
 
 
 @pytest.fixture
-def cloud(make_cloud: CloudFactory) -> Coords:
+def cloud() -> Coords:
     """Return a 12-atom chiral cloud spanning about 10 angstroms.
-
-    Args:
-        make_cloud: Point-cloud factory.
 
     Returns:
         ``(12, 3)`` coordinates.
     """
-    return 5 * make_cloud(1, 12)[0]
+    return 5 * chiral_cloud(1, 12)[0]
 
 
 @pytest.fixture
@@ -162,31 +195,6 @@ def keep(cloud: Coords) -> Keep:
     """
     n = cloud.shape[0]
     return torch.arange(n) < n - 3
-
-
-@pytest.fixture
-def move() -> Callable[[Coords, RigidCase], Coords]:
-    """Return a function applying a ``RigidCase`` to coordinates.
-
-    Returns:
-        ``move(x, case) = x R + t``.
-    """
-
-    def apply(x: Coords, case: RigidCase) -> Coords:
-        """Rotate then translate ``x``.
-
-        Args:
-            x: Coordinates to move.
-            case: Motion to apply.
-
-        Returns:
-            Moved coordinates.
-        """
-        rotation = torch.tensor(case.rotation, dtype=torch.float32)
-        moved = einsum(x, rotation, "n d, d e -> n e")
-        return moved + torch.tensor(case.translation)
-
-    return apply
 
 
 @pytest.fixture
@@ -243,19 +251,61 @@ def com_coords() -> BatchCoords:
 
 
 @pytest.fixture
-def aug_coords(make_cloud: CloudFactory) -> BatchCoords:
+def aug_coords() -> BatchCoords:
     """Return four 12-atom structures far from the origin.
 
     The clouds are scaled by 10 and offset by 20 so that skipping the
     centring step would leave a large, visible offset.
 
-    Args:
-        make_cloud: Point-cloud factory.
-
     Returns:
         ``(4, 12, 3)`` coordinates.
     """
-    return 10 * make_cloud(4, 12) + 20
+    return 10 * chiral_cloud(4, 12) + 20
+
+
+@pytest.fixture
+def four_coord_cloud(cloud: Coords) -> Float[torch.Tensor, "N 4"]:
+    """Return ``cloud`` with a fourth coordinate appended to every atom.
+
+    Args:
+        cloud: Valid ``(N, 3)`` coordinates.
+
+    Returns:
+        ``(N, 4)`` coordinates that break every ``N 3`` contract.
+    """
+    return torch.cat([cloud, cloud[:, :1]], dim=-1)
+
+
+@pytest.fixture
+def mask_scenario(request: pytest.FixtureRequest) -> MaskScenario:
+    """Return the ``MaskScenario`` member routed in via indirect param.
+
+    Args:
+        request: Pytest request carrying the scenario in ``param``.
+
+    Returns:
+        The scenario under test.
+    """
+    return cast(MaskScenario, request.param)
+
+
+@pytest.fixture
+def augment_mask(
+    mask_scenario: MaskScenario,
+    padding: Bool[torch.Tensor, "B N"],
+) -> Bool[torch.Tensor, "B N"]:
+    """Return the mask the scenario passes to ``centre_random_augment``.
+
+    Args:
+        mask_scenario: Whether to mark padding.
+        padding: True for the 8 real atoms of each 12.
+
+    Returns:
+        ``padding`` when the scenario pads, otherwise all true.
+    """
+    if mask_scenario.value.pad:
+        return padding
+    return torch.ones_like(padding)
 
 
 @pytest.fixture
@@ -322,7 +372,6 @@ def augmented(
 def test_kabsch_undoes_a_rigid_motion(
     rigid_scenario: RigidScenario,
     cloud: Coords,
-    move: Callable[[Coords, RigidCase], Coords],
 ) -> None:
     """Kabsch maps a rigidly moved copy back onto the original.
 
@@ -333,9 +382,8 @@ def test_kabsch_undoes_a_rigid_motion(
     Args:
         rigid_scenario: Motion applied to the copy.
         cloud: Target structure.
-        move: Applies the motion.
     """
-    mobile = move(cloud, rigid_scenario.value)
+    mobile = rigid_scenario.value.apply(cloud)
     transform = kabsch_align(
         rearrange(mobile, "n d -> 1 n d"),
         rearrange(cloud, "n d -> 1 n d"),
@@ -351,7 +399,6 @@ def test_kabsch_undoes_a_rigid_motion(
 
 def test_kabsch_rmsd_aligns_each_batch_item_separately(
     cloud: Coords,
-    move: Callable[[Coords, RigidCase], Coords],
 ) -> None:
     """A batch holding every rigid scenario's copy is near zero per item.
 
@@ -360,9 +407,8 @@ def test_kabsch_rmsd_aligns_each_batch_item_separately(
 
     Args:
         cloud: Target structure.
-        move: Applies each motion.
     """
-    mobile = torch.stack([move(cloud, case.value) for case in RigidScenario])
+    mobile = torch.stack([case.value.apply(cloud) for case in RigidScenario])
     target = repeat(cloud, "n d -> b n d", b=len(mobile))
     rmsds = kabsch_rmsd(mobile, target)
     zeros = torch.zeros(len(mobile))
@@ -396,7 +442,6 @@ def test_kabsch_rmsd_ignores_deselected_atoms(
     select_scenario: SelectScenario,
     cloud: Coords,
     keep: Keep,
-    move: Callable[[Coords, RigidCase], Coords],
 ) -> None:
     """Displaced atoms that are deselected do not spoil the superposition.
 
@@ -408,9 +453,8 @@ def test_kabsch_rmsd_ignores_deselected_atoms(
         select_scenario: How the atoms are deselected.
         cloud: Target structure.
         keep: True for the 9 atoms that count.
-        move: Applies the screw motion.
     """
-    mobile = move(cloud, RigidScenario.screw.value)
+    mobile = RigidScenario.screw.value.apply(cloud)
     mobile[~keep] += 10
     value = select_scenario.value.call(mobile, cloud, keep)
     assert kabsch_rmsd(mobile, cloud).item() > 1
@@ -451,42 +495,67 @@ def test_rmsd_matches_hand_computed_value(
     "function",
     [
         pytest.param(kabsch_rotation, id="kabsch_rotation"),
-        pytest.param(
-            functools.partial(kabsch_align, return_transform=False),
-            id="kabsch_align",
-        ),
         pytest.param(rmsd, id="rmsd"),
         pytest.param(kabsch_rmsd, id="kabsch_rmsd"),
     ],
 )
 def test_alignment_functions_reject_four_coordinate_atoms(
     cloud: Coords,
+    four_coord_cloud: Float[torch.Tensor, "N 4"],
     function: Callable[[Float[torch.Tensor, "N 4"], Coords], object],
 ) -> None:
     """Each function's contract rejects coordinates of shape ``(N, 4)``.
 
+    ``kabsch_align`` has its own test below: its ``return_transform``
+    keyword is required, so it does not share these functions' signature.
+
     Args:
         cloud: Valid second argument.
+        four_coord_cloud: Bad first argument.
         function: Function under test, called with the bad coordinates
             first.
     """
-    bad = torch.cat([cloud, cloud[:, :1]], dim=-1)
     with pytest.raises(TypeCheckError):
-        _ = function(bad, cloud)
+        _ = function(four_coord_cloud, cloud)
 
 
-def test_apply_transform_rejects_four_coordinate_atoms(cloud: Coords) -> None:
+def test_kabsch_align_rejects_four_coordinate_atoms(
+    cloud: Coords,
+    four_coord_cloud: Float[torch.Tensor, "N 4"],
+) -> None:
+    """``kabsch_align`` rejects mobile coordinates of shape ``(N, 4)``.
+
+    Not parametrized: ``return_transform`` only changes what is returned,
+    not the input contract.
+
+    Args:
+        cloud: Valid target.
+        four_coord_cloud: Bad mobile coordinates.
+    """
+    with pytest.raises(TypeCheckError):
+        _ = kabsch_align(four_coord_cloud, cloud, return_transform=False)
+
+
+def test_apply_transform_rejects_four_coordinate_atoms(
+    cloud: Coords,
+    four_coord_cloud: Float[torch.Tensor, "N 4"],
+) -> None:
     """``apply_transform`` rejects coordinates of shape ``(N, 4)``.
 
     Not parametrized: the rotation and centroids are valid, so only the
     coordinates' shape is under test.
 
     Args:
-        cloud: Supplies valid centroids and the coordinates to extend.
+        cloud: Supplies valid centroids.
+        four_coord_cloud: Bad coordinates.
     """
-    bad = torch.cat([cloud, cloud[:, :1]], dim=-1)
     with pytest.raises(TypeCheckError):
-        _ = apply_transform(bad, torch.eye(3), cloud[:1], cloud[:1])
+        _ = apply_transform(
+            four_coord_cloud,
+            torch.eye(3),
+            cloud[:1],
+            cloud[:1],
+        )
 
 
 @pytest.mark.parametrize(
@@ -518,14 +587,14 @@ def test_masked_com_averages_only_valid_atoms(
 
 
 @pytest.mark.parametrize(
-    "masked",
-    [False, True],
-    ids=["no_mask", "padding_mask"],
+    "mask_scenario",
+    list(MaskScenario),
+    ids=[case.name for case in MaskScenario],
+    indirect=True,
 )
 def test_centre_random_augment_centres_before_rotating(
     aug_coords: BatchCoords,
-    padding: Bool[torch.Tensor, "B N"],
-    masked: bool,  # noqa: FBT001
+    augment_mask: Bool[torch.Tensor, "B N"],
 ) -> None:
     """With ``s_trans=0``, the counted atoms' centroid ends at the origin.
 
@@ -536,10 +605,9 @@ def test_centre_random_augment_centres_before_rotating(
 
     Args:
         aug_coords: Structures far from the origin.
-        padding: True for the 8 real atoms of each 12.
-        masked: Whether to pad and pass the mask.
+        augment_mask: True for the atoms that count.
     """
-    mask = padding if masked else torch.ones_like(padding)
+    mask = augment_mask
     coords = aug_coords * rearrange(mask.float(), "b n -> b n 1")
     out = centre_random_augment(coords, s_trans=0.0, mask=mask)
     weights = rearrange(mask.float(), "b n -> b n 1")
