@@ -73,7 +73,89 @@ type Array = npt.NDArray[np.float64] | npt.NDArray[np.intp]
 type Example = dict[str, Array]
 type AnyFloat = Float[torch.Tensor, "..."]
 type Convert = Callable[[AnyFloat, AnyFloat], object]
-type ProteinFactory = Callable[[tuple[int, ...], tuple[int, ...]], Protein]
+
+
+def feature_example(n: int) -> Example:
+    """Build an ``n``-residue numpy feature mapping.
+
+    A mapping rather than a dataclass because ``make_fixed_size`` and
+    ``truncate_to_length`` take one and rewrite its entries in place.
+    Residue ``r`` holds the value ``r + 1`` everywhere, so padding (0) and
+    kept residues are told apart.
+
+    Args:
+        n: Residue count.
+
+    Returns:
+        ``atom_positions``, ``atom_mask`` and ``residue_index``.
+    """
+    value = np.arange(1, n + 1, dtype=np.float64)
+    return {
+        "atom_positions": einops.repeat(value, "n -> n 37 3"),
+        "atom_mask": einops.repeat(value, "n -> n 37"),
+        "residue_index": np.arange(1, n + 1),
+    }
+
+
+def alanine_protein(
+    present: tuple[int, ...],
+    chains: tuple[int, ...],
+) -> Protein:
+    """Build one alanine per chain entry with chosen atom37 slots present.
+
+    Args:
+        present: Atom37 slots present in every residue.
+        chains: Chain index per residue.
+
+    Returns:
+        The protein, at deterministic positions.
+    """
+    n = len(chains)
+    mask = np.zeros((n, 37))
+    mask[:, list(present)] = 1.0
+    positions = einops.rearrange(
+        np.arange(n * 37 * 3, dtype=np.float64) / 10,
+        "(r a d) -> r a d",
+        a=37,
+        d=3,
+    )
+    return Protein(
+        atom_positions=positions,
+        aatype=np.zeros(n, dtype=np.intp),
+        atom_mask=mask,
+        residue_index=np.arange(n, dtype=np.intp),
+        chain_index=np.array(chains, dtype=np.intp),
+        b_factors=np.zeros((n, 37)),
+    )
+
+
+def write_pdb(path: pathlib.Path, records: str) -> pathlib.Path:
+    """Write ``"atom resname <chain><resseq>;..."`` records as a PDB file.
+
+    Each entry becomes one 80-column ATOM record at ``(1, 2, 3)``; an entry
+    starting with ``HETATM`` becomes a HETATM record instead. Atom names
+    are written in the 3-character form, which every name used here fits.
+
+    Args:
+        path: Destination file.
+        records: ``;``-separated ``[HETATM] atom resname <chain><n>``.
+
+    Returns:
+        The path written.
+    """
+    lines: list[str] = []
+    for serial, entry in enumerate(records.split(";"), start=1):
+        record, atom, resname, where = [PDB_REC_ATOM, *entry.split()][-4:]
+        name = f" {atom:<3}"
+        lines.append(
+            (
+                f"{record:<6}{serial:>5} {name} {resname:>3} "
+                + f"{where[0]}{int(where[1:]):>4}    "
+                + f"{1.0:8.3f}{2.0:8.3f}{3.0:8.3f}  1.00  0.00"
+            ).ljust(80),
+        )
+    _ = path.write_text("\n".join(lines) + "\n")
+    return path
 
 
 class TensorCase(enum.Enum):
@@ -387,6 +469,105 @@ class ToPdbScenario(enum.Enum):
     two_chains = PdbProteinCase((0, 1, 2, 4), (0, 0, 1, 1), 16, 2)
 
 
+@dataclasses.dataclass(frozen=True)
+class ResizeCase:
+    """A residue count before resizing and how many survive it.
+
+    Attributes:
+        n_res: Residues before resizing.
+        kept: Leading residues that must come through unchanged.
+    """
+
+    n_res: int
+    kept: int
+
+
+class FixedSizeScenario(enum.Enum):
+    """Inputs to ``make_fixed_size`` with ``max_seq_length = 10``.
+
+    Members:
+        padded: 5 residues, padded with zeros to 10.
+        unchanged: Exactly 10 residues.
+        truncated: 20 residues, cut to 10.
+    """
+
+    padded = ResizeCase(n_res=5, kept=5)
+    unchanged = ResizeCase(n_res=10, kept=10)
+    truncated = ResizeCase(n_res=20, kept=10)
+
+
+class TruncateScenario(enum.Enum):
+    """Inputs to ``truncate_to_length`` with a length of 50.
+
+    Members:
+        truncated: 100 residues, cut to 50.
+        exact: Exactly 50 residues.
+        short_not_padded: 30 residues, left at 30.
+    """
+
+    truncated = ResizeCase(n_res=100, kept=50)
+    exact = ResizeCase(n_res=50, kept=50)
+    short_not_padded = ResizeCase(n_res=30, kept=30)
+
+
+@dataclasses.dataclass(frozen=True)
+class TerCase:
+    """``chain_end`` arguments and the TER line they must produce.
+
+    Attributes:
+        serial: Atom serial number.
+        resname: Three-letter residue name.
+        chain: Chain identifier.
+        resseq: Residue number.
+        expected: The exact TER line.
+    """
+
+    serial: int
+    resname: str
+    chain: str
+    resseq: int
+    expected: str
+
+
+class TerScenario(enum.Enum):
+    """TER records with narrow and full-width columns.
+
+    Members:
+        a: A three-digit serial and two-digit residue number.
+        b: A one-digit serial and four-digit residue number.
+    """
+
+    a = TerCase(100, "ALA", "A", 10, "TER     100      ALA A  10")
+    b = TerCase(7, "GLY", "B", 1234, "TER       7      GLY B1234")
+
+
+@dataclasses.dataclass(frozen=True)
+class UnwritableCase:
+    """A protein ``to_pdb`` must refuse, and the error it raises.
+
+    Attributes:
+        aatype: Residue type for every residue.
+        chains: Chain index per residue.
+        error: Exception expected.
+    """
+
+    aatype: int
+    chains: tuple[int, ...]
+    error: type[Exception]
+
+
+class UnwritableScenario(enum.Enum):
+    """Proteins the PDB format cannot hold.
+
+    Members:
+        bad_aa: A residue type past the vocabulary.
+        too_many_chains: A chain index past the PDB chain alphabet.
+    """
+
+    bad_aa = UnwritableCase(RESTYPE_NUM + 1, (0, 0), InvalidAAtypesError)
+    too_many_chains = UnwritableCase(0, (0, PDB_MAX_CHAINS), ValueError)
+
+
 @pytest.fixture
 def atom_spec(request: pytest.FixtureRequest) -> TensorSpec:
     """Return the spec of the scenario routed in via indirect param.
@@ -499,39 +680,6 @@ def coords_dict() -> dict[str, list[list[float]]]:
 
 
 @pytest.fixture
-def make_example() -> Callable[[int], Example]:
-    """Return a factory for ``n``-residue numpy feature mappings.
-
-    A mapping rather than a dataclass because ``make_fixed_size`` and
-    ``truncate_to_length`` take one and rewrite its entries in place.
-    Residue ``r`` holds the value ``r + 1`` everywhere, so padding (0) and
-    kept residues are told apart.
-
-    Returns:
-        ``make(n)`` with ``atom_positions``, ``atom_mask`` and
-        ``residue_index``.
-    """
-
-    def make(n: int) -> Example:
-        """Build the mapping.
-
-        Args:
-            n: Residue count.
-
-        Returns:
-            The feature mapping.
-        """
-        value = np.arange(1, n + 1, dtype=np.float64)
-        return {
-            "atom_positions": einops.repeat(value, "n -> n 37 3"),
-            "atom_mask": einops.repeat(value, "n -> n 37"),
-            "residue_index": np.arange(1, n + 1),
-        }
-
-    return make
-
-
-@pytest.fixture
 def center_scenario(request: pytest.FixtureRequest) -> CenterPositionsScenario:
     """Return the ``CenterPositionsScenario`` routed in via indirect param.
 
@@ -593,48 +741,6 @@ def expected_centered_positions(
 
 
 @pytest.fixture
-def make_protein() -> ProteinFactory:
-    """Return a factory for alanine proteins with chosen atoms and chains.
-
-    ``make(present_atoms, chains)`` builds one residue per chain entry with
-    those atom37 slots present at deterministic positions.
-
-    Returns:
-        The factory.
-    """
-
-    def make(present: tuple[int, ...], chains: tuple[int, ...]) -> Protein:
-        """Build the protein.
-
-        Args:
-            present: Atom37 slots present in every residue.
-            chains: Chain index per residue.
-
-        Returns:
-            The protein.
-        """
-        n = len(chains)
-        mask = np.zeros((n, 37))
-        mask[:, list(present)] = 1.0
-        positions = einops.rearrange(
-            np.arange(n * 37 * 3, dtype=np.float64) / 10,
-            "(r a d) -> r a d",
-            a=37,
-            d=3,
-        )
-        return Protein(
-            atom_positions=positions,
-            aatype=np.zeros(n, dtype=np.intp),
-            atom_mask=mask,
-            residue_index=np.arange(n, dtype=np.intp),
-            chain_index=np.array(chains, dtype=np.intp),
-            b_factors=np.zeros((n, 37)),
-        )
-
-    return make
-
-
-@pytest.fixture
 def roundtrip_protein() -> Protein:
     """Return a 5-residue protein whose fields survive a PDB round trip.
 
@@ -662,45 +768,155 @@ def roundtrip_protein() -> Protein:
 
 
 @pytest.fixture
-def write_pdb(tmp_path: pathlib.Path) -> Callable[[str], pathlib.Path]:
-    """Return a writer turning ``"atom resname <chain><resseq>;..."`` to PDB.
+def resize_scenario(
+    request: pytest.FixtureRequest,
+) -> FixedSizeScenario | TruncateScenario:
+    """Return the resize scenario routed in via indirect param.
 
-    Each entry becomes one 80-column ATOM record at ``(1, 2, 3)``; an entry
-    starting with ``HETATM`` becomes a HETATM record instead. Atom names
-    are written in the 3-character form, which every name used here fits.
+    Args:
+        request: Pytest request carrying a ``FixedSizeScenario`` or
+            ``TruncateScenario`` member.
+
+    Returns:
+        The scenario under test.
+    """
+    return cast(FixedSizeScenario | TruncateScenario, request.param)
+
+
+@pytest.fixture
+def resize_input(
+    resize_scenario: FixedSizeScenario | TruncateScenario,
+) -> Example:
+    """Return the scenario's input mapping.
+
+    Args:
+        resize_scenario: Residue count before resizing.
+
+    Returns:
+        A fresh ``n_res``-residue mapping, which the test resizes in place.
+    """
+    return feature_example(resize_scenario.value.n_res)
+
+
+@pytest.fixture
+def resize_reference(
+    resize_scenario: FixedSizeScenario | TruncateScenario,
+) -> Example:
+    """Return the mapping of just the residues the resize must keep.
+
+    Args:
+        resize_scenario: Number of residues kept.
+
+    Returns:
+        A ``kept``-residue mapping.
+    """
+    return feature_example(resize_scenario.value.kept)
+
+
+@pytest.fixture
+def ter_scenario(request: pytest.FixtureRequest) -> TerScenario:
+    """Return the ``TerScenario`` member routed in via indirect param.
+
+    Args:
+        request: Pytest request carrying the scenario in ``param``.
+
+    Returns:
+        The scenario under test.
+    """
+    return cast(TerScenario, request.param)
+
+
+@pytest.fixture
+def to_pdb_protein(to_pdb_scenario: ToPdbScenario) -> Protein:
+    """Build the alanine protein a ``to_pdb`` scenario describes.
+
+    Args:
+        to_pdb_scenario: Present atoms and chains.
+
+    Returns:
+        The protein.
+    """
+    case = to_pdb_scenario.value
+    return alanine_protein(case.present_atoms, case.chains)
+
+
+@pytest.fixture
+def unwritable_scenario(request: pytest.FixtureRequest) -> UnwritableScenario:
+    """Return the ``UnwritableScenario`` member routed in via indirect param.
+
+    Args:
+        request: Pytest request carrying the scenario in ``param``.
+
+    Returns:
+        The scenario under test.
+    """
+    return cast(UnwritableScenario, request.param)
+
+
+@pytest.fixture
+def unwritable_protein(unwritable_scenario: UnwritableScenario) -> Protein:
+    """Build a protein with the scenario's residue type and chains.
+
+    Args:
+        unwritable_scenario: Residue type and chains to write.
+
+    Returns:
+        A protein ``to_pdb`` must refuse.
+    """
+    case = unwritable_scenario.value
+    return dataclasses.replace(
+        alanine_protein((1,), case.chains),
+        aatype=np.full(len(case.chains), case.aatype, dtype=np.intp),
+    )
+
+
+@pytest.fixture
+def scenario_pdb(
+    pdb_scenario: PdbScenario,
+    tmp_path: pathlib.Path,
+) -> pathlib.Path:
+    """Write the scenario's records to a PDB file.
+
+    Args:
+        pdb_scenario: Records to write.
+        tmp_path: Per-test directory.
+
+    Returns:
+        The file path.
+    """
+    return write_pdb(tmp_path / "model.pdb", pdb_scenario.value.records)
+
+
+@pytest.fixture
+def hetatm_pdb(
+    request: pytest.FixtureRequest,
+    tmp_path: pathlib.Path,
+) -> pathlib.Path:
+    """Write two ATOM residues followed by the routed-in HETATM record.
+
+    Args:
+        request: Pytest request carrying the HETATM record in ``param``.
+        tmp_path: Per-test directory.
+
+    Returns:
+        The file path.
+    """
+    hetatm = cast(str, request.param)
+    records = f"N ALA A1;N GLY A2;{hetatm}"
+    return write_pdb(tmp_path / "model.pdb", records)
+
+
+@pytest.fixture
+def gapped_pdb(tmp_path: pathlib.Path) -> pathlib.Path:
+    """Write two residues numbered 5 and 10, leaving a gap.
 
     Args:
         tmp_path: Per-test directory.
 
     Returns:
-        ``write(records)``, returning the file path.
+        The file path.
     """
-
-    def write(records: str) -> pathlib.Path:
-        """Write the records to ``model.pdb``.
-
-        Args:
-            records: ``;``-separated ``[HETATM] atom resname <chain><n>``.
-
-        Returns:
-            The file path.
-        """
-        lines: list[str] = []
-        for serial, entry in enumerate(records.split(";"), start=1):
-            record, atom, resname, where = [PDB_REC_ATOM, *entry.split()][-4:]
-            name = f" {atom:<3}"
-            lines.append(
-                (
-                    f"{record:<6}{serial:>5} {name} {resname:>3} "
-                    + f"{where[0]}{int(where[1:]):>4}    "
-                    + f"{1.0:8.3f}{2.0:8.3f}{3.0:8.3f}  1.00  0.00"
-                ).ljust(80),
-            )
-        path = tmp_path / "model.pdb"
-        _ = path.write_text("\n".join(lines) + "\n")
-        return path
-
-    return write
+    return write_pdb(tmp_path / "model.pdb", "N ALA A5;N ALA A10")
 
 
 @pytest.fixture
@@ -955,54 +1171,51 @@ def test_make_np_example_masks_and_zeroes_nan_coordinates(
 
 
 @pytest.mark.parametrize(
-    "n_res",
-    [5, 10, 20],
-    ids=["padded", "unchanged", "truncated"],
+    "resize_scenario",
+    list(FixedSizeScenario),
+    ids=[case.name for case in FixedSizeScenario],
+    indirect=True,
 )
 def test_make_fixed_size_pads_or_truncates_to_ten(
-    make_example: Callable[[int], Example],
-    n_res: int,
+    resize_scenario: FixedSizeScenario,
+    resize_input: Example,
+    resize_reference: Example,
 ) -> None:
     """Every array ends with 10 residues: the first kept, the rest zero.
 
     Args:
-        make_example: Feature-mapping factory; residue ``r`` holds ``r + 1``.
-        n_res: Residues before resizing.
+        resize_scenario: Residues before resizing and residues kept.
+        resize_input: Mapping to resize; residue ``r`` holds ``r + 1``.
+        resize_reference: Mapping of only the kept residues.
     """
-    example = make_example(n_res)
-    make_fixed_size(example, max_seq_length=10)
-    kept = min(n_res, 10)
-    out = {k: torch.tensor(v) for k, v in example.items()}
-    reference = {k: torch.tensor(v) for k, v in make_example(kept).items()}
+    kept = resize_scenario.value.kept
+    make_fixed_size(resize_input, max_seq_length=10)
+    out = {k: torch.tensor(v) for k, v in resize_input.items()}
+    reference = {k: torch.tensor(v) for k, v in resize_reference.items()}
     assert {k: len(v) for k, v in out.items()} == dict.fromkeys(out, 10)
     assert all(torch.equal(out[k][:kept], reference[k]) for k in out)
     assert all(torch.count_nonzero(out[k][kept:]) == 0 for k in out)
 
 
 @pytest.mark.parametrize(
-    ("n_res", "expected"),
-    [
-        pytest.param(100, 50, id="truncated"),
-        pytest.param(50, 50, id="exact"),
-        pytest.param(30, 30, id="short_not_padded"),
-    ],
+    "resize_scenario",
+    list(TruncateScenario),
+    ids=[case.name for case in TruncateScenario],
+    indirect=True,
 )
 def test_truncate_to_length_cuts_but_never_pads(
-    make_example: Callable[[int], Example],
-    n_res: int,
-    expected: int,
+    resize_input: Example,
+    resize_reference: Example,
 ) -> None:
     """Arrays longer than 50 residues are cut to 50; shorter ones are kept.
 
     Args:
-        make_example: Feature-mapping factory.
-        n_res: Residues before truncation.
-        expected: Residues after.
+        resize_input: Mapping to truncate.
+        resize_reference: Mapping of only the residues that must remain.
     """
-    example = make_example(n_res)
-    truncate_to_length(example, 50)
-    out = {k: torch.tensor(v) for k, v in example.items()}
-    reference = {k: torch.tensor(v) for k, v in make_example(expected).items()}
+    truncate_to_length(resize_input, 50)
+    out = {k: torch.tensor(v) for k, v in resize_input.items()}
+    reference = {k: torch.tensor(v) for k, v in resize_reference.items()}
     assert all(torch.equal(out[k], reference[k]) for k in out)
 
 
@@ -1034,31 +1247,20 @@ def test_center_positions(
 
 
 @pytest.mark.parametrize(
-    ("args", "expected"),
-    [
-        pytest.param(
-            (100, "ALA", "A", 10),
-            "TER     100      ALA A  10",
-            id="a",
-        ),
-        pytest.param(
-            (7, "GLY", "B", 1234),
-            "TER       7      GLY B1234",
-            id="b",
-        ),
-    ],
+    "ter_scenario",
+    list(TerScenario),
+    ids=[case.name for case in TerScenario],
+    indirect=True,
 )
-def test_chain_end_formats_a_ter_record(
-    args: tuple[int, str, str, int],
-    expected: str,
-) -> None:
+def test_chain_end_formats_a_ter_record(ter_scenario: TerScenario) -> None:
     """``chain_end`` lays out serial, residue, chain and number in columns.
 
     Args:
-        args: ``(serial, resname, chain, resseq)``.
-        expected: The exact TER line.
+        ter_scenario: Arguments and the exact TER line.
     """
-    assert chain_end(*args) == expected
+    case = ter_scenario.value
+    line = chain_end(case.serial, case.resname, case.chain, case.resseq)
+    assert line == case.expected
 
 
 @pytest.mark.parametrize(
@@ -1069,7 +1271,7 @@ def test_chain_end_formats_a_ter_record(
 )
 def test_to_pdb_writes_one_atom_line_per_present_atom(
     to_pdb_scenario: ToPdbScenario,
-    make_protein: ProteinFactory,
+    to_pdb_protein: Protein,
 ) -> None:
     """The PDB has a MODEL block, an ATOM per present atom, a TER per chain.
 
@@ -1077,10 +1279,10 @@ def test_to_pdb_writes_one_atom_line_per_present_atom(
 
     Args:
         to_pdb_scenario: Protein layout and expected record counts.
-        make_protein: Protein factory.
+        to_pdb_protein: Protein with that layout.
     """
     case = to_pdb_scenario.value
-    lines = to_pdb(make_protein(case.present_atoms, case.chains)).splitlines()
+    lines = to_pdb(to_pdb_protein).splitlines()
     records = [line.split()[0] for line in lines if line.strip()]
     assert {len(line) for line in lines} == {80}
     assert records.count(PDB_REC_ATOM) == case.atom_lines
@@ -1090,32 +1292,23 @@ def test_to_pdb_writes_one_atom_line_per_present_atom(
 
 
 @pytest.mark.parametrize(
-    ("aatype", "chains", "error"),
-    [
-        pytest.param(RESTYPE_NUM + 1, (0, 0), InvalidAAtypesError, id="bad_aa"),
-        pytest.param(0, (0, PDB_MAX_CHAINS), ValueError, id="too_many_chains"),
-    ],
+    "unwritable_scenario",
+    list(UnwritableScenario),
+    ids=[case.name for case in UnwritableScenario],
+    indirect=True,
 )
 def test_to_pdb_rejects_unwritable_proteins(
-    make_protein: ProteinFactory,
-    aatype: int,
-    chains: tuple[int, ...],
-    error: type[Exception],
+    unwritable_scenario: UnwritableScenario,
+    unwritable_protein: Protein,
 ) -> None:
     """A residue type past the vocabulary, or too many chains, raises.
 
     Args:
-        make_protein: Protein factory.
-        aatype: Residue type for every residue.
-        chains: Chain index per residue.
-        error: Exception expected.
+        unwritable_scenario: Supplies the exception expected.
+        unwritable_protein: Protein the PDB format cannot hold.
     """
-    protein = dataclasses.replace(
-        make_protein((1,), chains),
-        aatype=np.full(len(chains), aatype, dtype=np.intp),
-    )
-    with pytest.raises(error):
-        _ = to_pdb(protein)
+    with pytest.raises(unwritable_scenario.value.error):
+        _ = to_pdb(unwritable_protein)
 
 
 def test_to_pdb_and_protein_from_pdb_round_trip(
@@ -1156,7 +1349,7 @@ def test_to_pdb_and_protein_from_pdb_round_trip(
 )
 def test_protein_from_pdb_classifies_molecules_and_chains(
     pdb_scenario: PdbScenario,
-    write_pdb: Callable[[str], pathlib.Path],
+    scenario_pdb: pathlib.Path,
 ) -> None:
     """Each residue's molecule type goes to ``b_factors``; chains are indexed.
 
@@ -1164,12 +1357,12 @@ def test_protein_from_pdb_classifies_molecules_and_chains(
 
     Args:
         pdb_scenario: Records and expected classification.
-        write_pdb: PDB writer.
+        scenario_pdb: PDB file holding the scenario's records.
     """
     case = pdb_scenario.value
     codes = {"p": MOL_TYPE_PROTEIN, "d": MOL_TYPE_DNA, "r": MOL_TYPE_RNA}
     is_nucleotide = {"p": False, "d": True, "r": True}
-    protein = protein_from_pdb(write_pdb(case.records))
+    protein = protein_from_pdb(scenario_pdb)
     b_factors = torch.tensor(protein.b_factors[:, 0])
     aatype = torch.tensor(protein.aatype)
     nucleotide = torch.tensor([is_nucleotide[c] for c in case.mol_types])
@@ -1184,35 +1377,34 @@ def test_protein_from_pdb_classifies_molecules_and_chains(
 
 
 @pytest.mark.parametrize(
-    "hetatm",
+    "hetatm_pdb",
     ["HETATM O HOH A100", "HETATM MG MG A200", "HETATM N1 ATP A300"],
     ids=["water", "ion", "ligand"],
+    indirect=True,
 )
 def test_protein_from_pdb_skips_hetatm_records(
-    write_pdb: Callable[[str], pathlib.Path],
-    hetatm: str,
+    hetatm_pdb: pathlib.Path,
 ) -> None:
     """HETATM residues (water, ions, ligands) are left out of the protein.
 
     Args:
-        write_pdb: PDB writer.
-        hetatm: The HETATM record added after two ATOM residues.
+        hetatm_pdb: Two ATOM residues, then one HETATM record.
     """
-    protein = protein_from_pdb(write_pdb(f"N ALA A1;N GLY A2;{hetatm}"))
+    protein = protein_from_pdb(hetatm_pdb)
     assert protein.atom_positions.shape[0] == len(["ALA", "GLY"])
 
 
 def test_protein_from_pdb_keeps_pdb_residue_numbers(
-    write_pdb: Callable[[str], pathlib.Path],
+    gapped_pdb: pathlib.Path,
 ) -> None:
     """``residue_index`` holds the RESSEQ column, gaps included.
 
     Not parametrized: one gap shows the numbers are copied, not counted.
 
     Args:
-        write_pdb: PDB writer.
+        gapped_pdb: Residues numbered 5 and 10.
     """
-    protein = protein_from_pdb(write_pdb("N ALA A5;N ALA A10"))
+    protein = protein_from_pdb(gapped_pdb)
     assert torch.equal(
         torch.tensor(protein.residue_index),
         torch.tensor([5, 10]),
