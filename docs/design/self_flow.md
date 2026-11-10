@@ -241,9 +241,13 @@ enforces `k_s < k_t` after rounding.
   must pass it through. It is `None` when Self-Flow is disabled, and on
   validation and sampling batches.
 - `LossMetrics`: add `self_flow_loss`, logged to wandb next to
-  `intermediate_loss`. Add a diagnostic `self_flow_teacher_gt_mse`, the
-  teacher's unit-6 error against GT. It shows whether the target is better
-  than what the student already gets from `med_loss`.
+  `intermediate_loss`. Add these diagnostics:
+  - `self_flow_teacher_gt_mse`: the teacher's unit-6 error against GT. It
+    shows whether the target is better than what the student already gets
+    from `med_loss`.
+  - `L_sf` bucketed by student σ (§9.1).
+  - Each σ group's share of the λ-weighted `atom_loss` against its share of
+    atoms (§9.2).
 
 ## 6. Experiment plan
 
@@ -261,7 +265,8 @@ metrics and sample quality. Wall-clock time is reported separately.
 
 "Sucks or not" criterion: `sf-coords` should beat `dual-t` on validation
 Kabsch MSE and lDDT at matched steps, and `dual-t` should be at least as good
-as `baseline`. The overhead should be under 35% per step. With a no-grad
+as `baseline`. If `dual-t` falls short of `baseline`, revisit the
+mixed-noise loss weighting first (§9.2), before judging the teacher loss. The overhead should be under 35% per step. With a no-grad
 forward at about one third of forward plus checkpointed backward, the expected
 overhead is about 25–30%, plus CPU time to featurize the second view.
 
@@ -293,10 +298,63 @@ overhead is about 25–30%, plus CPU time to featurize the second view.
   conditioning-dropout code path yet: only a mask-token placeholder in
   `atom_utils.py` and docstring references. Applying it in the featurizer
   before both views are built would share it automatically.
-- **λ weighting for `L_sf`.** The proposal uses the student's per-atom
-  `λ(σ_i)` to stay on the same scale as `med_loss`. An unweighted MSE is the
-  natural alternative, since the paper's `L_rep` has no time weighting. Worth
-  ablating if `L_sf` dominates at small σ.
-- **Mixed-noise `L_gen`.** The paper does not spell out per-token weighting of
-  the generative loss. The proposal uses per-atom `λ(σ_i)` in `atom_loss` and
-  `med_loss`, and leaves smooth-lDDT, distogram and CE unchanged.
+
+## 9. Decisions
+
+### 9.1 λ weighting for `L_sf`
+
+**Default:** use the student's per-atom `λ(σ_i)`, so `L_sf` is on the same
+scale as `med_loss` and `γ_sf = 0.8` keeps a similar meaning.
+
+**Why it might be wrong:** `L_sf` has a target with its own error, the
+teacher's prediction. At small σ the two views are nearly identical, and λ is
+large (about 100 at σ = 0.1, and about 15% of draws have σ < 1). So the
+leftover student–teacher disagreement, including the teacher's own mistakes,
+gets amplified on exactly the samples where distillation teaches the least.
+The paper's `L_rep` has no time weighting.
+
+**Decision rule:** log `L_sf` bucketed by the student's σ (for example,
+log-spaced buckets over the sampler's range). If the low-σ buckets dominate
+the total, switch to an unweighted MSE or clamp λ.
+
+### 9.2 Per-residue weighting of the mixed-noise `L_gen`
+
+**Default:** in `atom_loss` and `med_loss`, multiply each atom's squared error
+by its own `λ(σ_i)` *before* the weighted mean. Smooth-lDDT, the distogram
+losses and CE have never been noise-weighted and stay unchanged.
+
+**Why it is the principled choice:** EDM's denoiser is
+`D = c_skip·x + c_out·F`, so `D − x0 = c_out·(F − F_target)`, and
+`λ = 1/c_out²`. That gives
+
+```
+λ(σ_i) · ‖D_i − x0_i‖²  =  ‖F_i − F_target,i‖²
+```
+
+Per-atom λ therefore weights every atom equally in terms of the raw network
+output F. Low-σ residues have large λ, but their coordinate-space errors are
+smaller by the same factor, so a clean subset does not automatically dominate
+the sample's loss. For uniform σ this reduces exactly to today's per-sample
+form. It relies on the per-atom `c_skip`/`c_out` from §3.3.
+
+**Decision rule:**
+
+1. **Gate on `dual-t` vs `baseline` (§6).** `dual-t` uses mixed noise with no
+   teacher loss. If it underperforms `baseline` on uniform-σ validation, the
+   mixed-noise generative loss is the prime suspect, and its weighting is the
+   first thing to change. The paper found that the dual-timestep schedule
+   alone helps slightly, so "matches or beats baseline" is a fair bar.
+2. **Log each group's share of the loss.** Per sample, split residues into the
+   lower-σ and higher-σ groups. Log each group's share of the λ-weighted
+   `atom_loss` next to its share of valid atoms. If the cancellation above
+   holds, the two shares should roughly match. A large, persistent gap means
+   one group is taking most of the gradient. Likely causes are poor
+   calibration at one end of the σ range, or whole-protein Kabsch alignment
+   letting noisy residues inflate errors on clean ones.
+
+**Fallback (if either check fails):** take the mean within each σ group
+separately, then combine the group means weighted by each group's fraction of
+atoms. Each group then contributes in proportion to its size, whatever its λ.
+
+**Test (either way):** with `R_M = 0`, the per-atom form must reproduce
+`main`'s `atom_loss` and `med_loss` exactly. This belongs in phase 1 (§7).
