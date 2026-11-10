@@ -58,7 +58,12 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import Adam
 from torch.optim.lr_scheduler import LambdaLR
 from tqdm import tqdm
-from train.train_config import TrainArgs, TrainConfig
+from train.train_config import (
+    PretrainedFrom,
+    ResumeFrom,
+    TrainArgs,
+    TrainConfig,
+)
 
 CUDA_DEVICE_TYPE = "cuda"
 
@@ -84,6 +89,7 @@ class Checkpoint:
 
 def load_checkpoint(
     model_params: ModelSetup,
+    path: Path,
     rank: int,
     log: FilteringBoundLogger,
 ) -> tuple[ModelSetup, Float[torch.Tensor, ""]]:
@@ -92,14 +98,14 @@ def load_checkpoint(
     Args:
         model_params: ModelSetup holding the model, optimizer, and scheduler to
             restore.
+        path: Checkpoint file to read, as written by ``save_checkpoint``.
         rank: Current process rank; info log emitted only on rank 0.
         log: Bound structlog logger.
 
     Returns:
-        The same ``model_params`` with model, optimizer, and scheduler state
-        restored.
+        The same ``model_params`` with model, optimizer, scheduler, and EMA
+        state restored, and the checkpoint's best validation loss.
     """
-    path: Path = model_params.tcfg.checkpoint.checkpoint_path
     raw: dict[str, object] = cast(
         dict[str, object],
         torch.load(path, map_location=model_params.device, weights_only=True),
@@ -130,6 +136,83 @@ def load_checkpoint(
     if rank == 0:
         log.info("resumed from checkpoint", path=path)
     return model_params, ckpt.best_val_loss
+
+
+def load_pretrained_weights(
+    model_params: ModelSetup,
+    path: Path,
+    rank: int,
+    log: FilteringBoundLogger,
+) -> ModelSetup:
+    """Seed the model and its EMA from a checkpoint's model weights.
+
+    Only the weights are taken from the checkpoint. The optimizer, LR
+    schedule, and best validation loss keep their fresh state, so training
+    starts a new run from these weights rather than continuing the old one.
+
+    Args:
+        model_params: ModelSetup whose model and EMA receive the weights.
+        path: Checkpoint file to read, as written by ``save_checkpoint``.
+        rank: Current process rank; info log emitted only on rank 0.
+        log: Bound structlog logger.
+
+    Returns:
+        The same ``model_params`` with model weights and EMA shadow set to
+        the checkpoint's model weights.
+    """
+    raw: dict[str, object] = cast(
+        dict[str, object],
+        torch.load(path, map_location=model_params.device, weights_only=True),
+    )
+    weights = cast(dict[str, Float[torch.Tensor, "..."]], raw["model"])
+    _ = (
+        cast(MainTrunk, model_params.model.module).load_state_dict(weights)
+        if isinstance(model_params.model, DDP)
+        else model_params.model.load_state_dict(weights)
+    )
+    model_params.ema.load_state_dict(weights)
+    if rank == 0:
+        log.info("loaded pretrained weights", path=path)
+    return model_params
+
+
+def restore_training_state(
+    model_params: ModelSetup,
+    rank: int,
+    log: FilteringBoundLogger,
+) -> tuple[ModelSetup, Float[torch.Tensor, ""]]:
+    """Apply the checkpoint source named in ``tcfg.training.init_from``.
+
+    ``ResumeFrom`` restores the full training state from its path.
+    ``PretrainedFrom`` loads only model weights from its path and starts
+    with no best validation loss. With ``None``, the freshly initialised
+    state is returned unchanged.
+
+    Args:
+        model_params: ModelSetup to restore into.
+        rank: Current process rank; info log emitted only on rank 0.
+        log: Bound structlog logger.
+
+    Returns:
+        The (possibly restored) ``model_params`` and the best validation
+        loss to start from: the checkpoint's when resuming, else infinity.
+    """
+    init_from = model_params.tcfg.training.init_from
+    if isinstance(init_from, ResumeFrom):
+        return load_checkpoint(
+            model_params=model_params,
+            path=init_from.path,
+            rank=rank,
+            log=log,
+        )
+    if isinstance(init_from, PretrainedFrom):
+        model_params = load_pretrained_weights(
+            model_params=model_params,
+            path=init_from.path,
+            rank=rank,
+            log=log,
+        )
+    return model_params, torch.tensor(float("inf"))
 
 
 def save_checkpoint(
@@ -592,7 +675,7 @@ def log_epoch(
 
     Checkpoints include model weights, optimizer state, scheduler state, and
     epoch number so training can be resumed exactly via
-    ``TrainingParams.resume_checkpoint``.
+    ``ResumeFrom`` in ``TrainingParams.init_from``.
 
     Args:
         epoch_metrics: Aggregated metrics for this epoch, including epoch
@@ -1151,14 +1234,11 @@ def main(args: TrainArgs, tcfg: TrainConfig) -> None:
             ema=EMA(model, decay=tp.ema_decay),
         )
 
-        if tcfg.training.pretrained_weights is not None:
-            model_params, best_val_loss = load_checkpoint(
-                model_params=model_params,
-                rank=rank,
-                log=log,
-            )
-        else:
-            best_val_loss = torch.tensor(float("inf"))
+        model_params, best_val_loss = restore_training_state(
+            model_params=model_params,
+            rank=rank,
+            log=log,
+        )
 
         if is_rank_zero and tcfg.logging.use_wandb:
             _ = wandb.init(
