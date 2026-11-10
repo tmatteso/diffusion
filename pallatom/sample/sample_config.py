@@ -22,8 +22,6 @@ class SamplerParams(BaseModel):
 
     Attributes:
         model_config: Pydantic config — frozen to prevent mutation after init.
-        rho: Exponent controlling the non-linear time-step spacing; higher
-            values concentrate steps near low noise levels.
         S_churn: Amount of stochasticity injected at each step; 0 recovers
             deterministic DDIM.
         S_tmin: Lower bound of the schedule-time window in which churn is
@@ -43,7 +41,6 @@ class SamplerParams(BaseModel):
 
     model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True)
 
-    rho: float = Field(default=7.0, gt=0)
     S_churn: float = Field(default=0.2, ge=0)
     S_tmin: float = Field(default=0.01, ge=0)
     S_tmax: float = Field(default=1.0, gt=0)
