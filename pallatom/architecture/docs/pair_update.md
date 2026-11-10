@@ -24,9 +24,9 @@ coordinates. It replaces the simplified `PairUpdate` stub originally in
 ## `TransformRBF`
 
 Converts a scalar distance matrix into a radial basis function feature
-vector: `n_rbf` (default 39) Gaussian centres evenly spaced between `d_min`
-(3.25 Å) and `d_max` (50.75 Å), each with width `sigma` (default 5.0). This
-is the standard RBF distance-discretization used to turn continuous
+vector: `n_rbf` (default 39) centres `c` evenly spaced between `d_min`
+(3.25 Å) and `d_max` (50.75 Å), each a Gaussian `exp(-(d - c)² / (2σ²))`
+whose standard deviation is `sigma` (default 5.0 Å). This is the standard RBF distance-discretization used to turn continuous
 coordinates into a bias `PairUpdate` can add into pair-embedding space.
 
 ## `TriangleAttentionStartingNodeWithBias` — step 3
