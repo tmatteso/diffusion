@@ -47,7 +47,8 @@ class ParamsForRBF:
 class TransformRBF(nn.Module):
     """Converts scalar distance into RBF feature vector then to pair embed dim.
 
-    Centers are evenly spaced in [d_min, d_max]; width = spacing.
+    Centers are evenly spaced in [d_min, d_max]. Each basis is a Gaussian
+    exp(-(d - c)^2 / (2 * sigma^2)) whose standard deviation is sigma (Å).
     """
 
     def __init__(
@@ -91,8 +92,7 @@ class TransformRBF(nn.Module):
         """
         rbf: Float[torch.Tensor, "B N_res N_res n_rbf"] = torch.exp(
             -((rearrange(d, "b n_i n_j -> b n_i n_j 1") - self.centers) ** 2)
-            / 2
-            * self.sigma**2,
+            / (2 * self.sigma**2),
         )
         return rbf
 

@@ -6,6 +6,10 @@ DropoutColumnwise, and PairUpdate including output shapes, finite-value
 checks, gradient flow, dropout semantics, and SE(3) geometric invariance.
 """
 
+import dataclasses
+import enum
+from typing import cast
+
 import pytest
 import torch
 from architecture.pair_update import (
@@ -236,6 +240,99 @@ def test_transform_rbf_symmetric_distance_gives_symmetric_output(
     with torch.no_grad():
         out = rbf(d)
     assert mean_abs_asymmetry(out).item() < TOLERANCE
+
+
+@dataclasses.dataclass(frozen=True)
+class RBFActivationCase:
+    """One distance and the exact activation one basis must give for it.
+
+    Attributes:
+        distance: Input distance in Å.
+        basis: Index of the RBF centre whose activation is checked.
+        expected: Closed-form value exp(-(distance - centre)^2 / (2 sigma^2))
+            for the default ParamsForRBF (centres 3.25 to 50.75 Å, 1.25 Å
+            apart, sigma = 5.0 Å).
+    """
+
+    distance: float
+    basis: int
+    expected: float
+
+
+class RBFActivationScenario(enum.Enum):
+    """Distances at known offsets from a centre, in units of sigma or spacing.
+
+    Members:
+        on_first_centre: Exactly on centre 0 (3.25 Å), so activation is 1.
+        half_spacing: Halfway between centres 0 and 1 (0.625 Å past centre
+            0). The old precedence bug, which multiplied by sigma^2 instead
+            of dividing, gave 0.0076 here.
+        one_sigma: One sigma (5 Å) past centre 0, so activation is exp(-0.5).
+        two_sigma_last: Two sigma (10 Å) before the last centre (50.75 Å),
+            so activation is exp(-2).
+    """
+
+    on_first_centre = RBFActivationCase(3.25, 0, 1.0)
+    half_spacing = RBFActivationCase(3.875, 0, 0.992218)
+    one_sigma = RBFActivationCase(8.25, 0, 0.606531)
+    two_sigma_last = RBFActivationCase(40.75, 38, 0.135335)
+
+
+@pytest.fixture
+def rbf_activation_scenario(
+    request: pytest.FixtureRequest,
+) -> RBFActivationScenario:
+    """Expose the indirect RBF activation scenario to the factory and the test.
+
+    Args:
+        request: Pytest fixture request whose ``.param`` attribute is an
+            RBFActivationScenario member.
+
+    Returns:
+        The scenario member for the current test case.
+    """
+    return cast(RBFActivationScenario, request.param)
+
+
+@pytest.fixture
+def single_distance(
+    rbf_activation_scenario: RBFActivationScenario,
+) -> Float[torch.Tensor, "1 1 1"]:
+    """Build a one-pair distance matrix holding the scenario's distance.
+
+    Args:
+        rbf_activation_scenario: Scenario whose ``distance`` fills the matrix.
+
+    Returns:
+        A ``(1, 1, 1)`` tensor containing only that distance.
+    """
+    return torch.tensor([[[rbf_activation_scenario.value.distance]]])
+
+
+@pytest.mark.parametrize(
+    "rbf_activation_scenario",
+    list(RBFActivationScenario),
+    ids=[case.name for case in RBFActivationScenario],
+    indirect=True,
+)
+def test_transform_rbf_matches_gaussian_closed_form(
+    rbf: TransformRBF,
+    single_distance: Float[torch.Tensor, "1 1 1"],
+    rbf_activation_scenario: RBFActivationScenario,
+) -> None:
+    """Each basis is a Gaussian whose standard deviation is sigma.
+
+    Checks the activation of one basis against exp(-(d - c)^2 / (2 sigma^2))
+    at distances placed on a centre, half a centre spacing away, and one and
+    two sigma away. The symmetry, range and shape checks above hold for any
+    positive width, so they cannot tell sigma from 1 / sigma; these exact
+    values can, and they fail under the old formula, which multiplied by
+    sigma^2 and made each basis about 0.2 Å wide instead of 5 Å.
+    """
+    with torch.no_grad():
+        out = rbf(single_distance)
+    case = rbf_activation_scenario.value
+    assert abs(out[0, 0, 0, case.basis].item() - case.expected) < TOLERANCE
 
 
 # ---------------------------------------------------------------------------

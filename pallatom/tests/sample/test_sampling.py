@@ -10,25 +10,36 @@ import pytest
 import torch
 from architecture.main_trunk import PredictedOutputs
 from beartype import beartype
-from einops import rearrange, reduce
+from einops import rearrange, reduce, repeat
 from helpers.alignment import masked_com
-from helpers.atom_utils import RESTYPE_NUM_NO_X, Protein, restype_order
+from helpers.atom_utils import (
+    ATOM5_CB,
+    ATOM5_NAMES,
+    ATOM5_TO_ATOM37,
+    ATOM37_CB,
+    RESTYPE_NUM_NO_X,
+    Protein,
+    ResidueRepresentation,
+    restype_order,
+)
 from helpers.data import (
     Distogram,
     FeaturizedBatch,
     normalized_time_from_sigma,
 )
 from helpers.useful_objects import manual_seed
-from jaxtyping import Bool, Float, TypeCheckError, jaxtyped
+from jaxtyping import Bool, Float, Int, TypeCheckError, jaxtyped
 from sample.sample_config import SamplerParams
 from sample.sampling import (
     NATOM,
     AllAtomContext,
     EDMSampler,
     TemplateContext,
+    backbone_cb_positions,
     build_aa_context,
     build_sampling_context,
     build_template_context,
+    sampled_structure_to_pdb,
 )
 from train.train_config import NoiseScheduleParams
 
@@ -1822,3 +1833,184 @@ def test_churn_raises_template_time_above_t_p(
     assert (
         churned_template_time > torch.linspace(0.1, 0.9, 9, dtype=torch.float64)
     ).all()
+
+
+@pytest.fixture
+def cb_slot_value(request: pytest.FixtureRequest) -> float:
+    """Expose the indirect value to write into the model's CB slot.
+
+    Args:
+        request: Pytest fixture request whose ``.param`` attribute is the
+            coordinate value for every axis of the CB slot.
+
+    Returns:
+        The CB slot coordinate value.
+    """
+    return cast(float, request.param)
+
+
+@pytest.fixture
+def sampled_residue_count() -> int:
+    """Number of identical residues in the sampled structure.
+
+    Three residues gives two peptide bonds and an interior residue; every
+    residue is the same ideal alanine, so the count only checks that each
+    residue is written, not any residue-to-residue geometry.
+
+    Returns:
+        The residue count.
+    """
+    return 3
+
+
+@pytest.fixture
+def sampled_atom37_positions(
+    ideal_alanine_atom5: Float[torch.Tensor, "5 3"],
+    cb_slot_value: float,
+) -> Float[torch.Tensor, "1 1 37 3"]:
+    """Build one ideal alanine in atom37 layout with a chosen CB slot value.
+
+    Args:
+        ideal_alanine_atom5: Ideal alanine positions in atom5 order.
+        cb_slot_value: Value written to every axis of the CB slot.
+
+    Returns:
+        Atom37 positions shaped like a sampled structure.
+    """
+    positions = torch.zeros(1, 1, ResidueRepresentation.atom37, 3)
+    positions[0, 0, ATOM5_TO_ATOM37] = ideal_alanine_atom5
+    positions[0, 0, ATOM37_CB] = cb_slot_value
+    return positions
+
+
+@pytest.fixture
+def sampled_atom37_mask(
+    sampled_atom37_positions: Float[torch.Tensor, "1 1 37 3"],
+) -> Float[torch.Tensor, "1 1 37"]:
+    """Mark every atom37 slot present, as the sampler does.
+
+    Args:
+        sampled_atom37_positions: Positions the mask belongs to.
+
+    Returns:
+        An all-ones mask matching the positions.
+    """
+    return torch.ones_like(sampled_atom37_positions[..., 0])
+
+
+@pytest.fixture
+def sampled_atom5_positions(
+    ideal_alanine_atom5: Float[torch.Tensor, "5 3"],
+    cb_slot_value: float,
+    sampled_residue_count: int,
+) -> Float[torch.Tensor, "N_res 5 3"]:
+    """Build a chain of ideal alanines with a chosen CB slot value.
+
+    Args:
+        ideal_alanine_atom5: Ideal alanine positions in atom5 order.
+        cb_slot_value: Value written to every axis of each CB slot.
+        sampled_residue_count: Number of residues in the chain.
+
+    Returns:
+        Atom5 positions shaped like one sampled structure.
+    """
+    positions = repeat(
+        ideal_alanine_atom5,
+        "a d -> n a d",
+        n=sampled_residue_count,
+    ).clone()
+    positions[:, ATOM5_CB] = cb_slot_value
+    return positions
+
+
+@pytest.fixture
+def alanine_aatype(sampled_residue_count: int) -> Int[torch.Tensor, "N_res"]:
+    """Residue types for an all-alanine chain.
+
+    Args:
+        sampled_residue_count: Number of residues in the chain.
+
+    Returns:
+        The alanine residue index for every residue.
+    """
+    return torch.full((sampled_residue_count,), restype_order["A"])
+
+
+@pytest.fixture
+def expected_backbone_atom_names(sampled_residue_count: int) -> str:
+    """The ATOM record names a CB-free backbone PDB must list, in order.
+
+    Args:
+        sampled_residue_count: Number of residues in the chain.
+
+    Returns:
+        N, CA, C and O repeated once per residue, joined by spaces.
+    """
+    backbone = [
+        name for slot, name in enumerate(ATOM5_NAMES) if slot != ATOM5_CB
+    ]
+    return " ".join(backbone * sampled_residue_count)
+
+
+@pytest.mark.parametrize(
+    "cb_slot_value",
+    [
+        pytest.param(0.0, id="zero_cb_slot"),
+        pytest.param(99.0, id="far_cb_slot"),
+    ],
+    indirect=True,
+)
+def test_backbone_cb_positions_ignores_cb_slot(
+    sampled_atom37_positions: Float[torch.Tensor, "1 1 37 3"],
+    sampled_atom37_mask: Float[torch.Tensor, "1 1 37"],
+    ideal_alanine_cb: Float[torch.Tensor, "3"],
+) -> None:
+    """Self-conditioning Cβ comes from the backbone, not the CB slot.
+
+    The model's CB slot is unsupervised and sampling marks every atom as
+    present, so whatever that slot holds must not reach the template.
+
+    Args:
+        sampled_atom37_positions: Ideal alanine with a chosen CB slot value.
+        sampled_atom37_mask: All-present mask, as the sampler builds it.
+        ideal_alanine_cb: The ideal alanine's known Cβ.
+    """
+    cb_positions = backbone_cb_positions(
+        sampled_atom37_positions,
+        sampled_atom37_mask,
+    )
+
+    assert torch.allclose(cb_positions, ideal_alanine_cb, atol=0.01)
+
+
+@pytest.mark.parametrize(
+    "cb_slot_value",
+    [
+        pytest.param(0.0, id="zero_cb_slot"),
+        pytest.param(99.0, id="far_cb_slot"),
+    ],
+    indirect=True,
+)
+def test_sampled_structure_to_pdb_writes_backbone_without_cb(
+    sampled_atom5_positions: Float[torch.Tensor, "N_res 5 3"],
+    alanine_aatype: Int[torch.Tensor, "N_res"],
+    expected_backbone_atom_names: str,
+) -> None:
+    """Sampled PDBs hold N, CA, C and O per residue and no CB.
+
+    The model's CB slot is unsupervised, so whatever value it holds, zero or
+    far off, must not reach the PDB.
+
+    Args:
+        sampled_atom5_positions: Ideal alanines with a chosen CB slot value.
+        alanine_aatype: Residue types for the chain.
+        expected_backbone_atom_names: ATOM names the PDB must list, in order.
+    """
+    pdb = sampled_structure_to_pdb(sampled_atom5_positions, alanine_aatype)
+
+    atom_names = " ".join(
+        line[12:16].strip()
+        for line in pdb.splitlines()
+        if line.startswith("ATOM")
+    )
+    assert atom_names == expected_backbone_atom_names
