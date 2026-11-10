@@ -5,6 +5,8 @@ and centre_random_augment — including correctness, shape-contract enforcement,
 and numerical tolerance checks.
 """
 
+import math
+
 import pytest
 import torch
 from architecture.losses import atom_loss
@@ -19,12 +21,32 @@ from helpers.alignment import (
     rmsd,
 )
 from helpers.useful_objects import manual_seed
+from hypothesis import given
+from hypothesis import strategies as st
 from jaxtyping import Bool, Float, Int, TypeCheckError
+from tests.strategies import (
+    CloudPair,
+    MaskedCloudPair,
+    ShuffledCloudPair,
+    batched_clouds,
+    cloud_pairs,
+    masked_cloud_pairs,
+    point_clouds,
+    rotate,
+    rotations,
+    shuffled_cloud_pairs,
+    translations,
+)
 
 _ = manual_seed(42)
 N, B = 50, 8
 TOLERANCE = 1e-5
 TIGHT_TOLERANCE = 1e-3
+GEOMETRY_TOLERANCE = 1e-6
+MIN_CHIRAL_ATOMS = 4
+MAX_SEED = 2**31 - 1
+SEEDS = st.integers(0, MAX_SEED)
+SCALES = st.floats(0.1, 10.0, width=64)
 
 
 @pytest.fixture
@@ -38,149 +60,6 @@ def uniform_aa_indices() -> Int[torch.Tensor, "B N"]:
         Integer tensor of shape (B, N), all entries 0.
     """
     return torch.zeros(B, N, dtype=torch.long)
-
-
-@pytest.fixture
-def ref() -> Float[torch.Tensor, "N 3"]:
-    """Provide random reference coordinates (N, 3).
-
-    Used as the fixed target in single-structure alignment tests.
-    """
-    return torch.randn(N, 3)
-
-
-@pytest.fixture
-def rigid_mobile(ref: Float[torch.Tensor, "N 3"]) -> Float[torch.Tensor, "N 3"]:
-    """Ref after random rigid rotation+translation.
-
-    A proper rotation (det = +1) is drawn from QR decomposition and a random
-    translation is applied, giving a mobile structure that should align to ref
-    with RMSD ≈ 0.
-    """
-    q = torch.qr(torch.randn(3, 3)).Q
-    if q.det() < 0:
-        q[:, 0] *= -1
-    return einsum(ref, q, "n d, e d -> n e") + torch.randn(1, 3)
-
-
-@pytest.fixture
-def batch_ref() -> Float[torch.Tensor, "B N 3"]:
-    """Provide batched random reference coordinates (B, N, 3).
-
-    Seeded with 42 for reproducibility across batched alignment tests.
-    """
-    _ = manual_seed(42)
-    return torch.randn(B, N, 3)
-
-
-@pytest.fixture
-def noisy_mobile(
-    batch_ref: Float[torch.Tensor, "B N 3"],
-) -> Float[torch.Tensor, "B N 3"]:
-    """Provide batch_ref with small Gaussian noise (sigma=0.1) added.
-
-    Gives a mobile batch that is close but not identical to the reference,
-    suitable for testing RMSD is small but non-zero.
-    """
-    return batch_ref + 0.1 * torch.randn(B, N, 3)
-
-
-@pytest.fixture
-def tail_weights() -> Float[torch.Tensor, "N"]:
-    """Provide per-atom weights that zero out residues 40+.
-
-    Used to verify that masked Kabsch alignment ignores the tail atoms
-    when computing RMSD.
-    """
-    w = torch.ones(N)
-    w[40:] = 0.0
-    return w
-
-
-def test_rotation_translation_rmsd_near_zero(
-    ref: Float[torch.Tensor, "N 3"],
-    rigid_mobile: Float[torch.Tensor, "N 3"],
-) -> None:
-    """Kabsch RMSD is near zero after an exact rigid rotation+translation.
-
-    Verifies that kabsch_rmsd correctly recovers the superimposition for a
-    structure transformed by a known proper rotation and translation.
-    """
-    assert kabsch_rmsd(rigid_mobile, ref).item() < TIGHT_TOLERANCE
-
-
-def test_kabsch_rmsd_batched_rigid_transforms_near_zero(
-    batch_ref: Float[torch.Tensor, "B N 3"],
-) -> None:
-    """Batched Kabsch RMSD ~zero for rigid-transformed structures.
-
-    Each batch element is transformed with a distinct proper rotation and
-    translation; kabsch_rmsd must recover near-zero RMSD for all elements
-    simultaneously.
-    """
-    _ = manual_seed(0)
-    mobiles: list[Float[torch.Tensor, "N 3"]] = []
-    for i in range(B):
-        q = torch.qr(torch.randn(3, 3)).Q
-        if q.det() < 0:
-            q[:, 0] *= -1
-        t: Float[torch.Tensor, "1 3"] = torch.randn(1, 3)
-        mobiles.append(einsum(batch_ref[i], q, "n d, e d -> n e") + t)
-    mobile_batch: Float[torch.Tensor, "B N 3"] = torch.stack(mobiles)
-    rmsds = kabsch_rmsd(mobile_batch, batch_ref)
-    assert rmsds.shape == (B,)
-    # Float32 Kabsch SVD residuals on random 50-atom clouds run ~2e-4;
-    # 1e-3 gives headroom
-    assert (rmsds < TIGHT_TOLERANCE).all()
-
-
-def test_masked_rmsd_near_zero(
-    ref: Float[torch.Tensor, "N 3"],
-    rigid_mobile: Float[torch.Tensor, "N 3"],
-    tail_weights: Float[torch.Tensor, "N"],
-) -> None:
-    """Masked Kabsch RMSD is near zero after an exact rigid transform.
-
-    Verifies that per-atom weights are respected and the masked alignment
-    achieves the same near-zero RMSD as the unmasked case.
-    """
-    assert (
-        kabsch_rmsd(rigid_mobile, ref, weights=tail_weights).item()
-        < TIGHT_TOLERANCE
-    )
-
-
-def test_apply_transform_reconstructs_target(
-    ref: Float[torch.Tensor, "N 3"],
-    rigid_mobile: Float[torch.Tensor, "N 3"],
-) -> None:
-    """apply_transform with Kabsch-recovered transform reconstructs target.
-
-    Checks the round-trip: kabsch_align returns the rotation and centroids,
-    and apply_transform using those values must reproduce the reference
-    coordinates within TIGHT_TOLERANCE.
-    """
-    _, R, c_mob, c_tgt = kabsch_align(  # pylint: disable=unpacking-non-sequence
-        rearrange(rigid_mobile, "n d -> 1 n d"),
-        rearrange(ref, "n d -> 1 n d"),
-        return_transform=True,
-    )
-    aligned = apply_transform(rigid_mobile, R, c_mob, c_tgt)
-    assert torch.allclose(aligned, ref, atol=TIGHT_TOLERANCE)
-
-
-def test_identity_alignment_unchanged(ref: Float[torch.Tensor, "N 3"]) -> None:
-    """Aligning a structure to itself leaves it unchanged.
-
-    Verifies that kabsch_align is idempotent when mobile and target are the
-    same tensor — the identity transform should be applied.
-    """
-    (aligned,) = kabsch_align(  # pylint: disable=unpacking-non-sequence
-        ref,
-        ref,
-        return_transform=False,
-    )
-    assert torch.allclose(aligned, ref, atol=TOLERANCE)
 
 
 def test_atom_loss_perfect_prediction_near_zero(
@@ -304,59 +183,6 @@ def test_apply_transform_wrong_shape() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_masked_com_no_mask_matches_plain_mean(
-    aug_coords: Float[torch.Tensor, "B N 3"],
-) -> None:
-    """Without a mask, masked_com reduces to the plain per-batch mean."""
-    out: Float[torch.Tensor, "B 1 3"] = masked_com(aug_coords)
-    expected: Float[torch.Tensor, "B 1 3"] = reduce(
-        aug_coords,
-        "b n d -> b 1 d",
-        "mean",
-    )
-    assert torch.allclose(out, expected, atol=TOLERANCE)
-
-
-def test_masked_com_ignores_zero_padded_atoms() -> None:
-    """Zero-padded atoms don't bias the centre of mass toward the origin.
-
-    A structure with real atoms offset from the origin, plus zero-padded
-    atoms appended, must have the same masked_com as the real atoms alone.
-    """
-    real: Float[torch.Tensor, "1 N 3"] = rearrange(
-        torch.randn(N, 3) + 5.0,
-        "n d -> 1 n d",
-    )
-    padded: Float[torch.Tensor, "1 N2 3"] = torch.cat(
-        [real, torch.zeros(1, N, 3)],
-        dim=1,
-    )
-    mask: Bool[torch.Tensor, "1 N2"] = torch.cat(
-        [
-            torch.ones(1, N, dtype=torch.bool),
-            torch.zeros(1, N, dtype=torch.bool),
-        ],
-        dim=1,
-    )
-    out: Float[torch.Tensor, "1 1 3"] = masked_com(padded, mask=mask)
-    expected: Float[torch.Tensor, "1 1 3"] = reduce(
-        real,
-        "b n d -> b 1 d",
-        "mean",
-    )
-    assert torch.allclose(out, expected, atol=TOLERANCE)
-
-
-def test_masked_com_all_valid_mask_matches_unmasked(
-    aug_coords: Float[torch.Tensor, "B N 3"],
-) -> None:
-    """An all-True mask reproduces the unmasked result exactly."""
-    mask: Bool[torch.Tensor, "B N"] = torch.ones(B, N, dtype=torch.bool)
-    out_masked: Float[torch.Tensor, "B 1 3"] = masked_com(aug_coords, mask=mask)
-    out_unmasked: Float[torch.Tensor, "B 1 3"] = masked_com(aug_coords)
-    assert torch.equal(out_masked, out_unmasked)
-
-
 def test_masked_com_wrong_shape_raises_type_error(
     aug_coords: Float[torch.Tensor, "B N 3"],
 ) -> None:
@@ -398,20 +224,6 @@ def test_centre_random_augment_output_shape(
     assert out.shape == aug_coords.shape
 
 
-def test_centre_random_augment_zero_s_trans_gives_zero_centroid(
-    aug_coords: Float[torch.Tensor, "B N 3"],
-) -> None:
-    """With s_trans=0, each batch element is exactly centred (mean ≈ 0).
-
-    Verifies that centre_random_augment subtracts the centroid for every
-    batch element and, with translation noise disabled, applies no further
-    offset before returning.
-    """
-    out = centre_random_augment(aug_coords, s_trans=0.0)
-    centroid: Float[torch.Tensor, "B 3"] = reduce(out, "b n d -> b d", "mean")
-    assert centroid.abs().max().item() < TOLERANCE
-
-
 def test_centre_random_augment_default_s_trans_matches_one(
     aug_coords: Float[torch.Tensor, "B N 3"],
 ) -> None:
@@ -425,67 +237,6 @@ def test_centre_random_augment_default_s_trans_matches_one(
     _ = manual_seed(11)
     out_explicit = centre_random_augment(aug_coords, s_trans=1.0)
     assert torch.equal(out_default, out_explicit)
-
-
-def test_centre_random_augment_translation_scales_with_s_trans(
-    aug_coords: Float[torch.Tensor, "B N 3"],
-) -> None:
-    """Output centroid scales linearly with s_trans.
-
-    Per t ~ s_trans * N(0, I3), the underlying standard-normal translation
-    draw is identical regardless of s_trans for a fixed RNG state, so
-    doubling s_trans must exactly double the resulting centroid offset.
-    """
-    _ = manual_seed(99)
-    out_a = centre_random_augment(aug_coords, s_trans=2.0)
-    centroid_a: Float[torch.Tensor, "B 3"] = reduce(
-        out_a,
-        "b n d -> b d",
-        "mean",
-    )
-
-    _ = manual_seed(99)
-    out_b = centre_random_augment(aug_coords, s_trans=4.0)
-    centroid_b: Float[torch.Tensor, "B 3"] = reduce(
-        out_b,
-        "b n d -> b d",
-        "mean",
-    )
-
-    assert torch.allclose(centroid_b, 2.0 * centroid_a, atol=TOLERANCE)
-
-
-def test_centre_random_augment_preserves_gram_matrix(
-    aug_coords: Float[torch.Tensor, "B N 3"],
-) -> None:
-    """All pairwise inner products of the re-centred output are preserved.
-
-    For a pure rotation R, (XR)^T (XR) = X^T X, so the Gram matrix of the
-    output, re-centred about its own mean to remove the translation noise,
-    is invariant. Catches accidental scaling or reflection.
-    """
-    centred: Float[torch.Tensor, "B N 3"] = aug_coords - reduce(
-        aug_coords,
-        "b n d -> b 1 d",
-        "mean",
-    )
-    out: Float[torch.Tensor, "B N 3"] = centre_random_augment(aug_coords)
-    out_centred: Float[torch.Tensor, "B N 3"] = out - reduce(
-        out,
-        "b n d -> b 1 d",
-        "mean",
-    )
-    gram_before: Float[torch.Tensor, "B N N"] = einsum(
-        centred,
-        centred,
-        "b n d, b m d -> b n m",
-    )
-    gram_after: Float[torch.Tensor, "B N N"] = einsum(
-        out_centred,
-        out_centred,
-        "b n d, b m d -> b n m",
-    )
-    assert torch.allclose(gram_before, gram_after, atol=1e-3)
 
 
 def test_centre_random_augment_invertible_via_kabsch(
@@ -571,30 +322,6 @@ def test_centre_random_augment_recovered_rotation_is_proper_so3(
     assert torch.allclose(dets, torch.ones(B), atol=1e-3)
 
 
-def test_centre_random_augment_is_translation_invariant(
-    aug_coords: Float[torch.Tensor, "B N 3"],
-) -> None:
-    """Adding a global translation to input leaves the output unchanged.
-
-    After centring, (coords + shift) - mean(coords + shift) = coords -
-    mean(coords), so the same random rotation and translation noise act on
-    identical centred data.
-    """
-    shift: Float[torch.Tensor, "1 1 3"] = rearrange(
-        torch.tensor([5.0, -3.0, 2.0]),
-        "d -> 1 1 d",
-    )
-    _ = manual_seed(123)
-    out_original: Float[torch.Tensor, "B N 3"] = centre_random_augment(
-        aug_coords,
-    )
-    _ = manual_seed(123)
-    out_shifted: Float[torch.Tensor, "B N 3"] = centre_random_augment(
-        aug_coords + shift,
-    )
-    assert torch.allclose(out_original, out_shifted, atol=TOLERANCE)
-
-
 def test_centre_random_augment_applies_independent_rotations_per_batch(
     aug_coords: Float[torch.Tensor, "B N 3"],
 ) -> None:
@@ -641,39 +368,6 @@ def test_centre_random_augment_applies_independent_translations(
         assert (
             diff > TIGHT_TOLERANCE
         ), f"Batch elements {i} and {i+1} received the same translation"
-
-
-def test_centre_random_augment_single_atom_zero_s_trans_is_zero() -> None:
-    """Single-atom cloud has zero centred coords; rotation maps zero to zero.
-
-    Verifies that centre_random_augment handles the degenerate single-atom
-    case correctly with translation noise disabled — only centred position
-    is the origin, and any rotation leaves it there.
-    """
-    single: Float[torch.Tensor, "B 1 3"] = torch.randn(B, 1, 3) * 5.0
-    out: Float[torch.Tensor, "B 1 3"] = centre_random_augment(
-        single,
-        s_trans=0.0,
-    )
-    assert torch.allclose(out, torch.zeros_like(out), atol=1e-6)
-
-
-def test_centre_random_augment_single_atom_equals_translation() -> None:
-    """Single-atom output is independent of the input position.
-
-    A single point is invariant under rotation about the origin, so once
-    centred (collapsing to the origin) the only remaining contribution to
-    the output is the added translation t — identical for any single-atom
-    input under the same RNG state.
-    """
-    single: Float[torch.Tensor, "B 1 3"] = torch.randn(B, 1, 3) * 5.0
-    _ = manual_seed(17)
-    out: Float[torch.Tensor, "B 1 3"] = centre_random_augment(single)
-    _ = manual_seed(17)
-    zeroed: Float[torch.Tensor, "B 1 3"] = centre_random_augment(
-        torch.zeros_like(single),
-    )
-    assert torch.allclose(out, zeroed, atol=1e-6)
 
 
 def test_centre_random_augment_is_deterministic_under_fixed_seed(
@@ -754,33 +448,6 @@ def padded_coords(
     return aug_coords * rearrange(padding_mask.float(), "b n -> b n 1")
 
 
-def test_centre_random_augment_mask_recovers_valid_centroid(
-    padded_coords: Float[torch.Tensor, "B N 3"],
-    padding_mask: Bool[torch.Tensor, "B N"],
-) -> None:
-    """With a mask, only valid atoms are centred to zero mean.
-
-    With s_trans=0 and a proper rotation about the origin, the valid atoms'
-    weighted centroid stays at the origin post-augmentation only if the
-    centroid used for centring was computed from valid atoms alone.
-    """
-    out: Float[torch.Tensor, "B N 3"] = centre_random_augment(
-        padded_coords,
-        s_trans=0.0,
-        mask=padding_mask,
-    )
-    weights: Float[torch.Tensor, "B N 1"] = rearrange(
-        padding_mask.float(),
-        "b n -> b n 1",
-    )
-    valid_centroid: Float[torch.Tensor, "B 3"] = reduce(
-        out * weights,
-        "b n d -> b d",
-        "sum",
-    ) / reduce(weights, "b n d -> b d", "sum")
-    assert valid_centroid.abs().max().item() < TOLERANCE
-
-
 def test_centre_random_augment_mask_changes_output_with_padding(
     padded_coords: Float[torch.Tensor, "B N 3"],
     padding_mask: Bool[torch.Tensor, "B N"],
@@ -811,28 +478,6 @@ def test_centre_random_augment_mask_changes_output_with_padding(
     assert diff > TIGHT_TOLERANCE
 
 
-def test_centre_random_augment_all_valid_mask_matches_unmasked(
-    aug_coords: Float[torch.Tensor, "B N 3"],
-) -> None:
-    """An all-True mask reproduces the unmasked result exactly.
-
-    When every atom is valid, the mask-aware centroid reduces to the plain
-    mean, so passing an all-ones mask must be bit-identical to omitting the
-    mask entirely under the same RNG state.
-    """
-    mask: Bool[torch.Tensor, "B N"] = torch.ones(B, N, dtype=torch.bool)
-    _ = manual_seed(64)
-    out_masked: Float[torch.Tensor, "B N 3"] = centre_random_augment(
-        aug_coords,
-        mask=mask,
-    )
-    _ = manual_seed(64)
-    out_unmasked: Float[torch.Tensor, "B N 3"] = centre_random_augment(
-        aug_coords,
-    )
-    assert torch.equal(out_masked, out_unmasked)
-
-
 def test_centre_random_augment_mask_wrong_shape_raises_type_error(
     aug_coords: Float[torch.Tensor, "B N 3"],
 ) -> None:
@@ -848,3 +493,361 @@ def test_centre_random_augment_mask_wrong_shape_raises_type_error(
     )
     with pytest.raises(TypeCheckError):
         _ = centre_random_augment(aug_coords, mask=bad_mask)
+
+
+# ---------------------------------------------------------------------------
+# Properties
+# ---------------------------------------------------------------------------
+
+
+def _centred(
+    coords: Float[torch.Tensor, "... n 3"],
+) -> Float[torch.Tensor, "... n 3"]:
+    """Subtract each structure's mean atom position."""
+    return coords - reduce(coords, "... n d -> ... 1 d", "mean")
+
+
+def _chirality(
+    coords: Float[torch.Tensor, "... n 3"],
+) -> Float[torch.Tensor, "..."]:
+    """Return the signed volume of the first four atoms.
+
+    Rotations and translations preserve this value, while a reflection
+    negates it.
+
+    Args:
+        coords: Coordinates with at least four atoms.
+
+    Returns:
+        The determinant of the three edges leaving the first atom.
+    """
+    return torch.det(coords[..., 1:4, :] - coords[..., :1, :])
+
+
+@given(points=point_clouds(), rotation=rotations(), shift=translations())
+def test_kabsch_align_undoes_rigid_motion(
+    points: Float[torch.Tensor, "N 3"],
+    rotation: Float[torch.Tensor, "3 3"],
+    shift: Float[torch.Tensor, "1 3"],
+) -> None:
+    """Aligning a rigidly moved copy of a cloud restores the original."""
+    moved = rotate(points, rotation) + shift
+    (aligned,) = kabsch_align(  # pylint: disable=unpacking-non-sequence
+        moved,
+        points,
+        return_transform=False,
+    )
+    assert torch.allclose(aligned, points, atol=GEOMETRY_TOLERANCE)
+
+
+@given(pair=cloud_pairs())
+def test_kabsch_rotation_is_proper_for_any_clouds(pair: CloudPair) -> None:
+    """The result is orthogonal with det = +1, even for unrelated clouds."""
+    R = kabsch_rotation(_centred(pair.mobile), _centred(pair.target))
+    identity = einsum(R, R.mH, "i j, j k -> i k")
+    expected = torch.eye(3, dtype=torch.float64)
+    assert torch.allclose(identity, expected, atol=GEOMETRY_TOLERANCE)
+    assert math.isclose(torch.det(R).item(), 1.0, rel_tol=GEOMETRY_TOLERANCE)
+
+
+@given(points=point_clouds(min_atoms=MIN_CHIRAL_ATOMS))
+def test_kabsch_rotation_is_proper_for_mirror_images(
+    points: Float[torch.Tensor, "N 3"],
+) -> None:
+    """A mirror image can't be matched by reflecting: det stays +1."""
+    mirror = points * torch.tensor([-1.0, 1.0, 1.0], dtype=torch.float64)
+    R = kabsch_rotation(_centred(points), _centred(mirror))
+    assert math.isclose(torch.det(R).item(), 1.0, rel_tol=GEOMETRY_TOLERANCE)
+
+
+@given(pair=cloud_pairs(), rotation=rotations())
+def test_kabsch_align_is_at_least_as_good_as_any_rotation(
+    pair: CloudPair,
+    rotation: Float[torch.Tensor, "3 3"],
+) -> None:
+    """No other rotation about the centroid gives a lower RMSD."""
+    (aligned,) = kabsch_align(  # pylint: disable=unpacking-non-sequence
+        pair.mobile,
+        pair.target,
+        return_transform=False,
+    )
+    centroid = reduce(pair.target, "n d -> 1 d", "mean")
+    other = rotate(_centred(pair.mobile), rotation) + centroid
+    best = rmsd(aligned, pair.target).item()
+    assert best <= rmsd(other, pair.target).item() + GEOMETRY_TOLERANCE
+
+
+@given(pair=cloud_pairs(), shift=translations())
+def test_kabsch_align_maps_centroid_onto_target(
+    pair: CloudPair,
+    shift: Float[torch.Tensor, "1 3"],
+) -> None:
+    """The aligned centroid lands on the target, wherever the target is.
+
+    Coordinates aren't compared directly: when one cloud is a single repeated
+    point the best rotation isn't unique, so only the centroid and the RMSD
+    are defined.
+    """
+    target = pair.target + shift
+    (aligned,) = kabsch_align(  # pylint: disable=unpacking-non-sequence
+        pair.mobile,
+        target,
+        return_transform=False,
+    )
+    assert torch.allclose(
+        reduce(aligned, "n d -> d", "mean"),
+        reduce(target, "n d -> d", "mean"),
+        atol=GEOMETRY_TOLERANCE,
+    )
+
+
+@given(pair=cloud_pairs(), shift=translations())
+def test_kabsch_rmsd_ignores_translation(
+    pair: CloudPair,
+    shift: Float[torch.Tensor, "1 3"],
+) -> None:
+    """Shifting either cloud leaves the best achievable RMSD unchanged."""
+    base = kabsch_rmsd(pair.mobile, pair.target)
+    moved_mobile = kabsch_rmsd(pair.mobile + shift, pair.target)
+    moved_target = kabsch_rmsd(pair.mobile, pair.target + shift)
+    assert torch.allclose(moved_mobile, base, atol=GEOMETRY_TOLERANCE)
+    assert torch.allclose(moved_target, base, atol=GEOMETRY_TOLERANCE)
+
+
+@given(shuffled=shuffled_cloud_pairs())
+def test_kabsch_rmsd_ignores_atom_order(shuffled: ShuffledCloudPair) -> None:
+    """Reordering both clouds in the same way leaves the RMSD unchanged."""
+    pair, order = shuffled.pair, shuffled.order
+    assert torch.allclose(
+        kabsch_rmsd(pair.mobile[order], pair.target[order]),
+        kabsch_rmsd(pair.mobile, pair.target),
+        atol=GEOMETRY_TOLERANCE,
+    )
+
+
+@given(pair=cloud_pairs())
+def test_kabsch_rmsd_is_symmetric(pair: CloudPair) -> None:
+    """Swapping mobile and target gives the same RMSD."""
+    assert torch.allclose(
+        kabsch_rmsd(pair.mobile, pair.target),
+        kabsch_rmsd(pair.target, pair.mobile),
+        atol=GEOMETRY_TOLERANCE,
+    )
+
+
+@given(masked=masked_cloud_pairs())
+def test_kabsch_rmsd_mask_matches_selected_atoms(
+    masked: MaskedCloudPair,
+) -> None:
+    """Masking atoms out is the same as deleting them."""
+    pair, mask = masked.pair, masked.mask
+    assert torch.allclose(
+        kabsch_rmsd(pair.mobile, pair.target, mask=mask),
+        kabsch_rmsd(pair.mobile[mask], pair.target[mask]),
+        atol=TOLERANCE,
+    )
+
+
+@given(pair=cloud_pairs(), scale=SCALES)
+def test_kabsch_rmsd_uniform_weights_match_unweighted(
+    pair: CloudPair,
+    scale: float,
+) -> None:
+    """Equal weights of any size match no weights at all."""
+    weights = torch.full_like(pair.mobile[:, 0], scale)
+    assert torch.allclose(
+        kabsch_rmsd(pair.mobile, pair.target, weights=weights),
+        kabsch_rmsd(pair.mobile, pair.target),
+        atol=TOLERANCE,
+    )
+
+
+@given(masked=masked_cloud_pairs(), scale=SCALES)
+def test_kabsch_rmsd_weights_and_mask_combine(
+    masked: MaskedCloudPair,
+    scale: float,
+) -> None:
+    """Equal weights on top of a mask match using the mask alone."""
+    pair, mask = masked.pair, masked.mask
+    weights = torch.full_like(pair.mobile[:, 0], scale)
+    assert torch.allclose(
+        kabsch_rmsd(pair.mobile, pair.target, weights=weights, mask=mask),
+        kabsch_rmsd(pair.mobile[mask], pair.target[mask]),
+        atol=TOLERANCE,
+    )
+
+
+@given(pair=cloud_pairs(), rotation=rotations(), shift=translations())
+def test_apply_transform_reproduces_kabsch_align(
+    pair: CloudPair,
+    rotation: Float[torch.Tensor, "3 3"],
+    shift: Float[torch.Tensor, "1 3"],
+) -> None:
+    """Reusing the returned transform gives the same coordinates."""
+    moved = rotate(pair.target, rotation) + shift
+    aligned, R, c_mobile, c_target = (  # pylint: disable=unpacking-non-sequence
+        kabsch_align(moved, pair.mobile, return_transform=True)
+    )
+    assert torch.allclose(
+        apply_transform(moved, R, c_mobile, c_target),
+        aligned,
+        atol=GEOMETRY_TOLERANCE,
+    )
+
+
+@given(pair=cloud_pairs())
+def test_rmsd_is_symmetric(pair: CloudPair) -> None:
+    """Swapping the arguments gives the same RMSD."""
+    assert torch.allclose(
+        rmsd(pair.mobile, pair.target),
+        rmsd(pair.target, pair.mobile),
+    )
+
+
+@given(masked=masked_cloud_pairs())
+def test_rmsd_mask_matches_selected_atoms(masked: MaskedCloudPair) -> None:
+    """Masking atoms out is the same as deleting them."""
+    pair, mask = masked.pair, masked.mask
+    assert torch.allclose(
+        rmsd(pair.mobile, pair.target, mask=mask),
+        rmsd(pair.mobile[mask], pair.target[mask]),
+    )
+
+
+@given(masked=masked_cloud_pairs())
+def test_rmsd_weights_match_mask(masked: MaskedCloudPair) -> None:
+    """Weights of 1 and 0 select atoms the same way a mask does."""
+    pair, mask = masked.pair, masked.mask
+    assert torch.allclose(
+        rmsd(pair.mobile, pair.target, weights=mask.double()),
+        rmsd(pair.mobile, pair.target, mask=mask),
+        atol=TOLERANCE,
+    )
+
+
+@given(masked=masked_cloud_pairs(), shift=translations())
+def test_masked_com_matches_selected_atoms(
+    masked: MaskedCloudPair,
+    shift: Float[torch.Tensor, "1 3"],
+) -> None:
+    """The centre uses only valid atoms and follows a translation."""
+    coords = rearrange(masked.pair.mobile, "n d -> 1 n d")
+    mask = rearrange(masked.mask, "n -> 1 n")
+    expected = reduce(masked.pair.mobile[masked.mask], "n d -> 1 1 d", "mean")
+    moved = masked_com(coords + shift, mask=mask)
+    assert torch.allclose(
+        masked_com(coords, mask=mask),
+        expected,
+        atol=GEOMETRY_TOLERANCE,
+    )
+    assert torch.allclose(moved, expected + shift, atol=GEOMETRY_TOLERANCE)
+
+
+@given(coords=batched_clouds())
+def test_masked_com_all_valid_matches_mean(
+    coords: Float[torch.Tensor, "B N 3"],
+) -> None:
+    """With every atom valid, or no mask at all, the result is the mean."""
+    mask = torch.ones_like(coords[..., 0], dtype=torch.bool)
+    expected = reduce(coords, "b n d -> b 1 d", "mean")
+    assert torch.equal(masked_com(coords), expected)
+    assert torch.allclose(masked_com(coords, mask=mask), expected)
+
+
+@given(coords=batched_clouds(), seed=SEEDS, s_trans=SCALES)
+def test_centre_random_augment_is_rigid(
+    coords: Float[torch.Tensor, "B N 3"],
+    seed: int,
+    s_trans: float,
+) -> None:
+    """Inner products between centred atoms are unchanged."""
+    _ = manual_seed(seed)
+    out = _centred(centre_random_augment(coords, s_trans=s_trans))
+    before = _centred(coords)
+    assert torch.allclose(
+        einsum(out, out, "b n d, b m d -> b n m"),
+        einsum(before, before, "b n d, b m d -> b n m"),
+        rtol=GEOMETRY_TOLERANCE,
+        atol=TOLERANCE,
+    )
+
+
+@given(coords=batched_clouds(min_atoms=MIN_CHIRAL_ATOMS), seed=SEEDS)
+def test_centre_random_augment_never_reflects(
+    coords: Float[torch.Tensor, "B N 3"],
+    seed: int,
+) -> None:
+    """Signed volume is preserved, so left-handed atoms stay left-handed."""
+    _ = manual_seed(seed)
+    out = centre_random_augment(coords)
+    assert torch.allclose(
+        _chirality(out),
+        _chirality(coords),
+        rtol=GEOMETRY_TOLERANCE,
+        atol=TOLERANCE,
+    )
+
+
+@given(coords=batched_clouds(), seed=SEEDS)
+def test_centre_random_augment_without_translation_is_centred(
+    coords: Float[torch.Tensor, "B N 3"],
+    seed: int,
+) -> None:
+    """With s_trans=0 the output centroid is the origin."""
+    _ = manual_seed(seed)
+    out = centre_random_augment(coords, s_trans=0.0)
+    centroid = reduce(out, "b n d -> b d", "mean")
+    assert centroid.abs().max().item() < GEOMETRY_TOLERANCE
+
+
+@given(coords=batched_clouds(), seed=SEEDS, scale=SCALES)
+def test_centre_random_augment_centroid_scales_with_s_trans(
+    coords: Float[torch.Tensor, "B N 3"],
+    seed: int,
+    scale: float,
+) -> None:
+    """For the same draw, the output centroid is linear in s_trans."""
+    _ = manual_seed(seed)
+    base = centre_random_augment(coords, s_trans=1.0)
+    _ = manual_seed(seed)
+    scaled = centre_random_augment(coords, s_trans=scale)
+    assert torch.allclose(
+        reduce(scaled, "b n d -> b d", "mean"),
+        scale * reduce(base, "b n d -> b d", "mean"),
+        atol=GEOMETRY_TOLERANCE,
+    )
+
+
+@given(coords=batched_clouds(), shift=translations(), seed=SEEDS)
+def test_centre_random_augment_ignores_input_position(
+    coords: Float[torch.Tensor, "B N 3"],
+    shift: Float[torch.Tensor, "1 3"],
+    seed: int,
+) -> None:
+    """A translated input gives the same output for the same draw."""
+    _ = manual_seed(seed)
+    base = centre_random_augment(coords)
+    _ = manual_seed(seed)
+    moved = centre_random_augment(coords + rearrange(shift, "o d -> 1 o d"))
+    assert torch.allclose(moved, base, atol=GEOMETRY_TOLERANCE)
+
+
+@given(masked=masked_cloud_pairs(), seed=SEEDS)
+def test_centre_random_augment_mask_ignores_padding_values(
+    masked: MaskedCloudPair,
+    seed: int,
+) -> None:
+    """Coordinates of padded atoms can't affect the valid atoms' output."""
+    coords = rearrange(masked.pair.mobile, "n d -> 1 n d")
+    other = rearrange(masked.pair.target, "n d -> 1 n d")
+    mask = rearrange(masked.mask, "n -> 1 n")
+    padded_differently = torch.where(
+        rearrange(mask, "b n -> b n 1"),
+        coords,
+        other,
+    )
+    _ = manual_seed(seed)
+    base = centre_random_augment(coords, mask=mask)
+    _ = manual_seed(seed)
+    moved = centre_random_augment(padded_differently, mask=mask)
+    assert torch.allclose(moved[mask], base[mask], atol=GEOMETRY_TOLERANCE)
