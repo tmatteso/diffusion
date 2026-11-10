@@ -40,3 +40,6 @@ training set is a filtered subset of
   practical rules for writing new code in this repo.
 - [docs/self_hosted_runner.md](docs/self_hosted_runner.md) — registering a
   machine as a GitHub Actions self-hosted GPU runner.
+- [docs/design/sampling_website.md](docs/design/sampling_website.md) — design
+  for a minimal FastAPI + React (TypeScript) website for unconditional
+  sampling from a checkpoint.
