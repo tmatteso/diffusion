@@ -10,8 +10,9 @@ jobs:
   checks-arm64:
     uses: ./.github/workflows/devcontainer-checks.yml
     with:
-      runs-on: '["ubuntu-latest"]'
+      runs-on: '["ubuntu-24.04-arm"]'
       devcontainer-config: .devcontainer/arm64/devcontainer.json
       image-name: devcontainer-arm64
+      static-checks-cmd: uv run --no-sync pre-commit run --all-files --show-diff-on-failure
       stub-ssh-agent: true
       no-cache: true

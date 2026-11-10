@@ -60,6 +60,8 @@ from torch.optim.lr_scheduler import LambdaLR
 from tqdm import tqdm
 from train.train_config import TrainArgs, TrainConfig
 
+CUDA_DEVICE_TYPE = "cuda"
+
 
 @dataclasses.dataclass
 class Checkpoint:
@@ -697,6 +699,29 @@ def flush_micro_buffer(
     return dataclasses.replace(step, global_step=new_global_step)
 
 
+def any_rank_true(flag: bool, device: torch.device) -> bool:  # noqa: FBT001
+    """Return the logical OR of ``flag`` across all ranks.
+
+    Must be called by every rank at the same point. Returns ``flag`` unchanged
+    when no process group is initialised.
+
+    Args:
+        flag: This rank's local decision.
+        device: Device for the reduction tensor (CUDA for NCCL, CPU for gloo).
+
+    Returns:
+        The same decision on every rank.
+    """
+    if not dist.is_initialized():
+        return flag
+    flag_tensor: Int[torch.Tensor, ""] = torch.tensor(int(flag), device=device)
+    _ = dist.all_reduce(  # pyright: ignore[reportUnknownMemberType]
+        flag_tensor,
+        op=dist.ReduceOp.MAX,
+    )
+    return bool(flag_tensor.item())
+
+
 def collect_distributed_vars() -> tuple[int, int, int]:
     """Return (rank, world_size, local_rank) for the current DDP context."""
     if not dist.is_initialized():
@@ -797,6 +822,10 @@ def train(
     ``tcfg.training.accumulated_token_budget`` is divided by ``world_size`` to
     get the per-rank token threshold; micro-batches accumulate until their
     combined token count hits that threshold before each optimizer step.
+    The flush decision is collective (``any_rank_true``), so every rank takes
+    the same number of optimizer steps, which requires every rank to yield the
+    same number of batches per epoch, as ``DistributedSampler`` guarantees.
+    Micro-batches left at epoch end are flushed as a final partial window.
 
     Per-epoch validation runs against the EMA shadow weights rather than
     the raw trained weights (matching AlphaFold2's checkpoint-selection
@@ -825,7 +854,11 @@ def train(
     if dist.is_initialized():
         ddp_wrapped: DDP = DDP(
             model_params.model,
-            device_ids=[local_rank],
+            device_ids=(
+                [local_rank]
+                if model_params.device.type == CUDA_DEVICE_TYPE
+                else None
+            ),
             find_unused_parameters=False,
             gradient_as_bucket_view=True,
         )
@@ -888,10 +921,13 @@ def train(
             n_proteins: int = int(batch.r_gt.shape[0])
             n_all_tokens: int = int(batch.f_pseudo_beta_mask.sum().item())
 
-            # if adding this batch would push tokens over the budget, flush.
-            if (
-                micro_buffer
-                and accum_tokens + n_all_tokens > per_rank_token_budget
+            # if adding this batch would push tokens over the budget on any
+            # rank, every rank flushes, so all ranks take the same number of
+            # optimizer steps (and DDP gradient all-reduces) per epoch.
+            if any_rank_true(
+                bool(micro_buffer)
+                and accum_tokens + n_all_tokens > per_rank_token_budget,
+                model_params.device,
             ):
                 step = flush_micro_buffer(
                     micro_buffer,
@@ -906,6 +942,16 @@ def train(
             n_proteins_buffer.append(n_proteins)
             accum_tokens += n_all_tokens
             step.pbar.update(1)  # pyright: ignore[reportUnusedCallResult]
+
+        # flush the remaining micro-batches; ranks flush in lockstep, so the
+        # buffer is non-empty on every rank or on none.
+        if micro_buffer:
+            step = flush_micro_buffer(
+                micro_buffer,
+                n_proteins_buffer,
+                model_params,
+                step,
+            )
 
         with swapped_in_ema_weights(model_params):
             epoch_val_metrics, _ = evaluate(
