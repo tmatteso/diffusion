@@ -8,6 +8,7 @@ length/indexing; and make_bucketed_data_loaders behaviour.
 """
 
 import dataclasses
+import enum
 import functools
 import json
 import math
@@ -2300,38 +2301,80 @@ def test_normalized_time_from_sigma_bounds(
     torch.testing.assert_close(t, torch.tensor(expected), atol=1e-6, rtol=0)
 
 
+@dataclasses.dataclass(frozen=True)
+class NullTemplateCase:
+    """Shape requested from ``null_template_distogram`` in one scenario.
+
+    Attributes:
+        shape: Requested (B, N_res, N_res, n_templ_bins) shape, which the
+            returned tensor must match exactly.
+    """
+
+    shape: torch.Size
+
+
+class NullTemplateScenario(enum.Enum):
+    """Null template shapes, varying batch, residue and bin counts.
+
+    Members:
+        single_sample: One 4-residue sample with the production 39 bins.
+        batched_19_bins: Three 7-residue samples with 19 bins.
+    """
+
+    single_sample = NullTemplateCase(torch.Size((1, 4, 4, 39)))
+    batched_19_bins = NullTemplateCase(torch.Size((3, 7, 7, 19)))
+
+
 @pytest.fixture
-def null_template(
+def null_template_scenario(
     request: pytest.FixtureRequest,
-) -> Float[torch.Tensor, "B N_res N_res n_templ_bins"]:
-    """Build a null template distogram of the requested shape on the CPU.
+) -> NullTemplateScenario:
+    """Expose the indirect NullTemplateScenario parameter to the test.
 
     Args:
-        request: Carries the target ``torch.Size``.
+        request: Pytest fixture request whose ``.param`` attribute is a
+            NullTemplateScenario member.
+
+    Returns:
+        The scenario for the current test case.
+    """
+    return cast(NullTemplateScenario, request.param)
+
+
+@pytest.fixture
+def null_template(
+    null_template_scenario: NullTemplateScenario,
+) -> Float[torch.Tensor, "B N_res N_res n_templ_bins"]:
+    """Build the scenario's null template distogram on the CPU.
+
+    Args:
+        null_template_scenario: Scenario holding the shape to request.
 
     Returns:
         The output of ``null_template_distogram`` for that shape.
     """
-    return null_template_distogram(cast(torch.Size, request.param), "cpu")
+    return null_template_distogram(null_template_scenario.value.shape, "cpu")
 
 
 @pytest.mark.parametrize(
-    ("null_template", "shape"),
-    [
-        pytest.param(*[torch.Size((1, 4, 4, 39))] * 2, id="single_sample"),
-        pytest.param(*[torch.Size((3, 7, 7, 19))] * 2, id="batched_19_bins"),
-    ],
-    indirect=["null_template"],
+    "null_template_scenario",
+    list(NullTemplateScenario),
+    ids=[case.name for case in NullTemplateScenario],
+    indirect=True,
 )
 def test_null_template_distogram_is_all_zero(
     null_template: Float[torch.Tensor, "B N_res N_res n_templ_bins"],
-    shape: torch.Size,
+    null_template_scenario: NullTemplateScenario,
 ) -> None:
     """The null template has the requested shape, float dtype, and no mass.
 
     A real template is one-hot on the bin axis; the null must sum to zero
     there so the trunk can tell "no template" apart from any structure.
+
+    Args:
+        null_template: The null template built for the scenario.
+        null_template_scenario: Scenario holding the requested shape.
     """
-    assert null_template.shape == shape
+    assert null_template.shape == null_template_scenario.value.shape
     assert null_template.dtype == torch.float32
     assert not null_template.any()
