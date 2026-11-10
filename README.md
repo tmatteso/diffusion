@@ -41,5 +41,5 @@ training set is a filtered subset of
 - [docs/self_hosted_runner.md](docs/self_hosted_runner.md) — registering a
   machine as a GitHub Actions self-hosted GPU runner.
 - [docs/design/sampling_website.md](docs/design/sampling_website.md) — design
-  for a minimal FastAPI + React (TypeScript) website for unconditional
-  sampling from a checkpoint.
+  for the FastAPI + React (TypeScript) sampling website and its roadmap
+  (RabbitMQ job queue, k3s, observability).

@@ -1,116 +1,88 @@
-# Design: minimum viable sampling website
+# Design: unconditional sampling website
 
 **Status:** Draft, for review
-**Scope:** A local web UI that samples proteins unconditionally from one
-trained `MainTrunk` checkpoint and shows the results in 3D.
-**Stack:** FastAPI (Python 3.12) backend, React + TypeScript (Vite) frontend.
+**Scope of this doc:** The MVP (Phase 1) in full detail. Phases 2–4 are
+covered in enough detail that the MVP does not paint them into a corner.
+**Stack:** FastAPI (Python 3.12) backend; React + TypeScript (Vite) frontend
+deployed to GitHub Pages.
 
 ---
 
 ## 1. Problem
 
 Today the only way to look at samples is the notebook path described in
-[`pallatom/README.md`](../../pallatom/README.md): write a `SampleConfig` to
-JSON, run `sample/sampling.py` as a subprocess, read `samples.json` back, and
-render one PDB string at a time with `py3Dmol`. Each step is manual, and you
-need a Jupyter kernel on the GPU box.
+[`pallatom/README.md`](../../pallatom/README.md). You write a `SampleConfig`
+to JSON, run `sample/sampling.py` as a subprocess, read `samples.json` back,
+and render one PDB string at a time with `py3Dmol`. Every step is manual,
+and it only works for someone with a Jupyter kernel on the GPU box.
 
-We want a page where you choose a length and a sample count, click
-**Sample**, and get rotatable structures, their sequences and PDB downloads
-back.
+We want a public web page where anyone can pick a length and a sample count,
+click **Sample**, and get back rotatable 3D structures, their sequences, and
+PDB downloads.
 
-## 2. Goals and non-goals
+## 2. Roadmap at a glance
 
-**Goals (MVP)**
+| Phase | What | Auth | Job transport | Hosts |
+|-------|------|------|---------------|-------|
+| **1 (MVP)** | Sampling website | **none** | in-process queue + worker thread | Frontend on GitHub Pages; API + worker on the current GPU box |
+| 2 | Two-machine job queue | yes | **RabbitMQ** | ARM64 cloud host (gateway, broker, auth) + GPU box (workers) |
+| 3 | Orchestration | yes | RabbitMQ | **k3s** + NVIDIA GPU Operator + Gateway API Inference Extension |
+| 4 | Observability | yes | RabbitMQ | **Prometheus, Grafana, Alertmanager, Loki** on the cluster |
+
+The rest of this doc is about Phase 1. §9 describes the later phases and
+lists the MVP decisions that exist to make them cheap.
+
+## 3. MVP goals and non-goals
+
+**Goals**
 
 1. Load **one** checkpoint (EMA weights) when the server starts, and keep it
-   resident on the GPU, or on the CPU on arm64.
+   resident on one GPU of the current machine.
 2. Run unconditional sampling with a user-chosen `n_res` and `n_samples`, an
    optional `seed`, and an optional `ddim_steps` override.
-3. Show each sample in an interactive 3D viewer, coloured as a cartoon
-   spectrum like the notebook, next to its decoded one-letter sequence.
-4. Let the user download each sample as a `.pdb` file.
-5. Serve the whole thing as one process on one port, so that
-   `ssh -L 8000:localhost:8000 <gpu-box>` is the whole deployment story.
+3. Shape the API around jobs: submit a job, then poll it. Put the transport
+   behind an interface, so that Phase 2 swaps in RabbitMQ without changing
+   the HTTP contract or the frontend.
+4. Show each sample in an interactive 3D viewer (cartoon, spectrum colouring,
+   as in the notebook) next to its one-letter sequence, with a `.pdb`
+   download.
+5. Host the frontend on **GitHub Pages**
+   (`https://tmatteso.github.io/diffusion/`). The repo is public and Pages
+   is already set to deploy from Actions.
 6. Hold the new Python code to the same quality bar as the rest of
-   `pallatom/` (basedpyright `all`, ruff `ALL`, jaxtyping, einops, and so on),
-   and give the TypeScript an equally strict bar.
+   `pallatom/`, and give the TypeScript an equally strict bar.
 
-**Non-goals (explicitly deferred)**
+**Non-goals for the MVP**
 
-- Conditional sampling, such as templates, motifs or a fixed sequence.
-  `build_sampling_context(pdb_file_path=None, ...)` stays `None`.
-- Switching checkpoints from the UI, or uploading checkpoints.
-- Authentication, multiple users, persistent job history and databases.
-- Streaming the denoising trajectory, or a progress bar (see §9, Phase 2).
-- Public internet hosting.
+- Auth, RabbitMQ, or a second machine (Phase 2).
+- Containers or Kubernetes (Phase 3).
+- Metrics endpoints or dashboards (Phase 4). We still emit structured logs
+  now (§5.6).
+- Conditional sampling (templates, motifs, fixed sequence), switching
+  checkpoints, cancelling jobs, or streaming the denoising trajectory.
+- Keeping jobs across server restarts. Job results live in memory.
 
-## 3. Constraints from the existing code
+## 4. Constraints from the existing code and environment
 
-| Fact | Consequence for the design |
-|------|----------------------------|
-| A checkpoint `.pt` holds only `model`, `optimizer` and `ema` state dicts (`train/train_loop.py`). It holds **no** architecture config. | The server cannot rebuild `MainTrunk` from the `.pt` file alone. It must start from a `SampleConfig` JSON, which already carries `model`, `noise`, the distogram params and `checkpoint.checkpoint_path`. |
-| `sample/sampling.py::main` mixes four jobs: model loading, context building, `EDMSampler.sample`, and conversion to PDB plus writing the file. | Refactor these into reusable functions (§5.1) so that the CLI and the API share one code path. |
-| `EDMSampler.sample` draws from torch's global RNG. | Seeding is `torch.manual_seed(seed)`. That is safe only if a single sampling job runs at a time, which the MVP enforces anyway (§5.4). |
-| `fastapi`, `uvicorn[standard]` and `pydantic` are already in `pyproject.toml`. | The backend needs no new Python dependencies. |
-| basedpyright type-checks only `pallatom/`, and `extraPaths` resolves imports without the `pallatom.` prefix. | Put the backend at `pallatom/serve/` so that it gets full type checking and imports like `from sample.sampling import ...`. |
+| Fact | Consequence |
+|------|-------------|
+| A checkpoint `.pt` holds only `model`, `optimizer` and `ema` state dicts (`train/train_loop.py`). It has **no** architecture config. | The server starts from a `SampleConfig` JSON, which carries `model`, `noise`, the distogram params and `checkpoint.checkpoint_path`. |
+| `sample/sampling.py::main` mixes model loading, context building, `EDMSampler.sample`, and PDB conversion and writing. | Refactor these into reusable functions (§5.1). The CLI, the MVP worker thread and the Phase 2 RabbitMQ consumer then share one code path. |
+| `EDMSampler.sample` draws from torch's global RNG. | `torch.manual_seed(seed)` is only safe when one job runs at a time per process. The single worker thread guarantees that. |
+| `fastapi`, `uvicorn[standard]` and `pydantic` are already dependencies. | The MVP backend needs no new Python dependencies. |
+| basedpyright type-checks `pallatom/`, and `extraPaths` resolves imports without the `pallatom.` prefix. | The backend lives at `pallatom/serve/`. |
+| `CLAUDE.md` bans `Any` and `TypedDict`. | Every payload is a Pydantic model. The handlers do not use `app.state`, which is `Any`; they are bound methods on typed objects (§5.4). |
+| GitHub Pages serves over **HTTPS** from a different origin than the API. | The API must be reachable over HTTPS, or browsers block it as mixed content, and it must send **CORS** headers for the Pages origin (§5.5). |
+| The GPU box has two RTX 4070 SUPERs. | The MVP runs one worker on one GPU (`--device cuda:0`). The second GPU becomes a second consumer in Phase 2. |
 | The devcontainer has no Node toolchain. | Add the `node` devcontainer feature (§7). |
-| `CLAUDE.md` bans `Any` and `TypedDict`. | Every API payload is a Pydantic model. The FastAPI handlers avoid `app.state`, which is `Any`, and bind a typed service object instead (§5.3). |
 
-## 4. Architecture
-
-```
-┌──────────────────────────── browser ────────────────────────────┐
-│  React + TS (Vite build)                                         │
-│  SampleForm ──► api.ts (typed fetch) ──► SampleGallery           │
-│                                         └─ StructureViewer (3Dmol)│
-└───────────────▲──────────────────────────────┬───────────────────┘
-                │ static assets (web/dist)     │ JSON /api/*
-┌───────────────┴──────────────────────────────▼───────────────────┐
-│  uvicorn ── FastAPI app  (pallatom/serve/app.py)                  │
-│    StaticFiles("/")        APIRouter("/api")                      │
-│                              └─ SamplingService (one instance)    │
-│                                   ├─ MainTrunk (EMA, eval, device)│
-│                                   ├─ distogram modules            │
-│                                   └─ threading.Lock               │
-│                                        │                          │
-│                     sample/sampling.py: build_sampling_context,   │
-│                     EDMSampler, structures_to_pdb  (refactored)   │
-└───────────────────────────────────────────────────────────────────┘
-```
-
-Repository layout:
-
-```
-pallatom/
-  sample/sampling.py        # refactored: load_model / run_sampling / to_samples
-  serve/
-    __init__.py
-    README.md
-    api_models.py           # Pydantic request/response models
-    service.py              # SamplingService: owns model + lock
-    app.py                  # create_app(), CLI entry point (uvicorn)
-  tests/serve/              # TestClient tests against a tiny CPU model
-web/
-  package.json  tsconfig.json  vite.config.ts  eslint.config.js
-  index.html
-  src/
-    main.tsx  App.tsx
-    api/client.ts           # typed fetch wrapper
-    api/schema.d.ts         # generated from FastAPI's OpenAPI (committed)
-    components/SampleForm.tsx
-    components/SampleGallery.tsx
-    components/SampleCard.tsx
-    components/StructureViewer.tsx
-```
-
-## 5. Backend
+## 5. Backend (Phase 1)
 
 ### 5.1 Refactor `sample/sampling.py` (no behaviour change)
 
 Split `main` into three public functions. The CLI then becomes a thin
-composition of them, and its output stays byte-for-byte identical for a
-fixed seed.
+composition of them, and its output for a fixed seed stays byte-for-byte
+the same.
 
 ```python
 def load_model(scfg: SampleConfig, device: str) -> LoadedModel: ...
@@ -122,7 +94,7 @@ def run_sampling(
     n_res: int,
     n_samples: int,
 ) -> tuple[Float[torch.Tensor, "B N_atom 3"], Float[torch.Tensor, "B N_res"]]: ...
-    # build_sampling_context + EDMSampler.sample, under torch.inference_mode()
+    # build_sampling_context + EDMSampler.sample under torch.inference_mode()
 
 def to_samples(
     coords: Float[torch.Tensor, "B N_atom 3"],
@@ -132,245 +104,410 @@ def to_samples(
 ```
 
 `LoadedModel` and `SampledProtein` (`pdb: str`, `sequence: str`) are frozen
-`@dataclass`es. The refactor lands as its own PR, together with a regression
-test showing that the CLI output is unchanged.
+`@dataclass`es.
 
-### 5.2 API surface
+### 5.2 Layout: the transport is separate from the work
 
-All routes live under `/api`. Every request and response is a Pydantic model
-in `serve/api_models.py`. FastAPI publishes them as OpenAPI, and the frontend
+```
+pallatom/serve/
+  messages.py     # Pydantic: SampleJobSpec, SampleJob, SampleResult, JobStatus…
+  worker.py       # execute_job(job, loaded) -> SampleResult   (no I/O, no transport)
+  queue.py        # JobQueue / JobStore Protocols + InProcess implementations
+  api.py          # SamplerApi: typed HTTP handlers (bound methods)
+  app.py          # create_app(), CLI entry point (uvicorn)
+  README.md
+pallatom/tests/serve/
+```
+
+Phase 2 will use these parts as follows:
+
+- `messages.py` already defines the **wire format**. The JSON that
+  `SampleJob.model_dump_json()` produces in the MVP is exactly the AMQP
+  message body that Phase 2 publishes.
+- `execute_job` is a pure function of a job and a loaded model. In the MVP,
+  a worker thread calls it. In Phase 2, a RabbitMQ consumer process calls it
+  unchanged.
+- The MVP has `InProcessJobQueue`, built on `queue.Queue` with a single
+  worker thread, and `InMemoryJobStore`, a bounded dict with a TTL. Phase 2
+  adds `RabbitMQJobQueue` and a persistent store behind the same
+  `typing.Protocol`s.
+
+```python
+class JobQueue(Protocol):
+    def submit(self, job: SampleJob) -> None: ...      # raises QueueFull
+    def depth(self) -> int: ...
+
+class JobStore(Protocol):
+    def put(self, status: JobStatus) -> None: ...
+    def get(self, job_id: UUID) -> JobStatus | None: ...
+```
+
+### 5.3 API surface
+
+All routes live under `/api`. Request and response types are the Pydantic
+models in `messages.py`, which FastAPI publishes as OpenAPI. The frontend
 types are generated from that (§6.3).
 
 | Method | Path | Request | Response |
 |--------|------|---------|----------|
-| `GET` | `/api/health` | — | `{status: "ok", device: str}` |
-| `GET` | `/api/model` | — | `ModelInfo`: checkpoint file name (basename only, never the full path), the default `SamplerParams`, and the server's limits (`max_n_res`, `max_n_samples`, `max_ddim_steps`) |
-| `POST` | `/api/sample` | `SampleRequest` | `SampleResponse` |
+| `GET` | `/api/health` | — | `{status: "ok", device, queue_depth}` |
+| `GET` | `/api/model` | — | `ModelInfo`: checkpoint file name (basename only), default `SamplerParams`, and the limits `max_n_res`, `max_n_samples` and `max_ddim_steps` |
+| `POST` | `/api/jobs` | `SampleJobSpec` | `202` + `JobStatus` (`job_id`, `state: "queued"`, `position`) |
+| `GET` | `/api/jobs/{job_id}` | — | `JobStatus` |
 
 ```python
-class SampleRequest(BaseModel):
+class SampleJobSpec(BaseModel):          # what the user asks for
     model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True, extra="forbid")
     n_res: int = Field(default=100, ge=MIN_N_RES, le=MAX_N_RES)
     n_samples: int = Field(default=4, ge=1, le=MAX_N_SAMPLES)
     seed: int | None = Field(default=None, ge=0, le=2**31 - 1)
     ddim_steps: int | None = Field(default=None, gt=1, le=MAX_DDIM_STEPS)
 
+class SampleJob(BaseModel):              # what goes on the queue (AMQP body in Phase 2)
+    job_id: UUID
+    spec: SampleJobSpec
+    seed: int                            # resolved: drawn by the API if spec.seed is None
+    submitted_at: datetime
+    schema_version: Literal[1] = 1
+
 class SampleOut(BaseModel):
     index: int
-    sequence: str          # one-letter, length n_res
+    sequence: str
     pdb: str
 
-class SampleResponse(BaseModel):
-    seed: int              # echoed; server draws one if the request had None
+class SampleResult(BaseModel):
+    job_id: UUID
+    seed: int
     n_res: int
     ddim_steps: int
     elapsed_s: float
     samples: list[SampleOut]
+
+class JobStatus(BaseModel):
+    job_id: UUID
+    state: Literal["queued", "running", "succeeded", "failed"]
+    position: int | None = None          # queued only
+    result: SampleResult | None = None   # succeeded only
+    error: str | None = None             # failed only: short, user-safe message
 ```
 
-The proposed limits are `MIN_N_RES = 32`, `MAX_N_RES = 256`,
-`MAX_N_SAMPLES = 8` and `MAX_DDIM_STEPS = 500`. They bound GPU memory, since
-pair features are O(B·N_res²). Tune them once we have the measurements in
-§8.
+`schema_version` lets Phase 2 consumers reject or upgrade messages that a
+newer or older gateway puts on the queue.
 
-Errors:
+The proposed limits are `MIN_N_RES = 32`, `MAX_N_RES = 256`,
+`MAX_N_SAMPLES = 8`, `MAX_DDIM_STEPS = 500` and `MAX_QUEUE_DEPTH = 4`. They
+bound GPU memory (pair features are O(B·N_res²)) and bound the queue, since
+the endpoint is public with no auth. Tune them once we have the measurements
+in §8.
 
 | Status | When |
 |--------|------|
-| `422` | Validation failed (FastAPI default) |
-| `409` | A sampling job is already running (§5.4) |
-| `503` | The model failed to load at startup |
-| `500` | CUDA OOM or another sampler failure, with a short message; the full traceback is logged through structlog only |
+| `202` | Job accepted |
+| `404` | Unknown or expired `job_id` |
+| `422` | Validation failed |
+| `429` | The queue is full, or this client exceeded its rate limit (§5.5); includes `Retry-After` |
+| `503` | The model failed to load |
 
-### 5.3 Typed wiring without `app.state`
+Sampler failures, including CUDA OOM, never surface as HTTP 500. They become
+`state: "failed"` with a short message, and the traceback goes to the logs
+only.
 
-`app.state` is typed as `Any`, so going through it would trip
-`reportAny`. Instead, `create_app` takes a fully constructed service and
-registers the service's **bound methods** as routes. This needs no closures
-and no globals:
+**Why jobs instead of one long request, even in the MVP:** a 200-step sample
+can take tens of seconds or more. Polling keeps every HTTP call short, which
+avoids proxy and tunnel timeouts (Cloudflare cuts requests off at 100 s).
+Polling is also the contract the RabbitMQ design needs anyway. The frontend
+polls `GET /api/jobs/{id}` every 1.5 s.
+
+### 5.4 Typed wiring and the worker
 
 ```python
-def create_app(service: SamplingService, static_dir: Path | None) -> FastAPI:
+def create_app(api: SamplerApi, allowed_origins: list[str]) -> FastAPI:
     app = FastAPI(title="pallatom sampler")
-    app.add_api_route("/api/health", service.health, methods=["GET"])
-    app.add_api_route("/api/model", service.model_info, methods=["GET"])
-    app.add_api_route("/api/sample", service.sample, methods=["POST"])
-    if static_dir is not None:
-        app.mount("/", StaticFiles(directory=static_dir, html=True))
+    app.add_middleware(CORSMiddleware, allow_origins=allowed_origins,
+                       allow_methods=["GET", "POST"], allow_headers=["Content-Type"])
+    app.add_api_route("/api/health", api.health, methods=["GET"])
+    app.add_api_route("/api/model", api.model_info, methods=["GET"])
+    app.add_api_route("/api/jobs", api.submit, methods=["POST"], status_code=202)
+    app.add_api_route("/api/jobs/{job_id}", api.status, methods=["GET"])
     return app
 ```
 
-The entry point is `python pallatom/serve/app.py --config
-sample_config.json [--host 127.0.0.1] [--port 8000] [--static web/dist]`. It
-validates the `SampleConfig`, builds the service (which loads the model
-eagerly), and calls `uvicorn.run(app, ...)`. Loading eagerly means a bad
-config or checkpoint fails at startup, not on the first request.
-
-### 5.4 Concurrency model
-
-- `service.sample` is a **sync** `def`, so FastAPI runs it in its threadpool,
-  and a long GPU call never blocks the event loop or `/api/health`.
-- A `threading.Lock` is held for the whole sampling job. If
-  `lock.acquire(blocking=False)` fails, the server returns `409 Busy`
-  immediately instead of queueing. With one GPU and one model, a queue adds
-  little for a single-user MVP. The frontend disables the button while a
-  request is in flight, so the 409 only shows up when two tabs are open.
-- `torch.manual_seed(seed)` runs inside the lock, so a given seed is
+- Routes are bound methods on `SamplerApi`, which holds a `JobQueue`, a
+  `JobStore` and the `ModelInfo`. This avoids closures, globals and
+  `app.state`.
+- `InProcessJobQueue` starts **one** daemon worker thread. The thread loops
+  over `queue.get()`, sets the store to `running`, seeds torch, calls
+  `execute_job`, and stores `succeeded` or `failed`. Because there is a
+  single consumer per process, no lock is needed, and seeds are
   reproducible on a given device.
-- The request is synchronous. If sampling takes longer than about 60 s, the
-  long-request problem moves to the reverse proxy or tunnel, and Phase 2
-  replaces this with jobs (§9).
+- The entry point is `python pallatom/serve/app.py --config
+  sample_config.json --device cuda:0 --allowed-origin
+  https://tmatteso.github.io [--host 127.0.0.1] [--port 8000]`. It loads the
+  model eagerly, so a bad config or checkpoint fails at startup.
 
-### 5.5 Logging and security
+### 5.5 Public exposure without auth
 
-- Reuse `StructlogConfig` (wrapped around `uvicorn.run`). Log one line per
-  request with `n_res`, `n_samples`, `seed`, `elapsed_s` and the device.
-- Bind to `127.0.0.1` by default. There is no auth, so remote access goes
-  through an SSH tunnel.
-- The checkpoint path comes **only** from the server-side config, never from a
-  request. `torch.load` runs with `weights_only=True`, which is already the
-  default on torch 2.11; write it explicitly anyway.
-- Do not add CORS middleware. In dev, Vite proxies `/api`, and in prod the
-  page and the API share an origin.
+The GitHub Pages page needs an HTTPS URL for the API. The server keeps
+binding to `127.0.0.1` and is published through **Cloudflare Tunnel**
+(`cloudflared`). The tunnel connects outbound, so we open no inbound ports
+and need no TLS certificates on the box. That is also the same
+outbound-only pattern the GPU box keeps in Phase 2.
 
-## 6. Frontend
+- **Named tunnel (recommended):** a stable hostname such as
+  `sampler.<your-domain>`. This needs a domain on Cloudflare (the free plan
+  is enough).
+- **Quick tunnel (fallback if there is no domain):** a random
+  `*.trycloudflare.com` URL that changes every time the tunnel restarts. The
+  frontend therefore accepts a runtime override, `?api=<url>`, remembered in
+  `localStorage`, on top of the URL baked in at build time (§6.4).
+
+The endpoint is public and has no auth, so we rely on hard limits instead:
+
+- The request limits and the bounded queue (§5.3) cap how much GPU time any
+  burst can consume.
+- A per-client token bucket allows about 10 job submissions an hour per IP.
+  It keys on the `CF-Connecting-IP` header, which is trusted only because
+  the server listens solely on loopback behind the tunnel. It is in memory
+  and implemented in `api.py`, with no new dependency.
+- CORS allows only `https://tmatteso.github.io`. This stops other websites
+  from embedding the API, but it does **not** stop scripts like `curl`;
+  only the limits above stop those.
+- The checkpoint path comes only from the server config. No endpoint reads
+  or writes files. `torch.load(..., weights_only=True)`.
+- Kill switch: stop `cloudflared`. The model and the local API keep running.
+
+### 5.6 Logging (ready for Loki in Phase 4)
+
+Reuse `StructlogConfig`. Log one JSON line per job transition with
+`job_id`, `state`, `n_res`, `n_samples`, `seed`, `elapsed_s`, `device` and
+`queue_depth`. Keep the label-worthy fields low-cardinality (`state`,
+`device`) and keep `job_id` in the message body, so Phase 4 can send these
+lines to Loki as they are.
+
+## 6. Frontend (Phase 1)
 
 ### 6.1 Stack
 
-- **Vite + React 19 + TypeScript**, strict mode. No router and no state
-  library: one page, `useState` and `useReducer`.
-- **3Dmol.js** (npm `3dmol`) for the viewer. It is the JavaScript library
-  under `py3Dmol`, so the notebook view carries over directly:
+- **Vite + React 19 + TypeScript**, strict. No router and no state library.
+- **3Dmol.js** (npm `3dmol`), the JavaScript library under `py3Dmol`:
   `addModel(pdb, "pdb")`, cartoon with `color: "spectrum"`, then `zoomTo()`.
-- No CSS framework. Use a small hand-written stylesheet with a responsive
-  CSS grid for the gallery.
+- No CSS framework; a small stylesheet with a responsive grid.
 
 ### 6.2 UI
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│ pallatom sampler        checkpoint: pallatom_best.pt · cuda  │
+│ pallatom sampler   checkpoint: pallatom_best.pt · cuda:0 · ● │
 ├──────────────────────────────────────────────────────────────┤
 │ Length [ 100 ]  Samples [ 4 ]  Seed [      ] (blank = random)│
 │ ▸ Advanced: DDIM steps [ 200 ]                    [ Sample ] │
 ├──────────────────────────────────────────────────────────────┤
-│ seed 12345 · 4 × 100 res · 200 steps · 38.2 s                │
+│ Queued (position 2)…  →  Running… 00:23  →  Done in 38.2 s   │
 │ ┌──────────────┐ ┌──────────────┐ ┌──────────────┐ ┌───────┐ │
 │ │  3D viewer   │ │  3D viewer   │ │  3D viewer   │ │  ...  │ │
-│ │              │ │              │ │              │ │       │ │
 │ │ MKLV…(copy)  │ │ ...          │ │ ...          │ │       │ │
 │ │ [Download]   │ │ [Download]   │ │ [Download]   │ │       │ │
 │ └──────────────┘ └──────────────┘ └──────────────┘ └───────┘ │
 └──────────────────────────────────────────────────────────────┘
 ```
 
-- The form's limits and defaults come from `GET /api/model`, so the UI
-  never hard-codes a range the server would reject.
-- While sampling, the button shows a spinner with elapsed time and is
-  disabled. Errors (409, 422, 500) appear in an inline banner.
-- **Download** builds a `Blob` client-side and saves it as
-  `pallatom_seed{seed}_{index}.pdb`. There is no extra endpoint.
-- Each `StructureViewer` owns one 3Dmol viewer. It creates the viewer in a
-  `useEffect` and calls `viewer.clear()` on cleanup, so WebGL contexts don't
-  leak. Browsers cap these at about 16, which is another reason
-  `MAX_N_SAMPLES` is 8.
+- The header dot shows the result of `GET /api/health`. When the API is
+  unreachable, the page shows "sampler offline", not a broken form.
+- The form's limits and defaults come from `GET /api/model`.
+- The page polls `GET /api/jobs/{id}` until the job reaches a terminal
+  state. A `429` appears as "busy, try again in N s".
+- **Download** saves a client-side `Blob` as
+  `pallatom_seed{seed}_{index}.pdb`.
+- Each `StructureViewer` creates one 3Dmol viewer in `useEffect` and calls
+  `clear()` on cleanup. Browsers cap WebGL contexts at about 16, which is
+  another reason `MAX_N_SAMPLES` is 8.
 
 ### 6.3 Keeping types in sync
 
-`npm run gen:api` runs `openapi-typescript` against
-`http://localhost:8000/openapi.json` and writes `src/api/schema.d.ts`, which
-is committed. `api/client.ts` takes its request and response types only from
-that file. CI regenerates the file from a CPU-only app instance and fails on
-a diff, so a backend schema change cannot silently break the frontend.
+`npm run gen:api` runs `openapi-typescript` against the app's
+`/openapi.json` and writes `src/api/schema.d.ts`, which is committed. CI
+regenerates the file from a CPU-only app instance and fails on a diff.
 
-### 6.4 Strictness (the TypeScript counterpart of the Python bar)
+### 6.4 GitHub Pages deployment
+
+- A new workflow, `.github/workflows/pages.yml`, runs on `push` to `main`
+  when files under `web/**` change, and on `workflow_dispatch`. It runs
+  `actions/configure-pages`, `setup-node`, `npm ci`, `npm run build`,
+  `actions/upload-pages-artifact` (`web/dist`) and `actions/deploy-pages`.
+- Vite sets `base: "/diffusion/"` so asset paths resolve under the project
+  site.
+- The API URL comes from `VITE_API_BASE_URL`, read from a repository
+  variable (`vars.SAMPLER_API_URL`). It is not a secret: the frontend ships
+  it to every browser anyway. The runtime override `?api=` (§5.5) takes
+  precedence when present.
+- The workflow is validated by the existing `check-github-workflows` hook.
+
+### 6.5 Strictness
 
 - `tsconfig`: `strict`, `noUncheckedIndexedAccess`,
   `exactOptionalPropertyTypes`, `noImplicitOverride`.
-- ESLint (`typescript-eslint` `strictTypeChecked`):
-  `@typescript-eslint/no-explicit-any: error` and the `no-unsafe-*` rules.
-  These mirror the repo-wide `Any` ban.
-- Prettier for formatting, with an 80-column print width to match Black.
+- ESLint with `typescript-eslint` `strictTypeChecked`;
+  `no-explicit-any` and the `no-unsafe-*` rules are errors, mirroring the
+  repo's `Any` ban.
+- Prettier with an 80-column print width, to match Black.
 
-## 7. Tooling, devcontainer and CI
+## 7. Tooling, devcontainer and CI (Phase 1)
 
 - **Devcontainer:** add `"features": {"ghcr.io/devcontainers/features/node:1":
-  {"version": "22"}}` to both `cuda/` and `arm64/` `devcontainer.json`. The
-  CUDA container already uses `--network=host`. For arm64, add
-  `forwardPorts: [8000, 5173]`.
+  {"version": "22"}}` to both the `cuda/` and `arm64/` devcontainers. ARM64
+  CI runs every pre-commit hook, including the new frontend ones.
 - **`.gitignore`:** `web/node_modules/`, `web/dist/`.
-- **Pre-commit** (`language: system`, scoped with `files: ^web/`):
-  `tsc --noEmit`, `eslint`, `prettier --check`. The `language: system` choice
-  follows the existing rule that tool versions come from the lockfile
-  (`web/package-lock.json`), not from `rev:` pins.
-- **CI:** the static-checks job already runs `pre-commit run --all-files`
-  inside the devcontainer, so the new hooks run in CI automatically once Node
-  is in the image. Add `npm ci && npm run build && npm test` to the
-  `test` job, next to `pytest pallatom`.
-- **Python lint scope:** `pallatom/serve/` falls under every existing hook
-  unchanged. It needs no new carve-outs.
+- **Pre-commit** (`language: system`, `files: ^web/`, with versions taken
+  from `web/package-lock.json`): `tsc --noEmit`, `eslint`,
+  `prettier --check`.
+- **CI:** add `npm ci && npm run build && npm test` and the OpenAPI drift
+  check to the `test` job, next to `pytest pallatom`.
+- **Running it on the box:** a short `pallatom/serve/README.md` section
+  covers how to start uvicorn and `cloudflared` in `tmux`. The MVP has no
+  systemd units or containers; Phase 3 replaces all of this.
 
-## 8. Testing
+## 8. Testing (Phase 1)
 
 **Backend** (`pallatom/tests/serve/`, following the tests style guide)
 
-- Build a **tiny** `MainTrunk` on CPU from small `ModelParams` with random
-  weights. It is saved to `tmp_path` as `{"ema": state_dict}`, which
-  exercises the real `load_model` path.
-- Use `TestClient(create_app(service, static_dir=None))` to test:
-  - that `/api/health` and `/api/model` have the right shapes and limits
-  - that `/api/sample` with `ddim_steps=2`, `n_res=MIN_N_RES` and
-    `n_samples=2` returns 2 parseable PDBs, sequences of length `n_res`, and
-    the echoed seed
-  - that the same seed gives identical PDBs
-  - `422` for out-of-range or extra fields
-  - `409` when the lock is already held, by acquiring
-    `service.lock` in the test
+- Build a tiny `MainTrunk` from small `ModelParams` with random weights,
+  save it to `tmp_path` as `{"ema": state_dict}`, and load it through the
+  real `load_model` on CPU.
+- Test `execute_job` directly: `ddim_steps=2`, `n_res=MIN_N_RES` and
+  `n_samples=2` give 2 parseable PDBs and sequences of length `n_res`, and
+  the same seed gives identical output.
+- Test through `TestClient`:
+  - submit, then poll until `succeeded`
+  - `422` on out-of-range or extra fields
+  - `404` for an unknown id
+  - `429` when the queue is full (fill it with a queue whose worker is not
+    started) and when the rate limit is hit
+  - CORS headers present for the allowed origin and absent for others
+- Round-trip `SampleJob` through JSON. This guards the future AMQP wire
+  format.
 - A regression test for the refactor: the old and new CLI output match for a
   fixed seed.
 
 **Frontend** (Vitest + React Testing Library)
 
-- `SampleForm` clamps values to the limits from `/api/model`, and disables
-  itself while busy.
-- `client.ts` maps 409, 422 and 500 to typed error results (`fetch` is
-  mocked).
-- `StructureViewer` is smoke-tested with `3dmol` mocked, because jsdom has no
-  WebGL.
+- The form respects the limits from `/api/model`. The polling state machine
+  goes through queued, running and succeeded or failed (with timers mocked).
+  `429` and offline states render. The `?api=` override is used.
+  `StructureViewer` is smoke-tested with `3dmol` mocked.
 
 **Manual acceptance:** on the GPU box, take `pallatom_toy_best.pt` and its
-config, sample 4 × 100 residues, and check that the structures render and
-the downloaded PDBs open in PyMOL. Record the wall time and peak GPU memory
-at `n_res ∈ {64, 128, 256}` and `n_samples ∈ {1, 4, 8}`, and use those numbers
-to finalise the limits in §5.2.
+config, open the Pages URL through the tunnel, sample 4 × 100 residues, and
+check that the PDBs open in PyMOL. Record the wall time and peak GPU memory
+for `n_res ∈ {64, 128, 256}` × `n_samples ∈ {1, 4, 8}` to finalise the
+limits.
 
-## 9. Delivery plan
+## 9. Later phases
 
-| PR | Content | Ships value on its own? |
-|----|---------|-------------------------|
-| 1 | Refactor `sampling.py` into `load_model` / `run_sampling` / `to_samples`, plus the regression test | Yes: the CLI is cleaner and reusable |
-| 2 | `pallatom/serve/` (API models, service, app) and its tests | Yes: the API is usable with `curl` |
-| 3 | `web/` scaffold, Node devcontainer feature, pre-commit hooks, CI steps | Partly: tooling only |
-| 4 | Frontend UI, OpenAPI type generation, `StaticFiles` mount, README section | Yes: the MVP is complete |
+### 9.1 Phase 2: two machines, RabbitMQ, auth
 
-**Phase 2 (after the MVP, not in scope here):** `POST /api/jobs` returning a
-job id, Server-Sent Events for per-step progress (`EDMSampler.sample` would
-take an optional step callback), cancellation, a checkpoint picker that lists
-a configured directory, and an animated view of the trajectory.
+```
+browser ──HTTPS──► ARM64 cloud host (always on)
+                   ├─ auth proxy (oauth2-proxy w/ GitHub login, or Cloudflare Access)
+                   ├─ FastAPI gateway  (same api.py; RabbitMQJobQueue + persistent JobStore)
+                   └─ RabbitMQ
+                         ▲ AMQP over TLS, opened outbound from the GPU box
+GPU box ─ worker per GPU (CUDA_VISIBLE_DEVICES=0 / =1), each: consume → execute_job → publish result
+```
 
-## 10. Open questions
+- **Queues:** a durable quorum queue `sample.jobs`. Workers consume with
+  `prefetch_count=1` and **manual ack after the result is published**, so
+  a worker that crashes mid-job causes redelivery. A dead-letter exchange
+  catches jobs that fail repeatedly (track redeliveries with a header
+  counter). A message TTL drops jobs nobody will poll for.
+- **Results:** workers publish `SampleResult` or a failure to
+  `sample.results`. The gateway consumes that queue and writes it to the
+  `JobStore`, so the GPU box only ever makes outbound connections. The store
+  becomes persistent (Redis or Postgres; to be decided in Phase 2). The
+  queue position comes from the queue's message count.
+- **Two GPUs means two consumers.** No code changes; this is the reason for
+  the single-consumer-per-process design in the MVP.
+- **Auth with Pages:** cookies sent across origins (Pages to the API) are
+  increasingly blocked as third-party cookies. When auth arrives, either
+  serve the frontend from the gateway's origin, or put Pages and the API
+  under one domain that we control. A custom domain on Pages, with the API
+  on a subdomain, keeps cookies first-party. Decide this at the start of
+  Phase 2. The frontend code doesn't change either way, because the API base
+  URL is already configurable.
+- **The HTTP contract doesn't change.** The frontend is untouched apart from
+  login and logout.
+
+### 9.2 Phase 3: k3s + NVIDIA GPU Operator + Gateway API Inference Extension (about a week or more)
+
+- **k3s** runs a mixed-architecture cluster: the ARM64 host is the server
+  node and the GPU box joins as an amd64 agent. Images are built for both
+  architectures with `docker buildx`. GPU workloads are pinned to the GPU
+  node with `nodeSelector`.
+- **NVIDIA GPU Operator** manages the driver and container toolkit, the
+  device plugin (`nvidia.com/gpu: 1` per worker pod) and the **DCGM
+  exporter**, which Phase 4 scrapes for free.
+- **RabbitMQ** moves in-cluster, through the RabbitMQ Cluster Operator.
+  Worker pods are a Deployment with one pod per GPU.
+- **Health probes:** split `/api/health` into `/healthz` (liveness) and
+  `/readyz` (model loaded; broker connected).
+- **Gateway API Inference Extension: a fit question to settle before
+  building.** GIE's endpoint picker routes *synchronous* inference requests
+  across model-server pods using live metrics from those servers, and it
+  targets OpenAI-style LLM servers. In the RabbitMQ design, workers *pull*
+  jobs, so load balancing already happens at the queue, and GIE would have
+  nothing to route on the job path. It becomes useful if we add a
+  synchronous low-latency endpoint, or serve several checkpoints or models
+  side by side. If we stay purely queue-driven, a plain Gateway API
+  `HTTPRoute` to the gateway, plus **KEDA**'s RabbitMQ scaler for workers,
+  may be the better tool. See open question 3.
+
+### 9.3 Phase 4: observability
+
+- **Prometheus** scrapes everything, so targets only need to expose a port.
+  Use a single instance with `--storage.tsdb.retention.time` set to 15–30
+  days on local disk, and **no** Thanos or Mimir. Add **Alertmanager** and
+  **Grafana**. On k3s, `kube-prometheus-stack` installs all of these, plus
+  node-exporter and kube-state-metrics.
+- **Scrape targets:**
+  - the gateway's `/metrics` via `prometheus_client`: request rate and
+    status, jobs submitted, accepted and rejected (`429`), and queue depth
+  - the workers' `/metrics`: a histogram of job duration by `n_res` bucket,
+    failures by reason, and peak GPU memory per job
+  - RabbitMQ's built-in `rabbitmq_prometheus` plugin on `:15692`
+  - DCGM exporter (GPU utilisation, memory, temperature)
+  - node-exporter
+- **Alerts to start with:** worker down or zero consumers on `sample.jobs`;
+  queue depth above N for 10 minutes; job failure rate above X% over
+  15 minutes; GPU memory near its limit or temperature too high; disk filling
+  up, including Prometheus' own TSDB.
+- **Loki** with Grafana Alloy (or Promtail) collects the structlog JSON from
+  §5.6.
+- Phase 3 must land before Phase 4. With the Phase 2 topology alone, the GPU
+  box only makes outbound connections, so a Prometheus server on the ARM
+  host could not scrape it. Inside the k3s cluster network that problem goes
+  away.
+
+## 10. Delivery plan
+
+| PR | Content |
+|----|---------|
+| 1 | Refactor `sampling.py` into `load_model` / `run_sampling` / `to_samples`, plus the regression test |
+| 2 | `pallatom/serve/`: messages, `execute_job`, in-process queue and store, `SamplerApi`, CORS, rate limit, tests |
+| 3 | `web/` scaffold, Node devcontainer feature, pre-commit hooks, CI steps |
+| 4 | Frontend UI, OpenAPI type generation, `pages.yml`, tunnel and run docs. **The MVP is complete.** |
+| 5+ | Phase 2: RabbitMQ queue and store implementations, worker process, ARM64 gateway deployment, auth |
+| later | Phase 3 (k3s + GPU Operator + gateway/GIE), then Phase 4 (observability) |
+
+## 11. Open questions
 
 1. **Embed the config in checkpoints?** If `train_loop.py` also saved
    `TrainConfig.model_dump()` into the `.pt`, the server could start from a
-   checkpoint alone, and a config and checkpoint could never be mismatched.
-   That would be a small change to training, but it would leave older
-   checkpoints in a separate format.
-2. **Where will it run?** Locally on the CUDA box behind an SSH tunnel (this
-   doc's assumption), or on a rented instance that people reach from
-   outside? The second option would bring auth and job queueing into scope.
-3. **Sync request vs jobs.** We need §8's timing numbers. If a typical
-   request takes much longer than 60 s, the job API should move from Phase 2
-   into the MVP.
-4. **Node in the arm64 image.** Is the extra image size acceptable, or
-   should the frontend be built in a separate CI job outside the
-   devcontainer?
+   checkpoint alone. That is a small change to training; older checkpoints
+   would still need a separate config.
+2. **Is a domain available on Cloudflare?** With one, we get a named tunnel
+   and a stable API URL. Without one, the MVP uses a quick tunnel plus the
+   `?api=` override.
+3. **What is GIE for in Phase 3?** Is it meant for a future synchronous
+   path or multi-model routing? Or should the queue-driven design use a plain
+   `HTTPRoute` and KEDA (§9.2)?
+4. **Where does the frontend live once auth arrives?** Gateway origin versus
+   a custom domain on Pages (§9.1).
