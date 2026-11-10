@@ -41,3 +41,26 @@ def sine_pattern(
         f"({axes}) -> {axes}",
         **dict(zip(names, shape, strict=True)),
     )
+
+
+def chiral_cloud(b: int, n: int) -> Float[torch.Tensor, "B N 3"]:
+    """Build ``b`` deterministic, non-planar, chiral clouds of ``n`` atoms.
+
+    Atom ``k``, counted across the whole batch, sits at
+    ``(sin 0.37k, sin(0.91k + 1), cos 1.73k)``. Unrelated frequencies per
+    axis keep the points off any common plane, which ``sine_pattern``
+    cannot do; use this function whenever a test depends on the geometry
+    of the coordinates.
+
+    Args:
+        b: Number of clouds.
+        n: Atoms per cloud.
+
+    Returns:
+        ``(b, n, 3)`` coordinates in ``[-1, 1]``.
+    """
+    k = torch.arange(b * n, dtype=torch.float32)
+    axes = torch.stack(
+        [torch.sin(0.37 * k), torch.sin(0.91 * k + 1), torch.cos(1.73 * k)],
+    )
+    return rearrange(axes, "d (b n) -> b n d", b=b)
