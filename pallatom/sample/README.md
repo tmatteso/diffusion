@@ -140,7 +140,7 @@ For `timestep` in `1 .. total_timesteps - 2`:
      distogram is already in the context (the one built once in step 1, from
      the actual template — or lack thereof). Its `r_denoised` output is
      converted back to atom37 (`atom5_to_atom37`) and reduced to Cβ
-     positions (`atom37_to_cb`), which are fed through the distogram
+     positions (`backbone_cb_positions`), which are fed through the distogram
      function to build a **same-step** self-conditioning template distogram.
    - The **second** call re-denoises the same `noisy_r_l`, this time with
      that freshly-computed self-conditioning distogram substituted in. Its
@@ -189,9 +189,10 @@ returned.
 
 Loads a checkpoint into `MainTrunk`, builds the atom/template `Distogram`
 modules and the static sampling context (`build_sampling_context`), runs
-`EDMSampler.sample`, converts the resulting atom5 coordinates back to atom37
-(`atom5_to_atom37`), and writes every sampled structure as a PDB string into
-a single JSON list at `scfg.output.output_path`.
+`EDMSampler.sample`, and writes every sampled structure as a PDB string into
+a single JSON list at `scfg.output.output_path`. `sampled_structure_to_pdb`
+converts each structure back to atom37 (`atom5_to_atom37`) and leaves out the
+model's unsupervised `CB` slot, so PDBs hold `N`, `CA`, `C` and `O` only.
 
 ## Parameters (`sample_config.py`)
 
