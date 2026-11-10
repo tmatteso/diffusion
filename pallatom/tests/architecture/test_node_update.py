@@ -10,10 +10,11 @@ Inputs are deterministic sine patterns and every module is built under a
 fixed seed inside its fixture, so each test is reproducible on its own.
 """
 
+import abc
 import dataclasses
 import enum
 from collections.abc import Callable
-from typing import cast
+from typing import cast, override
 
 import pytest
 import torch
@@ -127,14 +128,84 @@ class BetaScenario(enum.Enum):
 
 
 @dataclasses.dataclass(frozen=True)
-class MalformedCall:
-    """A module call whose first argument has lost its channel axis.
+class MalformedCall(abc.ABC):
+    """A module call whose first argument has lost its channel axis."""
 
-    Attributes:
-        call: Invokes one module with the malformed argument.
-    """
+    @abc.abstractmethod
+    def call(
+        self, node_modules: NodeModules, dense_inputs: NodeInputs,
+    ) -> object:
+        """Call one module with ``dense_inputs.s`` cut to ``(B, N_res)``.
 
-    call: Callable[[NodeModules, NodeInputs], object]
+        Args:
+            node_modules: Modules to call.
+            dense_inputs: Dense inputs the malformed argument is cut from.
+
+        Returns:
+            Whatever the module returns; the test expects it to raise.
+        """
+
+
+@dataclasses.dataclass(frozen=True)
+class MalformedAdaLN(MalformedCall):
+    """``AdaLN(a, s)`` with ``a`` as ``(B, N_res)``."""
+
+    @override
+    def call(
+        self, node_modules: NodeModules, dense_inputs: NodeInputs,
+    ) -> object:
+        """Call ``AdaLN`` with a 2-D ``a``.
+
+        Args:
+            node_modules: Supplies ``adaln``.
+            dense_inputs: Supplies ``s`` and ``t``.
+
+        Returns:
+            The module's output.
+        """
+        return node_modules.adaln(dense_inputs.s[..., 0], dense_inputs.t)
+
+
+@dataclasses.dataclass(frozen=True)
+class MalformedAttention(MalformedCall):
+    """``AttentionPairBias(a, None, z)`` with ``a`` as ``(B, N_res)``."""
+
+    @override
+    def call(
+        self, node_modules: NodeModules, dense_inputs: NodeInputs,
+    ) -> object:
+        """Call ``AttentionPairBias`` with a 2-D ``a``.
+
+        Args:
+            node_modules: Supplies ``attn``.
+            dense_inputs: Supplies ``s`` and ``z``.
+
+        Returns:
+            The module's output.
+        """
+        return node_modules.attn(dense_inputs.s[..., 0], None, dense_inputs.z)
+
+
+@dataclasses.dataclass(frozen=True)
+class MalformedNodeUpdate(MalformedCall):
+    """``NodeUpdate(s, t, z)`` with ``s`` as ``(B, N_res)``."""
+
+    @override
+    def call(
+        self, node_modules: NodeModules, dense_inputs: NodeInputs,
+    ) -> object:
+        """Call ``NodeUpdate`` with a 2-D ``s``.
+
+        Args:
+            node_modules: Supplies ``node``.
+            dense_inputs: Supplies ``s``, ``t`` and ``z``.
+
+        Returns:
+            The module's output.
+        """
+        return node_modules.node(
+            dense_inputs.s[..., 0], dense_inputs.t, dense_inputs.z,
+        )
 
 
 class MalformedScenario(enum.Enum):
@@ -146,9 +217,9 @@ class MalformedScenario(enum.Enum):
         node_update: ``NodeUpdate(s, t, z)`` with ``s`` 2-D.
     """
 
-    adaln = MalformedCall(lambda m, x: m.adaln(x.s[..., 0], x.t))
-    attention = MalformedCall(lambda m, x: m.attn(x.s[..., 0], None, x.z))
-    node_update = MalformedCall(lambda m, x: m.node(x.s[..., 0], x.t, x.z))
+    adaln = MalformedAdaLN()
+    attention = MalformedAttention()
+    node_update = MalformedNodeUpdate()
 
 
 @pytest.fixture
