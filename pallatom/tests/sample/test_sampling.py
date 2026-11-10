@@ -1772,28 +1772,42 @@ def test_normalized_time_inverts_noise_schedule(
     )
 
 
+@dataclasses.dataclass(frozen=True)
+class ChurnedTemplateTimes:
+    """Loop times and the template weights churn turns them into.
+
+    Attributes:
+        t_p: The sampler loop's normalized times, ``0.1, 0.2, ..., 0.9``.
+        template_time: ``normalized_time_from_sigma`` of each ``t_p``'s
+            scheduled sigma after churn raises it by ``1 + gamma``.
+    """
+
+    t_p: Float[torch.Tensor, "T"]
+    template_time: Float[torch.Tensor, "T"]
+
+
 @pytest.fixture
-def churned_template_time(
-    request: pytest.FixtureRequest,
+def churned_template_times(
+    churn_gamma: float,
     zero_denoiser_mock: MagicMock,
     context: FeaturizedBatch,
     templ_disto: Distogram,
-) -> Float[torch.Tensor, "T"]:
+) -> ChurnedTemplateTimes:
     """Template weights for churned noise levels along a grid of ``t_p``.
 
     Raises each scheduled sigma by ``1 + gamma``, as the sampler's churn
     does, and maps it back to normalized time with the production schedule.
 
     Args:
-        request: Carries the churn amount ``gamma``.
+        churn_gamma: Churn amount, parametrized directly by the requesting
+            test.
         zero_denoiser_mock: Denoiser required to build the sampler; unused.
         context: Sampling context required to build the sampler.
         templ_disto: Template distogram module required by the sampler.
 
     Returns:
-        The template weight at each of ``t_p = 0.1, 0.2, ..., 0.9``.
+        The ``t_p`` grid and the template weight at each of its points.
     """
-    gamma = cast(float, request.param)
     noise = NoiseScheduleParams()
     sampler = EDMSampler(
         zero_denoiser_mock,
@@ -1802,36 +1816,40 @@ def churned_template_time(
         SamplerParams(),
         noise,
     )
-    return torch.stack(
+    t_p = torch.linspace(0.1, 0.9, 9, dtype=torch.float64)
+    template_time = torch.stack(
         [
             normalized_time_from_sigma(
-                sampler.noise_schedule(t_p) * (1 + gamma),
+                sampler.noise_schedule(t) * (1 + churn_gamma),
                 noise,
             )
-            for t_p in torch.linspace(0.1, 0.9, 9, dtype=torch.float64)
+            for t in t_p
         ],
     )
+    return ChurnedTemplateTimes(t_p=t_p, template_time=template_time)
 
 
 @pytest.mark.parametrize(
-    "churned_template_time",
+    "churn_gamma",
     [
         pytest.param(0.2, id="pallatom_churn"),
         pytest.param(1.0, id="doubled_sigma"),
     ],
-    indirect=True,
 )
 def test_churn_raises_template_time_above_t_p(
-    churned_template_time: Float[torch.Tensor, "T"],
+    churned_template_times: ChurnedTemplateTimes,
 ) -> None:
     """Churn makes the template weight exceed the loop's ``t_p``.
 
     This is why the sampler no longer passes ``t_p`` as the template weight:
     churn raises ``t_hat`` above ``noise_schedule(t_p)``, so ``t_p``
     understates the noise the model actually sees on every churned step.
+
+    Args:
+        churned_template_times: The ``t_p`` grid and its churned weights.
     """
     assert (
-        churned_template_time > torch.linspace(0.1, 0.9, 9, dtype=torch.float64)
+        churned_template_times.template_time > churned_template_times.t_p
     ).all()
 
 

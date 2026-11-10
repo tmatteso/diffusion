@@ -2782,19 +2782,47 @@ def test_self_conditioned_template_is_binned_prediction(
     assert not torch.equal(template_pair.baseline, template_pair.perturbed)
 
 
+@dataclasses.dataclass(frozen=True)
+class TemplateSourceCase:
+    """Training config for one template source.
+
+    Attributes:
+        self_condition: Value of ``training.self_condition``. True builds the
+            template from the model's own detached prediction; False uses
+            the noised ground-truth template from the featurizer.
+    """
+
+    self_condition: bool
+
+
+class TemplateSource(Enum):
+    """Where ``take_step`` gets the template it feeds the trunk.
+
+    Members:
+        self_conditioned_template: The binned prediction of a detached pass
+            run against the null template.
+        noised_ground_truth_template: The featurized template binned from
+            the noised ground truth.
+    """
+
+    self_conditioned_template = TemplateSourceCase(self_condition=True)
+    noised_ground_truth_template = TemplateSourceCase(self_condition=False)
+
+
 @pytest.fixture
 def self_condition_setup(
-    request: pytest.FixtureRequest,
+    template_source: TemplateSource,
     model_params: ModelSetup,
 ) -> ModelSetup:
     """Return ``model_params`` with ``training.self_condition`` overridden.
 
     Args:
-        request: Carries the ``self_condition`` flag.
+        template_source: Template source to configure, parametrized
+            directly by the requesting test.
         model_params: Base model setup to copy.
 
     Returns:
-        A ModelSetup whose config has the requested flag.
+        A ModelSetup whose config has the scenario's flag.
     """
     base_cfg = model_params.tcfg
     return dataclasses.replace(
@@ -2802,7 +2830,11 @@ def self_condition_setup(
         tcfg=base_cfg.model_copy(
             update={
                 "training": base_cfg.training.model_copy(
-                    update={"self_condition": cast(bool, request.param)},
+                    update={
+                        "self_condition": (
+                            template_source.value.self_condition
+                        ),
+                    },
                 ),
             },
         ),
@@ -2810,12 +2842,9 @@ def self_condition_setup(
 
 
 @pytest.mark.parametrize(
-    "self_condition_setup",
-    [
-        pytest.param(True, id="self_conditioned_template"),
-        pytest.param(False, id="noised_ground_truth_template"),
-    ],
-    indirect=True,
+    "template_source",
+    list(TemplateSource),
+    ids=[case.name for case in TemplateSource],
 )
 def test_take_step_trains_template_embedder(
     featurized_batch: FeaturizedBatch,
@@ -2825,6 +2854,10 @@ def test_take_step_trains_template_embedder(
 
     The self-conditioning pass is detached, so it must not cut the gradient
     path of the grad-tracking pass that consumes its template.
+
+    Args:
+        featurized_batch: Batch to train on.
+        self_condition_setup: Model setup configured for the template source.
     """
     trunk = cast(MainTrunk, self_condition_setup.model)
     _ = trunk.train()
