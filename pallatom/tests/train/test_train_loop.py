@@ -16,15 +16,14 @@ module and the tests read a frozen record of it.
 import copy
 import dataclasses
 import enum
-import functools
 import hashlib
 import json
 import multiprocessing
 import pathlib
-from collections.abc import Callable
 from datetime import timedelta
 from multiprocessing.queues import SimpleQueue
-from typing import Protocol, cast
+from typing import cast
+from unittest import mock
 
 import numpy as np
 import pytest
@@ -79,6 +78,7 @@ from train.train_config import (
 )
 from train.train_loop import (
     alphafold_lr_lambda,
+    build_lr_scheduler,
     component_grad_norms,
     evaluate,
     load_checkpoint,
@@ -251,17 +251,48 @@ class WandbGate(enum.Enum):
     wandb_enabled = GateCase(do_log=True, use_wandb=True, calls=1)
 
 
-class TcfgFactory(Protocol):
-    """Builds a TrainConfig for a case, checkpointing under a directory."""
+@dataclasses.dataclass(frozen=True)
+class TrainHarness:
+    """Everything a full ``train()`` run is assembled from.
 
-    def __call__(
+    The methods build fresh objects from the frozen settings each time they
+    are called, so every run starts from the same seeded trunk.
+
+    Attributes:
+        model_config: Model and distogram settings.
+        distograms: Distogram modules every setup carries.
+        dataset_files: Dataset and splits paths; shard and log paths are
+            replaced per run.
+    """
+
+    model_config: TrainModelConfig
+    distograms: Distograms
+    dataset_files: TrainArgs
+
+    def trunk(self) -> MainTrunk:
+        """Build the small trunk under a fixed seed.
+
+        Returns:
+            A freshly initialised MainTrunk.
+        """
+        _ = manual_seed(0)
+        config = self.model_config
+        return MainTrunk(
+            model_params=config.model,
+            template_distogram_params=config.template,
+            residue_distogram_params=config.residue,
+            atom_distogram_params=config.atom,
+            noise_params=config.noise,
+        )
+
+    def tcfg(
         self,
         work_dir: pathlib.Path,
         case: TrainCase,
         *,
         loader_budget: int = 63,
     ) -> TrainConfig:
-        """Build the configuration.
+        """Build a TrainConfig for ``case`` matching the shared model.
 
         Args:
             work_dir: Directory for the checkpoint.
@@ -271,24 +302,195 @@ class TcfgFactory(Protocol):
         Returns:
             The configuration.
         """
-        ...  # pylint: disable=unnecessary-ellipsis
+        config = self.model_config
+        return TrainConfig(
+            training=TrainingParams(
+                num_epochs=case.num_epochs,
+                lr=1e-4,
+                grad_clip=case.grad_clip,
+                accumulated_token_budget=case.token_budget,
+            ),
+            model=config.model,
+            distogram_template=config.template,
+            distogram_residue=config.residue,
+            distogram_atom=config.atom,
+            noise=config.noise,
+            checkpoint=CheckpointParams(
+                checkpoint_path=work_dir / "best.pt",
+                save_every=100,
+            ),
+            logging=LoggingParams(use_wandb=case.use_wandb),
+            test_loader=LoaderConfig(batch_size=2),
+            train_loader=TrainLoaderConfig(
+                token_budget=loader_budget,
+                noise_magnitude=0,
+                n_shards=1,
+                num_workers=1,
+                epoch_prefetch_depth=1,
+                batch_prefetch_depth=1,
+                n_threads=1,
+            ),
+        )
+
+    def setup(self, trunk: MainTrunk | DDP, tcfg: TrainConfig) -> ModelSetup:
+        """Bundle ``trunk`` with Adam, the training LR schedule and an EMA.
+
+        Args:
+            trunk: Model, plain or DDP-wrapped.
+            tcfg: Training configuration.
+
+        Returns:
+            The setup on CPU.
+        """
+        optimizer = Adam(trunk.parameters(), lr=tcfg.training.lr)
+        return ModelSetup(
+            model=trunk,
+            tcfg=tcfg,
+            distogram_template=self.distograms.template,
+            distogram_residue=self.distograms.residue,
+            distogram_atom=self.distograms.atom,
+            device=torch.device("cpu"),
+            optimizer=optimizer,
+            scheduler=build_lr_scheduler(optimizer, tcfg.training),
+            ema=EMA(trunk, decay=tcfg.training.ema_decay),
+        )
+
+    def loaders(self, work_dir: pathlib.Path, tcfg: TrainConfig) -> Loaders:
+        """Build loaders over the synthetic proteins, sharding in ``work_dir``.
+
+        Args:
+            work_dir: Directory for shards, config and logs.
+            tcfg: Configuration whose loader settings apply.
+
+        Returns:
+            The loaders.
+        """
+        args = dataclasses.replace(
+            self.dataset_files,
+            shard_dir=work_dir / "shards",
+            config=work_dir / "config.json",
+            structlog_jsonl=work_dir / "structlog.jsonl",
+        )
+        train_loader, test_loader, _ = make_bucketed_data_loaders(
+            cfg=tcfg,
+            extra_train_args=args,
+        )
+        return Loaders(train=train_loader, test=test_loader)
+
+
+@dataclasses.dataclass
+class TrainRunCache:
+    """Runs each ``TrainScenario`` at most once per module and keeps the record.
+
+    The cache is explicit because a parametrized module-scoped fixture does
+    not guarantee one run per scenario: pytest groups parameters by their
+    position in each ``parametrize`` list. Each run spies on
+    ``all_reduce_mean`` and captures ``wandb.log`` inside the run itself,
+    since function-scoped ``monkeypatch`` cannot serve a module-scoped
+    cache.
+
+    Attributes:
+        tmp_path_factory: Factory for each run's directory.
+        harness: Builds the trunk, configuration, setup and loaders.
+        runs: Records made so far, by scenario.
+    """
+
+    tmp_path_factory: pytest.TempPathFactory
+    harness: TrainHarness
+    runs: dict[TrainScenario, TrainRun] = dataclasses.field(
+        default_factory=dict,
+    )
+
+    def get(self, scenario: TrainScenario) -> TrainRun:
+        """Return the scenario's record, running it on first use.
+
+        Args:
+            scenario: Configuration to look up.
+
+        Returns:
+            The record.
+        """
+        if scenario not in self.runs:
+            self.runs[scenario] = self.record(scenario)
+        return self.runs[scenario]
+
+    def record(self, scenario: TrainScenario) -> TrainRun:
+        """Run ``train()`` for the scenario and record what it did.
+
+        ``all_reduce_mean`` is wrapped by an autospec mock whose side effect
+        is the real method, so every reduction still runs and the mock
+        records which instance each call reduced.
+
+        Args:
+            scenario: Configuration to run.
+
+        Returns:
+            The record.
+        """
+        work = self.tmp_path_factory.mktemp(scenario.name)
+        tcfg = self.harness.tcfg(work, scenario.value)
+        trunk = self.harness.trunk()
+        built = self.harness.loaders(work, tcfg)
+        before = [p.clone().detach() for p in trunk.parameters()]
+        payloads: list[dict[str, object]] = []
+        with (
+            pytest.MonkeyPatch.context() as patch,
+            mock.patch.object(
+                TensorAccumulatorMixin,
+                "all_reduce_mean",
+                autospec=True,
+                side_effect=TensorAccumulatorMixin.all_reduce_mean,
+            ) as reduce_spy,
+        ):
+            patch.setattr("train.train_loop.wandb.log", payloads.append)
+            train(
+                best_val_loss=torch.tensor(float("inf")),
+                train_loader=built.train,
+                test_loader=built.test,
+                model_params=self.harness.setup(trunk, tcfg),
+                log=cast(FilteringBoundLogger, structlog.get_logger()),
+            )
+        return TrainRun(
+            parameters_changed=any(
+                not torch.equal(b, a)
+                for b, a in zip(before, trunk.parameters(), strict=True)
+            ),
+            reduced_metrics=[
+                cast(TensorAccumulatorMixin, call.args[0])
+                for call in reduce_spy.call_args_list
+            ],
+            wandb_payloads=payloads,
+            checkpoint=cast(
+                dict[str, dict[str, object]],
+                torch.load(work / "best.pt", weights_only=True),
+            ),
+            num_epochs=scenario.value.num_epochs,
+        )
 
 
 @dataclasses.dataclass(frozen=True)
-class TrainHarness:
-    """The factories a full ``train()`` run is assembled from.
+class CheckpointWriteCase:
+    """A rank passed to ``save_checkpoint`` and whether it writes a file.
 
     Attributes:
-        make_trunk: Builds a freshly seeded trunk.
-        make_tcfg: Builds a configuration for a case.
-        make_setup: Bundles a trunk with optimizer, scheduler and EMA.
-        make_loaders: Builds loaders over the synthetic proteins.
+        rank: Rank passed to ``save_checkpoint``.
+        writes: Whether a checkpoint file must appear.
     """
 
-    make_trunk: Callable[[], MainTrunk]
-    make_tcfg: TcfgFactory
-    make_setup: Callable[[MainTrunk | DDP, TrainConfig], ModelSetup]
-    make_loaders: Callable[[pathlib.Path, TrainConfig], Loaders]
+    rank: int
+    writes: bool
+
+
+class CheckpointWriteScenario(enum.Enum):
+    """Ranks that do and do not write the checkpoint.
+
+    Members:
+        rank0: Rank 0 writes every state.
+        rank1: Any other rank writes nothing.
+    """
+
+    rank0 = CheckpointWriteCase(rank=0, writes=True)
+    rank1 = CheckpointWriteCase(rank=1, writes=False)
 
 
 @pytest.fixture(scope="module")
@@ -330,35 +532,6 @@ def model_config() -> TrainModelConfig:
 
 
 @pytest.fixture(scope="module")
-def make_trunk(model_config: TrainModelConfig) -> Callable[[], MainTrunk]:
-    """Return a factory for the small trunk, built under a fixed seed.
-
-    Args:
-        model_config: Model and distogram settings.
-
-    Returns:
-        Zero-argument factory.
-    """
-
-    def make() -> MainTrunk:
-        """Build the trunk.
-
-        Returns:
-            A freshly initialised MainTrunk.
-        """
-        _ = manual_seed(0)
-        return MainTrunk(
-            model_params=model_config.model,
-            template_distogram_params=model_config.template,
-            residue_distogram_params=model_config.residue,
-            atom_distogram_params=model_config.atom,
-            noise_params=model_config.noise,
-        )
-
-    return make
-
-
-@pytest.fixture(scope="module")
 def distograms(model_config: TrainModelConfig) -> Distograms:
     """Build the three distogram modules from the shared settings.
 
@@ -375,113 +548,6 @@ def distograms(model_config: TrainModelConfig) -> Distograms:
         residue=build_distogram_module(model_config.residue).eval(),
         atom=build_distogram_module(model_config.atom).eval(),
     )
-
-
-@pytest.fixture(scope="module")
-def make_tcfg(model_config: TrainModelConfig) -> TcfgFactory:
-    """Return a factory for TrainConfigs matching the shared model.
-
-    Args:
-        model_config: Model and distogram settings.
-
-    Returns:
-        ``make(work_dir, case, loader_budget=63)``.
-    """
-
-    def make(
-        work_dir: pathlib.Path,
-        case: TrainCase,
-        *,
-        loader_budget: int = 63,
-    ) -> TrainConfig:
-        """Build the configuration.
-
-        Args:
-            work_dir: Directory for the checkpoint.
-            case: Training settings.
-            loader_budget: Token budget of each loader batch.
-
-        Returns:
-            The configuration.
-        """
-        return TrainConfig(
-            training=TrainingParams(
-                num_epochs=case.num_epochs,
-                lr=1e-4,
-                grad_clip=case.grad_clip,
-                accumulated_token_budget=case.token_budget,
-            ),
-            model=model_config.model,
-            distogram_template=model_config.template,
-            distogram_residue=model_config.residue,
-            distogram_atom=model_config.atom,
-            noise=model_config.noise,
-            checkpoint=CheckpointParams(
-                checkpoint_path=work_dir / "best.pt",
-                save_every=100,
-            ),
-            logging=LoggingParams(use_wandb=case.use_wandb),
-            test_loader=LoaderConfig(batch_size=2),
-            train_loader=TrainLoaderConfig(
-                token_budget=loader_budget,
-                noise_magnitude=0,
-                n_shards=1,
-                num_workers=1,
-                epoch_prefetch_depth=1,
-                batch_prefetch_depth=1,
-                n_threads=1,
-            ),
-        )
-
-    return make
-
-
-@pytest.fixture(scope="module")
-def make_setup(
-    distograms: Distograms,
-) -> Callable[[MainTrunk | DDP, TrainConfig], ModelSetup]:
-    """Return a factory bundling a trunk with Adam, LambdaLR and an EMA.
-
-    Args:
-        distograms: Distogram modules to carry.
-
-    Returns:
-        ``make(trunk, tcfg)``.
-    """
-
-    def make(trunk: MainTrunk | DDP, tcfg: TrainConfig) -> ModelSetup:
-        """Build the setup.
-
-        Args:
-            trunk: Model, plain or DDP-wrapped.
-            tcfg: Training configuration.
-
-        Returns:
-            The setup on CPU.
-        """
-        optimizer = Adam(trunk.parameters(), lr=tcfg.training.lr)
-        scheduler = LambdaLR(
-            optimizer,
-            lr_lambda=functools.partial(
-                alphafold_lr_lambda,
-                warmup_steps=tcfg.training.lr_warmup_steps,
-                decay_steps=tcfg.training.lr_decay_steps,
-                decay_factor=tcfg.training.lr_decay_factor,
-            ),
-        )
-        return ModelSetup(
-            model=trunk,
-            tcfg=tcfg,
-            distogram_template=distograms.template,
-            distogram_residue=distograms.residue,
-            distogram_atom=distograms.atom,
-            device=torch.device("cpu"),
-            optimizer=optimizer,
-            scheduler=scheduler,
-            ema=EMA(trunk, decay=tcfg.training.ema_decay),
-        )
-
-    return make
 
 
 @pytest.fixture(scope="module")
@@ -530,89 +596,43 @@ def dataset_files(tmp_path_factory: pytest.TempPathFactory) -> TrainArgs:
 
 
 @pytest.fixture(scope="module")
-def make_loaders(
+def harness(
+    model_config: TrainModelConfig,
+    distograms: Distograms,
     dataset_files: TrainArgs,
-) -> Callable[[pathlib.Path, TrainConfig], Loaders]:
-    """Return a factory for loaders over the synthetic proteins.
+) -> TrainHarness:
+    """Bundle the settings and data a full ``train()`` run is built from.
+
+    Module-scoped: every field is frozen settings, fixed modules or paths.
 
     Args:
+        model_config: Model and distogram settings.
+        distograms: Distogram modules.
         dataset_files: Dataset and splits paths.
 
     Returns:
-        ``make(work_dir, tcfg)``, sharding under ``work_dir``.
-    """
-
-    def make(work_dir: pathlib.Path, tcfg: TrainConfig) -> Loaders:
-        """Build the loaders.
-
-        Args:
-            work_dir: Directory for shards, config and logs.
-            tcfg: Configuration whose loader settings apply.
-
-        Returns:
-            The loaders.
-        """
-        args = dataclasses.replace(
-            dataset_files,
-            shard_dir=work_dir / "shards",
-            config=work_dir / "config.json",
-            structlog_jsonl=work_dir / "structlog.jsonl",
-        )
-        train_loader, test_loader, _ = make_bucketed_data_loaders(
-            cfg=tcfg,
-            extra_train_args=args,
-        )
-        return Loaders(train=train_loader, test=test_loader)
-
-    return make
-
-
-@pytest.fixture(scope="module")
-def harness(
-    make_trunk: Callable[[], MainTrunk],
-    make_tcfg: TcfgFactory,
-    make_setup: Callable[[MainTrunk | DDP, TrainConfig], ModelSetup],
-    make_loaders: Callable[[pathlib.Path, TrainConfig], Loaders],
-) -> TrainHarness:
-    """Bundle the four factories a full ``train()`` run needs.
-
-    Args:
-        make_trunk: Trunk factory.
-        make_tcfg: Configuration factory.
-        make_setup: Setup factory.
-        make_loaders: Loader factory.
-
-    Returns:
-        The bundle.
+        The harness.
     """
     return TrainHarness(
-        make_trunk=make_trunk,
-        make_tcfg=make_tcfg,
-        make_setup=make_setup,
-        make_loaders=make_loaders,
+        model_config=model_config,
+        distograms=distograms,
+        dataset_files=dataset_files,
     )
 
 
 @pytest.fixture
-def model_params(
-    tmp_path: pathlib.Path,
-    make_trunk: Callable[[], MainTrunk],
-    make_tcfg: TcfgFactory,
-    make_setup: Callable[[MainTrunk | DDP, TrainConfig], ModelSetup],
-) -> ModelSetup:
+def model_params(tmp_path: pathlib.Path, harness: TrainHarness) -> ModelSetup:
     """Build a fresh setup with the default one-epoch configuration.
 
     Args:
         tmp_path: Per-test directory for the checkpoint.
-        make_trunk: Trunk factory.
-        make_tcfg: Configuration factory.
-        make_setup: Setup factory.
+        harness: Builds the trunk, configuration and setup.
 
     Returns:
         The setup, with W&B off.
     """
-    tcfg = make_tcfg(tmp_path, TrainScenario.default_budget.value)
-    return make_setup(make_trunk(), tcfg)
+    tcfg = harness.tcfg(tmp_path, TrainScenario.default_budget.value)
+    return harness.setup(harness.trunk(), tcfg)
 
 
 @pytest.fixture
@@ -656,19 +676,19 @@ def featurized_batch(model_params: ModelSetup) -> FeaturizedBatch:
 def loaders(
     tmp_path: pathlib.Path,
     model_params: ModelSetup,
-    make_loaders: Callable[[pathlib.Path, TrainConfig], Loaders],
+    harness: TrainHarness,
 ) -> Loaders:
     """Build loaders over the synthetic proteins in a per-test directory.
 
     Args:
         tmp_path: Per-test directory.
         model_params: Supplies the configuration.
-        make_loaders: Loader factory.
+        harness: Builds the loaders.
 
     Returns:
         The loaders.
     """
-    return make_loaders(tmp_path, model_params.tcfg)
+    return harness.loaders(tmp_path, model_params.tcfg)
 
 
 @pytest.fixture
@@ -769,100 +789,73 @@ def lr_schedule_optimizer() -> Adam:
     return Adam([nn.Parameter(torch.zeros(1))], lr=2.0)
 
 
+@pytest.fixture
+def lr_schedule_training() -> TrainingParams:
+    """Return 4 warmup steps, then a halving every 3 steps.
+
+    Returns:
+        Training parameters supplying the schedule's shape.
+    """
+    return TrainingParams(
+        lr_warmup_steps=4,
+        lr_decay_steps=3,
+        lr_decay_factor=0.5,
+    )
+
+
+@pytest.fixture
+def lr_scheduler(
+    lr_schedule_optimizer: Adam,
+    lr_schedule_training: TrainingParams,
+) -> LambdaLR:
+    """Build the training LR schedule over ``lr_schedule_optimizer``.
+
+    Args:
+        lr_schedule_optimizer: Adam at base rate 2.
+        lr_schedule_training: Warmup and decay settings.
+
+    Returns:
+        The scheduler at step 0.
+    """
+    return build_lr_scheduler(lr_schedule_optimizer, lr_schedule_training)
+
+
+@pytest.fixture
+def checkpoint_write_scenario(
+    request: pytest.FixtureRequest,
+) -> CheckpointWriteScenario:
+    """Return the ``CheckpointWriteScenario`` routed in via indirect param.
+
+    Args:
+        request: Pytest request carrying the scenario in ``param``.
+
+    Returns:
+        The scenario under test.
+    """
+    return cast(CheckpointWriteScenario, request.param)
+
+
 @pytest.fixture(scope="module")
 def recorded_train_runs(
     tmp_path_factory: pytest.TempPathFactory,
     harness: TrainHarness,
-) -> Callable[[TrainScenario], TrainRun]:
-    """Return a lookup that runs each TrainScenario at most once per module.
-
-    The cache is explicit because a parametrized module-scoped fixture does
-    not guarantee one run per scenario: pytest groups parameters by their
-    position in each ``parametrize`` list. Each run spies on
-    ``all_reduce_mean`` and captures ``wandb.log`` through
-    ``MonkeyPatch.context``, since function-scoped ``monkeypatch`` cannot
-    serve a module-scoped cache.
+) -> TrainRunCache:
+    """Return the module's cache of ``train()`` runs, one per scenario.
 
     Args:
         tmp_path_factory: Factory for each run's directory.
-        harness: Model, configuration, setup and loader factories.
+        harness: Builds each run.
 
     Returns:
-        Callable returning the scenario's TrainRun, running it on first use.
+        An empty cache that runs each scenario on first use.
     """
-    runs: dict[TrainScenario, TrainRun] = {}
-    original_reduce = TensorAccumulatorMixin.all_reduce_mean
-
-    def record(scenario: TrainScenario) -> TrainRun:
-        """Run ``train()`` for the scenario and record what it did.
-
-        Args:
-            scenario: Configuration to run.
-
-        Returns:
-            The record.
-        """
-        work = tmp_path_factory.mktemp(scenario.name)
-        tcfg = harness.make_tcfg(work, scenario.value)
-        trunk = harness.make_trunk()
-        built = harness.make_loaders(work, tcfg)
-        before = [p.clone().detach() for p in trunk.parameters()]
-        reduced: list[TensorAccumulatorMixin] = []
-        payloads: list[dict[str, object]] = []
-
-        def spy(self: TensorAccumulatorMixin) -> None:
-            """Record the instance, then run the real reduction.
-
-            Args:
-                self: Metrics being reduced.
-            """
-            reduced.append(self)
-            original_reduce(self)
-
-        with pytest.MonkeyPatch.context() as patch:
-            patch.setattr(TensorAccumulatorMixin, "all_reduce_mean", spy)
-            patch.setattr("train.train_loop.wandb.log", payloads.append)
-            train(
-                best_val_loss=torch.tensor(float("inf")),
-                train_loader=built.train,
-                test_loader=built.test,
-                model_params=harness.make_setup(trunk, tcfg),
-                log=cast(FilteringBoundLogger, structlog.get_logger()),
-            )
-        return TrainRun(
-            parameters_changed=any(
-                not torch.equal(b, a)
-                for b, a in zip(before, trunk.parameters(), strict=True)
-            ),
-            reduced_metrics=reduced,
-            wandb_payloads=payloads,
-            checkpoint=cast(
-                dict[str, dict[str, object]],
-                torch.load(work / "best.pt", weights_only=True),
-            ),
-            num_epochs=scenario.value.num_epochs,
-        )
-
-    def lookup(scenario: TrainScenario) -> TrainRun:
-        """Return the scenario's record, running it on first use.
-
-        Args:
-            scenario: Configuration to look up.
-
-        Returns:
-            The record.
-        """
-        if scenario not in runs:
-            runs[scenario] = record(scenario)
-        return runs[scenario]
-
-    return lookup
+    return TrainRunCache(tmp_path_factory=tmp_path_factory, harness=harness)
 
 
 @pytest.fixture
 def train_run(
     request: pytest.FixtureRequest,
-    recorded_train_runs: Callable[[TrainScenario], TrainRun],
+    recorded_train_runs: TrainRunCache,
 ) -> TrainRun:
     """Return the shared record for the scenario routed in via param.
 
@@ -871,12 +864,12 @@ def train_run(
 
     Args:
         request: Pytest request carrying a ``TrainScenario``.
-        recorded_train_runs: Module-wide lookup.
+        recorded_train_runs: Module-wide cache of runs.
 
     Returns:
         The scenario's record.
     """
-    return recorded_train_runs(cast(TrainScenario, request.param))
+    return recorded_train_runs.get(cast(TrainScenario, request.param))
 
 
 def test_take_step_eval_reports_finite_metrics_without_gradients(
@@ -977,7 +970,6 @@ def test_take_step_grad_scale_divides_the_gradient(
 def test_process_accum_window_scales_each_batch_by_protein_share(
     featurized_batch: FeaturizedBatch,
     model_params: ModelSetup,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Batch ``i`` of the window gets ``grad_scale = total / proteins_i``.
 
@@ -988,45 +980,23 @@ def test_process_accum_window_scales_each_batch_by_protein_share(
     Args:
         featurized_batch: Batch used for both window slots.
         model_params: Setup holding the model.
-        monkeypatch: Wraps ``take_step`` to record its scale.
     """
-    scales: list[float] = []
-    real_take_step = take_step
-
-    def recording_take_step(
-        *,
-        batch: FeaturizedBatch,
-        model_params: ModelSetup,  # pylint: disable=redefined-outer-name
-        train_mode: bool,
-        grad_scale: float = 1.0,
-    ) -> tuple[LossMetrics, ThroughputStatistics]:
-        """Record ``grad_scale``, then take the real step.
-
-        Args:
-            batch: Micro-batch.
-            model_params: Setup.
-            train_mode: Whether to backpropagate.
-            grad_scale: Divisor applied to the loss.
-
-        Returns:
-            The real step's metrics.
-        """
-        scales.append(grad_scale)
-        return real_take_step(
-            batch=batch,
-            model_params=model_params,
-            train_mode=train_mode,
-            grad_scale=grad_scale,
-        )
-
-    monkeypatch.setattr("train.train_loop.take_step", recording_take_step)
     _ = model_params.model.train()
-    loss, _ = process_accum_window(
-        [featurized_batch, featurized_batch],
-        [1, 3],
-        model_params,
-    )
+    with mock.patch(
+        "train.train_loop.take_step",
+        autospec=True,
+        side_effect=take_step,
+    ) as take_step_spy:
+        loss, _ = process_accum_window(
+            [featurized_batch, featurized_batch],
+            [1, 3],
+            model_params,
+        )
     losses = torch.tensor(list(loss.to_float_dict().values()))
+    scales = [
+        cast(float, call.kwargs["grad_scale"])
+        for call in take_step_spy.call_args_list
+    ]
     torch.testing.assert_close(
         torch.tensor(scales),
         torch.tensor([4.0, 4.0 / 3]),
@@ -1172,28 +1142,29 @@ def test_swapped_in_ema_weights_restores_raw_weights_on_error(
 
 
 @pytest.mark.parametrize(
-    ("rank", "writes"),
-    [(0, True), (1, False)],
-    ids=["rank0", "rank1"],
+    "checkpoint_write_scenario",
+    list(CheckpointWriteScenario),
+    ids=[case.name for case in CheckpointWriteScenario],
+    indirect=True,
 )
 def test_save_checkpoint_writes_only_on_rank_zero(
     model_params: ModelSetup,
     log: FilteringBoundLogger,
-    rank: int,
-    writes: bool,  # noqa: FBT001
+    checkpoint_write_scenario: CheckpointWriteScenario,
 ) -> None:
     """Rank 0 writes a checkpoint with every state; other ranks write none.
 
     Args:
         model_params: Setup to save.
         log: Logger.
-        rank: Rank passed to ``save_checkpoint``.
-        writes: Whether a file must appear.
+        checkpoint_write_scenario: Rank and whether it must write a file.
     """
+    case = checkpoint_write_scenario.value
+    writes = case.writes
     path = model_params.tcfg.checkpoint.checkpoint_path
     save_checkpoint(
         model_params=model_params,
-        rank=rank,
+        rank=case.rank,
         log=log,
         best_val_loss=torch.tensor(0.5),
     )
@@ -1406,11 +1377,13 @@ def test_accumulated_token_budget_accepts_any_positive_value(
         "second_decay_boundary_reached",
     ],
 )
-def test_lambda_lr_matches_alphafold_lr_lambda_through_real_scheduler(
+def test_build_lr_scheduler_follows_alphafold_lr_lambda(
     lr_schedule_optimizer: Adam,
+    lr_schedule_training: TrainingParams,
+    lr_scheduler: LambdaLR,
     n_steps: int,
 ) -> None:
-    """A real LambdaLR driven by ``alphafold_lr_lambda`` reproduces it.
+    """The training LR schedule reproduces ``alphafold_lr_lambda`` exactly.
 
     With 4 warmup steps, decay every 3 steps by 0.5 and base rate 2, the
     optimizer's live rate after ``n_steps`` must equal
@@ -1418,26 +1391,26 @@ def test_lambda_lr_matches_alphafold_lr_lambda_through_real_scheduler(
 
     Args:
         lr_schedule_optimizer: Adam at base rate 2.
+        lr_schedule_training: Warmup and decay settings.
+        lr_scheduler: ``build_lr_scheduler`` over that optimizer.
         n_steps: Scheduler steps to take.
     """
-    schedule = functools.partial(
-        alphafold_lr_lambda,
-        warmup_steps=4,
-        decay_steps=3,
-        decay_factor=0.5,
-    )
-    scheduler = LambdaLR(lr_schedule_optimizer, lr_lambda=schedule)
     for _ in range(n_steps):
-        scheduler.step()
+        lr_scheduler.step()
     actual = cast(float, lr_schedule_optimizer.param_groups[0]["lr"])
-    torch.testing.assert_close(actual, 2.0 * schedule(n_steps))
+    expected = alphafold_lr_lambda(
+        n_steps,
+        warmup_steps=lr_schedule_training.lr_warmup_steps,
+        decay_steps=lr_schedule_training.lr_decay_steps,
+        decay_factor=lr_schedule_training.lr_decay_factor,
+    )
+    torch.testing.assert_close(actual, 2.0 * expected)
 
 
 def test_train_preflushes_before_an_oversized_batch(
     tmp_path: pathlib.Path,
     harness: TrainHarness,
     log: FilteringBoundLogger,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Each window is flushed before a batch that would exceed the budget.
 
@@ -1449,49 +1422,32 @@ def test_train_preflushes_before_an_oversized_batch(
 
     Args:
         tmp_path: Per-test directory.
-        harness: Model, configuration, setup and loader factories.
+        harness: Builds the trunk, configuration, setup and loaders.
         log: Logger.
-        monkeypatch: Wraps ``process_accum_window`` to record windows.
     """
-    windows: list[int] = []
-    real_process = process_accum_window
-
-    def tracking_process(
-        micro_buffer: list[FeaturizedBatch],
-        n_proteins_per_batch: list[int],
-        model_params: ModelSetup,  # pylint: disable=redefined-outer-name
-    ) -> tuple[LossMetrics, ThroughputStatistics]:
-        """Record the window size, then process it for real.
-
-        Args:
-            micro_buffer: Batches in the window.
-            n_proteins_per_batch: Proteins per batch.
-            model_params: Setup.
-
-        Returns:
-            The real window's metrics.
-        """
-        windows.append(len(micro_buffer))
-        return real_process(micro_buffer, n_proteins_per_batch, model_params)
-
-    monkeypatch.setattr(
-        "train.train_loop.process_accum_window",
-        tracking_process,
-    )
-    tcfg = harness.make_tcfg(
+    tcfg = harness.tcfg(
         tmp_path,
         TrainCase(1, 7, 1.0, use_wandb=False),
         loader_budget=42,
     )
     tcfg = tcfg.model_copy(update={"test_loader": LoaderConfig(batch_size=1)})
-    built = harness.make_loaders(tmp_path, tcfg)
-    train(
-        best_val_loss=torch.tensor(float("inf")),
-        train_loader=built.train,
-        test_loader=built.test,
-        model_params=harness.make_setup(harness.make_trunk(), tcfg),
-        log=log,
-    )
+    built = harness.loaders(tmp_path, tcfg)
+    with mock.patch(
+        "train.train_loop.process_accum_window",
+        autospec=True,
+        side_effect=process_accum_window,
+    ) as process_spy:
+        train(
+            best_val_loss=torch.tensor(float("inf")),
+            train_loader=built.train,
+            test_loader=built.test,
+            model_params=harness.setup(harness.trunk(), tcfg),
+            log=log,
+        )
+    windows = [
+        len(cast(list[FeaturizedBatch], call.kwargs["micro_buffer"]))
+        for call in process_spy.call_args_list
+    ]
     assert windows == [1, 1, 1, 1]
 
 

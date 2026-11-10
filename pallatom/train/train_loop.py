@@ -55,10 +55,10 @@ from helpers.useful_objects import (
 from jaxtyping import Float, Int, jaxtyped
 from structlog.typing import FilteringBoundLogger
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.optim import Adam
+from torch.optim import Adam, Optimizer
 from torch.optim.lr_scheduler import LambdaLR
 from tqdm import tqdm
-from train.train_config import TrainArgs, TrainConfig
+from train.train_config import TrainArgs, TrainConfig, TrainingParams
 
 CUDA_DEVICE_TYPE = "cuda"
 
@@ -1075,6 +1075,35 @@ def alphafold_lr_lambda(
     return decay_factor ** ((step - warmup_steps) // decay_steps)
 
 
+def build_lr_scheduler(
+    optimizer: Optimizer,
+    training: TrainingParams,
+) -> LambdaLR:
+    """Wrap ``optimizer`` in the AlphaFold 3-style learning-rate schedule.
+
+    The scheduler multiplies the optimizer's base LR by
+    ``alphafold_lr_lambda`` at the current step, with warmup and decay
+    taken from ``training``. ``train()`` steps it once per optimizer step.
+
+    Args:
+        optimizer: Optimizer whose learning rate the schedule drives.
+        training: Supplies ``lr_warmup_steps``, ``lr_decay_steps`` and
+            ``lr_decay_factor``.
+
+    Returns:
+        The scheduler, at step 0.
+    """
+    return LambdaLR(
+        optimizer,
+        lr_lambda=functools.partial(
+            alphafold_lr_lambda,
+            warmup_steps=training.lr_warmup_steps,
+            decay_steps=training.lr_decay_steps,
+            decay_factor=training.lr_decay_factor,
+        ),
+    )
+
+
 def main(args: TrainArgs, tcfg: TrainConfig) -> None:
     """Entry point for training; dispatches to DDP or not based on args.ddp.
 
@@ -1125,15 +1154,7 @@ def main(args: TrainArgs, tcfg: TrainConfig) -> None:
             lr=tp.lr,
             weight_decay=tp.weight_decay,
         )
-        scheduler = LambdaLR(
-            optimizer,
-            lr_lambda=functools.partial(
-                alphafold_lr_lambda,
-                warmup_steps=tp.lr_warmup_steps,
-                decay_steps=tp.lr_decay_steps,
-                decay_factor=tp.lr_decay_factor,
-            ),
-        )
+        scheduler = build_lr_scheduler(optimizer, tp)
 
         distogram_template = build_distogram_module(tcfg.distogram_template)
         distogram_residue = build_distogram_module(tcfg.distogram_residue)
