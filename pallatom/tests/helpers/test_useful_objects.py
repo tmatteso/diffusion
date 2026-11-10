@@ -1,19 +1,23 @@
-"""Tests for LossMetrics, ThroughputStatistics, and ComponentNorms.
+"""Tests for TensorAccumulatorMixin and the metric dataclasses built on it.
 
-Covers valid construction from 0-D float tensors, field finiteness checks,
-jaxtyping shape-enforcement for each dataclass, and cross-rank averaging via
-TensorAccumulatorMixin.all_reduce_mean (including a real multi-process test
-proving genuine cross-rank communication, not just a single-rank no-op).
+Covers the mixin's field-wise arithmetic, ``weighted_avg``, ``zero_init`` and
+``to_float_dict`` with exact values on ThroughputStatistics, whose four
+fields hold distinct values; the scalar shape contract that
+``@jaxtyped`` enforces on LossMetrics, ThroughputStatistics and
+ComponentNorms; and ``all_reduce_mean`` with no process group, a one-rank
+group, and three real processes.
+
+Every expected value is exactly representable in float32, so results are
+compared with ``==`` rather than a tolerance.
 """
 
-import contextlib
 import dataclasses
+import enum
 import multiprocessing as mp
 import os
 import socket
-from collections.abc import Generator, Sequence
-from multiprocessing.process import BaseProcess
-from typing import TypeVar, cast
+from collections.abc import Callable
+from typing import cast
 
 import pytest
 import torch
@@ -26,564 +30,524 @@ from helpers.useful_objects import (
 )
 from jaxtyping import Float, TypeCheckError
 
-_ALL_REDUCE_TOLERANCE = 1e-6
-_ResultT = TypeVar("_ResultT")
 
+@dataclasses.dataclass(frozen=True)
+class ScalarCase:
+    """A mixin operator with a scalar operand and the values it must give.
 
-def _scalar() -> Float[torch.Tensor, ""]:
-    """Return a 0-D float tensor.
-
-    Creates a scalar tensor with value 1.0 for use as a valid field in the
-    shape-checked dataclasses under test.
+    Attributes:
+        operation: Unbound operator, called as ``operation(left, scalar)``
+            with ``left = (1, 2, 3, 4)``.
+        scalar: Scalar operand.
+        expected: Field values of the result, in field order.
     """
-    return torch.tensor(1.0)
+
+    operation: Callable[[ThroughputStatistics, float], ThroughputStatistics]
+    scalar: float
+    expected: tuple[float, ...]
 
 
-# ---------------------------------------------------------------------------
-# LossMetrics — valid construction
-# ---------------------------------------------------------------------------
+class ScalarScenario(enum.Enum):
+    """Scalar operators of TensorAccumulatorMixin.
 
-
-@pytest.fixture
-def loss_metrics() -> LossMetrics:
-    """Provide a valid LossMetrics with all scalar tensors set to 1.0.
-
-    Constructs a LossMetrics instance where every field is a 0-D float tensor
-    with value 1.0, suitable for shape-contract and finiteness tests.
+    Members:
+        divide: ``left /= 2`` halves every field in place.
+        multiply: ``left * 3`` scales every field into a new instance.
     """
-    s = _scalar()
-    return LossMetrics(
-        total_loss=s,
-        Kabsch_aligned_MSE_loss=s,
-        CE_loss=s,
-        smooth_lddt_loss=s,
-        res_distogram_loss=s,
-        atom_distogram_loss=s,
-        intermediate_loss=s,
-        RMSD=s,
-    )
+
+    divide = ScalarCase(ThroughputStatistics.__itruediv__, 2, (0.5, 1, 1.5, 2))
+    multiply = ScalarCase(ThroughputStatistics.__mul__, 3, (3, 6, 9, 12))
 
 
-def test_loss_metrics_constructs(loss_metrics: LossMetrics) -> None:
-    """LossMetrics constructs successfully from 0-D float tensors.
+@dataclasses.dataclass(frozen=True)
+class RankReport:
+    """Reduced field values one spawned rank sent back, by reduction.
 
-    Verifies that a LossMetrics instance is created without error when all
-    fields are valid scalar tensors.
+    Each field maps metric names to values, as ``to_float_dict`` returns
+    them.
+
+    Attributes:
+        rank: Rank that sent the report; every field it reduced started
+            at ``float(rank)``.
+        fresh_loss: LossMetrics reduced on the freshly created group.
+        loss: LossMetrics reduced after the scratch ``all_reduce`` calls.
+        throughput: ThroughputStatistics reduced after the scratch calls.
+        norms: ComponentNorms reduced after the scratch calls.
     """
-    assert isinstance(loss_metrics, LossMetrics)
+
+    rank: int
+    fresh_loss: dict[str, float]
+    loss: dict[str, float]
+    throughput: dict[str, float]
+    norms: dict[str, float]
+
+    def values(self) -> set[float]:
+        """Return every reduced value in the report.
+
+        Returns:
+            The values of all four reductions, merged into one set.
+        """
+        reductions = (self.fresh_loss, self.loss, self.throughput, self.norms)
+        return {v for reduction in reductions for v in reduction.values()}
 
 
-def test_loss_metrics_total_loss_is_scalar(loss_metrics: LossMetrics) -> None:
-    """LossMetrics.total_loss is a 0-D tensor.
+@dataclasses.dataclass(frozen=True)
+class AllReduceRun:
+    """Reports from every spawned rank after reducing.
 
-    Verifies that the total_loss field has zero dimensions, confirming the
-    scalar shape contract is preserved after construction.
+    Attributes:
+        world_size: Number of ranks spawned.
+        reports: One report per rank, in the order they reached the queue.
     """
-    assert loss_metrics.total_loss.ndim == 0
+
+    world_size: int
+    reports: tuple[RankReport, ...]
 
 
-def test_loss_metrics_all_fields_finite(loss_metrics: LossMetrics) -> None:
-    """All LossMetrics tensor fields are finite.
+@dataclasses.dataclass(frozen=True)
+class ProcessGroupCase:
+    """Process-group state a single-process ``all_reduce_mean`` runs under.
 
-    Verifies that every tensor field in LossMetrics contains only finite values
-    when initialised from the fixture.
+    Attributes:
+        group_active: Whether a one-rank gloo group is started first.
     """
-    for field in [
-        loss_metrics.total_loss,
-        loss_metrics.Kabsch_aligned_MSE_loss,
-        loss_metrics.CE_loss,
-        loss_metrics.smooth_lddt_loss,
-        loss_metrics.res_distogram_loss,
-        loss_metrics.atom_distogram_loss,
-        loss_metrics.intermediate_loss,
-        loss_metrics.RMSD,
-    ]:
-        assert torch.isfinite(field)
+
+    group_active: bool
 
 
-# ---------------------------------------------------------------------------
-# LossMetrics — shape enforcement
-# ---------------------------------------------------------------------------
+class ProcessGroup(enum.Enum):
+    """Single-process settings for ``all_reduce_mean``.
 
-
-def test_loss_metrics_rejects_1d_total_loss() -> None:
-    """LossMetrics raises when total_loss is 1-D instead of scalar.
-
-    Verifies that passing a rank-1 tensor for total_loss triggers a
-    jaxtyping TypeCheckError or equivalent exception.
+    Members:
+        no_group: No process group exists, so the method must return before
+            any collective call.
+        single_rank_group: A one-rank gloo group exists, so the real
+            collective path runs over a world of one.
     """
-    s = _scalar()
-    with pytest.raises((TypeCheckError, Exception)):
-        _ = LossMetrics(
-            total_loss=torch.tensor([1.0]),
-            Kabsch_aligned_MSE_loss=s,
-            CE_loss=s,
-            smooth_lddt_loss=s,
-            res_distogram_loss=s,
-            atom_distogram_loss=s,
-            intermediate_loss=s,
-            RMSD=s,
-        )
+
+    no_group = ProcessGroupCase(group_active=False)
+    single_rank_group = ProcessGroupCase(group_active=True)
 
 
-# ---------------------------------------------------------------------------
-# ThroughputStatistics — valid construction
-# ---------------------------------------------------------------------------
+@dataclasses.dataclass(frozen=True)
+class FieldOverride:
+    """One field of a metric dataclass and a replacement value for it.
 
-
-@pytest.fixture
-def throughput_statistics() -> ThroughputStatistics:
-    """Provide a valid ThroughputStatistics with all scalar tensors set to 1.0.
-
-    Constructs a ThroughputStatistics instance where every field is a 0-D float
-    tensor with value 1.0, suitable for shape-contract and finiteness tests.
+    Attributes:
+        name: Name of the field to replace.
+        value: Replacement tensor; 1-D, so it breaks the field's scalar
+            shape contract.
     """
-    s = _scalar()
-    return ThroughputStatistics(
-        avg_batch_size=s,
-        token_pack_rate=s,
-        residues_per_sec=s,
-        atoms_per_sec=s,
-    )
+
+    name: str
+    value: Float[torch.Tensor, " n"]
 
 
-def test_throughput_statistics_constructs(
-    throughput_statistics: ThroughputStatistics,
-) -> None:
-    """ThroughputStatistics constructs successfully from 0-D float tensors.
+def metrics_filled_with(
+    metric_class: type[TensorAccumulatorMixin],
+    value: float,
+) -> TensorAccumulatorMixin:
+    """Build ``metric_class`` with every field a separate 0-D ``value``.
 
-    Verifies that a ThroughputStatistics instance is created without error when
-    all fields are valid scalar tensors.
-    """
-    assert isinstance(throughput_statistics, ThroughputStatistics)
+    The instance comes from the class's own ``zero_init``, and each field
+    is then set to a fresh ``torch.tensor(value)``.
 
-
-def test_throughput_statistics_avg_batch_size_is_scalar(
-    throughput_statistics: ThroughputStatistics,
-) -> None:
-    """ThroughputStatistics.avg_batch_size is a 0-D tensor.
-
-    Verifies that the avg_batch_size field has zero dimensions, confirming the
-    scalar shape contract is preserved after construction.
-    """
-    assert throughput_statistics.avg_batch_size.ndim == 0
-
-
-def test_throughput_statistics_all_fields_finite(
-    throughput_statistics: ThroughputStatistics,
-) -> None:
-    """All ThroughputStatistics tensor fields are finite.
-
-    Verifies every tensor field in ThroughputStatistics contains only finite
-    values when initialised from the fixture.
-    """
-    for field in [
-        throughput_statistics.avg_batch_size,
-        throughput_statistics.token_pack_rate,
-        throughput_statistics.residues_per_sec,
-        throughput_statistics.atoms_per_sec,
-    ]:
-        assert torch.isfinite(field)
-
-
-# ---------------------------------------------------------------------------
-# ThroughputStatistics — shape enforcement
-# ---------------------------------------------------------------------------
-
-
-def test_throughput_statistics_rejects_1d_avg_batch_size() -> None:
-    """ThroughputStatistics raises when avg_batch_size is 1-D instead of scalar.
-
-    Verifies that passing a rank-1 tensor for avg_batch_size triggers a
-    jaxtyping TypeCheckError or equivalent exception.
-    """
-    s = _scalar()
-    with pytest.raises((TypeCheckError, Exception)):
-        _ = ThroughputStatistics(
-            avg_batch_size=torch.tensor([1.0]),
-            token_pack_rate=s,
-            residues_per_sec=s,
-            atoms_per_sec=s,
-        )
-
-
-# ---------------------------------------------------------------------------
-# ComponentNorms — valid construction
-# ---------------------------------------------------------------------------
-
-
-@pytest.fixture
-def component_norms() -> ComponentNorms:
-    """Provide a valid ComponentNorms with all scalar tensors set to 1.0.
-
-    Constructs a ComponentNorms instance where every field is a 0-D float tensor
-    with value 1.0, suitable for shape-contract and finiteness tests.
-    """
-    s = _scalar()
-    return ComponentNorms(
-        template_embedder=s,
-        atom_encoder=s,
-        atom_decoders=s,
-        residue_distogram_head=s,
-        atom_distogram_head=s,
-        inter_proj_seq=s,
-        inter_seq_logits=s,
-        proj_seq=s,
-        seq_logits=s,
-    )
-
-
-def test_component_norms_constructs(component_norms: ComponentNorms) -> None:
-    """ComponentNorms constructs successfully from 0-D float tensors.
-
-    Verifies that a ComponentNorms instance is created without error when all
-    fields are valid scalar tensors.
-    """
-    assert isinstance(component_norms, ComponentNorms)
-
-
-def test_component_norms_template_embedder_is_scalar(
-    component_norms: ComponentNorms,
-) -> None:
-    """ComponentNorms.template_embedder is a 0-D tensor.
-
-    Verifies the template_embedder field has zero dimensions, confirming the
-    scalar shape contract is preserved after construction.
-    """
-    assert component_norms.template_embedder.ndim == 0
-
-
-def test_component_norms_all_fields_finite(
-    component_norms: ComponentNorms,
-) -> None:
-    """All ComponentNorms tensor fields are finite.
-
-    Verifies every tensor field in ComponentNorms contains only finite values
-    when initialised from the fixture.
-    """
-    for field in [
-        component_norms.template_embedder,
-        component_norms.atom_encoder,
-        component_norms.atom_decoders,
-        component_norms.residue_distogram_head,
-        component_norms.atom_distogram_head,
-        component_norms.inter_proj_seq,
-        component_norms.inter_seq_logits,
-        component_norms.proj_seq,
-        component_norms.seq_logits,
-    ]:
-        assert torch.isfinite(field)
-
-
-# ---------------------------------------------------------------------------
-# ComponentNorms — shape enforcement
-# ---------------------------------------------------------------------------
-
-
-def test_component_norms_rejects_1d_template_embedder() -> None:
-    """ComponentNorms raises when template_embedder is 1-D instead of scalar.
-
-    Verifies that passing a rank-1 tensor for template_embedder triggers a
-    jaxtyping TypeCheckError or equivalent exception.
-    """
-    s = _scalar()
-    with pytest.raises((TypeCheckError, Exception)):
-        _ = ComponentNorms(
-            template_embedder=torch.tensor([1.0]),
-            atom_encoder=s,
-            atom_decoders=s,
-            residue_distogram_head=s,
-            atom_distogram_head=s,
-            inter_proj_seq=s,
-            inter_seq_logits=s,
-            proj_seq=s,
-            seq_logits=s,
-        )
-
-
-# ---------------------------------------------------------------------------
-# TensorAccumulatorMixin.all_reduce_mean
-# ---------------------------------------------------------------------------
-
-
-@contextlib.contextmanager
-def _single_process_gloo_group() -> Generator[None]:
-    """Init and tear down a single-process gloo group for DDP-adjacent tests."""
-    # HashStore is a private torch.distributed C-extension symbol that
-    # isn't officially re-exported; getattr() sidesteps the static
-    # private-import check, whose result is otherwise inconsistent
-    # across torch's per-platform packaging.
-    dist.init_process_group(
-        backend="gloo",
-        store=getattr(  # noqa: B009  # pyright: ignore[reportAny]
-            dist,
-            "HashStore",
-        )(),
-        rank=0,
-        world_size=1,
-    )
-    try:
-        yield
-    finally:
-        dist.destroy_process_group()
-
-
-@pytest.mark.parametrize(
-    "fixture_name",
-    ["loss_metrics", "throughput_statistics", "component_norms"],
-    ids=["LossMetrics", "ThroughputStatistics", "ComponentNorms"],
-)
-def test_all_reduce_mean_noop_without_process_group(
-    fixture_name: str,
-    request: pytest.FixtureRequest,
-) -> None:
-    """all_reduce_mean() is a no-op when no distributed process group exists.
-
-    Arrange: take a metrics instance (every field 1.0) with no active
-    distributed process group -- the default state for ordinary
-    single-device test execution.
-    Act: call all_reduce_mean().
-    Assert: every field is bit-for-bit unchanged, confirming single-device
-    training never attempts a collective call that would hang or error
-    without a process group.
-    """
-    metrics = cast(
-        TensorAccumulatorMixin,
-        request.getfixturevalue(fixture_name),
-    )
-    assert not dist.is_initialized()
-    before = {
-        f.name: cast(torch.Tensor, getattr(metrics, f.name)).clone()
-        for f in dataclasses.fields(metrics)
-    }
-
-    metrics.all_reduce_mean()
-
-    for f in dataclasses.fields(metrics):
-        assert torch.equal(
-            cast(torch.Tensor, getattr(metrics, f.name)),
-            before[f.name],
-        )
-
-
-@pytest.mark.parametrize(
-    "fixture_name",
-    ["loss_metrics", "throughput_statistics", "component_norms"],
-    ids=["LossMetrics", "ThroughputStatistics", "ComponentNorms"],
-)
-def test_all_reduce_mean_unchanged_with_single_rank_process_group(
-    fixture_name: str,
-    request: pytest.FixtureRequest,
-) -> None:
-    """all_reduce_mean() runs the real collective path at world_size=1.
-
-    Arrange: enter a real (single-process) gloo process group and take a
-    metrics instance (every field 1.0).
-    Act: call all_reduce_mean() with an actual process group active.
-    Assert: every field is unchanged (the mean of one value is itself).
-    This only proves the collective call path doesn't crash when a group
-    is active -- it cannot by itself distinguish "correctly computed the
-    mean of one rank" from "silently skipped the reduction", since both
-    produce the same output at world_size=1. That distinction is what
-    test_all_reduce_mean_averages_across_real_ranks below proves.
-    """
-    metrics = cast(
-        TensorAccumulatorMixin,
-        request.getfixturevalue(fixture_name),
-    )
-    before = {
-        f.name: cast(torch.Tensor, getattr(metrics, f.name)).clone()
-        for f in dataclasses.fields(metrics)
-    }
-
-    with _single_process_gloo_group():
-        metrics.all_reduce_mean()
-
-    for f in dataclasses.fields(metrics):
-        assert torch.equal(
-            cast(torch.Tensor, getattr(metrics, f.name)),
-            before[f.name],
-        )
-
-
-def _free_port() -> int:
-    """Return an OS-assigned free TCP port by briefly binding to it.
+    Args:
+        metric_class: Metric dataclass to build.
+        value: Starting value of every field.
 
     Returns:
-        A port number free at the moment of the call, for process-group
-        rendezvous in the multiprocess test below.
+        Instance whose fields are all ``torch.tensor(value)``.
+    """
+    metrics = metric_class.zero_init(torch.device("cpu"))
+    for field in dataclasses.fields(metrics):
+        setattr(metrics, field.name, torch.tensor(value))
+    return metrics
+
+
+def reduce_at_rank(
+    metric_class: type[TensorAccumulatorMixin],
+    rank: int,
+) -> dict[str, float]:
+    """Build ``metric_class`` with every field at ``rank`` and reduce it.
+
+    ``metrics_filled_with`` sets each field to ``float(rank)``, so every
+    rank contributes its own
+    number to the mean. Called by ``all_reduce_mean_worker`` inside a
+    spawned rank, after the process group exists.
+
+    Args:
+        metric_class: Metric dataclass to build and reduce.
+        rank: This process's rank, used as every field's starting value.
+
+    Returns:
+        The reduced instance's ``to_float_dict``.
+    """
+    metrics = metrics_filled_with(metric_class, float(rank))
+    metrics.all_reduce_mean()
+    return metrics.to_float_dict()
+
+
+def all_reduce_mean_worker(
+    rank: int,
+    world_size: int,
+    port: int,
+    result_queue: "mp.Queue[RankReport]",
+) -> None:
+    """Spawned rank for ``test_all_reduce_mean_averages_across_real_ranks``.
+
+    A module-level function rather than a fixture because ``spawn`` pickles
+    the target by its qualified name. The rank first reduces a LossMetrics
+    on the fresh group, then runs three plain ``all_reduce`` calls on
+    scratch tensors, as gradient syncs would during backward, and then
+    reduces a LossMetrics, a ThroughputStatistics and a ComponentNorms.
+    Every field of every instance starts at this rank's own value. The
+    same sequence of collectives runs on every rank, as collectives
+    require.
+
+    Args:
+        rank: This process's rank.
+        world_size: Total number of ranks in the process group.
+        port: TCP port used for process-group rendezvous.
+        result_queue: Receives this rank's report.
+    """
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(port)
+    dist.init_process_group(backend="gloo", rank=rank, world_size=world_size)
+    fresh_loss = reduce_at_rank(LossMetrics, rank)
+    for _ in range(3):
+        _ = dist.all_reduce(  # pyright: ignore[reportUnknownMemberType]
+            torch.tensor(float(rank)),
+            op=dist.ReduceOp.SUM,
+        )
+    loss = reduce_at_rank(LossMetrics, rank)
+    throughput = reduce_at_rank(ThroughputStatistics, rank)
+    norms = reduce_at_rank(ComponentNorms, rank)
+    result_queue.put(RankReport(rank, fresh_loss, loss, throughput, norms))
+    dist.destroy_process_group()
+
+
+@pytest.fixture(
+    params=[LossMetrics, ThroughputStatistics, ComponentNorms],
+    ids=["LossMetrics", "ThroughputStatistics", "ComponentNorms"],
+)
+def metric_cls(request: pytest.FixtureRequest) -> type[TensorAccumulatorMixin]:
+    """Run the requesting test once per real metric dataclass.
+
+    Args:
+        request: Pytest request carrying the class in ``param``.
+
+    Returns:
+        The metric dataclass under test.
+    """
+    return cast(type[TensorAccumulatorMixin], request.param)
+
+
+@pytest.fixture
+def metrics_of_ones(
+    metric_cls: type[TensorAccumulatorMixin],
+) -> TensorAccumulatorMixin:
+    """Build ``metric_cls`` with every field a separate 0-D tensor of 1.0.
+
+    Args:
+        metric_cls: Metric dataclass to build.
+
+    Returns:
+        Instance whose fields are all ``torch.tensor(1.0)``.
+    """
+    return metrics_filled_with(metric_cls, 1.0)
+
+
+@pytest.fixture
+def vector_field(metric_cls: type[TensorAccumulatorMixin]) -> FieldOverride:
+    """Return a 1-D tensor aimed at the first scalar field of ``metric_cls``.
+
+    Only that one field is replaced, and every other field stays a valid
+    0-D tensor, so the scalar shape of one field is the only contract the
+    test breaks.
+
+    Args:
+        metric_cls: Metric dataclass whose first field is targeted.
+
+    Returns:
+        The first field's name with the 1-D tensor ``[1.0]``.
+    """
+    first_field = dataclasses.fields(metric_cls)[0]
+    return FieldOverride(name=first_field.name, value=torch.tensor([1.0]))
+
+
+@pytest.fixture
+def process_group(request: pytest.FixtureRequest) -> ProcessGroup:
+    """Start a one-rank gloo group when the scenario asks for one.
+
+    Args:
+        request: Pytest request carrying the ``ProcessGroup`` member,
+            passed with ``indirect=True``.
+
+    Returns:
+        The scenario, with its group already started if it has one.
+    """
+    scenario = cast(ProcessGroup, request.param)
+    if scenario.value.group_active:
+        request.getfixturevalue("single_process_gloo_group")
+    return scenario
+
+
+@pytest.fixture
+def left() -> ThroughputStatistics:
+    """Return the left operand ``(1, 2, 3, 4)``.
+
+    Distinct values per field catch an operation applied to the wrong
+    field. Built by hand rather than from a factory fixture: ``left`` and
+    ``right`` are the only two instances, both fixed, and naming each
+    field beside its value is easier to check than a factory's positional
+    arguments.
+
+    Returns:
+        Fresh metrics; operations may mutate them in place.
+    """
+    return ThroughputStatistics(
+        avg_batch_size=torch.tensor(1.0),
+        token_pack_rate=torch.tensor(2.0),
+        residues_per_sec=torch.tensor(3.0),
+        atoms_per_sec=torch.tensor(4.0),
+    )
+
+
+@pytest.fixture
+def right() -> ThroughputStatistics:
+    """Return the right operand ``(10, 20, 30, 40)``.
+
+    Built by hand for the same reason as ``left``.
+
+    Returns:
+        Fresh metrics.
+    """
+    return ThroughputStatistics(
+        avg_batch_size=torch.tensor(10.0),
+        token_pack_rate=torch.tensor(20.0),
+        residues_per_sec=torch.tensor(30.0),
+        atoms_per_sec=torch.tensor(40.0),
+    )
+
+
+@pytest.fixture
+def free_port() -> int:
+    """Return an OS-assigned TCP port that was free when the fixture ran.
+
+    Returns:
+        Port number for process-group rendezvous.
     """
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
         return cast(int, sock.getsockname()[1])
 
 
-def _rank_loss_metrics(
-    rank_value: Float[torch.Tensor, ""],
-) -> LossMetrics:
-    """Build a LossMetrics with every field set to the given value.
+@pytest.fixture
+def all_reduce_run(free_port: int) -> AllReduceRun:
+    """Spawn three real ranks that each run ``all_reduce_mean_worker``.
+
+    Three ranks starting at 0, 1 and 2 have a mean of 1.0, a value no rank
+    started with, so a reduction that silently no-ops or divides by the
+    wrong count cannot produce it.
 
     Args:
-        rank_value: Scalar each field is cloned from.
+        free_port: Port for the ranks' rendezvous.
 
     Returns:
-        LossMetrics holding ``rank_value`` in every field.
-    """
-    return LossMetrics(
-        total_loss=rank_value.clone(),
-        Kabsch_aligned_MSE_loss=rank_value.clone(),
-        CE_loss=rank_value.clone(),
-        smooth_lddt_loss=rank_value.clone(),
-        res_distogram_loss=rank_value.clone(),
-        atom_distogram_loss=rank_value.clone(),
-        intermediate_loss=rank_value.clone(),
-        RMSD=rank_value.clone(),
-    )
-
-
-def _start_and_collect(
-    processes: Sequence[BaseProcess],
-    result_queue: "mp.Queue[_ResultT]",
-    world_size: int,
-) -> list[_ResultT]:
-    """Start every worker process and collect their reported results.
-
-    Args:
-        processes: Worker processes to start.
-        result_queue: Queue each worker reports its result to.
-        world_size: Expected number of results to collect.
-
-    Returns:
-        One reported result per worker, in receipt order.
-    """
-    for p in processes:
-        p.start()
-    return [result_queue.get(timeout=60) for _ in range(world_size)]
-
-
-_PRIOR_COLLECTIVE_CALLS = 3
-
-
-def _all_reduce_mean_worker(
-    rank: int,
-    world_size: int,
-    port: int,
-    result_queue: "mp.Queue[tuple[float, float, float, float]]",
-) -> None:
-    """Multiprocess worker for test_all_reduce_mean_averages_across_real_ranks.
-
-    Reduces a LossMetrics on the fresh process group first. Then simulates
-    the realistic DDP pattern where other collectives (e.g. gradient
-    all-reduces during backward) already exercised the group before any
-    epoch-metrics reduction runs: performs a few generic all_reduce calls
-    on scratch tensors, then builds a LossMetrics, ThroughputStatistics,
-    and ComponentNorms -- every field set to this rank's own value -- and
-    calls all_reduce_mean() on each in turn. Reports one representative
-    field per reduction back to the parent.
-
-    Args:
-        rank: This process's rank.
-        world_size: Total number of ranks in the process group.
-        port: TCP port used for process-group rendezvous.
-        result_queue: Multiprocessing queue to report the post-reduce
-            ``(fresh_group_total_loss, total_loss, avg_batch_size,
-            template_embedder)`` values.
-    """
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = str(port)
-    dist.init_process_group(backend="gloo", rank=rank, world_size=world_size)
-    rank_value = torch.tensor(float(rank))
-
-    fresh_group_metrics = _rank_loss_metrics(rank_value)
-    fresh_group_metrics.all_reduce_mean()
-
-    for _ in range(_PRIOR_COLLECTIVE_CALLS):
-        scratch = torch.tensor(float(rank))
-        _ = dist.all_reduce(  # pyright: ignore[reportUnknownMemberType]
-            scratch,
-            op=dist.ReduceOp.SUM,
-        )
-
-    worker_loss_metrics = _rank_loss_metrics(rank_value)
-    worker_throughput_stats = ThroughputStatistics(
-        avg_batch_size=rank_value.clone(),
-        token_pack_rate=rank_value.clone(),
-        residues_per_sec=rank_value.clone(),
-        atoms_per_sec=rank_value.clone(),
-    )
-    worker_component_norms = ComponentNorms(
-        template_embedder=rank_value.clone(),
-        atom_encoder=rank_value.clone(),
-        atom_decoders=rank_value.clone(),
-        residue_distogram_head=rank_value.clone(),
-        atom_distogram_head=rank_value.clone(),
-        inter_proj_seq=rank_value.clone(),
-        inter_seq_logits=rank_value.clone(),
-        proj_seq=rank_value.clone(),
-        seq_logits=rank_value.clone(),
-    )
-
-    worker_loss_metrics.all_reduce_mean()
-    worker_throughput_stats.all_reduce_mean()
-    worker_component_norms.all_reduce_mean()
-
-    result_queue.put(
-        (
-            fresh_group_metrics.total_loss.item(),
-            worker_loss_metrics.total_loss.item(),
-            worker_throughput_stats.avg_batch_size.item(),
-            worker_component_norms.template_embedder.item(),
-        ),
-    )
-    dist.destroy_process_group()
-
-
-def test_all_reduce_mean_averages_across_real_ranks() -> None:
-    """all_reduce_mean() averages across genuinely separate processes.
-
-    Takes no fixtures and is not parametrized because every case shares one
-    process group: spawning real ranks re-imports torch in each, which takes
-    seconds, and the scenarios below are consecutive stages of one group's
-    life rather than independent inputs.
-
-    Arrange: spawn WORLD_SIZE=3 real OS processes. Each rank's metrics have
-    every field set to its own rank (0, 1, 2) -- so the correct global mean
-    is (0+1+2)/3 = 1.0, a value no rank started with.
-    Act: each rank calls all_reduce_mean() on a LossMetrics in the fresh
-    process group, then performs several generic all_reduce calls on scratch
-    tensors -- mimicking the common DDP pattern where gradient
-    synchronization already exercised the group before any epoch-metrics
-    reduction runs -- then calls all_reduce_mean() on a LossMetrics,
-    ThroughputStatistics, and ComponentNorms, in the same order on every
-    rank (collectives require every rank to issue the same sequence of
-    calls, or the process group hangs or mismatches).
-    Assert: every rank converges to 1.0 for all four reductions. This proves
-    the reduction really communicated across process boundaries, which a
-    broken implementation (one that silently no-ops, or divides by the wrong
-    denominator) cannot fake; that prior collective traffic doesn't corrupt,
-    hang, or desynchronize later reductions; and that all_reduce_mean()
-    behaves identically on all three metric dataclasses.
+        Every rank's report.
     """
     world_size = 3
-    port = _free_port()
     ctx = mp.get_context("spawn")
-    result_queue: "mp.Queue[tuple[float, float, float, float]]" = ctx.Queue()
+    result_queue: "mp.Queue[RankReport]" = ctx.Queue()
     processes = [
         ctx.Process(
-            target=_all_reduce_mean_worker,
-            args=(rank, world_size, port, result_queue),
+            target=all_reduce_mean_worker,
+            args=(rank, world_size, free_port, result_queue),
         )
         for rank in range(world_size)
     ]
+    for process in processes:
+        process.start()
     try:
-        results = _start_and_collect(processes, result_queue, world_size)
+        reports = tuple(result_queue.get(timeout=60) for _ in processes)
     finally:
-        for p in processes:
-            p.join(timeout=60)
-            if p.is_alive():
-                p.terminate()
+        for process in processes:
+            process.join(timeout=60)
+            if process.is_alive():
+                process.terminate()
+    return AllReduceRun(world_size=world_size, reports=reports)
 
-    expected_mean = sum(range(world_size)) / world_size
-    for rank_results in results:
-        for result in rank_results:
-            assert abs(result - expected_mean) < _ALL_REDUCE_TOLERANCE
+
+def test_in_place_add_sums_field_wise(
+    left: ThroughputStatistics,
+    right: ThroughputStatistics,
+) -> None:
+    """``left += right`` adds each field of ``right`` to the same field.
+
+    Not parametrized: every field holds a distinct value, so a field
+    mix-up or a non-additive result would both show.
+
+    Args:
+        left: Left operand ``(1, 2, 3, 4)``, updated in place.
+        right: Right operand ``(10, 20, 30, 40)``.
+    """
+    left += right
+    assert tuple(left.to_float_dict().values()) == (11.0, 22.0, 33.0, 44.0)
+
+
+@pytest.mark.parametrize(
+    "scalar_scenario",
+    list(ScalarScenario),
+    ids=[case.name for case in ScalarScenario],
+)
+def test_scalar_operations_scale_every_field(
+    left: ThroughputStatistics,
+    scalar_scenario: ScalarScenario,
+) -> None:
+    """``/= scalar`` and ``* scalar`` apply the scalar to every field.
+
+    Args:
+        left: Operand ``(1, 2, 3, 4)``.
+        scalar_scenario: Operator, scalar and expected field values.
+    """
+    case = scalar_scenario.value
+    result = case.operation(left, case.scalar)
+    assert tuple(result.to_float_dict().values()) == case.expected
+
+
+@pytest.mark.parametrize(
+    ("weights", "expected"),
+    [
+        pytest.param([1, 1], (5.5, 11.0, 16.5, 22.0), id="equal_weights"),
+        pytest.param([2, 1], (4.0, 8.0, 12.0, 16.0), id="left_weighted_twice"),
+        pytest.param([0, 1], (10.0, 20.0, 30.0, 40.0), id="left_weight_zero"),
+    ],
+)
+def test_weighted_avg_weights_each_instance_by_protein_count(
+    left: ThroughputStatistics,
+    right: ThroughputStatistics,
+    weights: list[int],
+    expected: tuple[float, float, float, float],
+) -> None:
+    """``weighted_avg`` returns the protein-count-weighted mean per field.
+
+    With left ``(1, 2, 3, 4)`` and right ``(10, 20, 30, 40)``, weights 2
+    and 1 give ``(2 * 1 + 10) / 3 = 4`` in the first field; a zero weight
+    drops that instance entirely. The result is built through the class's
+    ``@jaxtyped`` constructor, so a wrongly shaped field would raise.
+
+    Args:
+        left: First instance ``(1, 2, 3, 4)``.
+        right: Second instance ``(10, 20, 30, 40)``.
+        weights: Protein count for each instance.
+        expected: Field values of the weighted mean, in field order.
+    """
+    result = ThroughputStatistics.weighted_avg([left, right], weights)
+    assert tuple(result.to_float_dict().values()) == expected
+
+
+@pytest.mark.parametrize("prefix", ["", "train/"], ids=["no_prefix", "train"])
+def test_to_float_dict_prefixes_every_key(
+    left: ThroughputStatistics,
+    prefix: str,
+) -> None:
+    """``to_float_dict(prefix)`` keys each field ``prefix + name``, in order.
+
+    Args:
+        left: Instance to convert.
+        prefix: String prepended to each field name.
+    """
+    names = [f.name for f in dataclasses.fields(ThroughputStatistics)]
+    assert list(left.to_float_dict(prefix)) == [prefix + n for n in names]
+
+
+def test_metrics_zero_init_fields_are_float32_scalars(
+    metric_cls: type[TensorAccumulatorMixin],
+) -> None:
+    """``zero_init`` gives every field a 0-D float32 zero.
+
+    Parametrized over the real metric classes through ``metric_cls``; CPU
+    is the only device available in every test environment.
+
+    Args:
+        metric_cls: Metric dataclass to build.
+    """
+    metrics = metric_cls.zero_init(torch.device("cpu"))
+    tensors = [
+        cast(torch.Tensor, getattr(metrics, f.name))
+        for f in dataclasses.fields(metrics)
+    ]
+    assert {(t.shape, t.dtype) for t in tensors} == {
+        (torch.Size([]), torch.float32),
+    }
+    assert set(metrics.to_float_dict().values()) == {0.0}
+
+
+def test_metrics_reject_non_scalar_field(
+    metrics_of_ones: TensorAccumulatorMixin,
+    vector_field: FieldOverride,
+) -> None:
+    """``@jaxtyped`` rejects a 1-D tensor in a scalar field at construction.
+
+    Parametrized over the real metric classes through ``metric_cls``.
+    ``dataclasses.replace`` builds a new instance through the class's
+    ``@jaxtyped`` ``__init__`` with one field swapped for the 1-D tensor,
+    so the construction expected to raise happens inside ``pytest.raises``.
+
+    Args:
+        metrics_of_ones: Valid instance whose other fields are kept.
+        vector_field: Name of the field to replace and its 1-D tensor.
+    """
+    with pytest.raises(TypeCheckError):
+        _ = dataclasses.replace(
+            metrics_of_ones,
+            **{vector_field.name: vector_field.value},
+        )
+
+
+@pytest.mark.parametrize(
+    "process_group",
+    list(ProcessGroup),
+    ids=[case.name for case in ProcessGroup],
+    indirect=True,
+)
+def test_all_reduce_mean_keeps_values_on_one_process(
+    process_group: ProcessGroup,
+    metrics_of_ones: TensorAccumulatorMixin,
+) -> None:
+    """With no group or a one-rank group, every field stays at 1.0.
+
+    With no group, ``all_reduce_mean`` must return before any collective
+    call, which would otherwise raise. With a one-rank group the real
+    collective path runs and the mean of one value is itself. Neither case
+    can tell a correct reduction from a skipped one; the three-process test
+    below does that.
+
+    Args:
+        process_group: Whether a one-rank gloo group is active.
+        metrics_of_ones: Instance with every field 1.0.
+    """
+    assert dist.is_initialized() == process_group.value.group_active
+    metrics_of_ones.all_reduce_mean()
+    assert set(metrics_of_ones.to_float_dict().values()) == {1.0}
+
+
+def test_all_reduce_mean_averages_across_real_ranks(
+    all_reduce_run: AllReduceRun,
+) -> None:
+    """Every field on every rank converges to the mean of the rank values.
+
+    Not parametrized: spawning ranks re-imports torch in each, which takes
+    seconds, so one process group covers every case. The reductions on a
+    fresh group and after unrelated collectives are consecutive stages of
+    that group, and each metric class is reduced in turn within it.
+
+    Args:
+        all_reduce_run: Field values every rank reported.
+    """
+    world_size = all_reduce_run.world_size
+    expected = sum(range(world_size)) / world_size
+    reports = all_reduce_run.reports
+    assert sorted(report.rank for report in reports) == list(range(world_size))
+    assert {v for report in reports for v in report.values()} == {expected}
