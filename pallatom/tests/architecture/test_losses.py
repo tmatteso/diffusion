@@ -13,10 +13,11 @@ anchors most expected values. Coordinates come from
 ``tests.patterns.chiral_cloud``.
 """
 
+import abc
 import dataclasses
 import enum
 import math
-from collections.abc import Callable
+from typing import override
 
 import numpy as np
 import pytest
@@ -258,14 +259,104 @@ class MalformedInputs:
 
 
 @dataclasses.dataclass(frozen=True)
-class BadCall:
-    """A loss call with one input of the wrong shape.
+class BadCall(abc.ABC):
+    """A loss call with one input of the wrong shape."""
 
-    Attributes:
-        call: Invokes the loss on ``MalformedInputs``.
-    """
+    @abc.abstractmethod
+    def call(self, bad: MalformedInputs) -> object:
+        """Call one loss on inputs drawn from ``bad``.
 
-    call: Callable[[MalformedInputs], object]
+        Args:
+            bad: Valid and malformed tensors to pass.
+
+        Returns:
+            The loss's result; the test expects it to raise.
+        """
+
+
+@dataclasses.dataclass(frozen=True)
+class PairwiseCall(BadCall):
+    """Calls ``pairwise_dist`` on 4-coordinate atoms."""
+
+    @override
+    def call(self, bad: MalformedInputs) -> object:
+        """Make the malformed call.
+
+        Args:
+            bad: Valid and malformed tensors to pass.
+
+        Returns:
+            The pairwise distances.
+        """
+        return pairwise_dist(bad.coords4)
+
+
+@dataclasses.dataclass(frozen=True)
+class SmoothLddtCall(BadCall):
+    """Calls ``smooth_lddt_loss`` on 4-coordinate predictions."""
+
+    @override
+    def call(self, bad: MalformedInputs) -> object:
+        """Make the malformed call.
+
+        Args:
+            bad: Valid and malformed tensors to pass.
+
+        Returns:
+            The loss.
+        """
+        return smooth_lddt_loss(bad.coords4, bad.coords3)
+
+
+@dataclasses.dataclass(frozen=True)
+class ResidueDistoCall(BadCall):
+    """Calls ``distogram_loss_residue`` on logits with no bins."""
+
+    @override
+    def call(self, bad: MalformedInputs) -> object:
+        """Make the malformed call.
+
+        Args:
+            bad: Valid and malformed tensors to pass.
+
+        Returns:
+            The loss.
+        """
+        return distogram_loss_residue(bad.flat, bad.idx)
+
+
+@dataclasses.dataclass(frozen=True)
+class AtomDistoCall(BadCall):
+    """Calls ``distogram_loss_atom`` on logits with no bins."""
+
+    @override
+    def call(self, bad: MalformedInputs) -> object:
+        """Make the malformed call.
+
+        Args:
+            bad: Valid and malformed tensors to pass.
+
+        Returns:
+            The loss.
+        """
+        return distogram_loss_atom(bad.flat, bad.idx)
+
+
+@dataclasses.dataclass(frozen=True)
+class SeqCeCall(BadCall):
+    """Calls ``seq_ce_loss`` with 1-D targets for 3-D logits."""
+
+    @override
+    def call(self, bad: MalformedInputs) -> object:
+        """Make the malformed call.
+
+        Args:
+            bad: Valid and malformed tensors to pass.
+
+        Returns:
+            The loss.
+        """
+        return seq_ce_loss(bad.seq, bad.idx[0])
 
 
 class MalformedScenario(enum.Enum):
@@ -279,11 +370,11 @@ class MalformedScenario(enum.Enum):
         seq_ce: ``seq_ce_loss`` with 1-D targets for 3-D logits.
     """
 
-    pairwise = BadCall(lambda x: pairwise_dist(x.coords4))
-    smooth_lddt = BadCall(lambda x: smooth_lddt_loss(x.coords4, x.coords3))
-    residue_disto = BadCall(lambda x: distogram_loss_residue(x.flat, x.idx))
-    atom_disto = BadCall(lambda x: distogram_loss_atom(x.flat, x.idx))
-    seq_ce = BadCall(lambda x: seq_ce_loss(x.seq, x.idx[0]))
+    pairwise = PairwiseCall()
+    smooth_lddt = SmoothLddtCall()
+    residue_disto = ResidueDistoCall()
+    atom_disto = AtomDistoCall()
+    seq_ce = SeqCeCall()
 
 
 @pytest.fixture

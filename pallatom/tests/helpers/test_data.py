@@ -14,15 +14,16 @@ depends on a random generator except through ``featurize``'s noise, which
 is seeded in its fixtures.
 """
 
+import abc
 import dataclasses
 import enum
 import json
 import pathlib
 import pickle
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from concurrent.futures import Executor
 from math import cos, sin
-from typing import cast
+from typing import cast, override
 
 import numpy as np
 import pytest
@@ -50,7 +51,7 @@ from helpers.data import (
     sinusoidal_encoding,
 )
 from helpers.useful_objects import manual_seed
-from jaxtyping import Float, TypeCheckError
+from jaxtyping import Float, Shaped, TypeCheckError
 from tests.patterns import sine_pattern
 from train.train_config import LoaderConfig as EvalLoaderConfig
 from train.train_config import (
@@ -190,16 +191,136 @@ class Distograms:
 
 
 @dataclasses.dataclass(frozen=True)
-class FieldBreak:
+class FieldBreak(abc.ABC):
     """A featurized field replaced by a tensor with one axis wrong.
 
     Attributes:
         field: Name of the dataclass field to replace.
-        malform: Maps the valid tensor to the malformed one.
     """
 
     field: str
-    malform: Callable[[torch.Tensor], torch.Tensor]
+
+    @abc.abstractmethod
+    def malform(
+        self,
+        tensor: Shaped[torch.Tensor, "..."],
+    ) -> Shaped[torch.Tensor, "..."]:
+        """Map the field's valid tensor to the malformed one.
+
+        Args:
+            tensor: The field's valid value.
+
+        Returns:
+            The malformed replacement.
+        """
+
+
+@dataclasses.dataclass(frozen=True)
+class SelectBreak(FieldBreak):
+    """Keep one index of an axis, removing that axis.
+
+    Attributes:
+        dim: Axis to select from.
+        index: Position along ``dim`` to keep.
+    """
+
+    dim: int
+    index: int
+
+    @override
+    def malform(
+        self,
+        tensor: Shaped[torch.Tensor, "..."],
+    ) -> Shaped[torch.Tensor, "..."]:
+        """Select ``index`` along ``dim``.
+
+        Args:
+            tensor: The field's valid value.
+
+        Returns:
+            ``tensor`` with axis ``dim`` removed.
+        """
+        return tensor.select(self.dim, self.index)
+
+
+@dataclasses.dataclass(frozen=True)
+class DropFirstBreak(FieldBreak):
+    """Remove the first entry of an axis, shortening it by one.
+
+    Attributes:
+        dim: Axis to shorten.
+    """
+
+    dim: int
+
+    @override
+    def malform(
+        self,
+        tensor: Shaped[torch.Tensor, "..."],
+    ) -> Shaped[torch.Tensor, "..."]:
+        """Drop index 0 along ``dim``.
+
+        Args:
+            tensor: The field's valid value.
+
+        Returns:
+            ``tensor`` with ``dim`` one shorter.
+        """
+        return tensor.narrow(self.dim, 1, tensor.shape[self.dim] - 1)
+
+
+@dataclasses.dataclass(frozen=True)
+class KeepFirstBreak(FieldBreak):
+    """Keep only the first entries of an axis.
+
+    Attributes:
+        dim: Axis to cut.
+        count: Number of entries to keep.
+    """
+
+    dim: int
+    count: int
+
+    @override
+    def malform(
+        self,
+        tensor: Shaped[torch.Tensor, "..."],
+    ) -> Shaped[torch.Tensor, "..."]:
+        """Keep the first ``count`` entries along ``dim``.
+
+        Args:
+            tensor: The field's valid value.
+
+        Returns:
+            ``tensor`` with ``dim`` cut to ``count``.
+        """
+        return tensor.narrow(self.dim, 0, self.count)
+
+
+@dataclasses.dataclass(frozen=True)
+class RepeatFirstBreak(FieldBreak):
+    """Append a copy of an axis's first entry, lengthening it by one.
+
+    Attributes:
+        dim: Axis to lengthen.
+    """
+
+    dim: int
+
+    @override
+    def malform(
+        self,
+        tensor: Shaped[torch.Tensor, "..."],
+    ) -> Shaped[torch.Tensor, "..."]:
+        """Append index 0 along ``dim`` to the end.
+
+        Args:
+            tensor: The field's valid value.
+
+        Returns:
+            ``tensor`` with ``dim`` one longer.
+        """
+        return torch.cat([tensor, tensor.narrow(self.dim, 0, 1)], dim=self.dim)
 
 
 class ItemBreak(enum.Enum):
@@ -213,11 +334,11 @@ class ItemBreak(enum.Enum):
         residue_count_drift: ``aa_indices`` has one residue fewer.
     """
 
-    coords_flat = FieldBreak("r_gt", lambda t: t[:, 0])
-    coords_four = FieldBreak("r_gt", lambda t: torch.cat([t, t[:, :1]], -1))
-    element_width = FieldBreak("ref_element", lambda t: t[:, :3])
-    atom_count_drift = FieldBreak("atom5_mask", lambda t: torch.cat([t, t[:1]]))
-    residue_count_drift = FieldBreak("aa_indices", lambda t: t[1:])
+    coords_flat = SelectBreak("r_gt", dim=1, index=0)
+    coords_four = RepeatFirstBreak("r_gt", dim=-1)
+    element_width = KeepFirstBreak("ref_element", dim=1, count=3)
+    atom_count_drift = RepeatFirstBreak("atom5_mask", dim=0)
+    residue_count_drift = DropFirstBreak("aa_indices", dim=0)
 
 
 class BatchBreak(enum.Enum):
@@ -229,9 +350,9 @@ class BatchBreak(enum.Enum):
         batch_drift: ``t_hat`` has one batch item fewer.
     """
 
-    unbatched_ref_pos = FieldBreak("ref_pos", lambda t: t[0])
-    coords_four = FieldBreak("r_gt", lambda t: torch.cat([t, t[..., :1]], -1))
-    batch_drift = FieldBreak("t_hat", lambda t: t[1:])
+    unbatched_ref_pos = SelectBreak("ref_pos", dim=0, index=0)
+    coords_four = RepeatFirstBreak("r_gt", dim=-1)
+    batch_drift = DropFirstBreak("t_hat", dim=0)
 
 
 @dataclasses.dataclass(frozen=True)
