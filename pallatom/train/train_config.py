@@ -73,6 +73,10 @@ class TrainingParams(BaseModel):
             trained parameters. The EMA weights (not the raw trained
             weights) are what get validated during training and loaded for
             inference, matching AlphaFold2/3 convention.
+        self_condition: Build the template from a detached forward pass of
+            the model against the null template, as the sampler does,
+            instead of from the noised ground truth. ``False`` restores the
+            noised ground-truth template for ablations.
     """
 
     model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True)
@@ -88,6 +92,7 @@ class TrainingParams(BaseModel):
     lr_decay_steps: int = Field(default=50_000, gt=0)
     lr_decay_factor: float = Field(default=0.95, gt=0, lt=1)
     ema_decay: float = Field(default=0.999, gt=0, lt=1)
+    self_condition: bool = True
 
 
 class ModelParams(BaseModel):
@@ -151,6 +156,10 @@ class NoiseScheduleParams(BaseModel):
             sigmas.
         P_std: Standard deviation of the log-normal distribution used to sample
             training sigmas.
+        rho: Exponent of the rho-spaced sampling schedule. Lives here rather
+            than on the sampler config because training also needs it: the
+            template weight ``t_normalized`` is the schedule's inverse applied
+            to ``t_hat``, so training and sampling must agree on ``rho``.
     """
 
     model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True)
@@ -160,6 +169,7 @@ class NoiseScheduleParams(BaseModel):
     sigma_min: float = Field(default=4 * 10 ** (-4), gt=0)
     P_mean: float = Field(default=-1.2)
     P_std: float = Field(default=1.5, gt=0)
+    rho: float = Field(default=7.0, gt=0)
 
     @model_validator(mode="after")
     def sigma_min_lt_max(self) -> "NoiseScheduleParams":
