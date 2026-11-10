@@ -26,7 +26,7 @@ import structlog
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from architecture.main_trunk import EMA, MainTrunk
+from architecture.main_trunk import EMA, MainTrunk, PredictedOutputs
 from einops import rearrange, reduce
 from helpers.atom_utils import (
     RESTYPE_NUM,
@@ -49,6 +49,7 @@ from helpers.useful_objects import (
     ThroughputStatistics,
     manual_seed,
 )
+from jaxtyping import Float
 from pydantic import ValidationError
 from structlog.typing import FilteringBoundLogger
 from torch.multiprocessing.spawn import spawn
@@ -78,6 +79,7 @@ from train.train_loop import (
     optimizer_step,
     process_accum_window,
     save_checkpoint,
+    self_conditioned_template,
     swapped_in_ema_weights,
     take_step,
     train,
@@ -2632,3 +2634,211 @@ def test_train_ddp_keeps_ranks_in_lockstep(
         lockstep_scenario.value.expected_steps,
     }
     assert len({digest for _, digest in reported}) == 1
+
+
+# ---------------------------------------------------------------------------
+# self_conditioned_template — the training-side self-conditioning pass
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class TrunkCall:
+    """What the trunk saw on one forward call.
+
+    Attributes:
+        grad_enabled: Whether autograd was on during the call.
+        template: The template distogram the call received.
+    """
+
+    grad_enabled: bool
+    template: Float[torch.Tensor, "B N_res N_res n_templ_bins"]
+
+
+@pytest.fixture
+def recorded_trunk_calls(
+    featurized_batch: FeaturizedBatch,
+    model_params: ModelSetup,
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[TrunkCall]:
+    """Run the self-conditioning pass in train mode and record trunk calls.
+
+    Wraps the real trunk's ``forward`` so each call records its input
+    template and autograd state, then runs unchanged. ``MainTrunk``
+    overrides ``__call__`` to call ``forward`` directly, so module hooks
+    never fire; the instance attribute set here is what ``__call__`` finds.
+    Recording the input checks what the pass feeds the model rather than
+    its binned output, which a small untrained model can leave unchanged at
+    bin resolution. Returns a list because a regression could add forwards.
+
+    Args:
+        featurized_batch: Batch whose noised ground-truth template is a
+            one-hot that must not reach the trunk.
+        model_params: Model and template distogram module.
+        monkeypatch: Installs and later removes the recording ``forward``.
+
+    Returns:
+        One ``TrunkCall`` per trunk forward made by the pass.
+    """
+    calls: list[TrunkCall] = []
+    trunk = cast(MainTrunk, model_params.model)
+    real_forward = trunk.forward
+
+    def recording_forward(batch: FeaturizedBatch) -> PredictedOutputs:
+        """Record the autograd state and template, then run the trunk."""
+        calls.append(
+            TrunkCall(
+                grad_enabled=torch.is_grad_enabled(),
+                template=batch.noised_res_distogram.detach().clone(),
+            ),
+        )
+        return real_forward(batch)
+
+    monkeypatch.setattr(trunk, "forward", recording_forward)
+    _ = trunk.train()
+    with torch.enable_grad():
+        _ = self_conditioned_template(featurized_batch, model_params)
+    return calls
+
+
+def test_self_conditioning_pass_runs_detached_on_null(
+    recorded_trunk_calls: list[TrunkCall],
+) -> None:
+    """The pass makes one trunk call, with autograd off, on the null.
+
+    Autograd must be off even when the caller has it on, or the pass would
+    store a second activation graph. The template must be the all-zero null,
+    not the featurizer's noised ground truth, which leaks true pair geometry
+    the sampler never has. No parametrization: the caller's grad-enabled
+    train mode is the one state in which either property can fail.
+    """
+    assert len(recorded_trunk_calls) == 1
+    assert not recorded_trunk_calls[0].grad_enabled
+    assert not recorded_trunk_calls[0].template.any()
+
+
+@dataclasses.dataclass(frozen=True)
+class TemplatePair:
+    """Templates built from a batch before and after its noisy input moved.
+
+    Attributes:
+        baseline: Template from the unmodified batch.
+        perturbed: Template after ``r_gt_noised`` was scaled and shifted.
+    """
+
+    baseline: Float[torch.Tensor, "B N_res N_res n_templ_bins"]
+    perturbed: Float[torch.Tensor, "B N_res N_res n_templ_bins"]
+
+
+@pytest.fixture
+def template_pair(
+    featurized_batch: FeaturizedBatch,
+    model_params: ModelSetup,
+) -> TemplatePair:
+    """Build the template from a batch, then again with moved coordinates.
+
+    The model runs in eval mode so dropout cannot make the two passes
+    differ on its own. Scaling ``r_gt_noised`` by 2 and shifting it by 1
+    moves every coordinate, so a template built from the prediction moves.
+
+    Args:
+        featurized_batch: Batch the templates are built from.
+        model_params: Model and template distogram module.
+
+    Returns:
+        The baseline and perturbed templates.
+    """
+    _ = model_params.model.eval()
+    perturbed_batch = dataclasses.replace(
+        featurized_batch,
+        r_gt_noised=featurized_batch.r_gt_noised * 2.0 + 1.0,
+    )
+    return TemplatePair(
+        baseline=self_conditioned_template(featurized_batch, model_params),
+        perturbed=self_conditioned_template(perturbed_batch, model_params),
+    )
+
+
+def test_self_conditioned_template_is_binned_prediction(
+    featurized_batch: FeaturizedBatch,
+    template_pair: TemplatePair,
+) -> None:
+    """The template is a one-hot per valid pair and follows the noisy input.
+
+    A one-hot over the bins for every valid residue pair shows the output is
+    a binned structure; changing with ``r_gt_noised`` shows that structure
+    is the model's prediction. No parametrization: the batch's noisy
+    coordinates are the only input the prediction is built from.
+    """
+    residue_mask = featurized_batch.f_pseudo_beta_mask.bool()
+    pair_mask = rearrange(residue_mask, "b i -> b i 1") & rearrange(
+        residue_mask,
+        "b j -> b 1 j",
+    )
+    bin_sums = reduce(template_pair.baseline, "b i j k -> b i j", "sum")
+    assert torch.equal(
+        bin_sums[pair_mask],
+        torch.ones_like(bin_sums[pair_mask]),
+    )
+    assert not torch.equal(template_pair.baseline, template_pair.perturbed)
+
+
+@pytest.fixture
+def self_condition_setup(
+    request: pytest.FixtureRequest,
+    model_params: ModelSetup,
+) -> ModelSetup:
+    """Return ``model_params`` with ``training.self_condition`` overridden.
+
+    Args:
+        request: Carries the ``self_condition`` flag.
+        model_params: Base model setup to copy.
+
+    Returns:
+        A ModelSetup whose config has the requested flag.
+    """
+    base_cfg = model_params.tcfg
+    return dataclasses.replace(
+        model_params,
+        tcfg=base_cfg.model_copy(
+            update={
+                "training": base_cfg.training.model_copy(
+                    update={"self_condition": cast(bool, request.param)},
+                ),
+            },
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "self_condition_setup",
+    [
+        pytest.param(True, id="self_conditioned_template"),
+        pytest.param(False, id="noised_ground_truth_template"),
+    ],
+    indirect=True,
+)
+def test_take_step_trains_template_embedder(
+    featurized_batch: FeaturizedBatch,
+    self_condition_setup: ModelSetup,
+) -> None:
+    """Both template sources leave finite, non-zero template embedder grads.
+
+    The self-conditioning pass is detached, so it must not cut the gradient
+    path of the grad-tracking pass that consumes its template.
+    """
+    trunk = cast(MainTrunk, self_condition_setup.model)
+    _ = trunk.train()
+    trunk.zero_grad()
+    _ = take_step(
+        batch=featurized_batch,
+        model_params=self_condition_setup,
+        train_mode=True,
+    )
+    grads = [
+        p.grad
+        for p in trunk.template_embedder.parameters()
+        if p.grad is not None
+    ]
+    assert grads
+    assert all(torch.isfinite(g).all() for g in grads)
+    assert any(g.any() for g in grads)

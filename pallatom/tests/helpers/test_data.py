@@ -40,6 +40,8 @@ from helpers.data import (
     featurize_batch,
     featurize_single_item,
     make_bucketed_data_loaders,
+    normalized_time_from_sigma,
+    null_template_distogram,
     ref_pos_for_residue,
     sinusoidal_encoding,
 )
@@ -51,6 +53,7 @@ from train.train_config import (
     LoaderConfig as EvalLoaderConfig,
 )
 from train.train_config import (
+    NoiseScheduleParams,
     TrainArgs,
     TrainConfig,
     TrainLoaderConfig,
@@ -2239,3 +2242,96 @@ def test_featurize_single_item_is_importable_from_data() -> None:
 def test_featurize_batch_is_importable_from_data() -> None:
     """featurize_batch is callable and importable from helpers.data."""
     assert callable(featurize_batch)
+
+
+# ---------------------------------------------------------------------------
+# Template weight and null template
+# ---------------------------------------------------------------------------
+
+
+def test_featurized_template_weight_is_normalized_noise_level(
+    featurized_item: FeaturizedItem,
+    tcfg: TrainConfig,
+) -> None:
+    """``t_normalized`` is the normalized noise level of ``t_hat`` everywhere.
+
+    The featurizer used to draw the template weight from ``U(0, 1)``
+    independently of ``t_hat``, which made it pure noise to the template
+    embedder. It must now equal the sampler's definition at every residue
+    pair. No other cases: the item's noise level is the only input.
+    """
+    expected = normalized_time_from_sigma(featurized_item.t_hat, tcfg.noise)
+    assert torch.equal(
+        featurized_item.t_normalized,
+        torch.full_like(featurized_item.t_normalized, expected.item()),
+    )
+
+
+@pytest.fixture
+def noise_schedule() -> NoiseScheduleParams:
+    """Provide the production noise schedule parameters."""
+    return NoiseScheduleParams()
+
+
+@pytest.mark.parametrize(
+    ("sigma_over_data", "expected"),
+    [
+        pytest.param(1e3, 1.0, id="above_sigma_max_clamps_to_1"),
+        pytest.param(1e-6, 0.0, id="below_sigma_min_clamps_to_0"),
+        pytest.param(160.0, 1.0, id="at_sigma_max"),
+        pytest.param(4e-4, 0.0, id="at_sigma_min"),
+    ],
+)
+def test_normalized_time_from_sigma_bounds(
+    noise_schedule: NoiseScheduleParams,
+    sigma_over_data: float,
+    expected: float,
+) -> None:
+    """Sigmas at or past the schedule's bounds map to exactly 0 or 1.
+
+    The lognormal training distribution draws sigmas outside
+    ``[sigma_min, sigma_max]``, so the inverse clamps rather than returning
+    times outside [0, 1].
+    """
+    t = normalized_time_from_sigma(
+        torch.tensor(sigma_over_data * noise_schedule.sigma_data),
+        noise_schedule,
+    )
+    torch.testing.assert_close(t, torch.tensor(expected), atol=1e-6, rtol=0)
+
+
+@pytest.fixture
+def null_template(
+    request: pytest.FixtureRequest,
+) -> Float[torch.Tensor, "B N_res N_res n_templ_bins"]:
+    """Build a null template distogram of the requested shape on the CPU.
+
+    Args:
+        request: Carries the target ``torch.Size``.
+
+    Returns:
+        The output of ``null_template_distogram`` for that shape.
+    """
+    return null_template_distogram(cast(torch.Size, request.param), "cpu")
+
+
+@pytest.mark.parametrize(
+    ("null_template", "shape"),
+    [
+        pytest.param(*[torch.Size((1, 4, 4, 39))] * 2, id="single_sample"),
+        pytest.param(*[torch.Size((3, 7, 7, 19))] * 2, id="batched_19_bins"),
+    ],
+    indirect=["null_template"],
+)
+def test_null_template_distogram_is_all_zero(
+    null_template: Float[torch.Tensor, "B N_res N_res n_templ_bins"],
+    shape: torch.Size,
+) -> None:
+    """The null template has the requested shape, float dtype, and no mass.
+
+    A real template is one-hot on the bin axis; the null must sum to zero
+    there so the trunk can tell "no template" apart from any structure.
+    """
+    assert null_template.shape == shape
+    assert null_template.dtype == torch.float32
+    assert not null_template.any()

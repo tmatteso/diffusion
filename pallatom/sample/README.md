@@ -88,6 +88,11 @@ template distogram change step to step):
   `Distogram` module to get the initial `f_template_distogram` — the
   structural conditioning signal `TemplateEmbedder` consumes (see
   [`architecture/docs/template_embedder.md`](../architecture/docs/template_embedder.md)).
+  With no template, the context instead holds the all-zero
+  `null_template_distogram`, the same "no template" training feeds its
+  detached self-conditioning pass. Binning the all-zero placeholder would
+  put every pair in bin 0, a confident claim that every residue sits within
+  3.25 Å of every other.
 - The reference atom conformer (`ref_pos`, `ref_element`) is tiled from a
   single alanine residue across every position — sampling always starts from
   a sequence-agnostic geometry and lets the model predict both structure and
@@ -137,14 +142,20 @@ For `timestep` in `1 .. total_timesteps - 2`:
    (which just injects the current noisy coordinates/noise level into the
    static context and runs `MainTrunk`):
    - The **first** call denoises `noisy_r_l` using whatever template
-     distogram is already in the context (the one built once in step 1, from
-     the actual template — or lack thereof). Its `r_denoised` output is
+     distogram is already in the context (the one built once in step 1: the
+     real template, or the all-zero null without one). Training runs the
+     same null-template pass before every step, so both see the same
+     template distribution. Its `r_denoised` output is
      converted back to atom37 (`atom5_to_atom37`) and reduced to Cβ
      positions (`atom37_to_cb`), which are fed through the distogram
      function to build a **same-step** self-conditioning template distogram.
    - The **second** call re-denoises the same `noisy_r_l`, this time with
      that freshly-computed self-conditioning distogram substituted in. Its
      `r_denoised`/`seq_logits` are the ones actually used for the ODE step.
+   Both calls pass `normalized_time_from_sigma(t_hat)` as the template
+   weight `t_normalized`, not `t_p`: that is how training defines it, and
+   under churn `t_hat` exceeds `noise_schedule(t_p)`, so `t_p` would
+   understate the noise level.
    This lets the model condition its structural denoising on its own
    preliminary structural guess for the same step — a form of iterative
    refinement within a single diffusion step, at the cost of two forward
@@ -211,6 +222,7 @@ noise schedule (`EDMSampler.noise_schedule`, step 3.1 above):
 | `sigma_data` | `16.0` | Scales the whole noise schedule (`t_hat = sigma_data * (...) ** rho`) and is the EDM preconditioning constant used inside `MainTrunk` to normalise `D_θ`'s input/output regardless of noise level. |
 | `sigma_max` | `160` | The noise level the trajectory starts at (`c_T` at `timestep=0`); must be large enough that `sigma_max`-noised data is indistinguishable from pure Gaussian noise. |
 | `sigma_min` | `4e-4` | The noise level the trajectory ends at; sampling stops just above pure clean data rather than at exactly `sigma=0`, matching EDM's schedule (which is only defined for `sigma > 0`). |
+| `rho` | `7.0` | Exponent in the noise schedule `t_hat = sigma_data * (sigma_min^(1/rho) + t·(sigma_max^(1/rho) - sigma_min^(1/rho)))^rho`. Higher `rho` concentrates more of the `total_timesteps` steps near the *low*-noise end of the schedule, since the schedule is non-linear in `t` — most of diffusion sampling's useful structural refinement happens at low noise, so this spends the step budget where it matters most. It lives here, not on `SamplerParams`, because training also inverts the schedule to compute the template weight. |
 | `P_mean`, `P_std` | `-1.2`, `1.5` | Parameters of the log-normal distribution used to sample *training* noise levels — not used during sampling itself, but part of the same config group since the model and its noise schedule must be trained and sampled with consistent `sigma_data`/`sigma_min`/`sigma_max`. |
 
 ### `sampler` — `SamplerParams`
@@ -220,7 +232,6 @@ The core EDM/DDIM sampler hyperparameters, consumed directly by
 
 | Field | Default | Role in sampling |
 |---|---|---|
-| `rho` | `7.0` | Exponent in the noise schedule `t_hat = sigma_data * (sigma_max^(1/rho) + t·(sigma_min^(1/rho) - sigma_max^(1/rho)))^rho`. Higher `rho` concentrates more of the `total_timesteps` steps near the *low*-noise end of the schedule, since the schedule is non-linear in `t` — most of diffusion sampling's useful structural refinement happens at low noise, so this spends the step budget where it matters most. |
 | `S_churn` | `0.2` | The stochastic noise-injection strength `gamma` used inside the `[S_tmin, S_tmax]` window (step 3.3 above). `0` recovers the fully deterministic ODE sampler; the default `0.2` makes the sampler mildly stochastic (SDE-like), generally improving sample diversity at a small quality cost. |
 | `S_tmin` | `0.01` | Lower bound (in normalized time, `timestep / total_timesteps`) of the window in which churn is applied. |
 | `S_tmax` | `1.0` | Upper bound of the churn window. Together `[S_tmin, S_tmax]` restricts stochastic noise injection to a sub-range of the trajectory — injecting extra noise very close to `sigma_min` tends to hurt rather than help, hence excluding the tail below `S_tmin`. |

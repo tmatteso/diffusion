@@ -30,8 +30,9 @@ from architecture.losses import (
 )
 from architecture.main_trunk import EMA, MainTrunk, PredictedOutputs
 from beartype import beartype
-from einops import reduce
+from einops import rearrange, reduce
 from helpers.alignment import kabsch_align
+from helpers.atom_utils import ATOMS_PER_RES, atom5_to_atom37, atom37_to_cb
 from helpers.context_managers import (
     DDPNoSync,
     DistProcessGroup,
@@ -43,6 +44,7 @@ from helpers.data import (
     FeaturizedBatch,
     build_distogram_module,
     make_bucketed_data_loaders,
+    null_template_distogram,
 )
 from helpers.useful_objects import (
     ComponentNorms,
@@ -192,6 +194,66 @@ def save_checkpoint(
 
 
 @jaxtyped(typechecker=beartype)
+def self_conditioned_template(
+    batch: FeaturizedBatch,
+    model_params: ModelSetup,
+) -> Float[torch.Tensor, "B N_res N_res n_templ_bins"]:
+    """Build the self-conditioning template from a detached forward pass.
+
+    Runs the trunk once under ``no_grad`` against the null template, then
+    bins the Cβ distogram of its prediction. This is the template the
+    sampler feeds the trunk at every step. Building it from noised
+    ground-truth coordinates instead trains the model to trust a template
+    whose errors are isotropic Gaussian, while at inference its errors are
+    the model's own.
+
+    Calls the unwrapped ``MainTrunk`` rather than the DDP wrapper so the
+    pass cannot touch the gradient reducer. The trunk keeps whatever mode
+    the caller set, so dropout stays on in training, as in AF2 recycling.
+
+    Args:
+        batch: Micro-batch already moved to the target device.
+        model_params: Bundled model and the template distogram module.
+
+    Returns:
+        One-hot template distogram over ``n_templ_bins`` distance bins.
+    """
+    trunk: MainTrunk = (
+        cast(MainTrunk, model_params.model.module)
+        if isinstance(model_params.model, DDP)
+        else model_params.model
+    )
+    with torch.no_grad():
+        pred: PredictedOutputs = trunk(
+            dataclasses.replace(
+                batch,
+                noised_res_distogram=null_template_distogram(
+                    batch.noised_res_distogram.shape,
+                    batch.noised_res_distogram.device,
+                ),
+            ),
+        )
+        atom37_positions, atom37_mask = atom5_to_atom37(
+            rearrange(
+                pred.r_denoised,
+                "b (n a) d -> b n a d",
+                a=ATOMS_PER_RES,
+            ),
+            rearrange(
+                batch.atom5_mask,
+                "b (n a) -> b n a",
+                a=ATOMS_PER_RES,
+            ).float(),
+        )
+        cb_positions, _ = atom37_to_cb(atom37_positions, atom37_mask)
+        template, _ = model_params.distogram_template(
+            cb_positions,
+            batch.f_pseudo_beta_mask.bool(),
+        )
+    return template
+
+
+@jaxtyped(typechecker=beartype)
 def take_step(
     *,
     batch: FeaturizedBatch,
@@ -234,6 +296,14 @@ def take_step(
     )
 
     with StepContext(model=model_params.model, train_mode=train_mode):
+        if model_params.tcfg.training.self_condition:
+            featurized_batch = dataclasses.replace(
+                featurized_batch,
+                noised_res_distogram=self_conditioned_template(
+                    featurized_batch,
+                    model_params,
+                ),
+            )
         # Elucidating diffusion model loss weighting:
         lambda_sigma_loss_weight: Float[torch.Tensor, "B"] = (
             featurized_batch.t_hat**2 + sigma_data**2
