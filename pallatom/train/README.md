@@ -135,6 +135,14 @@ eval):
 2. **`StepContext`** puts the model in eval mode with gradients disabled when
    `train_mode=False` (used by `evaluate`), or leaves it in train mode
    (dropout active, gradients enabled) otherwise.
+   - **Self-conditioning** (when `training.self_condition`):
+     `self_conditioned_template` runs the unwrapped trunk once under
+     `no_grad` against the all-zero null template, bins the Cβ distogram of
+     its prediction, and substitutes that for the batch's template. This is
+     the template the sampler builds at every step; the featurizer's
+     noised ground-truth template would teach the model to trust isotropic
+     Gaussian errors it never sees at inference. Costs one extra forward
+     per micro-batch. Validation goes through the same path.
 3. `model_params.model(featurized_batch)` runs the full `MainTrunk` forward
    pass, producing `PredictedOutputs` (see
    [`architecture/docs/main_trunk.md`](../architecture/docs/main_trunk.md)).
@@ -234,6 +242,7 @@ path passed via `--config`. It aggregates:
 | `accumulated_token_budget` | `4096` | Global (pre-`world_size`-division) token budget per optimizer step — see [Gradient accumulation](#gradient-accumulation-under-a-token-budget). |
 | `lr_decay_steps` | `50_000` | Optimizer steps between each `StepLR` decay. |
 | `lr_decay_factor` | `0.95` | Multiplicative LR decay applied every `lr_decay_steps` steps. |
+| `self_condition` | `True` | Build the template from a detached forward pass against the null template, as the sampler does (see `take_step`). `False` feeds the featurizer's noised ground-truth template instead, for ablations. |
 
 ### `model` — `ModelParams`
 
@@ -251,7 +260,11 @@ of [`pallatom/sample/README.md`](../sample/README.md)); during training,
 `P_mean`/`P_std`
 additionally parameterise the log-normal distribution each training sample's
 noise level `t_hat` is drawn from (upstream in the data pipeline), which is
-what `lambda_sigma_loss_weight` in `take_step` is computed from.
+what `lambda_sigma_loss_weight` in `take_step` is computed from. `rho` sets
+the template weight: the featurizer stores
+`t_normalized = normalized_time_from_sigma(t_hat)`, the inverse of the
+sampler's schedule, so the template embedder sees the same noise-level
+signal in training and sampling.
 
 ### `distogram_res` / `distogram_atom` — `ResidueDistogramParams` / `AtomDistogramParams`
 

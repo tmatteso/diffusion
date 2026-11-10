@@ -36,6 +36,8 @@ from helpers.data import (
     Distogram,
     FeaturizedBatch,
     build_distogram_module,
+    normalized_time_from_sigma,
+    null_template_distogram,
     ref_pos_for_residue,
 )
 from jaxtyping import Bool, Float, Int, Num, jaxtyped
@@ -398,7 +400,10 @@ def build_sampling_context(
 
     Args:
         pdb_file_path: Path to a PDB file used as template; None for no
-            template (zero-initialised coordinates are used instead).
+            template. Without a template the atom context is built from
+            zero-initialised coordinates and the template distogram is the
+            all-zero null from ``null_template_distogram``, the same null
+            training uses for its detached self-conditioning pass.
         atom_distogram_fn: Distogram for atom-level pairwise distances.
         templ_distogram_fn: Distogram for template Cβ pairwise distances.
         residue_number: Number of residues to generate.
@@ -438,6 +443,14 @@ def build_sampling_context(
             batch_size=B,
             device=device,
         )
+    template_distogram: Float[torch.Tensor, "B N_res N_res n_templ_bins"] = (
+        template_context.f_template_distogram
+        if pdb_file_path
+        else null_template_distogram(
+            template_context.f_template_distogram.shape,
+            device,
+        )
+    )
 
     # ── Ala reference conformer tiled over all residues ──────────────────────
     ala_ref_pos: Float[torch.Tensor, "5 3"] = ref_pos_for_residue("ALA").to(
@@ -506,7 +519,7 @@ def build_sampling_context(
             dtype=torch.long,
             device=device,
         ),
-        noised_res_distogram=template_context.f_template_distogram,
+        noised_res_distogram=template_distogram,
         f_pseudo_beta_mask=template_context.f_pseudo_beta_mask,
         r_gt=aa_ctx.r_gt,
         r_gt_noised=r_input,  # spoofed inputs, modified during sampling
@@ -528,7 +541,7 @@ class EDMSampler:
                 are replaced at every denoising step
     sigma_min : float  smallest noise level  (paper: 0.002)
     sigma_max : float  largest  noise level  (paper: 80.0)
-    rho       : float  schedule exponent     (paper: 7.0)
+    rho       : float  schedule exponent, read from noise_params (paper: 7.0)
     S_churn   : float  stochastic noise injected per step (0 = deterministic)
     S_tmin    : float  only inject noise while S_tmin <= timestep / ddim_steps
     S_tmax    : float  <= S_tmax; schedule time in [0, 1], 1 = maximum noise,
@@ -551,7 +564,8 @@ class EDMSampler:
         self.sigma_data: float = noise_params.sigma_data
         self.sigma_min: float = noise_params.sigma_min
         self.sigma_max: float = noise_params.sigma_max
-        self.rho: float = sampler_params.rho
+        self.noise_params: NoiseScheduleParams = noise_params
+        self.rho: float = noise_params.rho
         self.S_churn: float = sampler_params.S_churn
         self.S_tmin: float = sampler_params.S_tmin
         self.S_tmax: float = sampler_params.S_tmax
@@ -617,9 +631,9 @@ class EDMSampler:
             f_template_distogram: Optional template pairwise distance
                 distribution to inject into the batch; pass None to keep the
                 distogram already stored in the context.
-            normalized_timestep: Diffusion time in (0, 1] as a scalar tensor
-                (1 is maximum noise), broadcast to a (B, N_res, N_res) pair
-                field.
+            normalized_timestep: Normalized noise level of ``t_hat`` in
+                [0, 1] as a scalar tensor (1 is maximum noise), broadcast to a
+                (B, N_res, N_res) pair field.
             t_hat: Current noise level sigma as a scalar tensor.
 
         Returns:
@@ -727,6 +741,14 @@ class EDMSampler:
             # Select temporarily increased noise level t_hat
             t_hat: Float[torch.Tensor, ""] = c_T * (gamma + 1)
 
+            # The template weight is the normalized noise level of t_hat,
+            # computed exactly as training computes it. Under churn it sits
+            # above t_p, which understates the noise the model sees.
+            t_template: Float[torch.Tensor, ""] = normalized_time_from_sigma(
+                t_hat,
+                self.noise_params,
+            )
+
             # Add new noise to move from t_p to t_hat
             eps = torch.randn((shape), device=self.device)
             # zero the center of mass of the noise, over valid atoms only.
@@ -735,13 +757,14 @@ class EDMSampler:
                 self.S_noise * torch.sqrt(t_hat**2 - c_T**2) * eps
             )
 
-            # update the self condition feature
-            # the self-condition template distogram is init earlier.
+            # Self-conditioning pass against the context's template: the null
+            # template when sampling unconditionally, matching the detached
+            # pass training runs before every step.
             r_denoised, seq_logits = self.denoise(
                 r_noisy=noisy_r_l,
                 f_template_distogram=None,
                 t_hat=t_hat,
-                normalized_timestep=t_p,
+                normalized_timestep=t_template,
             )
 
             atom37_positions: Float[torch.Tensor, "B N_res 37 3"]
@@ -770,7 +793,7 @@ class EDMSampler:
                 r_noisy=noisy_r_l,
                 f_template_distogram=f_template_distogram,
                 t_hat=t_hat,
-                normalized_timestep=t_p,
+                normalized_timestep=t_template,
             )
             # Evaluate dx/dt at t_hat
             delta_l = (noisy_r_l - r_denoised) / t_hat

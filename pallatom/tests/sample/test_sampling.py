@@ -22,7 +22,11 @@ from helpers.atom_utils import (
     ResidueRepresentation,
     restype_order,
 )
-from helpers.data import Distogram, FeaturizedBatch
+from helpers.data import (
+    Distogram,
+    FeaturizedBatch,
+    normalized_time_from_sigma,
+)
 from helpers.useful_objects import manual_seed
 from jaxtyping import Bool, Float, Int, TypeCheckError, jaxtyped
 from sample.sample_config import SamplerParams
@@ -475,11 +479,12 @@ def noise_schedule_curve(
         zero_denoiser_mock,
         context,
         templ_disto,
-        SamplerParams(rho=scenario.rho),
+        SamplerParams(),
         NoiseScheduleParams(
             sigma_data=scenario.sigma_data,
             sigma_min=scenario.sigma_min,
             sigma_max=scenario.sigma_max,
+            rho=scenario.rho,
         ),
     )
     times = torch.linspace(0.0, 1.0, n_grid_points)
@@ -560,20 +565,19 @@ def test_noise_schedule_different_rho_gives_different_intermediate_values(
     must be identical across schedules; only the intermediate levels may
     differ.
     """
-    noise = NoiseScheduleParams(sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX)
     s1 = EDMSampler(
         zero_denoiser_mock,
         context,
         templ_disto,
-        SamplerParams(rho=7.0),
-        noise,
+        SamplerParams(),
+        NoiseScheduleParams(sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX, rho=7.0),
     )
     s2 = EDMSampler(
         zero_denoiser_mock,
         context,
         templ_disto,
-        SamplerParams(rho=3.0),
-        noise,
+        SamplerParams(),
+        NoiseScheduleParams(sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX, rho=3.0),
     )
     ts = torch.linspace(0.1, 0.9, 10)
     vals1 = torch.stack([s1.noise_schedule(t) for t in ts])
@@ -1543,11 +1547,17 @@ def unconditional_ctx(
 def test_unconditional(unconditional_ctx: FeaturizedBatch) -> None:
     """Verify unconditional (all-alanine, zero-coordinate) context.
 
-    Checks that the distogram peaks at bin 0, the pseudo-β mask is fully set,
-    ``aa_indices`` are all alanine (0), every atom5 entry is unmasked, and the
-    ground-truth coordinates are zero.
+    Checks that the template distogram is the all-zero null rather than a
+    binned structure, the pseudo-β mask is fully set, ``aa_indices`` are all
+    alanine (0), every atom5 entry is unmasked, and the ground-truth
+    coordinates are zero.
+
+    The bin-0 check pins the specific regression: binning the zero
+    coordinates puts every pair below the first edge, a one-hot in bin 0
+    that claims every residue sits within 3.25 Å of every other.
     """
-    assert (unconditional_ctx.noised_res_distogram.argmax(dim=-1) == 0).all()
+    assert not unconditional_ctx.noised_res_distogram.any()
+    assert not unconditional_ctx.noised_res_distogram[..., 0].all()
     assert (unconditional_ctx.f_pseudo_beta_mask == 1).all()
     assert (unconditional_ctx.aa_indices == 0).all()
     assert unconditional_ctx.atom5_mask.all()
@@ -1645,6 +1655,202 @@ def test_template_context_wrong_shape() -> None:
             ),  # missing bins dim
             f_pseudo_beta_mask=torch.zeros(1, N_RES, dtype=torch.long),
         )
+
+
+# ---------------------------------------------------------------------------
+# normalized_time_from_sigma — inverse of EDMSampler.noise_schedule
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class ScheduleInverseCase:
+    """Noise schedule parameters for one inversion scenario.
+
+    Attributes:
+        sigma_data: Data scale multiplying the whole schedule.
+        sigma_min: Minimum noise level, in units of ``sigma_data``.
+        sigma_max: Maximum noise level, in units of ``sigma_data``.
+        rho: Schedule exponent.
+    """
+
+    sigma_data: float
+    sigma_min: float
+    sigma_max: float
+    rho: float
+
+
+class ScheduleInverseScenario(Enum):
+    """Schedules that ``normalized_time_from_sigma`` must invert exactly.
+
+    Members:
+        production: The training and sampling defaults.
+        low_rho: rho of 3, so the inverse cannot hard-code rho = 7.
+        unit_data: sigma_data of 1 with the EDM paper's sigma range, so the
+            inverse cannot hard-code sigma_data or the sigma bounds.
+    """
+
+    production = ScheduleInverseCase(16.0, 4e-4, 160.0, 7.0)
+    low_rho = ScheduleInverseCase(16.0, 4e-4, 160.0, 3.0)
+    unit_data = ScheduleInverseCase(1.0, 0.002, 80.0, 7.0)
+
+
+@dataclasses.dataclass(frozen=True)
+class ScheduleRoundTrip:
+    """Times pushed through the schedule and back.
+
+    Attributes:
+        times: Normalized times fed to ``noise_schedule``.
+        recovered: ``normalized_time_from_sigma`` of each resulting sigma.
+    """
+
+    times: Float[torch.Tensor, "T"]
+    recovered: Float[torch.Tensor, "T"]
+
+
+@pytest.fixture
+def schedule_round_trip(
+    schedule_inverse_scenario: ScheduleInverseScenario,
+    zero_denoiser_mock: MagicMock,
+    context: FeaturizedBatch,
+    templ_disto: Distogram,
+) -> ScheduleRoundTrip:
+    """Push a grid of times through the sampler's schedule and invert it.
+
+    Args:
+        schedule_inverse_scenario: Schedule to invert, parametrized directly
+            by the requesting test.
+        zero_denoiser_mock: Denoiser required to build the sampler; unused.
+        context: Sampling context required to build the sampler.
+        templ_disto: Template distogram module required by the sampler.
+
+    Returns:
+        The input time grid and the times recovered from its sigmas.
+    """
+    case = schedule_inverse_scenario.value
+    noise = NoiseScheduleParams(
+        sigma_data=case.sigma_data,
+        sigma_min=case.sigma_min,
+        sigma_max=case.sigma_max,
+        rho=case.rho,
+    )
+    sampler = EDMSampler(
+        zero_denoiser_mock,
+        context,
+        templ_disto,
+        SamplerParams(),
+        noise,
+    )
+    times = torch.linspace(0.0, 1.0, 21, dtype=torch.float64)
+    recovered = torch.stack(
+        [
+            normalized_time_from_sigma(sampler.noise_schedule(t), noise)
+            for t in times
+        ],
+    )
+    return ScheduleRoundTrip(times=times, recovered=recovered)
+
+
+@pytest.mark.parametrize(
+    "schedule_inverse_scenario",
+    list(ScheduleInverseScenario),
+    ids=[case.name for case in ScheduleInverseScenario],
+)
+def test_normalized_time_inverts_noise_schedule(
+    schedule_round_trip: ScheduleRoundTrip,
+) -> None:
+    """``normalized_time_from_sigma(noise_schedule(t))`` recovers ``t``.
+
+    This pins training and sampling to the same definition of the template
+    weight: any disagreement in ``rho``, ``sigma_data`` or the sigma bounds
+    between the inverse and the schedule breaks the round trip.
+    """
+    torch.testing.assert_close(
+        schedule_round_trip.recovered,
+        schedule_round_trip.times,
+        atol=1e-9,
+        rtol=0.0,
+    )
+
+
+@dataclasses.dataclass(frozen=True)
+class ChurnedTemplateTimes:
+    """Loop times and the template weights churn turns them into.
+
+    Attributes:
+        t_p: The sampler loop's normalized times, ``0.1, 0.2, ..., 0.9``.
+        template_time: ``normalized_time_from_sigma`` of each ``t_p``'s
+            scheduled sigma after churn raises it by ``1 + gamma``.
+    """
+
+    t_p: Float[torch.Tensor, "T"]
+    template_time: Float[torch.Tensor, "T"]
+
+
+@pytest.fixture
+def churned_template_times(
+    churn_gamma: float,
+    zero_denoiser_mock: MagicMock,
+    context: FeaturizedBatch,
+    templ_disto: Distogram,
+) -> ChurnedTemplateTimes:
+    """Template weights for churned noise levels along a grid of ``t_p``.
+
+    Raises each scheduled sigma by ``1 + gamma``, as the sampler's churn
+    does, and maps it back to normalized time with the production schedule.
+
+    Args:
+        churn_gamma: Churn amount, parametrized directly by the requesting
+            test.
+        zero_denoiser_mock: Denoiser required to build the sampler; unused.
+        context: Sampling context required to build the sampler.
+        templ_disto: Template distogram module required by the sampler.
+
+    Returns:
+        The ``t_p`` grid and the template weight at each of its points.
+    """
+    noise = NoiseScheduleParams()
+    sampler = EDMSampler(
+        zero_denoiser_mock,
+        context,
+        templ_disto,
+        SamplerParams(),
+        noise,
+    )
+    t_p = torch.linspace(0.1, 0.9, 9, dtype=torch.float64)
+    template_time = torch.stack(
+        [
+            normalized_time_from_sigma(
+                sampler.noise_schedule(t) * (1 + churn_gamma),
+                noise,
+            )
+            for t in t_p
+        ],
+    )
+    return ChurnedTemplateTimes(t_p=t_p, template_time=template_time)
+
+
+@pytest.mark.parametrize(
+    "churn_gamma",
+    [
+        pytest.param(0.2, id="pallatom_churn"),
+        pytest.param(1.0, id="doubled_sigma"),
+    ],
+)
+def test_churn_raises_template_time_above_t_p(
+    churned_template_times: ChurnedTemplateTimes,
+) -> None:
+    """Churn makes the template weight exceed the loop's ``t_p``.
+
+    This is why the sampler no longer passes ``t_p`` as the template weight:
+    churn raises ``t_hat`` above ``noise_schedule(t_p)``, so ``t_p``
+    understates the noise the model actually sees on every churned step.
+
+    Args:
+        churned_template_times: The ``t_p`` grid and its churned weights.
+    """
+    assert (
+        churned_template_times.template_time > churned_template_times.t_p
+    ).all()
 
 
 @pytest.fixture
