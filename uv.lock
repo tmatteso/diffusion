@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = "==3.12.*"
 resolution-markers = [
     "sys_platform == 'win32'",
@@ -387,11 +387,11 @@ dependencies = [
     { name = "pydantic" },
     { name = "structlog" },
     { name = "torch", version = "2.11.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "sys_platform == 'darwin'" },
-    { name = "torch", version = "2.11.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "sys_platform != 'darwin'" },
+    { name = "torch", version = "2.11.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(platform_machine != 'x86_64' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'linux')" },
     { name = "torchaudio", version = "2.11.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "sys_platform == 'darwin'" },
-    { name = "torchaudio", version = "2.11.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "sys_platform != 'darwin'" },
+    { name = "torchaudio", version = "2.11.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(platform_machine != 'x86_64' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'linux')" },
     { name = "torchvision", version = "0.26.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "sys_platform == 'darwin'" },
-    { name = "torchvision", version = "0.26.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "sys_platform != 'darwin'" },
+    { name = "torchvision", version = "0.26.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(platform_machine != 'x86_64' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'linux')" },
     { name = "tqdm" },
     { name = "uvicorn", extra = ["standard"] },
     { name = "wandb" },
@@ -428,9 +428,9 @@ requires-dist = [
     { name = "py3dmol", specifier = ">=2.0.0" },
     { name = "pydantic", specifier = ">=2.0.0" },
     { name = "structlog", specifier = ">=24.0.0" },
-    { name = "torch", specifier = "==2.11.0", index = "https://download.pytorch.org/whl/cpu" },
-    { name = "torchaudio", specifier = "==2.11.0", index = "https://download.pytorch.org/whl/cpu" },
-    { name = "torchvision", specifier = "==0.26.0", index = "https://download.pytorch.org/whl/cpu" },
+    { name = "torch", marker = "platform_machine != 'x86_64' or sys_platform != 'linux'", specifier = "==2.11.0", index = "https://download.pytorch.org/whl/cpu" },
+    { name = "torchaudio", marker = "platform_machine != 'x86_64' or sys_platform != 'linux'", specifier = "==2.11.0", index = "https://download.pytorch.org/whl/cpu" },
+    { name = "torchvision", marker = "platform_machine != 'x86_64' or sys_platform != 'linux'", specifier = "==0.26.0", index = "https://download.pytorch.org/whl/cpu" },
     { name = "tqdm", specifier = ">=4.0.0" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.30.0" },
     { name = "wandb", specifier = ">=0.18.0" },
