@@ -7,13 +7,12 @@ contraction directions relate), PairformerBlock with and without the single
 track, PairformerStack as a composition of its blocks, and the output,
 gradient, batch-independence and shape contracts shared by all of them.
 
-Inputs come from the shared ``make_pattern`` fixture and every module is
+Inputs come from ``tests.patterns.sine_pattern`` and every module is
 built under a fixed seed, so each test is reproducible on its own.
 """
 
 import dataclasses
 import enum
-import functools
 from collections.abc import Callable
 from typing import cast
 
@@ -30,10 +29,10 @@ from architecture.pairformer_stack import (
 from einops import rearrange, reduce
 from helpers.useful_objects import manual_seed
 from jaxtyping import Bool, Float, TypeCheckError
-from tests.conftest import PatternFactory
+from tests.patterns import sine_pattern
 
 type Pair = Float[torch.Tensor, "B N_res N_res c"]
-type PairCall = Callable[[Pair], Pair]
+type PairModule = TMO | TMI | PairformerStack
 
 
 @dataclasses.dataclass(frozen=True)
@@ -96,6 +95,31 @@ class TriangleScenario(enum.Enum):
 
 
 @dataclasses.dataclass(frozen=True)
+class SymmetryCase:
+    """Whether the pair input is symmetric and what that implies.
+
+    Attributes:
+        symmetric_input: Average ``z`` with its transpose before the call.
+        directions_agree: Whether outgoing and incoming must then match.
+    """
+
+    symmetric_input: bool
+    directions_agree: bool
+
+
+class SymmetryScenario(enum.Enum):
+    """Pair inputs for comparing the two triangle directions.
+
+    Members:
+        asymmetric: ``z`` as built, so the two directions differ.
+        symmetric: ``z`` symmetrised, so the two directions agree.
+    """
+
+    asymmetric = SymmetryCase(symmetric_input=False, directions_agree=False)
+    symmetric = SymmetryCase(symmetric_input=True, directions_agree=True)
+
+
+@dataclasses.dataclass(frozen=True)
 class MalformedPair:
     """A reshaping of a valid pair tensor that breaks the shape contract.
 
@@ -139,34 +163,31 @@ def dims() -> PairDims:
 
 
 @pytest.fixture
-def z(dims: PairDims, make_pattern: PatternFactory) -> Pair:
+def z(dims: PairDims) -> Pair:
     """Return a deterministic, asymmetric pair embedding.
 
     Args:
         dims: Tensor sizes.
-        make_pattern: Sine-pattern factory.
 
     Returns:
         ``(B, N_res, N_res, c)`` tensor with distinct batch items.
     """
-    return make_pattern((dims.batch, dims.n_res, dims.n_res, dims.c), 0.37)
+    return sine_pattern((dims.batch, dims.n_res, dims.n_res, dims.c), 0.37)
 
 
 @pytest.fixture
 def s(
     dims: PairDims,
-    make_pattern: PatternFactory,
 ) -> Float[torch.Tensor, "B N_res c_res"]:
     """Return a deterministic single embedding for the single-track block.
 
     Args:
         dims: Tensor sizes.
-        make_pattern: Sine-pattern factory.
 
     Returns:
         ``(B, N_res, c_res)`` tensor.
     """
-    return make_pattern((dims.batch, dims.n_res, dims.c_res), 0.53)
+    return sine_pattern((dims.batch, dims.n_res, dims.c_res), 0.53)
 
 
 @pytest.fixture
@@ -273,34 +294,40 @@ def stack(dims: PairDims) -> PairformerStack:
     return PairformerStack(dims.c, dims.n_blocks, dims.n_heads).eval()
 
 
-@pytest.fixture
-def stack_call(stack: PairformerStack) -> PairCall:
-    """Return ``stack`` bound to ``s=None``, which makes it return ``z`` alone.
+def pair_forward(module: PairModule, pair: Pair) -> Pair:
+    """Run ``module`` on ``pair`` alone and return its output pair tensor.
+
+    ``PairformerStack`` takes the single embedding first, and passing
+    ``s=None`` makes it process and return the pair tensor alone; the two
+    triangle modules take the pair tensor only.
 
     Args:
-        stack: Pair-only stack.
+        module: Triangle module or pair-only stack under test.
+        pair: Pair embedding.
 
     Returns:
-        Callable from a pair tensor to the stack's output pair tensor.
+        The module's output pair tensor, shaped like ``pair``.
     """
-    return cast(PairCall, functools.partial(stack, None))
+    if isinstance(module, PairformerStack):
+        return module(None, pair)
+    return module(pair)
 
 
 @pytest.fixture
-def pair_call(request: pytest.FixtureRequest) -> PairCall:
-    """Return the ``z -> z`` fixture named by the indirect param.
+def pair_module(request: pytest.FixtureRequest) -> PairModule:
+    """Return the module fixture named by the indirect param.
 
     A pair-only ``PairformerBlock`` is covered through the stack, which
     ``test_stack_applies_its_blocks_in_order`` ties to its blocks.
 
     Args:
         request: Pytest request carrying ``"tmo"``, ``"tmi"`` or
-            ``"stack_call"``, the name of the fixture to use.
+            ``"stack"``, the name of the fixture to use.
 
     Returns:
-        Callable from a pair tensor to the module's output pair tensor.
+        The module under test.
     """
-    return cast(PairCall, request.getfixturevalue(cast(str, request.param)))
+    return cast(PairModule, request.getfixturevalue(cast(str, request.param)))
 
 
 @pytest.fixture
@@ -327,6 +354,36 @@ def changed_mask(
 
 
 @pytest.fixture
+def symmetry_scenario(request: pytest.FixtureRequest) -> SymmetryScenario:
+    """Return the ``SymmetryScenario`` member routed in via indirect param.
+
+    Args:
+        request: Pytest request carrying the scenario in ``param``.
+
+    Returns:
+        The scenario under test.
+    """
+    return cast(SymmetryScenario, request.param)
+
+
+@pytest.fixture
+def direction_input(symmetry_scenario: SymmetryScenario, z: Pair) -> Pair:
+    """Return ``z``, or ``z`` averaged with its transpose, per the scenario.
+
+    Args:
+        symmetry_scenario: Whether the input must be symmetric.
+        z: Asymmetric pair embedding.
+
+    Returns:
+        A pair embedding that is symmetric in ``i`` and ``j`` exactly
+        when the scenario asks for one.
+    """
+    if not symmetry_scenario.value.symmetric_input:
+        return z
+    return (z + rearrange(z, "b i j c -> b j i c")) / 2
+
+
+@pytest.fixture
 def malformed_scenario(request: pytest.FixtureRequest) -> MalformedScenario:
     """Return the ``MalformedScenario`` member routed in via indirect param.
 
@@ -340,67 +397,72 @@ def malformed_scenario(request: pytest.FixtureRequest) -> MalformedScenario:
 
 
 @pytest.mark.parametrize(
-    "pair_call",
-    ["tmo", "tmi", "stack_call"],
+    "pair_module",
+    ["tmo", "tmi", "stack"],
     ids=["outgoing", "incoming", "stack"],
     indirect=True,
 )
-def test_output_shape_dtype_and_finite(z: Pair, pair_call: PairCall) -> None:
+def test_output_shape_dtype_and_finite(
+    z: Pair,
+    pair_module: PairModule,
+) -> None:
     """Each module maps ``(B, N, N, c)`` float32 to the same, all finite.
 
     Args:
         z: Valid pair embedding.
-        pair_call: Module under test.
+        pair_module: Module under test.
     """
     with torch.no_grad():
-        out = pair_call(z)
+        out = pair_forward(pair_module, z)
     assert out.shape == z.shape
     assert out.dtype == z.dtype
     assert torch.isfinite(out).all()
 
 
 @pytest.mark.parametrize(
-    "pair_call",
-    ["tmo", "tmi", "stack_call"],
+    "pair_module",
+    ["tmo", "tmi", "stack"],
     ids=["outgoing", "incoming", "stack"],
     indirect=True,
 )
-def test_gradient_reaches_input(z: Pair, pair_call: PairCall) -> None:
+def test_gradient_reaches_input(z: Pair, pair_module: PairModule) -> None:
     """The summed output has a finite, nonzero gradient with respect to ``z``.
 
     Args:
         z: Valid pair embedding.
-        pair_call: Module under test.
+        pair_module: Module under test.
     """
     leaf = z.clone().requires_grad_()
-    out = reduce(pair_call(leaf), "b i j c -> ", "sum")
+    out = reduce(pair_forward(pair_module, leaf), "b i j c -> ", "sum")
     (grad,) = torch.autograd.grad(out, leaf)
     assert torch.isfinite(grad).all()
     assert torch.count_nonzero(grad) > 0
 
 
 @pytest.mark.parametrize(
-    "pair_call",
-    ["tmo", "tmi", "stack_call"],
+    "pair_module",
+    ["tmo", "tmi", "stack"],
     ids=["outgoing", "incoming", "stack"],
     indirect=True,
 )
-def test_batch_items_are_independent(z: Pair, pair_call: PairCall) -> None:
+def test_batch_items_are_independent(z: Pair, pair_module: PairModule) -> None:
     """Running each batch item alone matches its slice of the batched run.
 
     Args:
         z: Pair embedding whose batch items differ.
-        pair_call: Module under test.
+        pair_module: Module under test.
     """
     with torch.no_grad():
-        batched = pair_call(z)
-        separate = torch.cat([pair_call(z[i : i + 1]) for i in range(len(z))])
+        batched = pair_forward(pair_module, z)
+        separate = torch.cat(
+            [pair_forward(pair_module, z[i : i + 1]) for i in range(len(z))],
+        )
     torch.testing.assert_close(batched, separate, atol=1e-5, rtol=0)
 
 
 @pytest.mark.parametrize(
-    "pair_call",
-    ["tmo", "tmi", "stack_call"],
+    "pair_module",
+    ["tmo", "tmi", "stack"],
     ids=["outgoing", "incoming", "stack"],
     indirect=True,
 )
@@ -412,19 +474,19 @@ def test_batch_items_are_independent(z: Pair, pair_call: PairCall) -> None:
 )
 def test_forward_rejects_malformed_pair(
     z: Pair,
-    pair_call: PairCall,
+    pair_module: PairModule,
     malformed_scenario: MalformedScenario,
 ) -> None:
     """Each module's jaxtyping contract rejects every malformed layout.
 
     Args:
         z: Valid pair embedding to cut the malformed one from.
-        pair_call: Module under test.
+        pair_module: Module under test.
         malformed_scenario: How to break the shape.
     """
     malformed = malformed_scenario.value.malform(z)
     with pytest.raises(TypeCheckError):
-        _ = pair_call(malformed)
+        _ = pair_forward(pair_module, malformed)
 
 
 @pytest.mark.parametrize(
@@ -436,7 +498,6 @@ def test_forward_rejects_malformed_pair(
 def test_triangle_single_entry_reaches_exactly_its_row_and_column(
     triangle: TMO | TMI,
     z: Pair,
-    make_pattern: PatternFactory,
     changed_mask: Bool[torch.Tensor, "N_res N_res"],
 ) -> None:
     """Perturbing ``z[0, 1]`` changes exactly the positions the scenario lists.
@@ -449,11 +510,10 @@ def test_triangle_single_entry_reaches_exactly_its_row_and_column(
     Args:
         triangle: Module under test.
         z: Valid pair embedding.
-        make_pattern: Builds the channel-varying perturbation.
         changed_mask: Output positions that must change.
     """
     perturbed = z.clone()
-    perturbed[:, 0, 1] += 5 * make_pattern((z.shape[-1],), 1.3)
+    perturbed[:, 0, 1] += 5 * sine_pattern((z.shape[-1],), 1.3)
     with torch.no_grad():
         moved = ~torch.isclose(triangle(perturbed), triangle(z), atol=1e-6)
     changed = reduce(moved.float(), "b i j c -> i j", "max") > 0
@@ -576,18 +636,16 @@ def test_triangle_c_hidden_sets_internal_width_only(
 
 
 @pytest.mark.parametrize(
-    ("symmetrise", "expect_equal"),
-    [
-        pytest.param(False, False, id="asymmetric_differs"),
-        pytest.param(True, True, id="symmetric_matches"),
-    ],
+    "symmetry_scenario",
+    list(SymmetryScenario),
+    ids=[case.name for case in SymmetryScenario],
+    indirect=True,
 )
 def test_directions_agree_only_on_symmetric_input(
     tmo: TMO,
     tmi: TMI,
-    z: Pair,
-    symmetrise: bool,  # noqa: FBT001
-    expect_equal: bool,  # noqa: FBT001
+    symmetry_scenario: SymmetryScenario,
+    direction_input: Pair,
 ) -> None:
     """With shared weights, outgoing equals incoming iff ``z`` is symmetric.
 
@@ -599,15 +657,15 @@ def test_directions_agree_only_on_symmetric_input(
     Args:
         tmo: Outgoing module.
         tmi: Incoming module with ``tmo``'s weights.
-        z: Asymmetric pair embedding.
-        symmetrise: Whether to average ``z`` with its transpose first.
-        expect_equal: Whether the two outputs must match.
+        symmetry_scenario: Whether the input is symmetric and whether the
+            two directions must then agree.
+        direction_input: Pair embedding built for ``symmetry_scenario``.
     """
-    z_t = rearrange(z, "b i j c -> b j i c")
-    x = (z + z_t) / 2 if symmetrise else z
     with torch.no_grad():
-        agree = torch.allclose(tmo(x), tmi(x), atol=1e-4)
-    assert agree == expect_equal
+        out_tmo = tmo(direction_input)
+        out_tmi = tmi(direction_input)
+    agree = torch.allclose(out_tmo, out_tmi, atol=1e-4)
+    assert agree == symmetry_scenario.value.directions_agree
 
 
 def test_incoming_equals_outgoing_of_transpose_with_gates_pinned(

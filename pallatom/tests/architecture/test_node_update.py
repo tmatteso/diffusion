@@ -26,7 +26,7 @@ from architecture.node_update import (
 from einops import rearrange, reduce, repeat
 from helpers.useful_objects import manual_seed
 from jaxtyping import Float, Int, TypeCheckError
-from tests.conftest import PatternFactory
+from tests.patterns import sine_pattern
 
 type Single = Float[torch.Tensor, "B N_res c_res"]
 type Pair = Float[torch.Tensor, "B N_res N_j c_pair"]
@@ -100,6 +100,30 @@ class SparseInputs:
     s: Single
     z: Pair
     neighbor_idx: Int[torch.Tensor, "B N_res K"]
+
+
+@dataclasses.dataclass(frozen=True)
+class BetaCase:
+    """Whether the sparse attention call passes a ``beta`` bias.
+
+    Attributes:
+        pass_beta: Pass a zero ``beta`` aligned with ``neighbor_idx`` when
+            true, and ``None`` when false.
+    """
+
+    pass_beta: bool
+
+
+class BetaScenario(enum.Enum):
+    """Sparse attention calls with and without a ``beta`` bias.
+
+    Members:
+        no_beta: The bare sparse path, with ``beta=None``.
+        beta: The sparse path that also adds a ``(B, N, K)`` ``beta``.
+    """
+
+    no_beta = BetaCase(pass_beta=False)
+    beta = BetaCase(pass_beta=True)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -177,29 +201,26 @@ def dropout_node(dims: NodeDims) -> NodeUpdate:
 @pytest.fixture
 def inputs(
     dims: NodeDims,
-    make_pattern: PatternFactory,
 ) -> NodeInputs:
     """Build dense-path inputs from three unrelated sine patterns.
 
     Args:
         dims: Input sizes.
-        make_pattern: Sine-pattern factory.
 
     Returns:
         ``s``, ``t`` and ``z`` for ``N_j = N_res``.
     """
     b, n = dims.batch, dims.n_res
     return NodeInputs(
-        s=make_pattern((b, n, dims.c_res), 0.37),
-        t=make_pattern((b, n, dims.c_res), 0.53),
-        z=make_pattern((b, n, n, dims.c_pair), 0.71),
+        s=sine_pattern((b, n, dims.c_res), 0.37),
+        t=sine_pattern((b, n, dims.c_res), 0.53),
+        z=sine_pattern((b, n, n, dims.c_pair), 0.71),
     )
 
 
 @pytest.fixture
 def sparse_inputs(
     dims: NodeDims,
-    make_pattern: PatternFactory,
 ) -> SparseInputs:
     """Build sparse-path inputs with 20 nodes and 6 neighbours each.
 
@@ -207,7 +228,6 @@ def sparse_inputs(
 
     Args:
         dims: Channel sizes and batch.
-        make_pattern: Sine-pattern factory.
 
     Returns:
         Inputs for ``AttentionPairBias`` with ``neighbor_idx``.
@@ -218,9 +238,9 @@ def sparse_inputs(
         + rearrange(torch.arange(k), "k -> 1 k")
     ) % n
     return SparseInputs(
-        a=make_pattern((b, n, dims.c_res), 0.37),
-        s=make_pattern((b, n, dims.c_res), 0.53),
-        z=make_pattern((b, n, k, dims.c_pair), 0.71),
+        a=sine_pattern((b, n, dims.c_res), 0.37),
+        s=sine_pattern((b, n, dims.c_res), 0.53),
+        z=sine_pattern((b, n, k, dims.c_pair), 0.71),
         neighbor_idx=repeat(window, "n k -> b n k", b=b),
     )
 
@@ -240,6 +260,27 @@ def module_call(
         The chosen module as a callable.
     """
     return cast(ModuleCall, getattr(modules, cast(str, request.param)))
+
+
+@pytest.fixture
+def sparse_beta(
+    request: pytest.FixtureRequest,
+    sparse_inputs: SparseInputs,
+) -> Float[torch.Tensor, "B N K"] | None:
+    """Return the ``beta`` the routed-in ``BetaScenario`` asks for.
+
+    Args:
+        request: Pytest request carrying a ``BetaScenario`` member.
+        sparse_inputs: Inputs whose ``neighbor_idx`` sets the shape.
+
+    Returns:
+        Zeros shaped like ``neighbor_idx`` when the scenario passes a
+        ``beta``, otherwise ``None``.
+    """
+    scenario = cast(BetaScenario, request.param)
+    if not scenario.value.pass_beta:
+        return None
+    return torch.zeros(sparse_inputs.neighbor_idx.shape)
 
 
 @pytest.fixture
@@ -280,12 +321,17 @@ def test_dense_output_shape_dtype_and_finite(
     assert torch.isfinite(out).all()
 
 
-@pytest.mark.parametrize("with_beta", [False, True], ids=["no_beta", "beta"])
+@pytest.mark.parametrize(
+    "sparse_beta",
+    list(BetaScenario),
+    ids=[case.name for case in BetaScenario],
+    indirect=True,
+)
 def test_sparse_output_shape_and_finite(
     dims: NodeDims,
     modules: NodeModules,
     sparse_inputs: SparseInputs,
-    with_beta: bool,  # noqa: FBT001
+    sparse_beta: Float[torch.Tensor, "B N K"] | None,
 ) -> None:
     """Sparse attention with ``K < N_res`` returns finite ``(B, N, c_res)``.
 
@@ -296,12 +342,11 @@ def test_sparse_output_shape_and_finite(
         dims: Channel sizes.
         modules: Holds the attention module.
         sparse_inputs: Inputs with 6 of 20 neighbours per query.
-        with_beta: Whether to pass a zero ``beta`` of shape ``(B, N, K)``.
+        sparse_beta: Zero ``beta`` of shape ``(B, N, K)``, or ``None``.
     """
     x = sparse_inputs
-    beta = torch.zeros(x.neighbor_idx.shape) if with_beta else None
     with torch.no_grad():
-        out = modules.attn(x.a, x.s, x.z, beta, x.neighbor_idx)
+        out = modules.attn(x.a, x.s, x.z, sparse_beta, x.neighbor_idx)
     assert out.shape == (dims.batch, x.a.shape[1], dims.c_res)
     assert torch.isfinite(out).all()
 
@@ -506,7 +551,6 @@ def test_attention_beta_single_open_key_changes_output(
 def test_attention_beta_constant_shift_is_invariant(
     modules: NodeModules,
     inputs: NodeInputs,
-    make_pattern: PatternFactory,
     shift: float,
 ) -> None:
     """Adding a constant to every ``beta`` entry leaves the output unchanged.
@@ -516,10 +560,9 @@ def test_attention_beta_constant_shift_is_invariant(
     Args:
         modules: Holds the attention module.
         inputs: Dense inputs.
-        make_pattern: Builds a non-uniform base ``beta``.
         shift: Constant added to ``beta``.
     """
-    beta = make_pattern(inputs.z.shape[:-1], 0.29)
+    beta = sine_pattern(inputs.z.shape[:-1], 0.29)
     x = inputs
     with torch.no_grad():
         base = modules.attn(x.s, x.t, x.z, beta=beta)
