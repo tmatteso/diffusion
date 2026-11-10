@@ -11,10 +11,10 @@ Inputs come from ``tests.patterns.sine_pattern`` and every module is
 built under a fixed seed, so each test is reproducible on its own.
 """
 
+import abc
 import dataclasses
 import enum
-from collections.abc import Callable
-from typing import cast
+from typing import cast, override
 
 import pytest
 import torch
@@ -120,14 +120,67 @@ class SymmetryScenario(enum.Enum):
 
 
 @dataclasses.dataclass(frozen=True)
-class MalformedPair:
-    """A reshaping of a valid pair tensor that breaks the shape contract.
+class MalformedPair(abc.ABC):
+    """A reshaping of a valid pair tensor that breaks the shape contract."""
+
+    @abc.abstractmethod
+    def malform(self, pair: Pair) -> Float[torch.Tensor, "..."]:
+        """Map a valid ``(B, N, N, c)`` tensor to a malformed one.
+
+        Args:
+            pair: Valid pair embedding.
+
+        Returns:
+            The malformed tensor.
+        """
+
+
+@dataclasses.dataclass(frozen=True)
+class SelectIndex(MalformedPair):
+    """Keep one index of an axis, removing that axis.
 
     Attributes:
-        malform: Maps a valid ``(B, N, N, c)`` tensor to a malformed one.
+        dim: Axis to select from.
+        index: Position along ``dim`` to keep.
     """
 
-    malform: Callable[[Pair], Float[torch.Tensor, "..."]]
+    dim: int
+    index: int
+
+    @override
+    def malform(self, pair: Pair) -> Float[torch.Tensor, "..."]:
+        """Select ``index`` along ``dim``.
+
+        Args:
+            pair: Valid pair embedding.
+
+        Returns:
+            ``pair`` with axis ``dim`` removed.
+        """
+        return pair.select(self.dim, self.index)
+
+
+@dataclasses.dataclass(frozen=True)
+class DropFirst(MalformedPair):
+    """Remove the first entry of an axis, shortening it by one.
+
+    Attributes:
+        dim: Axis to shorten.
+    """
+
+    dim: int
+
+    @override
+    def malform(self, pair: Pair) -> Float[torch.Tensor, "..."]:
+        """Drop index 0 along ``dim``.
+
+        Args:
+            pair: Valid pair embedding.
+
+        Returns:
+            ``pair`` with ``dim`` one shorter.
+        """
+        return pair.narrow(self.dim, 1, pair.shape[self.dim] - 1)
 
 
 class MalformedScenario(enum.Enum):
@@ -139,9 +192,9 @@ class MalformedScenario(enum.Enum):
         non_square: ``(B, N, N - 1, c)``; the two residue axes differ.
     """
 
-    missing_batch = MalformedPair(lambda z: z[0])
-    missing_channel = MalformedPair(lambda z: z[..., 0])
-    non_square = MalformedPair(lambda z: z[:, :, 1:])
+    missing_batch = SelectIndex(dim=0, index=0)
+    missing_channel = SelectIndex(dim=-1, index=0)
+    non_square = DropFirst(dim=2)
 
 
 @pytest.fixture
