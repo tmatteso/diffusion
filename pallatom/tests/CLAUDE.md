@@ -3,6 +3,28 @@
 ## Structure
 
 - Write all tests as **module-level functions** (`def test_...`). Never group tests inside a class.
+- **Do not write closures.** A closure is a function defined inside another function that reads one of the outer function's local variables, such as a nested `def reduced(metric_class)` inside a worker that uses the worker's `rank`, or a fixture returning `lambda: case.convert(positions, mask)`. The captured variable is a hidden input: the inner function's signature does not show it, and the function cannot be called, imported or tested on its own. This rule covers fixtures, helpers, workers and tests alike:
+  - Never define a function inside another function, whether or not it captures anything. Define it at module level and pass every input as a parameter, as `reduce_at_rank(metric_class, rank)` in `test_useful_objects.py` does.
+  - Never write a `lambda` that reads a local variable of the enclosing function.
+  - When a fixture needs to build different data for different cases, use an `indirect=True` factory fixture that reads `request.param`. Do not return an inner builder function.
+
+  Existing closures in the suite are not a pattern to extend. Leaving them alone is fine, but rewrite any closure in code you touch.
+- **Do not write thunks or use `functools.partial`.** A thunk is a zero-argument callable that wraps a call so it runs later, such as a fixture returning `lambda: constructor(**kwargs)` for the test to call inside `pytest.raises`. Both thunks and `partial` objects hide what is being called behind an indirection the reader has to unwrap. A fixture returns data (a tensor, a dataclass or a custom object), never a callable:
+  - **Code expected to raise:** fixtures return the inputs, and the test makes the call that raises directly inside `with pytest.raises(...)`. That call is the test's Act step, so it is the one exception to the rule below against constructing objects inside a test. To break one field's contract, take a valid instance from a fixture and swap in the bad value with `dataclasses.replace`, which rebuilds the object through its `@jaxtyped` `__init__`. See `test_metrics_reject_non_scalar_field` in `test_useful_objects.py`, which takes the `metrics_of_ones` and `vector_field` fixtures:
+
+    ```python
+    with pytest.raises(TypeCheckError):
+        _ = dataclasses.replace(
+            metrics_of_ones,
+            **{vector_field.name: vector_field.value},
+        )
+    ```
+  - **Mock `side_effect`:** pass a module-level function by name (`side_effect=zero_forward`), with every input it needs taken from the call's own arguments.
+  - **Library APIs that demand a callable** (for example `LambdaLR`'s `lr_lambda`): do not rebuild the call in the test with `partial`. Move the construction into a named library function (such as a `build_scheduler(optimizer, config)` in `train/train_loop.py`) and have the test call that, so the test exercises the same code as training.
+
+  Existing thunks and `functools.partial` calls are not a pattern to extend. Rewrite any in code you touch.
+- **Do not cast a class to `Callable[..., T]` to call it.** A line such as `constructor: Callable[..., TensorAccumulatorMixin] = metric_cls` exists only to call a `type[...]` with arbitrary `**kwargs`, and the `...` turns off argument checking. It is the `Any` ban in disguise. Build instances through the class's own typed API instead: explicit keyword construction (`ThroughputStatistics(avg_batch_size=..., ...)`), a classmethod such as `zero_init`, or `dataclasses.replace` on an existing instance. See `metrics_filled_with` in `test_useful_objects.py`.
+- **Never give a test a `bool` parameter or fixture, and never silence ruff's boolean-trap rules with `# noqa: FBT001`.** A `bool` says nothing about what each case means, and the `noqa` is an inline comment the guide already bans. Give the two cases an enum whose member values are a frozen dataclass, pass it with `indirect=True`, and have the test read the named field. Write the dataclass with a keyword argument, as in `ProcessGroupCase(group_active=False)`, because a positional `ProcessGroupCase(False)` trips ruff's `FBT003`. See `ProcessGroup`, `ProcessGroupCase` and the `process_group` fixture in `test_useful_objects.py`, used by `test_all_reduce_mean_keeps_values_on_one_process`. Existing `# noqa: FBT001` suppressions are not a pattern to extend.
 - Use **`pytest` fixtures** for all shared tensors and inputs. Prefer factory fixtures over hard coded data fixtures. Factory fixtures construct data fixtures from input arguments. Use indirect=True for `@pytest.mark.parametrize` to pass parameters directly from the test function to fixture factory. Data fixtures should return a single `torch.Tensor`, dataclass,  custom object. Avoid fixtures that return dicts, tuples, or other composite builtin types. Fixtures may depend on other fixtures via argument injection — prefer composing small fixtures over writing large monolithic ones.
 - Brainstorm with the Arrange-Act-Assert (AAA) Pattern: Always structure your thoughts using this triad to define exactly what you are testing: Arrange: Set up the exact state of the world, initial inputs, and necessary mocks.Act: Perform the specific function, method, or API call you are testing.Assert: Verify the exact outcome (return values, exceptions, or side effects).
 - Aggressively use the `@pytest.mark.parametrize` marker for tests. Instead of writing 10 different test functions for 10 different inputs, use the @pytest.mark.parametrize decorator to cover base cases, boundaries, and edge cases in a single, readable function. Add ids so failures to the parameterized tests tell a story.
@@ -48,7 +70,7 @@
 - A great test suite is reliable and order-independent. Brainstorm potential hidden dependencies between your tests. If your tests rely on global states or network calls, design them to use monkeypatch to isolate environments securely.
 - Avoid Mocking as much as possible. Functional tests and integration tests are always superior to highly mocked unit tests.
 - Data Pipelines, deep learning models, file input and output, training and sampling scripts, all MUST have End to End tests to validate the entire workflow.
-- All tests must take at least one fixture as input. If a pytest does not use `@pytest.mark.parametrize`, justify why this test should test no other edge cases. Never construct objects to test or expected outputs to tests againt inside a test. Use pytest fixtures and `@pytest.mark.parametrize`.
+- All tests must take at least one fixture as input. If a pytest does not use `@pytest.mark.parametrize`, justify why this test should test no other edge cases. Never construct objects to test or expected outputs to tests againt inside a test. Use pytest fixtures and `@pytest.mark.parametrize`. The one exception is a call expected to raise: make it inside `with pytest.raises(...)` in the test body, using inputs from fixtures (see the thunk rule above).
 ## Type checking and shape contracts
 
 - Annotate helper functions with **`jaxtyping`** (`Float`, `Int`, `Bool`, etc.) and `@jaxtyped(typechecker=beartype)` so shape contracts are verified at call time.
