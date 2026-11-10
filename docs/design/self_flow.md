@@ -1,78 +1,159 @@
-# Design: Self-Flow dual-timestep self-distillation for pallatom
+# Design: Self-Flow and noise-schedule shifting for pallatom
 
-**Status:** Draft, for discussion. No code changes in this PR.
-**Reference:** Chefer, Esser et al., *Self-Supervised Flow Matching for
-Scalable Multi-Modal Synthesis* (Black Forest Labs, arXiv
-[2603.06507](https://arxiv.org/abs/2603.06507), March 2026).
+**Status:** Draft, for discussion. This PR contains only this document.
+
+This doc proposes two related changes to pallatom training:
+
+- **Self-Flow** (dual-timestep self-distillation from an EMA teacher).
+- **Noise-schedule shifting** (where the training and sampling noise levels
+  sit).
+
+It explains the design, then gives the order in which to land PRs and run
+experiments, with a go/no-go gate after each stage.
+
+**References:**
+
+- Chefer, Esser et al., *Self-Supervised Flow Matching for Scalable
+  Multi-Modal Synthesis*, Black Forest Labs, arXiv
+  [2603.06507](https://arxiv.org/abs/2603.06507), March 2026.
+- Esser et al., *Scaling Rectified Flow Transformers for High-Resolution
+  Image Synthesis*, ICML 2024, arXiv
+  [2403.03206](https://arxiv.org/abs/2403.03206), §5.3.2.
+- Black Forest Labs, *FLUX.2: Analyzing and Enhancing the Latent Space of
+  FLUX*, [techblog](https://bfl.ai/techblog/representation-comparison/),
+  November 2025.
 
 ## 1. Summary
 
-Self-Flow adds a self-supervised term to diffusion training. Each step builds
-two views of one example:
+Self-Flow trains a shallow layer of the model to match a deeper layer of its
+EMA copy. The student sees an input where each residue is noised at one of
+two sampled levels. The teacher sees every residue at the lower level. To
+match the teacher, the student has to infer clean structure from noisy
+context.
 
-- **Student view.** Every token is noised at one of two sampled noise levels,
-  chosen per token by a random mask.
-- **Teacher view.** Every token is noised at the *lower* of the two levels.
+In pallatom, the matching is one extra term in the intermediate-loss loop:
+the Kabsch-aligned MSE between student decoder unit 2 and EMA-teacher decoder
+unit 6 (`0.3·K` and `0.7·K` with `K_unit = 8`). Most of the work is
+elsewhere: making the noise level per residue rather than per protein.
 
-The teacher is the EMA copy of the model. A shallow student layer is trained to
-match a deeper teacher layer. Because the teacher sees the cleaner input, the
-student has to infer clean structure from noisy context. The paper reports
-faster convergence than REPA and does not need an external encoder.
+Noise-schedule shifting matters for two reasons:
 
-pallatom already has the main pieces:
+- The BFL FLUX.2 study shows that comparing two methods at one fixed noise
+  distribution can rank them the wrong way round.
+- Representation objectives like Self-Flow shift where the best noise level
+  sits.
 
-| Self-Flow needs | pallatom already has |
-|---|---|
-| EMA teacher weights | `EMA` in `architecture/main_trunk.py`, updated on every optimizer step |
-| Per-layer outputs | `intermediate_denoised_coord_stack` (one entry per decoder unit) |
-| A loss on per-layer outputs | `med_loss` (Kabsch-aligned MSE plus CE for each block) |
-| Per-token time conditioning | `TimeFourierEmbedding` already takes `log t̂` with shape `[B, N_res]` (it is a scalar broadcast today) |
+So every comparison below is made at each run's own best `P_mean`. A
+length-dependent shift is evaluated as a separate, later question.
 
-The proposal adds one more intermediate-loss term. It compares student
-decoder unit 2 (`0.3·K`) with EMA-teacher decoder unit 6 (`0.7·K`), using the
-Kabsch-aligned MSE we already have. The training input becomes a mixed-noise
-student view plus a cleaner teacher view.
+### Roadmap at a glance
 
-## 2. What the paper does
+| Stage | Lands | Runs | Question | Gate to continue |
+|---|---|---|---|---|
+| 0 | PR 1: sampler `α` multiplier | sampling-`α` sweep; baseline `P_mean` sweep | Where are today's best training and sampling noise levels? | none (reference numbers) |
+| 1 | PR 2: per-residue σ refactor | none | Is the refactor behaviour-preserving? | bitwise regression tests pass |
+| 2 | PR 3: dual-timestep featurizer | `dual-t` × 3 `P_mean` | Does mixed per-residue noise alone hurt? | `dual-t` ≥ `baseline` |
+| 3 | PR 4: EMA teacher + Arm A loss | `sf-coords` × 3 `P_mean` | Does coordinate-space Self-Flow help? | `sf-coords` > `dual-t` |
+| 4 | none | Self-Flow ablations | Which `R_M`, layer pair and λ weighting? | none (pick defaults) |
+| 5 | PR 5: Arm B (conditional) | `sf-latents` | Does the paper's representation-space version do better? | only if Stage 3 is flat |
+| 6 | PR 6: length-dependent shift | `β` sweep, then a 2×2 | Should the noise level grow with protein length? | none |
 
-The facts below were checked against the paper text (Sec. 3.3, 3.4, 4.4,
+Stages 0 and 1 can proceed in parallel: Stage 0 needs only a small sampler
+change and config edits.
+
+## 2. Background
+
+### 2.1 Self-Flow
+
+The facts below were checked against the paper text (Sec. 3.3, 3.4, 4.4;
 App. A.3, B, H).
 
-1. **Two timesteps.** Draw `t, s ~ p(t)` independently from the usual training
-   distribution.
-2. **Per-token mask.** `M = {i : u_i < R_M}` with `u_i ~ U(0,1)`, which is an
-   independent Bernoulli(`R_M`) draw per token. `R_M ≤ 0.5`. The paper uses
-   `R_M = 0.25` for images, `0.5` for audio and `0.1` for video ("due to
-   significant temporal redundancies"). It is applied to every sample. There is
-   no per-sample gate.
-3. **Per-token noise level.** `τ_i = s` if `i ∈ M`, otherwise `t`. Then
-   `x_τ = diag(1−τ)·x0 + diag(τ)·x1`. The model gets a per-token timestep
-   vector `t ∈ R^N` in place of a scalar.
-4. **Teacher input.** All tokens are noised at `τ_min = min(t, s)`. The
-   notation implies the same noise sample `x1` as the student view. The paper
-   does not say this explicitly.
-5. **Teacher weights.** The EMA copy (decay 0.9999), which is also the
-   evaluation model.
-6. **Representation loss.**
-   `L_rep = −E[cos(h_θ(student layer 0.3D), teacher layer 0.7D)]`.
-   `h_θ` is a small MLP projection head on the student only. ℓ1 was tried and
-   was unstable as feature norms grew.
-7. **Total loss.** `L = L_gen + γ·L_rep` with a fixed `γ = 0.8`. γ is not
-   ablated.
-8. **Ablations.** Removing `L_rep` costs more than 4 FID. Removing the masking
-   but keeping `L_rep` costs more than 1 FID. The dual-timestep schedule alone,
-   with no `L_rep`, gives a small gain. Results are stable across layer
-   choices near 0.3D/0.7D. A shallow teacher layer hurts, and a deep student
-   layer hurts generation.
-9. **Cost.** One extra teacher forward pass with no gradients. The paper gives
-   no overhead number.
+- **Two timesteps.** Draw `t, s ~ p(t)` independently from the usual
+  training distribution.
+- **Per-token mask.** Each token is masked independently with probability
+  `R_M ≤ 0.5`: a Bernoulli draw per token, not a fixed count. The paper uses
+  `R_M = 0.25` for images, `0.5` for audio and `0.1` for video ("due to
+  significant temporal redundancies"). It applies the schedule to every
+  sample.
+- **Per-token noise level.** `τ_i = s` for masked tokens, otherwise `t`. The
+  model is conditioned on the per-token vector `τ ∈ R^N`, not a scalar.
+- **Teacher.** The EMA copy of the model (decay 0.9999), which is also the
+  evaluation model. Its input has all tokens at `τ_min = min(t, s)`. The
+  notation implies the teacher and student share the same noise sample; the
+  paper does not say so explicitly.
+- **Loss.** `L = L_gen + γ·L_rep`, with `γ = 0.8` fixed and
+  `L_rep = −cos(h(student layer 0.3D), teacher layer 0.7D)`. `h` is a small
+  MLP head on the student only. ℓ1 was unstable as feature norms grew.
+- **Ablations.**
+  - Removing `L_rep` costs more than 4 FID.
+  - Removing the masking but keeping `L_rep` costs more than 1 FID.
+  - The dual-timestep schedule alone gives a small gain.
+  - Results are stable for layer choices near 0.3D/0.7D.
+- **Cost.** One extra no-grad teacher forward pass. The paper reports no
+  overhead number.
 
-## 3. Mapping to pallatom
+### 2.2 Noise-schedule shifting
+
+Both shifting papers use the same shift,
+`t' = α·t / (1 + (α−1)·t)`, with the rule of thumb `α = √(m/n)`. They apply
+it along different axes:
+
+| | Esser et al. (SD3) | BFL FLUX.2 study |
+|---|---|---|
+| Axis | number of **tokens** (resolution) | **channels per token** (dimension of the representation), with tokens fixed at 256 |
+| m, n | pixel counts | channels per token (SD-VAE's 16 as baseline) |
+| Chosen by | derived, then tuned (α = 3 at 1024²) | swept `α ∈ {1, 1.78, 2.95, 4.63, 6.93}`, separately for training and sampling |
+
+The common principle: **the right noise level depends on how redundant the
+representation is.** With more redundant tokens or channels, a given noise
+level destroys less information, so the schedule should move toward more
+noise.
+
+**The shift in EDM terms.** A rectified-flow input `(1−t)·x0 + t·ε`, divided
+by `(1−t)`, is `x0 + σ·ε` with `σ = t/(1−t)`. Substituting `t'` gives
+
+```
+σ' = α · σ
+```
+
+So the shift is a multiplicative rescale of σ. Since `ln σ = logit(t)`, our
+log-normal sampler over σ is exactly a logit-normal over t. A shift by α is
+then `P_mean += ln α`. The BFL study found that a shifted logit-normal always
+beat a shifted uniform, so we are already in the preferred family, and any
+shift is a change to `P_mean` alone.
+
+**BFL findings that shape the plan:**
+
+1. **The fixed-shift ranking can be wrong.** With each representation at its
+   own best shift, RAE beat FLUX.2 (gFID 3.10 vs 3.70). Without shifting, the
+   order reversed. The best vs worst training shift changed FID by 61–86%.
+   → §4.1: compare runs at their own best `P_mean`.
+2. **REPA lowers the best shift** ("generally results in a small reduction
+   of the optimal shifting value"). Self-Flow is a REPA-style objective.
+   → Self-Flow runs get their own `P_mean` sweep.
+3. **The best sampling shift is above the best training shift** for every
+   representation, and is "very dependent on the number of sampling steps
+   and choice of sampler." → Stage 0 adds a sampling-only sweep.
+4. **`√(m/n)` is only a starting point.** It matched RAE (`√(768/16)` =
+   6.93) but not FLUX.2, which preferred 4.63 against a predicted 2.83. The
+   study attributes the gap to FLUX.2's higher intrinsic dimension, i.e. less
+   redundancy across channels. → Shifts are swept, never computed (§3.7, §6).
+
+### 2.3 What pallatom already has
+
+| Self-Flow needs | pallatom has |
+|---|---|
+| EMA teacher weights | `EMA` in `architecture/main_trunk.py`, updated every optimizer step |
+| Per-layer outputs | `intermediate_denoised_coord_stack`, one entry per decoder unit |
+| A loss on per-layer outputs | `med_loss`: Kabsch-aligned MSE plus CE per unit |
+| Per-token time conditioning | `TimeFourierEmbedding` already takes `log t̂` as `[B, N_res]` (a broadcast scalar today) |
+| A logit-normal noise distribution | the EDM log-normal over σ (§2.2) |
+
+## 3. Design
 
 ### 3.1 Notation
 
-pallatom uses EDM, not rectified flow, so "timestep" here means the noise
-level `σ` (`t_hat` in code):
+pallatom uses EDM, so "timestep" means the noise level σ (`t_hat` in code):
 
 ```
 x_σ = x0 + σ · ε,        σ = σ_data · exp(N(P_mean, P_std²))
@@ -81,73 +162,77 @@ x_σ = x0 + σ · ε,        σ = σ_data · exp(N(P_mean, P_std²))
 The tokens are **residues**. All 5 atoms of a residue share that residue's
 `σ_i`. Masking happens at residue level, never atom level.
 
-### 3.2 Training-time algorithm
-
-For each item in `featurize_single_item`:
-
-1. Draw `σ_s, σ_t` independently from the existing log-normal.
-2. Draw `m ~ Bernoulli(R_M)` of length `N_res`, and set
-   `σ_i = where(m_i, σ_s, σ_t)`. This is the **ρ vector** from the original
-   notes.
-3. Draw a single `ε ~ N(0, I)` of shape `[N_atom, 3]`, shared by both views.
-4. Student coordinates: `r_student = r_gt + center(σ_atom ⊙ ε)`, where
-   `σ_atom = repeat(σ_res, "n -> (n a)", a=5)`. This is the
-   "diagonalize ρ and multiply by the noise" step.
-5. Teacher coordinates: `r_teacher = r_gt + center(σ_min · ε)` with
-   `σ_min = min(σ_s, σ_t)`.
-6. Build the self-conditioning template distogram **separately for each
-   view**, from that view's noised Cβ.
-
-Step 6 is where Self-Flow fits pallatom unusually well. The template distogram
-for pair `(i, j)` now carries noise from both `σ_i` and `σ_j`. Some regions of
-the pair map are sharp and others are blurred, which acts as span-masking of
-the distogram for free.
-
-**Centering detail.** Today we compute `t_hat · (ε − CoM(ε))`. With
-per-residue σ, `σ_i · (ε_i − CoM(ε))` does not have zero centre of mass.
-Center *after* scaling: `n = σ_atom ⊙ ε`, then `n − CoM(n)`. For uniform σ the
-two forms are identical, so the baseline is unchanged.
-
-#### 3.2.1 Train/inference mismatch
-
-With `R_M = 0.25`, the chance that no residue in a protein is masked is
-`0.75^N_res`. That is about 6·10⁻⁶ at `N_res = 50`. So under the
-dual-timestep schedule the student essentially never trains on uniform σ, yet
-every sampling step uses uniform σ. The paper applies the schedule to every
-sample and reports no problem on images. pallatom is more exposed to this,
-because per-residue σ also shapes the self-conditioning template distogram
-pair by pair.
-
-`SelfFlowParams.apply_prob` is the fraction of samples that get the
-dual-timestep schedule. The rest use `R_M = 0`, so the student and teacher
-inputs are identical. That case is the paper's "no masking, keep `L_rep`"
-ablation, so it is still a well-defined training signal. The default is 1.0,
-matching the paper. 0.5 is the first fallback if `dual-t` underperforms
-`baseline` (§6, §9.2). The uniform-σ validation run detects the mismatch, and
-this knob addresses it.
-
-### 3.3 Model changes (per-residue σ)
+### 3.2 Per-residue σ (PR 2)
 
 `t_hat` changes from `Float[Tensor, "B"]` to `Float[Tensor, "B N_res"]`
 everywhere. Wherever it is used, it is broadcast to atoms with
 `repeat(t_hat, "b n -> b (n a)", a=atoms_per_res)`.
 
-| Site (`main_trunk.py`) | Today | With per-residue σ |
+| Site | Today | With per-residue σ |
 |---|---|---|
-| Step 1, `c_in` (`denom`) | `[B]` | `[B, N_atom]`, per-atom scaling of `r_input` |
-| Step 3, `TimeFourierEmbedding` | `repeat(log t̂, "b -> b n")` | pass `0.25·log(t_hat)` directly, already `[B, N_res]` |
-| Step 14, `c_skip` / `c_out` (`w_gt`, `w_upd`) | `"b -> b 1 1"` | `"b n_atom -> b n_atom 1"` |
+| `main_trunk.py` step 1, `c_in` (`denom`) | `[B]` | `[B, N_atom]`: per-atom scaling of `r_input` |
+| `main_trunk.py` step 3, `TimeFourierEmbedding` | `repeat(log t̂, "b -> b n")` | pass `0.25·log(t_hat)` directly, already `[B, N_res]` |
+| `main_trunk.py` step 14, `c_skip`/`c_out` (`w_gt`, `w_upd`) | `"b -> b 1 1"` | `"b n_atom -> b n_atom 1"` |
 | `lambda_sigma_weight` (train loop) | `[B]` | `[B, N_atom]` |
-| `atom_loss` / `med_loss` | `λ` scales the per-sample loss after reduction | `λ` multiplies each atom's squared error **before** the weighted mean |
+| `atom_loss`, `med_loss` | λ scales the per-sample loss after reduction | λ multiplies each atom's squared error **before** the weighted mean |
+| `sample/sampling.py` | `repeat(t_hat, " -> b", b=B)` | `repeat(t_hat, " -> b n", b=B, n=N_res)`; inference always uses uniform σ |
 
-The sampler (`sample/sampling.py`) builds `t_hat_batch` with
-`repeat(t_hat, " -> b n", b=B, n=N_res)`. Inference always uses uniform σ.
+**Why per-atom λ.** EDM's denoiser is `D = c_skip·x + c_out·F`, so
+`D − x0 = c_out·(F − F_target)`. Since `λ = 1/c_out²`,
 
-This refactor is **behaviour-preserving when `R_M = 0`**. It should land
-first, on its own, with a regression test showing bitwise-equal outputs for
-uniform σ.
+```
+λ(σ_i) · ‖D_i − x0_i‖²  =  ‖F_i − F_target,i‖²
+```
 
-### 3.4 Teacher forward pass
+Per-atom λ therefore weights every atom equally in terms of the raw network
+output F. Low-σ residues have large λ, but their coordinate errors are
+smaller by the same factor, so a clean subset does not automatically dominate
+a sample's loss. This relies on `c_skip` and `c_out` also being per-atom.
+Smooth-lDDT, the distogram losses and CE have never been noise-weighted, and
+stay unchanged.
+
+With uniform σ every change in this table is an identity, so PR 2 must
+reproduce `main` exactly.
+
+### 3.3 Dual-timestep featurization (PR 3)
+
+For each item in `featurize_single_item`:
+
+1. Draw `σ_s, σ_t` independently from the log-normal.
+2. Draw `m ~ Bernoulli(R_M)` of length `N_res`, and set
+   `σ_i = where(m_i, σ_s, σ_t)`.
+3. Draw one `ε ~ N(0, I)` of shape `[N_atom, 3]`, shared by both views.
+4. Student coordinates: `r_student = r_gt + center(σ_atom ⊙ ε)`, where
+   `σ_atom = repeat(σ_res, "n -> (n a)", a=5)`.
+5. Teacher coordinates: `r_teacher = r_gt + center(σ_min · ε)`, where
+   `σ_min = min(σ_s, σ_t)`.
+6. Build the self-conditioning template distogram **separately for each
+   view**, from that view's noised Cβ.
+
+**Centering.** Today we compute `t_hat · (ε − CoM(ε))`. With per-residue σ,
+`σ_i · (ε_i − CoM(ε))` does not have zero centre of mass. Center *after*
+scaling: `n = σ_atom ⊙ ε`, then `n − CoM(n)`. For uniform σ the two forms are
+identical.
+
+**The template distogram.** Self-Flow fits pallatom unusually well here. The
+template distogram for pair `(i, j)` carries noise from both `σ_i` and `σ_j`.
+Some regions of the pair map are sharp and others blurred, which acts as
+span-masking of the distogram for free.
+
+**Train/inference mismatch and `apply_prob`.** With `R_M = 0.25`, the chance
+that no residue is masked is `0.75^N_res`, about 6·10⁻⁶ at 50 residues. So
+under this schedule the model essentially never trains on uniform σ, yet
+sampling always uses uniform σ. The paper reports no problem on images, but
+our template distogram makes pallatom more exposed. `apply_prob` is the
+fraction of samples that get the dual-timestep schedule. The rest use
+`R_M = 0`, which is the paper's "no masking, keep `L_rep`" setting and still
+a valid training signal. The default is 1.0, matching the paper. It is a
+Stage 2 fallback (§4).
+
+**Validation is always uniform σ** (`R_M = 0`, no teacher pass), so
+validation numbers stay comparable across all runs.
+
+### 3.4 EMA teacher forward pass (PR 4)
 
 ```python
 with torch.no_grad(), teacher_mode(inner_model):
@@ -161,410 +246,327 @@ with torch.no_grad(), teacher_mode(inner_model):
     )
 ```
 
-- **Do not use `EMA.swap` here.** `swap` reassigns `.data` on the live
-  parameters, and that does not bump autograd's version counter. If the
-  teacher ran between the student forward and `backward()`, the backward pass
-  would silently use the EMA weights in the saved tensors. Running the teacher
-  first would avoid that, but the code would then depend on call order to stay
-  correct. `functional_call` never mutates the module, so call order does not
-  matter.
-- **Run the teacher on the unwrapped module.** It must not go through DDP:
-  there are no gradients, so no all-reduce hooks are needed.
-- **Use eval mode for the teacher.** `NodeUpdate` uses `DropoutRowwise(0.25)`,
-  and a teacher target should be deterministic. `teacher_mode` is a small
-  context manager in `helpers/context_managers.py` (alongside `StepContext`)
-  that calls `eval()` and then restores the previous mode.
-- `teacher_batch` is
+- **Do not use `EMA.swap`.** `swap` reassigns `.data` on the live
+  parameters, which does not bump autograd's version counter. If the teacher
+  ran between the student forward and `backward()`, backward would silently
+  compute gradients with the EMA weights. `functional_call` never mutates the
+  module, so call order cannot matter.
+- **Bypass DDP.** Call the unwrapped module. There are no gradients, so no
+  all-reduce hooks are needed.
+- **Use eval mode.** `NodeUpdate` uses `DropoutRowwise(0.25)`, and a teacher
+  target should be deterministic. `teacher_mode` is a small context manager
+  in `helpers/context_managers.py`, next to `StepContext`, that calls
+  `eval()` and restores the previous mode.
+- **Reuse the batch.** `teacher_batch` is
   `dataclasses.replace(batch, r_gt_noised=..., noised_res_distogram=..., t_hat=...)`.
-  It reuses every clean field, so there is no second copy of the batch on the
-  GPU.
-- **Follow-up optimisation.** The teacher only needs decoder units `0..5`. A
-  later `MainTrunk.forward` keyword such as `n_units: int | None` could skip
-  units 7–8, the distogram heads and the sequence head. That saves roughly 30%
-  of the teacher pass. Not needed for v1.
+  Every clean field is shared, not copied.
+- **EMA decay.** The paper uses 0.9999; we use 0.999. One EMA serves as both
+  teacher and evaluation model, as in the paper. The bias-correction ramp
+  `min(decay, (step+1)/(step+10))` makes the teacher roughly equal to the
+  student for the first few hundred steps. That is harmless: the target is
+  then just "the deeper unit on a cleaner input". No warm-up gate.
 
 ### 3.5 The Self-Flow loss
+
+**Arm A, coordinate space (PR 4).**
 
 ```
 L_sf = mean_b  KabschMSE( student.coord_stack[k_s],
                           stopgrad(teacher.coord_stack[k_t]) ;  λ(σ_student) )
-k_s = round(0.3 · K_unit) − 1 = 1     (2nd decoder unit, K_unit = 8)
-k_t = round(0.7 · K_unit) − 1 = 5     (6th decoder unit)
+k_s = round(0.3 · K_unit) − 1 = 1     (decoder unit 2 when K_unit = 8)
+k_t = round(0.7 · K_unit) − 1 = 5     (decoder unit 6)
+total_loss += alpha_5 · L_sf,   alpha_5 = 0.8
 ```
 
-`atom_loss` can be reused as is, with the teacher coordinates in the `r_gt`
-slot. It already aligns the target onto the prediction under `no_grad`.
+- **Reuse `atom_loss`** as is, with the teacher coordinates in the `r_gt`
+  slot. It already aligns the target onto the prediction under `no_grad`.
+- **The sign is `+`.** The paper's leading minus comes from *maximizing*
+  cosine similarity. We *minimize* an MSE, so a minus sign would push the
+  student *away* from the teacher.
+- **The student is supposed to differ from the teacher.** Unit 2's
+  coordinates include `c_skip · r_input` from the noisier student input, so
+  the student must denoise the masked residues up to the teacher's level.
+  That is the intended signal, not a confound.
+- **λ defaults to the student's per-atom `λ(σ_i)`**, so `L_sf` is on the
+  same scale as `med_loss`. The risk: the target has its own error. At small
+  σ the two views are nearly identical and λ is large (about 100 at
+  σ = 0.1). So leftover teacher error could get amplified on exactly the
+  samples where distillation teaches least. The paper's `L_rep` has no time
+  weighting. The σ-bucketed diagnostic (§3.6) decides this in Stage 4.
 
-`total_loss += γ_sf · L_sf` with `γ_sf = 0.8`, which becomes `alpha_5` in
-`LossParams`.
+**Arm B, representation space (PR 5, conditional).** This is the paper's
+version:
 
-**The sign is `+`.** The paper's `−1·` comes from *maximising* cosine
-similarity. We *minimise* an MSE, so adding a `−1·` would push the student
-*away* from the teacher.
+- Take the student's `c_l` (or `s_i`) after unit 2 and pass it through a new
+  `LinearNoBias` → SiLU → `LinearNoBias` head (about `2·c²` parameters).
+- Compare it with the teacher's same tensor after unit 6, with no head.
+- Use `1 − cos` with a masked mean.
 
-### 3.6 Two loss variants (A/B)
+Both tensors are already SE(3)-invariant. This needs the forward pass to also
+return a stack of hidden states.
 
-The paper aligns **hidden representations** with cosine similarity through a
-projection head. The original notes propose aligning the **per-unit coordinate
-readout** with Kabsch MSE. The two are different bets, so both should run:
+**Why Arm A first.** It adds no modules and is a very small change to the
+intermediate-loss loop. Its risk is redundancy: unit 2 is already supervised
+against ground truth by `med_loss`, and the teacher's target is itself
+trained toward ground truth. If that redundancy makes Arm A flat, Arm B is
+the next thing to try.
 
-| | **Arm A: coordinate space** (original notes) | **Arm B: representation space** (paper) |
-|---|---|---|
-| Student signal | `intermediate_denoised_coord_stack[1]` | `c_l` or `s_i` after unit 2, through a new `LinearNoBias` + SiLU + `LinearNoBias` head |
-| Teacher signal | `intermediate_denoised_coord_stack[5]` | same tensor after unit 6, no head |
-| Distance | Kabsch-aligned MSE with `λ(σ)` weighting | `1 − cos`, per atom or per residue, masked mean |
-| New params | none | about `2·c²` |
-| Invariance | SE(3) handled by Kabsch | `c_l`/`s_i` are already invariant (no coordinates enter them except through `r_scaled` and the template) |
-| Risk | Unit 2 is already supervised against **GT** by `med_loss`. A teacher target that is itself trained toward GT may be redundant | Needs the coordinate stacks extended with a stack of hidden states |
-
-**Recommendation:** implement Arm A first. It has no new modules and the
-change to the intermediate-loss loop is very small. Add Arm B only if A is
-flat against the dual-timestep-only control (§6). In Arm A, the student
-coordinates at unit 2 include `c_skip · r_input` from a *noisier* input, so
-the student must denoise the masked residues up to the teacher's level. That
-is the intended signal, not a confound.
-
-## 4. Configuration
-
-A new `SelfFlowParams` block in `train/train_config.py` (pydantic, validated):
+### 3.6 Configuration, data structures and diagnostics
 
 ```python
 class SelfFlowParams(BaseModel):
     enabled: bool = False
     mask_ratio: float = Field(default=0.25, ge=0, le=0.5)      # R_M
-    apply_prob: float = Field(default=1.0, ge=0, le=1)         # §3.2.1
+    apply_prob: float = Field(default=1.0, ge=0, le=1)
     student_unit_frac: float = Field(default=0.3, gt=0, lt=1)
     teacher_unit_frac: float = Field(default=0.7, gt=0, lt=1)
     target: Literal["coords", "latents"] = "coords"            # Arm A / B
 ```
 
-The loss weight goes in `LossParams.alpha_5 = 0.8`. A `model_validator`
-enforces `k_s < k_t` after rounding.
+The loss weight is `LossParams.alpha_5 = 0.8`. A `model_validator` enforces
+`k_s < k_t` after rounding.
 
-- **EMA decay.** The paper uses 0.9999, and we use 0.999. One EMA serves both
-  the teacher and evaluation, which matches the paper. The bias-corrected ramp
-  `min(decay, (step+1)/(step+10))` means the teacher is about the same as the
-  student for the first few hundred steps. That is harmless, because the
-  target is then just "the deeper unit on a cleaner input". No warm-up gate in
-  v1.
-- **Validation always runs with `R_M = 0` and no teacher pass.** This keeps
-  validation numbers comparable with existing runs. Only the training collate
-  path uses the dual-timestep featurizer.
+**Data structures:**
 
-## 5. Data-structure changes
+- `FeaturizedItem.t_hat` becomes `"N_res"`, and `FeaturizedBatch.t_hat`
+  becomes `"B N_res"` (PR 2).
+- PR 3 adds `teacher_view: NoisedView | None` to `FeaturizedBatch`.
+  `NoisedView` is a new `@dataclass` with fields `r_noised`,
+  `noised_res_distogram` and `t_hat`. `to()` and `pin_memory()` pass it
+  through. It is `None` when Self-Flow is off, and for validation and
+  sampling batches.
 
-- `FeaturizedItem` / `FeaturizedBatch`: `t_hat` becomes `"N_res"` /
-  `"B N_res"`.
-- Add `teacher_view: NoisedView | None`, a new `@dataclass` with fields
-  `r_noised`, `noised_res_distogram` and `t_hat`. `to()` and `pin_memory()`
-  must pass it through. It is `None` when Self-Flow is disabled, and on
-  validation and sampling batches.
-- **Memory.** The second template distogram is `B × N_res² × 39`. As
-  float32, that is about 41 MB per 512-residue item, and it is now paid
-  twice: in pinned CPU memory, in the host-to-device copy, and on the GPU.
-  Ship the teacher's noised Cβ coordinates (`[B, N_res, 3]`) or uint8 bin
-  indices in `NoisedView`, and build the one-hot distogram on the device
-  inside the training step. Measure collate throughput and peak memory in
-  phase 2 before choosing.
-- `LossMetrics`: add `self_flow_loss`, logged to wandb next to
-  `intermediate_loss`. Add these diagnostics:
-  - `self_flow_teacher_gt_mse`: the teacher's unit-6 error against GT. It
-    shows whether the target is better than what the student already gets
-    from `med_loss`.
-  - `L_sf` bucketed by student σ (§9.1).
-  - Each σ group's share of the λ-weighted `atom_loss` against its share of
-    atoms (§9.2).
+**Metrics and diagnostics** (in `LossMetrics`, logged to wandb):
 
-## 6. Experiment plan
-
-Same seed, data, steps and batch for each run. Compare EMA-weight validation
-metrics and sample quality. Wall-clock time is reported separately.
-
-| Run | `R_M` | Teacher loss | Purpose |
-|---|---|---|---|
-| `baseline` | 0 | none | control |
-| `dual-t` | 0.25 | none (`alpha_5 = 0`) | the paper finds the dual-timestep schedule alone helps a little; isolates it |
-| `sf-coords` | 0.25 | Arm A | main hypothesis |
-| `sf-latents` | 0.25 | Arm B | the paper's version |
-| `sf-coords-R` | {0.1, 0.5} | Arm A | protein residues have strong local redundancy along the chain, so the right `R_M` may be closer to video (0.1) than to images (0.25) |
-| `sf-coords-layers` | 0.25 | Arm A, (k_s, k_t) ∈ {(2,8), (3,6)} | check sensitivity to the layer pair |
-| `sf-coords-p` | 0.25, `apply_prob = 0.5` | Arm A | train/inference mismatch fallback (§3.2.1); run if `dual-t` < `baseline` |
-
-### 6.1 Compare each arm at its own best noise level
-
-The BFL FLUX.2 latent-space study (§10.4) found two things that bear on this
-comparison:
-
-- The choice of noise-level shift alone moved FID by 61–86%, and comparing at
-  a fixed shift *reversed* the ranking of two representations.
-- A REPA-style representation objective lowers the best shift.
-
-Self-Flow is a REPA-style objective, so a Self-Flow arm may prefer a lower
-`P_mean` than `baseline`. Comparing both at `P_mean = −1.2` could then
-understate Self-Flow, or overstate it.
-
-**Protocol:**
-
-1. Run `baseline` and the leading Self-Flow arm (`sf-coords`, or `sf-latents`
-   if it wins the first pass) at `P_mean ∈ {−1.7, −1.2, −0.7}`.
-2. Compare each arm at its own best `P_mean`.
-3. Run the other rows of the table at `P_mean = −1.2` only. They are relative
-   comparisons within Self-Flow.
-
-This is a global shift (§10.1 with `β = 0`). The length-dependent shift stays
-out of this matrix (§10.5).
-
-### 6.2 Sampling-shift sweep (no retraining)
-
-Every representation in the BFL study did best at sampling with a slightly
-*higher* shift than its training shift, and the best value depended on the
-sampler. Add an `α` multiplier to `noise_schedule` in `sample/sampling.py`,
-so that `t_hat ← α · t_hat` with `α = 1` as the default. Sweep
-`α ∈ {1, 1.25, 1.5, 2}` on each final checkpoint. This needs no retraining, so
-it is the cheapest experiment in this doc. Report sample metrics at each arm's
-best sampling `α`, and also at `α = 1`.
-
-### 6.3 Success criterion
-
-"Sucks or not" criterion: at each arm's best `P_mean` (§6.1), `sf-coords`
-should beat `dual-t` on validation Kabsch MSE and lDDT at matched steps, and
-`dual-t` should be at least as good as `baseline`. If `dual-t` falls short of
-`baseline`, revisit the mixed-noise loss weighting first (§9.2), before
-judging the teacher loss.
-
-The overhead should be under 35% per step. With a no-grad forward at about
-one third of forward plus checkpointed backward, the expected overhead is
-about 25–30%, plus CPU time to featurize the second view.
-
-## 7. Implementation phases (separate PRs)
-
-1. **`refactor:` per-residue `t_hat`.** Covers the shape change across
-   `data.py`, `main_trunk.py`, `losses.py`, `train_loop.py` and `sampling.py`.
-   Regression test: uniform σ gives bitwise-identical `PredictedOutputs` and
-   losses compared with `main`.
-2. **`feat:` dual-timestep featurizer.** Adds `SelfFlowParams`, `NoisedView`
-   and the second template distogram. Tests: with `R_M = 0` the student view
-   equals the old path; student σ ∈ {σ_s, σ_t} per residue and is constant
-   within a residue; teacher σ equals `min`; both views share ε; the noise
-   CoM is zero over valid atoms.
-3. **`feat:` EMA teacher pass and `L_sf` (Arm A).** Adds `teacher_mode`,
-   `functional_call` and the new `LossMetrics` field. Tests: `L_sf = 0` when
-   student and teacher are identical and inputs are identical; no gradient
-   reaches the EMA shadow; student gradients are identical with and without
-   the teacher pass computed (guards against the swap/autograd trap in §3.4);
-   for `K_unit = 8` the unit indices are `(1, 5)`.
-4. **`feat:` Arm B (optional).** Adds the hidden-state stack and projection
-   head.
-
-## 8. Open questions
-
-- **Teacher dropout.** If conditioning dropout (sequence or template) is added
-  later, should it be *shared* between the views? Sharing seems right, so the
-  only difference between views is the noise. On `main` there is no
-  conditioning-dropout code path yet: only a mask-token placeholder in
-  `atom_utils.py` and docstring references. Applying it in the featurizer
-  before both views are built would share it automatically.
-
-## 9. Decisions
-
-### 9.1 λ weighting for `L_sf`
-
-**Default:** use the student's per-atom `λ(σ_i)`, so `L_sf` is on the same
-scale as `med_loss` and `γ_sf = 0.8` keeps a similar meaning.
-
-**Why it might be wrong:** `L_sf` has a target with its own error, the
-teacher's prediction. At small σ the two views are nearly identical, and λ is
-large (about 100 at σ = 0.1, and about 15% of draws have σ < 1). So the
-leftover student–teacher disagreement, including the teacher's own mistakes,
-gets amplified on exactly the samples where distillation teaches the least.
-The paper's `L_rep` has no time weighting.
-
-**Decision rule:** log `L_sf` bucketed by the student's σ (for example,
-log-spaced buckets over the sampler's range). If the low-σ buckets dominate
-the total, switch to an unweighted MSE or clamp λ.
-
-### 9.2 Per-residue weighting of the mixed-noise `L_gen`
-
-**Default:** in `atom_loss` and `med_loss`, multiply each atom's squared error
-by its own `λ(σ_i)` *before* the weighted mean. Smooth-lDDT, the distogram
-losses and CE have never been noise-weighted and stay unchanged.
-
-**Why it is the principled choice:** EDM's denoiser is
-`D = c_skip·x + c_out·F`, so `D − x0 = c_out·(F − F_target)`, and
-`λ = 1/c_out²`. That gives
-
-```
-λ(σ_i) · ‖D_i − x0_i‖²  =  ‖F_i − F_target,i‖²
-```
-
-Per-atom λ therefore weights every atom equally in terms of the raw network
-output F. Low-σ residues have large λ, but their coordinate-space errors are
-smaller by the same factor, so a clean subset does not automatically dominate
-the sample's loss. For uniform σ this reduces exactly to today's per-sample
-form. It relies on the per-atom `c_skip`/`c_out` from §3.3.
-
-**Decision rule:**
-
-1. **Gate on `dual-t` vs `baseline` (§6).** `dual-t` uses mixed noise with no
-   teacher loss. If it underperforms `baseline` on uniform-σ validation, the
-   mixed-noise generative loss is the prime suspect, and its weighting is the
-   first thing to change. The paper found that the dual-timestep schedule
-   alone helps slightly, so "matches or beats baseline" is a fair bar.
-2. **Log each group's share of the loss.** Per sample, split residues into the
-   lower-σ and higher-σ groups. Log each group's share of the λ-weighted
-   `atom_loss` next to its share of valid atoms. If the cancellation above
-   holds, the two shares should roughly match. A large, persistent gap means
-   one group is taking most of the gradient. Likely causes are poor
-   calibration at one end of the σ range, or whole-protein Kabsch alignment
-   letting noisy residues inflate errors on clean ones.
-
-**Fallback (if either check fails):** take the mean within each σ group
-separately, then combine the group means weighted by each group's fraction of
-atoms. Each group then contributes in proportion to its size, whatever its λ.
-
-**Test (either way):** with `R_M = 0`, the per-atom form must reproduce
-`main`'s `atom_loss` and `med_loss` exactly. This belongs in phase 1 (§7).
-
-## 10. Interaction with timestep shifting
-
-**References:**
-
-- Esser et al., *Scaling Rectified Flow Transformers for High-Resolution
-  Image Synthesis* (ICML 2024, arXiv
-  [2403.03206](https://arxiv.org/abs/2403.03206)), §5.3.2. FLUX uses the same
-  shift, with `log α` linear in token count: 0.5 at 256 tokens and 1.15 at
-  4096 tokens.
-- Black Forest Labs, *FLUX.2: Analyzing and Enhancing the Latent Space of
-  FLUX* ([techblog](https://bfl.ai/techblog/representation-comparison/),
-  November 2025).
-
-Both use the same shift formula. They apply it along different axes:
-
-| | Esser et al. (SD3) | BFL FLUX.2 study |
+| Metric | PR | Used by |
 |---|---|---|
-| Axis | number of **tokens** (resolution) | **channels per token** (dimension of the representation), with tokens fixed at 256 |
-| Heuristic | `α = √(m/n)`, m and n = pixel counts | `α = √(m/n)`, m and n = channels per token (SD-VAE's 16 as the baseline) |
-| Chosen by | derived, then tuned (α = 3 at 1024²) | swept `α ∈ {1, 1.78, 2.95, 4.63, 6.93}`, separately for training and sampling |
-| Question | how to train at a higher resolution | which latent space to diffuse in |
+| **Group share:** per sample, each σ group's share of the λ-weighted `atom_loss` against its share of valid atoms | 3 | Stage 2 gate |
+| `self_flow_loss` | 4 | Stage 3 |
+| `self_flow_teacher_gt_mse`: the teacher's unit-6 error against ground truth (is the target better than what `med_loss` already gives?) | 4 | Stage 3 |
+| `L_sf` bucketed by student σ (log-spaced buckets) | 4 | Stage 4 λ decision |
+| `L_sf` and `self_flow_teacher_gt_mse` by length bin | 6 | Stage 6 |
 
-The common principle: **the right noise level depends on how redundant the
-representation is.** Redundancy can come from the number of tokens or the
-number of channels per token. Redundancy, not the raw size of the
-representation, sets the shift. For pallatom, protein length is the token
-axis (§10.1–§10.3), and the per-residue atom representation is the channel
-axis (§10.4).
+If the per-atom λ argument in §3.2 holds, the two group shares roughly match.
+A large, persistent gap means one group is taking most of the gradient.
+Likely causes are poor calibration at one end of the σ range, or
+whole-protein Kabsch alignment letting noisy residues inflate errors on clean
+ones.
 
-### 10.1 The shift in EDM terms
+### 3.7 Noise-schedule shifts (PR 1, PR 6)
 
-The paper argues that with more tokens, a fixed noise level destroys less
-information, because the model can average over redundant tokens. So the
-schedule should move toward more noise as resolution grows. It uses
-`t' = α·t / (1 + (α−1)·t)` with `α = √(m/n)`.
+**Sampling shift (PR 1).** Add `α` to the sampler params (default 1.0) and
+apply `t_hat ← α · t_hat` in `noise_schedule` in `sample/sampling.py`.
+Evaluation-only; no retraining.
 
-The rectified-flow input is `x_t = (1−t)·x0 + t·ε`. Dividing by `(1−t)` gives
-`x0 + σ·ε` with `σ = t/(1−t)`. Substituting `t'` gives
+**Global training shift (no PR).** `P_mean` is already a config field.
 
-```
-σ' = α · σ
-```
-
-So in EDM the shift is a multiplicative rescale of σ. For our log-normal
-sampler, that is an additive shift of `P_mean` by `ln α`. The global
-`P_mean = −1.2` is already a fixed version of this knob. The protein analogue
-is a length-dependent mean:
+**Length-dependent shift (PR 6).** Protein length is our resolution axis.
+The proposal is a length-dependent mean,
 
 ```
-P_mean(N) = P_mean + β · ln(N_res / N_ref)
+P_mean(N) = P_mean + β · ln(N_res / N_ref),
 ```
 
-The sampler's `noise_schedule` needs the same `α(N)` multiplier, so that
-training and inference stay matched. FLUX applies the shift in both.
+with the same `α(N) = (N_res / N_ref)^β` applied to the sampler schedule, so
+training and inference stay matched. The constant-image argument gives
+`β = ½`. It does not carry over directly: local protein geometry (3.8 Å
+Cα–Cα, bond angles) does not depend on length, and only the global fold gets
+more redundant as N grows. So `β ∈ [0, ½]` is swept.
 
-The paper derives `β = ½` from a constant-image argument. That argument does
-not carry over directly: local protein geometry (3.8 Å Cα–Cα, bond angles)
-does not depend on length, and only the global fold becomes more redundant as
-`N` grows. Treat `β ∈ [0, ½]` as a tuned value. A related point: `σ_data = 16`
-is fixed, while coordinate spread grows with length (`R_g ∝ N^~0.4`). Part of
-what a length shift corrects is that preconditioning mismatch.
+There is a related point: `σ_data = 16` is fixed, while coordinate spread
+grows with length (`R_g ∝ N^~0.4`). Part of what a length shift corrects is
+that preconditioning mismatch.
 
-### 10.2 Interactions with Self-Flow
+How the length shift interacts with Self-Flow:
 
-1. **The two compose cleanly.** Both σ draws come from the shifted
-   distribution, and `min(ασ_s, ασ_t) = α·min(σ_s, σ_t)`. So the teacher's
-   σ_min is shifted consistently, with no extra logic. The shift goes where σ
-   is drawn in `featurize_single_item`, before the dual-timestep split.
-   Nothing in §3–§5 changes.
-2. **Both are redundancy knobs that depend on length.** With a fixed `R_M`,
-   long proteins have more clean anchor residues in absolute terms, so the
-   student's task gets easier as `N` grows. That is the same effect the shift
-   counteracts. Without a shift, expect Self-Flow's benefit to be concentrated
-   on short proteins. With a shift, long proteins move to higher σ, where the
-   information gap between student and teacher is largest.
-3. **The shift confounds the §9 diagnostics.** Under a shift, short proteins
-   are over-represented in the low-σ buckets. Both the §9.1 low-σ dominance
-   check and the §9.2 group-share check would then partly measure length.
-   Bucket by the unshifted `σ/α(N)`, or by (σ, length bin).
-4. **The teacher gets weaker on long proteins.** At higher σ the teacher's
-   prediction is less accurate in absolute terms, which may cancel the gain
-   from point 2. Log `L_sf` and `self_flow_teacher_gt_mse` by length bin.
-5. **Validation must match.** The uniform-σ validation, and the sampler, must
-   use the same shift setting as the run they are compared against.
+- **They compose cleanly.** Both σ draws come from the shifted distribution,
+  and `min(ασ_s, ασ_t) = α·min(σ_s, σ_t)`. The shift goes where σ is drawn,
+  before the dual-timestep split. No Self-Flow code changes.
+- **Both depend on length.** With a fixed `R_M`, long proteins have more
+  clean anchor residues, so the student's task gets easier as N grows. That
+  is the effect the shift counteracts. Without a shift, Self-Flow's benefit
+  may concentrate on short proteins. With one, long proteins move to higher
+  σ, where the gap between student and teacher is largest. But the teacher
+  is also less accurate there. Logging by length bin settles which effect
+  wins.
+- **The shift confounds σ-bucketed diagnostics.** Short proteins
+  over-populate the low-σ buckets. Under a shift, bucket by the unshifted
+  `σ/α(N)`, or by (σ, length bin).
 
-### 10.3 Our sampler already uses the recommended distribution family
+## 4. Rollout plan
 
-Since `σ = t/(1−t)`, we have `ln σ = logit(t)`. Our log-normal over σ is
-therefore a logit-normal over t, with `P_mean` ↔ μ and `P_std` ↔ s. The BFL
-study found that a shifted logit-normal, and its plateau variant, always beat
-a shifted uniform distribution. So we are already in the preferred family,
-and any shift is a change to `P_mean` alone.
+### 4.1 Ground rules for every experiment
 
-### 10.4 The channel axis: BFL's findings and what they mean here
+- **Matched settings.** Same seed, data split, step count and batch size.
+  Report validation Kabsch MSE, lDDT and RMSD on EMA weights, uniform σ, plus
+  sample metrics. Report wall-clock per step separately.
+- **Compare at each run's own best noise level.** Runs that decide a gate
+  are trained at `P_mean ∈ {−1.7, −1.2, −0.7}` and compared at their best
+  value (§2.2, finding 1). Ablations within one stage use the best `P_mean`
+  of the arm they ablate.
+- **Sample at each run's best sampling `α`** from the PR 1 sweep, and also
+  report `α = 1`.
 
-**What the study found** (ImageNet 256², DiT-XL, latent flow matching):
+### 4.2 Stage 0 — reference numbers (PR 1)
 
-- **The heuristic fits RAE but not FLUX.2.** RAE's best training shift was
-  6.93 = `√(768/16)`. FLUX.2 preferred 4.63 against a predicted 2.83. The
-  study attributes the gap to the FLUX.2 latent having a higher intrinsic
-  dimension, i.e. less redundancy across channels. The simple model does not
-  predict which way such a gap moves the optimum, so `√(m/n)` is a starting
-  point for a sweep, not a value to use directly.
-- **The best sampling shift is above the best training shift** for every
-  representation (6.93 for FLUX.2 and RAE), and is "very dependent on the
-  number of sampling steps and choice of sampler."
-- **The shift can reverse a comparison.** With each representation at its
-  own best shift, RAE beats FLUX.2 (gFID 3.10 vs 3.70). Without shifting, the
-  order reverses. The best vs worst training shift changed FID by 61–86%.
-- **REPA lowers the best shift** ("generally results in a small reduction of
-  the optimal shifting value").
+**PR 1 `feat:` sampler `α` multiplier** (§3.7).
+Tests: `α = 1` reproduces the current schedule exactly; the schedule scales
+linearly in `α`.
 
-**What it means for pallatom:**
+**Experiments:**
 
-1. **The channel axis is fixed today.** We diffuse raw atom5 coordinates, 15
-   numbers per residue, for every protein. It becomes the relevant axis if
-   the representation changes: atom14 or atom37, or a learned protein latent.
-2. **The channel count overstates the information.** Given the backbone
-   frame, N, C and Cβ are almost fully determined by ideal geometry. The real
-   information per residue is about 6 numbers for the rigid frame plus a few
-   torsions, not 15. That is the same kind of mismatch between channel count
-   and intrinsic dimension that moved FLUX.2 off `√(m/n)`. Any change of
-   representation should come with a shift sweep, not a computed shift.
-3. **Self-Flow will probably move the best shift.** It is a REPA-style
-   objective, so it likely lowers the best `P_mean`. That is why §6.1
-   compares arms at their own best `P_mean`.
-4. **Sampling and training shifts are separate settings.** That is why §6.2
-   adds the sampling-only sweep.
+1. **Exp 0a.** Sweep sampling `α ∈ {1, 1.25, 1.5, 2}` on the current best
+   checkpoint. It needs no training.
+2. **Exp 0b.** Train `baseline` at the three `P_mean` values. This is config
+   only.
 
-### 10.5 Experiment ordering
+**Output:** the baseline's best `P_mean` and best sampling `α`. This is the
+reference every later stage is measured against. If either differs from
+today's defaults, that is a win on its own.
 
-The *global* `P_mean` sweep belongs inside the §6 matrix (§6.1), because a
-fair comparison needs it. The *length-dependent* shift (`β > 0`) stays out of
-that matrix. Changing both at once would confound the results.
+### 4.3 Stage 1 — per-residue σ (PR 2)
 
-1. Run the sampling-shift sweep (§6.2) on the current best checkpoint. It is
-   free.
-2. Run the §6 Self-Flow matrix, with the §6.1 per-arm `P_mean` sweep and
-   `β = 0`.
-3. Run the length shift on its own: `β ∈ {0, 0.25, 0.5}` against `baseline`
-   at its best `P_mean`, with the sampler schedule shifted to match.
-4. Only if both help, run a 2×2 (length shift × Self-Flow, best arm), at each
-   cell's best global `P_mean`.
+**PR 2 `refactor:` per-residue `t_hat`** (§3.2). Covers `data.py`,
+`main_trunk.py`, `losses.py`, `train_loop.py` and `sampling.py`.
+
+Tests:
+
+- With uniform σ, `PredictedOutputs` and every loss are bitwise identical to
+  `main`.
+- Per-atom λ with uniform σ equals the per-sample form.
+- The sampler builds `[B, N_res]` σ.
+
+**Gate:** the tests pass. No experiment, since behaviour is unchanged by
+construction.
+
+### 4.4 Stage 2 — does mixed noise alone hurt? (PR 3)
+
+**PR 3 `feat:` dual-timestep featurizer** (§3.3). Adds `SelfFlowParams`,
+`NoisedView`, the second template distogram and the group-share diagnostic.
+
+Tests:
+
+- `R_M = 0` reproduces PR 2's featurization.
+- The student's σ per residue is in `{σ_s, σ_t}` and constant within a
+  residue.
+- The teacher's σ equals the minimum.
+- Both views share ε.
+- The noise centre of mass is zero over valid atoms.
+- `apply_prob = 0` always yields `R_M = 0`.
+
+**Exp 1: `dual-t`.** `R_M = 0.25`, no teacher loss, at the three `P_mean`
+values.
+
+**Gate:** `dual-t` ≥ `baseline`, each at its best `P_mean`. The paper found
+the schedule alone helps slightly, so this is a fair bar.
+
+**If the gate fails,** in this order:
+
+1. Check the group share. If one σ group is badly over-represented, switch
+   the generative loss to per-group normalization: take the mean within each
+   σ group, then weight the group means by atom fraction.
+2. Rerun with `apply_prob = 0.5` to address the train/inference mismatch.
+3. If both fail, stop. Mixed per-residue noise does not suit this model, and
+   Self-Flow's premise fails with it.
+
+### 4.5 Stage 3 — does Self-Flow help? (PR 4)
+
+**PR 4 `feat:` EMA teacher pass and Arm A loss** (§3.4, §3.5). Adds
+`teacher_mode`, `functional_call`, `alpha_5`, and the `self_flow_*` metrics.
+
+Tests:
+
+- `L_sf = 0` when the student and teacher weights and inputs are identical.
+- No gradient reaches the EMA shadow.
+- Student gradients are identical with and without the teacher pass. This
+  guards against the `swap`/autograd problem in §3.4.
+- `K_unit = 8` gives unit indices `(1, 5)`.
+
+**Exp 2: `sf-coords`.** Uses Stage 2's settings (`R_M = 0.25`, plus
+`apply_prob` or the group-normalized loss if Stage 2 needed them), at the
+three `P_mean` values. Expect its best `P_mean` to be at or below
+`dual-t`'s (§2.2, finding 2).
+
+**Gate:** `sf-coords` beats `dual-t` on validation Kabsch MSE and lDDT at
+matched steps, each at its best `P_mean`. Step overhead must stay under 35%.
+The estimate is 25–30%: a no-grad forward is about a third of a forward plus
+checkpointed backward, plus CPU time for the second view.
+
+- **Pass:** go to Stage 4.
+- **Flat or worse:** check `self_flow_teacher_gt_mse`. If the teacher's
+  unit-6 coordinates are not clearly better than the student's unit-2
+  coordinates against ground truth, the coordinate target is redundant with
+  `med_loss`. Skip to Stage 5.
+
+### 4.6 Stage 4 — tune Self-Flow (no PR)
+
+All runs here use `sf-coords`'s best `P_mean`, one axis at a time:
+
+| Run | Varies | Why |
+|---|---|---|
+| `sf-coords-R` | `R_M ∈ {0.1, 0.5}` | residues are locally redundant along the chain, so the best `R_M` may be nearer video's 0.1 than images' 0.25 |
+| `sf-coords-layers` | `(k_s, k_t) ∈ {(2, 8), (3, 6)}` | sensitivity to the layer pair; the paper reports a broad optimum |
+| `sf-coords-unweighted` | λ off for `L_sf` | run only if the σ-bucketed `L_sf` is dominated by the low-σ buckets (§3.5); clamping λ is the alternative |
+
+**Output:** new defaults for `SelfFlowParams`.
+
+### 4.7 Stage 5 — representation-space Self-Flow (PR 5, conditional)
+
+Do this only if Stage 3 was flat, or as a follow-up if Stage 3 passed by a
+small margin.
+
+**PR 5 `feat:` Arm B** (§3.5). Adds the hidden-state stack and the projection
+head.
+Tests: head shapes; zero loss for identical inputs; no gradient to the
+teacher.
+
+**Exp 4: `sf-latents`.** Run at its own three `P_mean` values. Compare with
+`dual-t` and with `sf-coords`.
+
+### 4.8 Stage 6 — length-dependent shift (PR 6)
+
+This stage is kept apart from the Self-Flow stages. It changes the noise
+distribution for each length, and mixing it with Self-Flow would make the
+earlier results impossible to interpret.
+
+**PR 6 `feat:` length-dependent `P_mean(N)` and sampler `α(N)`** (§3.7). Adds
+length-binned metrics and unshifted-σ bucketing.
+Tests: `β = 0` is the identity; the mean shift is `β·ln(N/N_ref)`; the
+training and sampling multipliers match.
+
+**Experiments:**
+
+1. **Exp 5.** `baseline` with `β ∈ {0, 0.25, 0.5}` at its best global
+   `P_mean`.
+2. **Exp 6** (only if Exp 5 and Stage 3 both helped). A 2×2 of length shift ×
+   the best Self-Flow arm, each cell at its own best global `P_mean`.
+
+### 4.9 Optional performance PR
+
+If Stage 3's overhead is near the limit, add a `MainTrunk.forward` keyword
+`n_units: int | None` so the teacher stops after unit `k_t`. This skips the
+remaining units, the distogram heads and the sequence head, saving about 30%
+of the teacher pass. It does not change behaviour. It can land any time
+after PR 4.
+
+## 5. Open question
+
+**Shared conditioning dropout.** If conditioning dropout (sequence or
+template) is added later, should the two views share the same draw? Sharing
+seems right, so that the only difference between the views is the noise.
+Otherwise the teacher could hold information the student cannot recover, and
+`L_sf` would never shrink. `main` has no conditioning-dropout code path yet.
+If it is applied in the featurizer before the views split, sharing comes for
+free.
+
+## 6. Out of scope: changing the per-residue representation
+
+The BFL study's axis, channels per token, is constant for us: we diffuse
+raw atom5 coordinates, 15 numbers per residue. It would matter if the
+representation changed (atom14, atom37, or a learned protein latent). The
+channel count also overstates the information: given the backbone frame,
+N, C and Cβ are almost fully determined by ideal geometry, so a residue
+carries about 6 numbers for the rigid frame plus a few torsions. That is the
+same kind of gap that moved FLUX.2 off `√(m/n)`. Any such change should come
+with its own `P_mean` and sampling-`α` sweeps (Stage 0's protocol), not a
+computed shift.
