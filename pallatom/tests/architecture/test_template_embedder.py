@@ -203,31 +203,43 @@ def base_inputs(dims: EmbedderDims) -> EmbedderInputs:
     )
 
 
-@pytest.fixture
-def run_embedder(
-    embedder: TemplateEmbedder,
-) -> Callable[[EmbedderInputs], Float[torch.Tensor, "B N_res N_res d"]]:
-    """Return a callable that feeds an ``EmbedderInputs`` to the embedder.
+def embed(
+    model: TemplateEmbedder,
+    inputs: EmbedderInputs,
+) -> Float[torch.Tensor, "B N_res N_res d"]:
+    """Run ``model.forward`` on the four fields of ``inputs`` in order.
 
     Args:
-        embedder: Model under test.
+        model: Template embedder to run.
+        inputs: Forward inputs.
 
     Returns:
-        Callable running ``forward`` on the four fields in order.
+        Template pair embedding.
     """
+    return model(
+        inputs.f_distogram,
+        inputs.f_pseudo_beta_mask,
+        inputs.z_ij,
+        inputs.t,
+    )
 
-    def run(x: EmbedderInputs) -> Float[torch.Tensor, "B N_res N_res d"]:
-        """Run the embedder on ``x``.
 
-        Args:
-            x: Forward inputs.
+@pytest.fixture
+def first_item_inputs(base_inputs: EmbedderInputs) -> EmbedderInputs:
+    """Return the first batch item of ``base_inputs`` as a batch of one.
 
-        Returns:
-            Template pair embedding.
-        """
-        return embedder(x.f_distogram, x.f_pseudo_beta_mask, x.z_ij, x.t)
+    Args:
+        base_inputs: Batched forward inputs.
 
-    return run
+    Returns:
+        Every field sliced to ``[:1]``, keeping the batch axis.
+    """
+    return EmbedderInputs(
+        f_distogram=base_inputs.f_distogram[:1],
+        f_pseudo_beta_mask=base_inputs.f_pseudo_beta_mask[:1],
+        z_ij=base_inputs.z_ij[:1],
+        t=base_inputs.t[:1],
+    )
 
 
 @pytest.fixture
@@ -261,7 +273,7 @@ def grad_input_name(request: pytest.FixtureRequest) -> str:
 def test_template_embedder_output_shape_and_dtype(
     dims: EmbedderDims,
     base_inputs: EmbedderInputs,
-    run_embedder: Callable[[EmbedderInputs], Float[torch.Tensor, "..."]],
+    embedder: TemplateEmbedder,
 ) -> None:
     """The embedding is float32 ``(B, N_res, N_res, d)`` and finite.
 
@@ -271,10 +283,10 @@ def test_template_embedder_output_shape_and_dtype(
     Args:
         dims: Sizes the output must match.
         base_inputs: Valid forward inputs.
-        run_embedder: Runs the model.
+        embedder: Model under test.
     """
     with torch.no_grad():
-        out = run_embedder(base_inputs)
+        out = embed(embedder, base_inputs)
     assert out.shape == (dims.batch, dims.n_res, dims.n_res, dims.d)
     assert out.dtype == torch.float32
     assert torch.isfinite(out).all()
@@ -289,7 +301,7 @@ def test_template_embedder_output_shape_and_dtype(
 def test_template_embedder_output_depends_on_each_input(
     base_inputs: EmbedderInputs,
     scenario_edit: InputEdit,
-    run_embedder: Callable[[EmbedderInputs], Float[torch.Tensor, "..."]],
+    embedder: TemplateEmbedder,
 ) -> None:
     """Changing any one input, all else fixed, changes the embedding.
 
@@ -298,17 +310,18 @@ def test_template_embedder_output_depends_on_each_input(
     Args:
         base_inputs: Valid forward inputs.
         scenario_edit: Change applied to one input.
-        run_embedder: Runs the model.
+        embedder: Model under test.
     """
     with torch.no_grad():
-        base = run_embedder(base_inputs)
-        edited = run_embedder(scenario_edit.apply(base_inputs))
+        base = embed(embedder, base_inputs)
+        edited = embed(embedder, scenario_edit.apply(base_inputs))
     assert not torch.allclose(base, edited)
 
 
 def test_template_embedder_batch_items_are_independent(
     base_inputs: EmbedderInputs,
-    run_embedder: Callable[[EmbedderInputs], Float[torch.Tensor, "..."]],
+    first_item_inputs: EmbedderInputs,
+    embedder: TemplateEmbedder,
 ) -> None:
     """Running the first item alone matches its slice of the batched run.
 
@@ -317,17 +330,12 @@ def test_template_embedder_batch_items_are_independent(
 
     Args:
         base_inputs: Batched forward inputs.
-        run_embedder: Runs the model.
+        first_item_inputs: The first batch item alone.
+        embedder: Model under test.
     """
-    first = EmbedderInputs(
-        f_distogram=base_inputs.f_distogram[:1],
-        f_pseudo_beta_mask=base_inputs.f_pseudo_beta_mask[:1],
-        z_ij=base_inputs.z_ij[:1],
-        t=base_inputs.t[:1],
-    )
     with torch.no_grad():
-        batched = run_embedder(base_inputs)[:1]
-        single = run_embedder(first)
+        batched = embed(embedder, base_inputs)[:1]
+        single = embed(embedder, first_item_inputs)
     torch.testing.assert_close(batched, single, atol=1e-5, rtol=0)
 
 
@@ -339,7 +347,7 @@ def test_template_embedder_batch_items_are_independent(
 def test_template_embedder_gradient_reaches_input(
     base_inputs: EmbedderInputs,
     grad_input_name: str,
-    run_embedder: Callable[[EmbedderInputs], Float[torch.Tensor, "..."]],
+    embedder: TemplateEmbedder,
 ) -> None:
     """The summed embedding has a finite, nonzero gradient for the input.
 
@@ -349,12 +357,12 @@ def test_template_embedder_gradient_reaches_input(
     Args:
         base_inputs: Valid forward inputs.
         grad_input_name: Field to differentiate with respect to.
-        run_embedder: Runs the model.
+        embedder: Model under test.
     """
     leaf = cast(torch.Tensor, getattr(base_inputs, grad_input_name))
     leaf = leaf.clone().requires_grad_()
     inputs = dataclasses.replace(base_inputs, **{grad_input_name: leaf})
-    out = reduce(run_embedder(inputs), "b i j d -> ", "sum")
+    out = reduce(embed(embedder, inputs), "b i j d -> ", "sum")
     torch.autograd.backward([out])
     assert leaf.grad is not None
     assert torch.isfinite(leaf.grad).all()
@@ -370,15 +378,15 @@ def test_template_embedder_gradient_reaches_input(
 def test_template_embedder_rejects_malformed_input(
     base_inputs: EmbedderInputs,
     scenario_edit: InputEdit,
-    run_embedder: Callable[[EmbedderInputs], Float[torch.Tensor, "..."]],
+    embedder: TemplateEmbedder,
 ) -> None:
     """A wrongly shaped input fails the jaxtyping contract on ``forward``.
 
     Args:
         base_inputs: Valid forward inputs.
         scenario_edit: Edit that breaks one input's shape.
-        run_embedder: Runs the model.
+        embedder: Model under test.
     """
     malformed = scenario_edit.apply(base_inputs)
     with pytest.raises(TypeCheckError):
-        _ = run_embedder(malformed)
+        _ = embed(embedder, malformed)

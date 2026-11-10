@@ -1,17 +1,9 @@
 """Fixtures shared by more than one test module under ``pallatom/tests``."""
 
-from collections.abc import Callable, Generator
+from collections.abc import Generator
 
 import pytest
-import torch
 import torch.distributed as dist
-from einops import rearrange
-from jaxtyping import Float
-
-type PatternFactory = Callable[
-    [tuple[int, ...], float],
-    Float[torch.Tensor, "..."],
-]
 
 
 @pytest.fixture
@@ -41,43 +33,3 @@ def single_process_gloo_group() -> Generator[None]:
         yield
     finally:
         dist.destroy_process_group()
-
-
-@pytest.fixture
-def make_pattern() -> PatternFactory:
-    """Return a factory for deterministic sine-pattern tensors.
-
-    ``make(shape, freq)`` fills ``shape`` with ``sin(freq * k)`` over the
-    flat element index ``k``. Distinct frequencies give inputs that are
-    unrelated to each other, with values in ``[-1, 1]``, so tests get
-    varied, reproducible tensors without a random generator.
-
-    Consecutive elements are linearly related, ``sin(a + 2f) =
-    2 cos(f) sin(a + f) - sin(a)``, so a ``(..., 3)`` tensor from this
-    factory holds coplanar points. Use it for features, not for
-    coordinates whose geometry the test depends on.
-
-    Returns:
-        The factory.
-    """
-
-    def make(shape: tuple[int, ...], freq: float) -> Float[torch.Tensor, "..."]:
-        """Build one sine-pattern tensor.
-
-        Args:
-            shape: Output shape.
-            freq: Angular step between consecutive elements.
-
-        Returns:
-            Float32 tensor of ``shape``.
-        """
-        names = [f"d{axis}" for axis in range(len(shape))]
-        axes = " ".join(names)
-        flat = torch.sin(freq * torch.arange(torch.Size(shape).numel()))
-        return rearrange(
-            flat.float(),
-            f"({axes}) -> {axes}",
-            **dict(zip(names, shape, strict=True)),
-        )
-
-    return make
