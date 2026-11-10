@@ -26,7 +26,7 @@ PDB downloads.
 |-------|------|------|---------------|-------|
 | **1 (MVP)** | Sampling website | **none** | in-process queue + worker thread | Frontend on GitHub Pages; API + worker on the current GPU box |
 | 2 | Two-machine job queue | yes | **RabbitMQ** | ARM64 cloud host (gateway, broker, auth) + GPU box (workers) |
-| 3 | Orchestration | yes | RabbitMQ | **k3s** + NVIDIA GPU Operator + Gateway API Inference Extension |
+| 3 | Orchestration | yes | RabbitMQ | **k3s** + NVIDIA GPU Operator, Gateway API `HTTPRoute`, **KEDA** worker autoscaling |
 | 4 | Observability | yes | RabbitMQ | **Prometheus, Grafana, Alertmanager, Loki** on the cluster |
 
 The rest of this doc is about Phase 1. §9 describes the later phases and
@@ -436,7 +436,16 @@ GPU box ─ worker per GPU (CUDA_VISIBLE_DEVICES=0 / =1), each: consume → exec
 - **The HTTP contract doesn't change.** The frontend is untouched apart from
   login and logout.
 
-### 9.2 Phase 3: k3s + NVIDIA GPU Operator + Gateway API Inference Extension (about a week or more)
+### 9.2 Phase 3: k3s + NVIDIA GPU Operator + HTTPRoute + KEDA (about a week or more)
+
+```
+browser ─► Gateway (Traefik) ─HTTPRoute /api─► FastAPI pods ─► RabbitMQ sample.jobs
+                                                                      │ queue length
+                                                    KEDA ◄────────────┘
+                                                      │ scales 1..2
+                                                      ▼
+                                         GPU worker Deployment (1 pod = 1 GPU)
+```
 
 - **k3s** runs a mixed-architecture cluster: the ARM64 host is the server
   node and the GPU box joins as an amd64 agent. Images are built for both
@@ -446,19 +455,81 @@ GPU box ─ worker per GPU (CUDA_VISIBLE_DEVICES=0 / =1), each: consume → exec
   device plugin (`nvidia.com/gpu: 1` per worker pod) and the **DCGM
   exporter**, which Phase 4 scrapes for free.
 - **RabbitMQ** moves in-cluster, through the RabbitMQ Cluster Operator.
-  Worker pods are a Deployment with one pod per GPU.
 - **Health probes:** split `/api/health` into `/healthz` (liveness) and
   `/readyz` (model loaded; broker connected).
-- **Gateway API Inference Extension: a fit question to settle before
-  building.** GIE's endpoint picker routes *synchronous* inference requests
-  across model-server pods using live metrics from those servers, and it
-  targets OpenAI-style LLM servers. In the RabbitMQ design, workers *pull*
-  jobs, so load balancing already happens at the queue, and GIE would have
-  nothing to route on the job path. It becomes useful if we add a
-  synchronous low-latency endpoint, or serve several checkpoints or models
-  side by side. If we stay purely queue-driven, a plain Gateway API
-  `HTTPRoute` to the gateway, plus **KEDA**'s RabbitMQ scaler for workers,
-  may be the better tool. See open question 3.
+
+**Ingress: Gateway API `HTTPRoute`.** A `Gateway` (the `:443` listener, the
+hostname and TLS) plus one `HTTPRoute` that sends `/api` to the FastAPI
+`Service`. We use Traefik, which k3s already ships; its Gateway API provider
+and the Gateway API CRDs have to be enabled once. TLS comes from
+cert-manager, or `cloudflared` keeps running in-cluster and points at the
+Gateway, so the public URL is unchanged from the MVP. The route only ever
+carries cheap CPU calls (submit and poll), so it needs no GPU-aware routing.
+
+**Why not the Gateway API Inference Extension (GIE)?** GIE's endpoint picker
+routes *synchronous* inference requests straight to model-server pods, using
+live load metrics from those pods. Our GPU workers receive no HTTP traffic:
+they *pull* from RabbitMQ with `prefetch_count=1`, and that already gives
+least-loaded dispatch. GIE would have nothing to route. Revisit it only if
+we add a synchronous low-latency path to GPU pods, or serve several
+checkpoints from separate pools.
+
+**Worker autoscaling: KEDA, with no scale to zero.** A KEDA `ScaledObject`
+scales the worker Deployment on the length of `sample.jobs`.
+`minReplicaCount: 1` keeps one worker warm at all times, so no job ever
+waits for a pod to be scheduled and the checkpoint to load.
+
+```yaml
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata: { name: sample-worker }
+spec:
+  scaleTargetRef: { name: sample-worker }
+  minReplicaCount: 1               # always one warm worker: no cold starts
+  maxReplicaCount: 2               # one per GPU
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown: { stabilizationWindowSeconds: 600 }   # 10 min idle before 2 → 1
+  triggers:
+    - type: rabbitmq
+      metadata: { queueName: sample.jobs, mode: QueueLength, value: "1" }
+      authenticationRef: { name: rabbitmq-conn }        # Secret with the AMQP URL
+```
+
+Trade-off: one GPU stays reserved for sampling at all times. Training runs
+get the second GPU whenever KEDA has scaled down to one worker. Using both
+GPUs for training means scaling the worker Deployment to 0 by hand, or
+pausing the `ScaledObject`.
+
+**Worker Deployment and graceful shutdown.** The autoscaler doesn't know
+which worker is busy. Rollouts, node drains and scaling from 2 to 1 can
+therefore all send `SIGTERM` to a worker in the middle of a job. The worker
+must exit cleanly instead of losing that job:
+
+1. On `SIGTERM`, the worker cancels its RabbitMQ consumer, so the broker
+   sends it no new jobs.
+2. It finishes the current job, publishes the result, **then** acks the
+   message.
+3. It closes the connection and exits 0.
+
+- `terminationGracePeriodSeconds` is set to about 1.5× the slowest allowed
+  job, taken from the §8 measurements at `MAX_N_RES` × `MAX_N_SAMPLES` ×
+  `MAX_DDIM_STEPS`.
+- If the grace period still runs out, Kubernetes sends `SIGKILL`. The
+  message was never acked, so RabbitMQ redelivers it to the other worker.
+  Delivery is at-least-once. Because the seed is fixed when the job is
+  submitted, re-running a job gives the same output, and the result write is
+  keyed by `job_id`, so a duplicate run just overwrites an identical result.
+- The rollout strategy is `RollingUpdate` with `maxSurge: 0` and
+  `maxUnavailable: 1`. With both GPUs in use, a surge pod could never be
+  scheduled, so the rollout would stall. With these settings it replaces one
+  worker at a time, and the other keeps consuming.
+- `readinessProbe` is `/readyz` (model loaded, broker connected). The worker
+  starts consuming only once it is ready.
+
+The shutdown logic belongs in the Phase 2 worker process. `systemctl stop`
+sends the same `SIGTERM`, so Phase 3 only adds the manifests around it.
 
 ### 9.3 Phase 4: observability
 
@@ -494,8 +565,8 @@ GPU box ─ worker per GPU (CUDA_VISIBLE_DEVICES=0 / =1), each: consume → exec
 | 2 | `pallatom/serve/`: messages, `execute_job`, in-process queue and store, `SamplerApi`, CORS, rate limit, tests |
 | 3 | `web/` scaffold, Node devcontainer feature, pre-commit hooks, CI steps |
 | 4 | Frontend UI, OpenAPI type generation, `pages.yml`, tunnel and run docs. **The MVP is complete.** |
-| 5+ | Phase 2: RabbitMQ queue and store implementations, worker process, ARM64 gateway deployment, auth |
-| later | Phase 3 (k3s + GPU Operator + gateway/GIE), then Phase 4 (observability) |
+| 5+ | Phase 2: RabbitMQ queue and store implementations, worker process with graceful `SIGTERM` shutdown, ARM64 gateway deployment, auth |
+| later | Phase 3 (k3s + GPU Operator + `HTTPRoute` + KEDA), then Phase 4 (observability) |
 
 ## 11. Open questions
 
@@ -506,8 +577,5 @@ GPU box ─ worker per GPU (CUDA_VISIBLE_DEVICES=0 / =1), each: consume → exec
 2. **Is a domain available on Cloudflare?** With one, we get a named tunnel
    and a stable API URL. Without one, the MVP uses a quick tunnel plus the
    `?api=` override.
-3. **What is GIE for in Phase 3?** Is it meant for a future synchronous
-   path or multi-model routing? Or should the queue-driven design use a plain
-   `HTTPRoute` and KEDA (§9.2)?
-4. **Where does the frontend live once auth arrives?** Gateway origin versus
+3. **Where does the frontend live once auth arrives?** Gateway origin versus
    a custom domain on Pages (§9.1).
