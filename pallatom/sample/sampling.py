@@ -489,14 +489,18 @@ def build_sampling_context(
     def tile(t: Float[torch.Tensor, "..."]) -> Float[torch.Tensor, "B ..."]:
         return repeat(t, "... -> b ...", b=B)
 
-    packed_t_hat = 1.0 * torch.ones(B, device=device)
+    packed_t_hat: Float[torch.Tensor, "B N_res"] = torch.ones(
+        B,
+        residue_number,
+        device=device,
+    )
     # Apply zero-centered noise to turn r_gt into r_input. The mean is taken
     # over valid atoms only, so padded atom slots don't bias it toward the
     # origin (match sampling convention).
     noise = torch.randn_like(aa_ctx.r_gt, device=device)
     noise = noise - masked_com(noise, mask=aa_ctx.atom5_mask)
     r_input: Float[torch.Tensor, "B N_atom 3"] = (
-        aa_ctx.r_gt + rearrange(packed_t_hat, "b -> b 1 1") * noise
+        aa_ctx.r_gt + repeat(packed_t_hat, "b n -> b (n a) 1", a=NATOM) * noise
     )
 
     return FeaturizedBatch(
@@ -634,7 +638,8 @@ class EDMSampler:
             normalized_timestep: Normalized noise level of ``t_hat`` in
                 [0, 1] as a scalar tensor (1 is maximum noise), broadcast to a
                 (B, N_res, N_res) pair field.
-            t_hat: Current noise level sigma as a scalar tensor.
+            t_hat: Current noise level sigma as a scalar tensor; every
+                residue is denoised at this level.
 
         Returns:
             A tuple of (r_denoised, seq_logits) where r_denoised has shape
@@ -642,7 +647,12 @@ class EDMSampler:
         """
         B: int = r_noisy.shape[0]
         N_res: int = self.context.aa_indices.shape[1]
-        t_hat_batch: Float[torch.Tensor, "B"] = repeat(t_hat, " -> b", b=B)
+        t_hat_batch: Float[torch.Tensor, "B N_res"] = repeat(
+            t_hat,
+            " -> b n",
+            b=B,
+            n=N_res,
+        )
         t_normalized: Float[torch.Tensor, "B N_res N_res"] = repeat(
             normalized_timestep,
             " -> b n1 n2",
