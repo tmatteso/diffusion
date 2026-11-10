@@ -104,6 +104,31 @@ class AllReduceRun:
     reports: tuple[RankReport, ...]
 
 
+def reduce_at_rank(
+    metric_class: type[TensorAccumulatorMixin],
+    rank: int,
+) -> dict[str, float]:
+    """Build ``metric_class`` with every field at ``rank`` and reduce it.
+
+    The instance comes from the class's own ``zero_init``, and each field
+    is then set to ``float(rank)``, so every rank contributes its own
+    number to the mean. Called by ``all_reduce_mean_worker`` inside a
+    spawned rank, after the process group exists.
+
+    Args:
+        metric_class: Metric dataclass to build and reduce.
+        rank: This process's rank, used as every field's starting value.
+
+    Returns:
+        The reduced instance's ``to_float_dict``.
+    """
+    metrics = metric_class.zero_init(torch.device("cpu"))
+    for field in dataclasses.fields(metrics):
+        setattr(metrics, field.name, torch.tensor(float(rank)))
+    metrics.all_reduce_mean()
+    return metrics.to_float_dict()
+
+
 def all_reduce_mean_worker(
     rank: int,
     world_size: int,
@@ -130,31 +155,15 @@ def all_reduce_mean_worker(
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(port)
     dist.init_process_group(backend="gloo", rank=rank, world_size=world_size)
-
-    def reduced(metric_class: type[TensorAccumulatorMixin]) -> dict[str, float]:
-        """Build ``metric_class`` at this rank's value and reduce it.
-
-        Args:
-            metric_class: Metric dataclass to build and reduce.
-
-        Returns:
-            The reduced instance's ``to_float_dict``.
-        """
-        constructor: Callable[..., TensorAccumulatorMixin] = metric_class
-        names = [f.name for f in dataclasses.fields(metric_class)]
-        metrics = constructor(**{n: torch.tensor(float(rank)) for n in names})
-        metrics.all_reduce_mean()
-        return metrics.to_float_dict()
-
-    fresh_loss = reduced(LossMetrics)
+    fresh_loss = reduce_at_rank(LossMetrics, rank)
     for _ in range(3):
         _ = dist.all_reduce(  # pyright: ignore[reportUnknownMemberType]
             torch.tensor(float(rank)),
             op=dist.ReduceOp.SUM,
         )
-    loss = reduced(LossMetrics)
-    throughput = reduced(ThroughputStatistics)
-    norms = reduced(ComponentNorms)
+    loss = reduce_at_rank(LossMetrics, rank)
+    throughput = reduce_at_rank(ThroughputStatistics, rank)
+    norms = reduce_at_rank(ComponentNorms, rank)
     result_queue.put(RankReport(rank, fresh_loss, loss, throughput, norms))
     dist.destroy_process_group()
 
