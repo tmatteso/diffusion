@@ -39,7 +39,7 @@ from helpers.atom_utils import RESTYPE_NUM_NO_X
 from helpers.data import FeaturizedBatch
 from helpers.useful_objects import manual_seed
 from jaxtyping import Float
-from tests.conftest import PatternFactory
+from tests.patterns import sine_pattern
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import Adam
 from train.train_config import (
@@ -230,7 +230,6 @@ def model(dims: TrunkDims) -> MainTrunk:
 @pytest.fixture
 def featurized_batch(
     dims: TrunkDims,
-    make_pattern: PatternFactory,
 ) -> FeaturizedBatch:
     """Build a deterministic FeaturizedBatch at the test sizes.
 
@@ -243,7 +242,6 @@ def featurized_batch(
 
     Args:
         dims: Batch sizes.
-        make_pattern: Sine-pattern factory.
 
     Returns:
         The batch.
@@ -259,9 +257,9 @@ def featurized_batch(
         "r -> (r a)",
         a=dims.atoms_per_res,
     )
-    r_gt = make_pattern((b, n, 3), 0.61)
+    r_gt = sine_pattern((b, n, 3), 0.61)
     return FeaturizedBatch(
-        ref_pos=make_pattern((b, n, 3), 0.37),
+        ref_pos=sine_pattern((b, n, 3), 0.37),
         ref_element=repeat(
             F.one_hot(
                 torch.arange(n) % dims.n_elements,
@@ -284,7 +282,7 @@ def featurized_batch(
         f_pseudo_beta_mask=torch.ones(b, r, dtype=torch.long),
         f_residue_idx=repeat(torch.arange(r), "r -> b r", b=b),
         r_gt=r_gt,
-        r_gt_noised=r_gt + make_pattern((b, n, 3), 0.83),
+        r_gt_noised=r_gt + sine_pattern((b, n, 3), 0.83),
         atom5_mask=torch.ones(b, n, dtype=torch.bool),
         aa_indices=repeat(
             torch.arange(r) % RESTYPE_NUM_NO_X,
@@ -292,7 +290,7 @@ def featurized_batch(
             b=b,
         ),
         t_hat=torch.tensor([0.5, 1.5]),
-        t_normalized=make_pattern((b, r, r), 0.29),
+        t_normalized=sine_pattern((b, r, r), 0.29),
         tok_idx=repeat(tok, "n -> b n", b=b),
         center_uid=repeat(centres, "n -> b n", b=b),
         gt_atom_distogram_sparse=repeat(
@@ -462,7 +460,6 @@ def rel_pos_encodings(
 
 def test_time_fourier_embedding_is_fixed_and_bounded(
     dims: TrunkDims,
-    make_pattern: PatternFactory,
 ) -> None:
     """The embedding has no parameters, frozen buffers, and outputs in [-1, 1].
 
@@ -472,10 +469,9 @@ def test_time_fourier_embedding_is_fixed_and_bounded(
 
     Args:
         dims: Supplies the embedding width and a sequence length.
-        make_pattern: Builds noise levels.
     """
     embedding = TimeFourierEmbedding(dims.c_res)
-    out = embedding(3 * make_pattern((dims.n_res,), 0.7))
+    out = embedding(3 * sine_pattern((dims.n_res,), 0.7))
     assert not list(embedding.parameters())
     assert not embedding.freqs.requires_grad
     assert not embedding.phases.requires_grad
