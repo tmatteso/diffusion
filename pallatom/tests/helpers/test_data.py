@@ -44,6 +44,8 @@ from helpers.data import (
     featurize_batch,
     featurize_single_item,
     make_bucketed_data_loaders,
+    normalized_time_from_sigma,
+    null_template_distogram,
     ref_pos_for_residue,
     sinusoidal_encoding,
 )
@@ -51,7 +53,12 @@ from helpers.useful_objects import manual_seed
 from jaxtyping import Float, TypeCheckError
 from tests.patterns import sine_pattern
 from train.train_config import LoaderConfig as EvalLoaderConfig
-from train.train_config import TrainArgs, TrainConfig, TrainLoaderConfig
+from train.train_config import (
+    NoiseScheduleParams,
+    TrainArgs,
+    TrainConfig,
+    TrainLoaderConfig,
+)
 
 type Entry = dict[str, object]
 
@@ -443,6 +450,55 @@ class ManifestScenario(enum.Enum):
     unknown_field_dropped = ManifestCase({}, {"unknown_field": 42})
 
 
+@dataclasses.dataclass(frozen=True)
+class PickleCase:
+    """Whether the dataset is read from before it is pickled.
+
+    Attributes:
+        read_first: Read one sample first, which opens the file handle.
+    """
+
+    read_first: bool
+
+
+class PickleState(enum.Enum):
+    """The dataset's file-handle state when it is pickled.
+
+    Members:
+        unopened: Pickled straight after construction.
+        opened: Pickled after reading one sample.
+    """
+
+    unopened = PickleCase(read_first=False)
+    opened = PickleCase(read_first=True)
+
+
+@dataclasses.dataclass(frozen=True)
+class DebugCacheCase:
+    """Shard-cache state before a debug run and the train size it must get.
+
+    Attributes:
+        prebuilt: Build a full-dataset loader first in the same shard
+            directory, leaving a 300-protein shard cache behind.
+        expected: Train-set size the debug run must cap at.
+    """
+
+    prebuilt: bool
+    expected: int
+
+
+class DebugCacheScenario(enum.Enum):
+    """Shard-cache states a debug run must ignore.
+
+    Members:
+        fresh_cache: No shard cache exists yet.
+        after_full_dataset_cache: A 300-protein cache already exists.
+    """
+
+    fresh_cache = DebugCacheCase(prebuilt=False, expected=252)
+    after_full_dataset_cache = DebugCacheCase(prebuilt=True, expected=252)
+
+
 @pytest.fixture
 def tcfg() -> TrainConfig:
     """Return the default training configuration.
@@ -554,32 +610,6 @@ def featurized_batch(
 
 
 @pytest.fixture
-def break_case(request: pytest.FixtureRequest) -> FieldBreak:
-    """Return the ``FieldBreak`` of the enum member routed in via param.
-
-    Args:
-        request: Pytest request carrying an ``ItemBreak`` or ``BatchBreak``.
-
-    Returns:
-        The field and reshape to apply.
-    """
-    return cast(ItemBreak | BatchBreak, request.param).value
-
-
-@pytest.fixture
-def bin_scenario(request: pytest.FixtureRequest) -> BinScenario:
-    """Return the ``BinScenario`` member routed in via indirect param.
-
-    Args:
-        request: Pytest request carrying the scenario in ``param``.
-
-    Returns:
-        The scenario under test.
-    """
-    return cast(BinScenario, request.param)
-
-
-@pytest.fixture
 def dataset_jsonl(tmp_path: pathlib.Path) -> pathlib.Path:
     """Write five 6-residue entries named ``1aa.A`` to ``5ee.A``.
 
@@ -651,19 +681,6 @@ def shard_dataset(
 
 
 @pytest.fixture
-def names_hash_scenario(request: pytest.FixtureRequest) -> NamesHashScenario:
-    """Return the ``NamesHashScenario`` member routed in via indirect param.
-
-    Args:
-        request: Pytest request carrying the scenario in ``param``.
-
-    Returns:
-        The scenario under test.
-    """
-    return cast(NamesHashScenario, request.param)
-
-
-@pytest.fixture
 def names_hashes(
     names_hash_scenario: NamesHashScenario,
     tmp_path: pathlib.Path,
@@ -674,7 +691,8 @@ def names_hashes(
     Each build gets its own directory, so neither reuses the other's cache.
 
     Args:
-        names_hash_scenario: Names of the two builds.
+        names_hash_scenario: Names of the two builds; the requesting test
+            parametrizes it.
         tmp_path: Per-test directory.
         shard_budget: Base shard parameters.
 
@@ -723,19 +741,6 @@ def single_entry_jsonl(tmp_path: pathlib.Path) -> pathlib.Path:
 
 
 @pytest.fixture
-def json_form(request: pytest.FixtureRequest) -> JsonForm:
-    """Return the ``JsonForm`` member routed in via indirect param.
-
-    Args:
-        request: Pytest request carrying the form in ``param``.
-
-    Returns:
-        The form under test.
-    """
-    return cast(JsonForm, request.param)
-
-
-@pytest.fixture
 def unknown_residue_json(json_form: JsonForm) -> object:
     """Return entry ``p1`` with five unknown codes, in the scenario's form.
 
@@ -743,7 +748,7 @@ def unknown_residue_json(json_form: JsonForm) -> object:
     five alanines.
 
     Args:
-        json_form: Dict or bytes.
+        json_form: Dict or bytes; the requesting test parametrizes it.
 
     Returns:
         The entry as a dict or as encoded JSON bytes.
@@ -752,19 +757,6 @@ def unknown_residue_json(json_form: JsonForm) -> object:
     if json_form.value.as_bytes:
         return json.dumps(entry).encode()
     return entry
-
-
-@pytest.fixture
-def overflow_scenario(request: pytest.FixtureRequest) -> OverflowScenario:
-    """Return the ``OverflowScenario`` member routed in via indirect param.
-
-    Args:
-        request: Pytest request carrying the scenario in ``param``.
-
-    Returns:
-        The scenario under test.
-    """
-    return cast(OverflowScenario, request.param)
 
 
 @pytest.fixture
@@ -788,50 +780,12 @@ def near_coords() -> Float[torch.Tensor, "12 3"]:
 
 
 @pytest.fixture
-def sinusoid_scenario(request: pytest.FixtureRequest) -> SinusoidScenario:
-    """Return the ``SinusoidScenario`` member routed in via indirect param.
-
-    Args:
-        request: Pytest request carrying the scenario in ``param``.
-
-    Returns:
-        The scenario under test.
-    """
-    return cast(SinusoidScenario, request.param)
-
-
-@pytest.fixture
-def cb_scenario(request: pytest.FixtureRequest) -> CbScenario:
-    """Return the ``CbScenario`` member routed in via indirect param.
-
-    Args:
-        request: Pytest request carrying the scenario in ``param``.
-
-    Returns:
-        The scenario under test.
-    """
-    return cast(CbScenario, request.param)
-
-
-@pytest.fixture
-def manifest_scenario(request: pytest.FixtureRequest) -> ManifestScenario:
-    """Return the ``ManifestScenario`` member routed in via indirect param.
-
-    Args:
-        request: Pytest request carrying the scenario in ``param``.
-
-    Returns:
-        The scenario under test.
-    """
-    return cast(ManifestScenario, request.param)
-
-
-@pytest.fixture
 def manifest(manifest_scenario: ManifestScenario) -> DatasetSplitsManifest:
     """Parse a manifest of one protein per split plus the scenario's fields.
 
     Args:
-        manifest_scenario: Optional fields to add.
+        manifest_scenario: Optional fields to add; the requesting test
+            parametrizes it.
 
     Returns:
         The parsed manifest.
@@ -885,24 +839,25 @@ def bucketed_train_args(tmp_path: pathlib.Path) -> TrainArgs:
 
 @pytest.fixture
 def debug_train_size(
-    request: pytest.FixtureRequest,
+    debug_cache_scenario: DebugCacheScenario,
     bucketed_cfg: TrainConfig,
     tmp_path: pathlib.Path,
 ) -> int:
     """Build a debug-run loader over 300 proteins and return its train size.
 
-    With a True param, a full-dataset loader is built first in the same
-    shard directory, leaving a 300-protein shard cache behind.
+    When the scenario asks for it, a full-dataset loader is built first in
+    the same shard directory, leaving a 300-protein shard cache behind.
 
     Args:
-        request: Pytest request carrying whether to build the full loader.
+        debug_cache_scenario: Whether to build the full loader first; the
+            requesting test parametrizes it.
         bucketed_cfg: Loader configuration.
         tmp_path: Per-test directory shared by both loaders.
 
     Returns:
         Number of proteins in the debug-run train dataset.
     """
-    if cast(bool, request.param):
+    if debug_cache_scenario.value.prebuilt:
         _ = make_bucketed_data_loaders(
             cfg=bucketed_cfg,
             extra_train_args=write_train_args(tmp_path, 300, debug_run=False),
@@ -916,20 +871,20 @@ def debug_train_size(
 
 @pytest.fixture
 def pickled_dataset(
-    request: pytest.FixtureRequest,
+    pickle_state: PickleState,
     train_dataset: ProteinDataset,
 ) -> ProteinDataset:
     """Pickle round-trip ``train_dataset``, optionally after reading from it.
 
     Args:
-        request: Pytest request carrying whether to read a sample first,
-            which opens the dataset's file handle.
+        pickle_state: Whether to read a sample first, which opens the
+            dataset's file handle; the requesting test parametrizes it.
         train_dataset: Dataset to pickle.
 
     Returns:
         The restored copy.
     """
-    if cast(bool, request.param):
+    if pickle_state.value.read_first:
         _ = train_dataset[0]
     raw = pickle.dumps(train_dataset)
     return cast(ProteinDataset, pickle.loads(raw))  # noqa: S301
@@ -1050,14 +1005,13 @@ def shard_loader_lifecycle(
 
 
 @pytest.mark.parametrize(
-    "break_case",
+    "item_break",
     list(ItemBreak),
     ids=[case.name for case in ItemBreak],
-    indirect=True,
 )
 def test_featurized_item_rejects_a_malformed_field(
     featurized_item: FeaturizedItem,
-    break_case: FieldBreak,
+    item_break: ItemBreak,
 ) -> None:
     """Rebuilding a valid item with one malformed field fails the contract.
 
@@ -1066,37 +1020,38 @@ def test_featurized_item_rejects_a_malformed_field(
 
     Args:
         featurized_item: Valid item from ``featurize_single_item``.
-        break_case: Field and reshape to apply.
+        item_break: Field and reshape to apply.
     """
-    old = cast(torch.Tensor, getattr(featurized_item, break_case.field))
+    field = item_break.value
+    old = cast(torch.Tensor, getattr(featurized_item, field.field))
     with pytest.raises(TypeCheckError):
         _ = dataclasses.replace(
             featurized_item,
-            **{break_case.field: break_case.malform(old)},
+            **{field.field: field.malform(old)},
         )
 
 
 @pytest.mark.parametrize(
-    "break_case",
+    "batch_break",
     list(BatchBreak),
     ids=[case.name for case in BatchBreak],
-    indirect=True,
 )
 def test_featurized_batch_rejects_a_malformed_field(
     featurized_batch: FeaturizedBatch,
-    break_case: FieldBreak,
+    batch_break: BatchBreak,
 ) -> None:
     """Rebuilding a valid batch with one malformed field fails the contract.
 
     Args:
         featurized_batch: Valid batch from ``featurize_batch``.
-        break_case: Field and reshape to apply.
+        batch_break: Field and reshape to apply.
     """
-    old = cast(torch.Tensor, getattr(featurized_batch, break_case.field))
+    field = batch_break.value
+    old = cast(torch.Tensor, getattr(featurized_batch, field.field))
     with pytest.raises(TypeCheckError):
         _ = dataclasses.replace(
             featurized_batch,
-            **{break_case.field: break_case.malform(old)},
+            **{field.field: field.malform(old)},
         )
 
 
@@ -1104,7 +1059,6 @@ def test_featurized_batch_rejects_a_malformed_field(
     "bin_scenario",
     list(BinScenario),
     ids=[case.name for case in BinScenario],
-    indirect=True,
 )
 def test_distogram_assigns_each_distance_its_bin(
     bin_scenario: BinScenario,
@@ -1129,7 +1083,6 @@ def test_distogram_assigns_each_distance_its_bin(
     "overflow_scenario",
     list(OverflowScenario),
     ids=[case.name for case in OverflowScenario],
-    indirect=True,
 )
 def test_distogram_is_a_symmetric_one_hot_over_its_bins(
     overflow_scenario: OverflowScenario,
@@ -1181,7 +1134,6 @@ def test_distogram_masks_every_pair_of_an_invalid_atom(
     "sinusoid_scenario",
     list(SinusoidScenario),
     ids=[case.name for case in SinusoidScenario],
-    indirect=True,
 )
 def test_sinusoidal_encoding_matches_its_closed_form(
     sinusoid_scenario: SinusoidScenario,
@@ -1203,7 +1155,6 @@ def test_sinusoidal_encoding_matches_its_closed_form(
     "cb_scenario",
     list(CbScenario),
     ids=[case.name for case in CbScenario],
-    indirect=True,
 )
 def test_ref_pos_for_residue_puts_ca_at_the_origin(
     cb_scenario: CbScenario,
@@ -1386,10 +1337,9 @@ def test_protein_dataset_truncates_long_entries(
 
 
 @pytest.mark.parametrize(
-    "pickled_dataset",
-    [False, True],
-    ids=["unopened", "opened"],
-    indirect=True,
+    "pickle_state",
+    list(PickleState),
+    ids=[case.name for case in PickleState],
 )
 def test_protein_dataset_survives_pickling(
     train_dataset: ProteinDataset,
@@ -1435,7 +1385,6 @@ def test_shard_metadata_records_the_build_parameters(
     "names_hash_scenario",
     list(NamesHashScenario),
     ids=[case.name for case in NamesHashScenario],
-    indirect=True,
 )
 def test_shard_metadata_names_hash_identifies_the_name_set(
     names_hash_scenario: NamesHashScenario,
@@ -1485,7 +1434,6 @@ def test_shard_dataset_reuses_existing_metadata(
     "json_form",
     list(JsonForm),
     ids=[case.name for case in JsonForm],
-    indirect=True,
 )
 def test_parse_protein_centres_ca_and_maps_unknown_residues_to_x(
     shard_dataset: ProteinShardDataset,
@@ -1562,16 +1510,13 @@ def test_bucketed_train_loader_yields_featurized_batches(
 
 
 @pytest.mark.parametrize(
-    ("debug_train_size", "expected"),
-    [
-        pytest.param(False, 252, id="fresh_cache"),
-        pytest.param(True, 252, id="after_full_dataset_cache"),
-    ],
-    indirect=["debug_train_size"],
+    "debug_cache_scenario",
+    list(DebugCacheScenario),
+    ids=[case.name for case in DebugCacheScenario],
 )
 def test_bucketed_debug_run_caps_train_split_at_252(
     debug_train_size: int,
-    expected: int,
+    debug_cache_scenario: DebugCacheScenario,
 ) -> None:
     """``debug_run`` trains on the first 252 proteins of a 300-protein split.
 
@@ -1581,16 +1526,16 @@ def test_bucketed_debug_run_caps_train_split_at_252(
 
     Args:
         debug_train_size: Train-set size of the debug-run loader.
-        expected: The cap ``make_bucketed_data_loaders`` applies.
+        debug_cache_scenario: The cap ``make_bucketed_data_loaders``
+            applies.
     """
-    assert debug_train_size == expected
+    assert debug_train_size == debug_cache_scenario.value.expected
 
 
 @pytest.mark.parametrize(
     "manifest_scenario",
     list(ManifestScenario),
     ids=[case.name for case in ManifestScenario],
-    indirect=True,
 )
 def test_dataset_splits_manifest_parses_splits_and_cath_nodes(
     manifest_scenario: ManifestScenario,
@@ -1608,3 +1553,194 @@ def test_dataset_splits_manifest_parses_splits_and_cath_nodes(
         ["p3"],
     )
     assert manifest.cath_nodes == manifest_scenario.value.cath_nodes
+
+
+@pytest.fixture
+def expected_t_normalized(
+    featurized_item: FeaturizedItem,
+    tcfg: TrainConfig,
+) -> Float[torch.Tensor, "N_res N_res"]:
+    """Build the template weight the featurizer must give ``featurized_item``.
+
+    Args:
+        featurized_item: Item whose ``t_hat`` sets the noise level.
+        tcfg: Supplies the noise schedule.
+
+    Returns:
+        ``normalized_time_from_sigma(t_hat)`` at every residue pair.
+    """
+    expected = normalized_time_from_sigma(featurized_item.t_hat, tcfg.noise)
+    return torch.full_like(featurized_item.t_normalized, expected.item())
+
+
+def test_featurized_template_weight_is_normalized_noise_level(
+    featurized_item: FeaturizedItem,
+    expected_t_normalized: Float[torch.Tensor, "N_res N_res"],
+) -> None:
+    """``t_normalized`` is the normalized noise level of ``t_hat`` everywhere.
+
+    The featurizer used to draw the template weight from ``U(0, 1)``
+    independently of ``t_hat``, which made it pure noise to the template
+    embedder. It must now equal the sampler's definition at every residue
+    pair. Not parametrized: the item's noise level is the only input.
+
+    Args:
+        featurized_item: Item under test.
+        expected_t_normalized: The sampler's weight for its ``t_hat``.
+    """
+    assert torch.equal(featurized_item.t_normalized, expected_t_normalized)
+
+
+@pytest.fixture
+def noise_schedule() -> NoiseScheduleParams:
+    """Provide the production noise schedule parameters.
+
+    Returns:
+        The default ``NoiseScheduleParams``.
+    """
+    return NoiseScheduleParams()
+
+
+@dataclasses.dataclass(frozen=True)
+class SigmaBoundCase:
+    """A noise level relative to ``sigma_data`` and its normalized time.
+
+    Attributes:
+        sigma_over_data: Noise level in units of ``sigma_data``.
+        expected: Normalized time the noise level must map to.
+    """
+
+    sigma_over_data: float
+    expected: float
+
+
+class SigmaBoundScenario(enum.Enum):
+    """Noise levels at and past the schedule's bounds.
+
+    The production schedule spans ``sigma_min = 4e-4`` to
+    ``sigma_max = 160`` in units of ``sigma_data``.
+
+    Members:
+        above_sigma_max_clamps_to_1: Far above ``sigma_max``.
+        below_sigma_min_clamps_to_0: Far below ``sigma_min``.
+        at_sigma_max: Exactly ``sigma_max``.
+        at_sigma_min: Exactly ``sigma_min``.
+    """
+
+    above_sigma_max_clamps_to_1 = SigmaBoundCase(1e3, 1.0)
+    below_sigma_min_clamps_to_0 = SigmaBoundCase(1e-6, 0.0)
+    at_sigma_max = SigmaBoundCase(160.0, 1.0)
+    at_sigma_min = SigmaBoundCase(4e-4, 0.0)
+
+
+@pytest.fixture
+def bound_sigma(
+    sigma_bound_scenario: SigmaBoundScenario,
+    noise_schedule: NoiseScheduleParams,
+) -> Float[torch.Tensor, ""]:
+    """Build the scenario's noise level in absolute units.
+
+    Args:
+        sigma_bound_scenario: Noise level relative to ``sigma_data``; the
+            requesting test parametrizes it.
+        noise_schedule: Supplies ``sigma_data``.
+
+    Returns:
+        A scalar noise level.
+    """
+    return torch.tensor(
+        sigma_bound_scenario.value.sigma_over_data * noise_schedule.sigma_data,
+    )
+
+
+@pytest.mark.parametrize(
+    "sigma_bound_scenario",
+    list(SigmaBoundScenario),
+    ids=[case.name for case in SigmaBoundScenario],
+)
+def test_normalized_time_from_sigma_bounds(
+    noise_schedule: NoiseScheduleParams,
+    bound_sigma: Float[torch.Tensor, ""],
+    sigma_bound_scenario: SigmaBoundScenario,
+) -> None:
+    """Sigmas at or past the schedule's bounds map to exactly 0 or 1.
+
+    The lognormal training distribution draws sigmas outside
+    ``[sigma_min, sigma_max]``, so the inverse clamps rather than returning
+    times outside [0, 1].
+
+    Args:
+        noise_schedule: Schedule whose bounds are tested.
+        bound_sigma: Noise level at or past a bound.
+        sigma_bound_scenario: Expected normalized time.
+    """
+    t = normalized_time_from_sigma(bound_sigma, noise_schedule)
+    torch.testing.assert_close(
+        t,
+        torch.tensor(sigma_bound_scenario.value.expected),
+        atol=1e-6,
+        rtol=0,
+    )
+
+
+@dataclasses.dataclass(frozen=True)
+class NullTemplateCase:
+    """Shape requested from ``null_template_distogram`` in one scenario.
+
+    Attributes:
+        shape: Requested (B, N_res, N_res, n_templ_bins) shape, which the
+            returned tensor must match exactly.
+    """
+
+    shape: torch.Size
+
+
+class NullTemplateScenario(enum.Enum):
+    """Null template shapes, varying batch, residue and bin counts.
+
+    Members:
+        single_sample: One 4-residue sample with the production 39 bins.
+        batched_19_bins: Three 7-residue samples with 19 bins.
+    """
+
+    single_sample = NullTemplateCase(torch.Size((1, 4, 4, 39)))
+    batched_19_bins = NullTemplateCase(torch.Size((3, 7, 7, 19)))
+
+
+@pytest.fixture
+def null_template(
+    null_template_scenario: NullTemplateScenario,
+) -> Float[torch.Tensor, "B N_res N_res n_templ_bins"]:
+    """Build the scenario's null template distogram on the CPU.
+
+    Args:
+        null_template_scenario: Scenario holding the shape to request,
+            parametrized directly by the requesting test.
+
+    Returns:
+        The output of ``null_template_distogram`` for that shape.
+    """
+    return null_template_distogram(null_template_scenario.value.shape, "cpu")
+
+
+@pytest.mark.parametrize(
+    "null_template_scenario",
+    list(NullTemplateScenario),
+    ids=[case.name for case in NullTemplateScenario],
+)
+def test_null_template_distogram_is_all_zero(
+    null_template: Float[torch.Tensor, "B N_res N_res n_templ_bins"],
+    null_template_scenario: NullTemplateScenario,
+) -> None:
+    """The null template has the requested shape, float dtype, and no mass.
+
+    A real template is one-hot on the bin axis; the null must sum to zero
+    there so the trunk can tell "no template" apart from any structure.
+
+    Args:
+        null_template: The null template built for the scenario.
+        null_template_scenario: Scenario holding the requested shape.
+    """
+    assert null_template.shape == null_template_scenario.value.shape
+    assert null_template.dtype == torch.float32
+    assert not null_template.any()

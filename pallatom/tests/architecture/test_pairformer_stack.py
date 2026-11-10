@@ -191,24 +191,12 @@ def s(
 
 
 @pytest.fixture
-def triangle_scenario(request: pytest.FixtureRequest) -> TriangleScenario:
-    """Return the ``TriangleScenario`` member routed in via indirect param.
-
-    Args:
-        request: Pytest request carrying the scenario in ``param``.
-
-    Returns:
-        The scenario under test.
-    """
-    return cast(TriangleScenario, request.param)
-
-
-@pytest.fixture
 def triangle(triangle_scenario: TriangleScenario, dims: PairDims) -> TMO | TMI:
     """Build the scenario's triangle multiplication under a fixed seed.
 
     Args:
-        triangle_scenario: Direction to build.
+        triangle_scenario: Direction to build; the requesting test
+            parametrizes it.
         dims: Module sizes.
 
     Returns:
@@ -314,20 +302,24 @@ def pair_forward(module: PairModule, pair: Pair) -> Pair:
 
 
 @pytest.fixture
-def pair_module(request: pytest.FixtureRequest) -> PairModule:
-    """Return the module fixture named by the indirect param.
+def pair_module(
+    request: pytest.FixtureRequest,
+    pair_module_name: str,
+) -> PairModule:
+    """Return the module fixture named by ``pair_module_name``.
 
     A pair-only ``PairformerBlock`` is covered through the stack, which
     ``test_stack_applies_its_blocks_in_order`` ties to its blocks.
 
     Args:
-        request: Pytest request carrying ``"tmo"``, ``"tmi"`` or
-            ``"stack"``, the name of the fixture to use.
+        request: Pytest request used to look up the named fixture.
+        pair_module_name: ``"tmo"``, ``"tmi"`` or ``"stack"``, the name
+            of the fixture to use; the requesting test parametrizes it.
 
     Returns:
         The module under test.
     """
-    return cast(PairModule, request.getfixturevalue(cast(str, request.param)))
+    return cast(PairModule, request.getfixturevalue(pair_module_name))
 
 
 @pytest.fixture
@@ -338,7 +330,8 @@ def changed_mask(
     """Build the output positions the scenario says ``z[0, 1]`` reaches.
 
     Args:
-        triangle_scenario: Holds the rows, columns and points.
+        triangle_scenario: Holds the rows, columns and points; the
+            requesting test parametrizes it.
         dims: Supplies ``N_res``.
 
     Returns:
@@ -354,24 +347,12 @@ def changed_mask(
 
 
 @pytest.fixture
-def symmetry_scenario(request: pytest.FixtureRequest) -> SymmetryScenario:
-    """Return the ``SymmetryScenario`` member routed in via indirect param.
-
-    Args:
-        request: Pytest request carrying the scenario in ``param``.
-
-    Returns:
-        The scenario under test.
-    """
-    return cast(SymmetryScenario, request.param)
-
-
-@pytest.fixture
 def direction_input(symmetry_scenario: SymmetryScenario, z: Pair) -> Pair:
     """Return ``z``, or ``z`` averaged with its transpose, per the scenario.
 
     Args:
-        symmetry_scenario: Whether the input must be symmetric.
+        symmetry_scenario: Whether the input must be symmetric; the
+            requesting test parametrizes it.
         z: Asymmetric pair embedding.
 
     Returns:
@@ -383,24 +364,10 @@ def direction_input(symmetry_scenario: SymmetryScenario, z: Pair) -> Pair:
     return (z + rearrange(z, "b i j c -> b j i c")) / 2
 
 
-@pytest.fixture
-def malformed_scenario(request: pytest.FixtureRequest) -> MalformedScenario:
-    """Return the ``MalformedScenario`` member routed in via indirect param.
-
-    Args:
-        request: Pytest request carrying the scenario in ``param``.
-
-    Returns:
-        The scenario under test.
-    """
-    return cast(MalformedScenario, request.param)
-
-
 @pytest.mark.parametrize(
-    "pair_module",
+    "pair_module_name",
     ["tmo", "tmi", "stack"],
     ids=["outgoing", "incoming", "stack"],
-    indirect=True,
 )
 def test_output_shape_dtype_and_finite(
     z: Pair,
@@ -420,10 +387,9 @@ def test_output_shape_dtype_and_finite(
 
 
 @pytest.mark.parametrize(
-    "pair_module",
+    "pair_module_name",
     ["tmo", "tmi", "stack"],
     ids=["outgoing", "incoming", "stack"],
-    indirect=True,
 )
 def test_gradient_reaches_input(z: Pair, pair_module: PairModule) -> None:
     """The summed output has a finite, nonzero gradient with respect to ``z``.
@@ -440,10 +406,9 @@ def test_gradient_reaches_input(z: Pair, pair_module: PairModule) -> None:
 
 
 @pytest.mark.parametrize(
-    "pair_module",
+    "pair_module_name",
     ["tmo", "tmi", "stack"],
     ids=["outgoing", "incoming", "stack"],
-    indirect=True,
 )
 def test_batch_items_are_independent(z: Pair, pair_module: PairModule) -> None:
     """Running each batch item alone matches its slice of the batched run.
@@ -461,16 +426,14 @@ def test_batch_items_are_independent(z: Pair, pair_module: PairModule) -> None:
 
 
 @pytest.mark.parametrize(
-    "pair_module",
+    "pair_module_name",
     ["tmo", "tmi", "stack"],
     ids=["outgoing", "incoming", "stack"],
-    indirect=True,
 )
 @pytest.mark.parametrize(
     "malformed_scenario",
     list(MalformedScenario),
     ids=[case.name for case in MalformedScenario],
-    indirect=True,
 )
 def test_forward_rejects_malformed_pair(
     z: Pair,
@@ -493,7 +456,6 @@ def test_forward_rejects_malformed_pair(
     "triangle_scenario",
     list(TriangleScenario),
     ids=[case.name for case in TriangleScenario],
-    indirect=True,
 )
 def test_triangle_single_entry_reaches_exactly_its_row_and_column(
     triangle: TMO | TMI,
@@ -524,7 +486,6 @@ def test_triangle_single_entry_reaches_exactly_its_row_and_column(
     "triangle_scenario",
     list(TriangleScenario),
     ids=[case.name for case in TriangleScenario],
-    indirect=True,
 )
 def test_triangle_closed_outer_gate_suppresses_output(
     triangle: TMO | TMI,
@@ -547,7 +508,6 @@ def test_triangle_closed_outer_gate_suppresses_output(
     "triangle_scenario",
     list(TriangleScenario),
     ids=[case.name for case in TriangleScenario],
-    indirect=True,
 )
 def test_triangle_outer_gate_sees_unnormalised_input(
     triangle: TMO | TMI,
@@ -575,7 +535,6 @@ def test_triangle_outer_gate_sees_unnormalised_input(
     "triangle_scenario",
     list(TriangleScenario),
     ids=[case.name for case in TriangleScenario],
-    indirect=True,
 )
 def test_triangle_projections_are_scale_invariant(
     triangle: TMO | TMI,
@@ -602,7 +561,6 @@ def test_triangle_projections_are_scale_invariant(
     "triangle_scenario",
     list(TriangleScenario),
     ids=[case.name for case in TriangleScenario],
-    indirect=True,
 )
 @pytest.mark.parametrize(
     ("c_hidden", "expected_hidden"),
@@ -639,7 +597,6 @@ def test_triangle_c_hidden_sets_internal_width_only(
     "symmetry_scenario",
     list(SymmetryScenario),
     ids=[case.name for case in SymmetryScenario],
-    indirect=True,
 )
 def test_directions_agree_only_on_symmetric_input(
     tmo: TMO,

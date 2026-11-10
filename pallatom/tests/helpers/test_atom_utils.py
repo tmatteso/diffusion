@@ -14,7 +14,7 @@ import enum
 import pathlib
 from collections.abc import Callable, Mapping
 from types import MappingProxyType
-from typing import ClassVar, cast
+from typing import ClassVar, cast, override
 
 import einops
 import numpy as np
@@ -26,6 +26,7 @@ from helpers.atom_utils import (
     ATOM5_CA,
     ATOM5_CB,
     ATOM5_N,
+    ATOM5_NAMES,
     ATOM5_O,
     ATOM5_TO_ATOM37,
     ATOM37_C,
@@ -178,6 +179,43 @@ class TensorCase(enum.Enum):
 
 
 @dataclasses.dataclass(frozen=True)
+class AtomSlot:
+    """One backbone atom's name, its index constants, and dataset presence.
+
+    Attributes:
+        atom_name: PDB atom name.
+        atom37_index: Index constant for this atom in the atom37 layout.
+        atom5_index: Index constant for this atom in the atom5 layout.
+        in_dataset: Whether dataset entries carry coordinates for this atom.
+            Entries hold N, CA, C and O only, so CB is always built as a
+            pseudo-Cβ from the backbone.
+    """
+
+    atom_name: str
+    atom37_index: int
+    atom5_index: int
+    in_dataset: bool
+
+
+class NamedAtom(enum.Enum):
+    """Backbone atoms with the index constants that must agree with their name.
+
+    Members:
+        n: Backbone nitrogen.
+        ca: Alpha carbon.
+        c: Carbonyl carbon.
+        o: Carbonyl oxygen.
+        cb: Beta carbon, which dataset entries never include.
+    """
+
+    n = AtomSlot("N", ATOM37_N, ATOM5_N, in_dataset=True)
+    ca = AtomSlot("CA", ATOM37_CA, ATOM5_CA, in_dataset=True)
+    c = AtomSlot("C", ATOM37_C, ATOM5_C, in_dataset=True)
+    o = AtomSlot("O", ATOM37_O, ATOM5_O, in_dataset=True)
+    cb = AtomSlot("CB", ATOM37_CB, ATOM5_CB, in_dataset=False)
+
+
+@dataclasses.dataclass(frozen=True)
 class TensorSpec:
     """Inputs of the atom tensor factory, shared by every conversion case.
 
@@ -195,6 +233,17 @@ class TensorSpec:
     batch: int
     n_res: int
 
+    def slot(self, atom: NamedAtom) -> int:
+        """Index of ``atom`` in this spec's atom layout.
+
+        Args:
+            atom: Backbone atom to locate.
+
+        Returns:
+            The atom's index along the atom axis of the built tensors.
+        """
+        return atom.value.atom37_index
+
 
 @dataclasses.dataclass(frozen=True)
 class Atom5Spec(TensorSpec):
@@ -210,6 +259,18 @@ class Atom5Spec(TensorSpec):
         ResidueRepresentation.atom5
     )
     provide_mask: bool
+
+    @override
+    def slot(self, atom: NamedAtom) -> int:
+        """Index of ``atom`` in the atom5 layout.
+
+        Args:
+            atom: Backbone atom to locate.
+
+        Returns:
+            The atom's index along the atom axis of the built tensors.
+        """
+        return atom.value.atom5_index
 
 
 @dataclasses.dataclass(frozen=True)
@@ -292,6 +353,19 @@ class AtomTensors:
 
     positions: Float[torch.Tensor, "B N_res atoms 3"]
     mask: Float[torch.Tensor, "B N_res atoms"]
+
+
+@dataclasses.dataclass(frozen=True)
+class SlotContents:
+    """Coordinates and mask values held by one atom slot across residues.
+
+    Attributes:
+        positions: The slot's coordinates for each residue (N_res, 3).
+        mask: The slot's mask value for each residue (N_res,).
+    """
+
+    positions: Float[torch.Tensor, "N_res 3"]
+    mask: Float[torch.Tensor, "N_res"]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -569,66 +643,55 @@ class UnwritableScenario(enum.Enum):
 
 
 @pytest.fixture
-def atom_spec(request: pytest.FixtureRequest) -> TensorSpec:
-    """Return the spec of the scenario routed in via indirect param.
+def atom_tensors(
+    atom_scenario: (
+        Atom37ToAtom5Scenario | Atom5ToAtom37Scenario | Atom37ToCbScenario
+    ),
+) -> AtomTensors:
+    """Build positions and mask for the scenario's geometry and layout.
+
+    Each atom is placed through ``TensorSpec.slot``, so atom5 inputs use
+    the atom5 order (N, CA, C, O, CB), which differs from atom37's.
 
     Args:
-        request: Pytest request carrying an atom scenario member.
-
-    Returns:
-        The member's ``TensorSpec`` (or subclass).
-    """
-    scenario = cast(
-        Atom37ToAtom5Scenario | Atom5ToAtom37Scenario | Atom37ToCbScenario,
-        request.param,
-    )
-    return scenario.value
-
-
-@pytest.fixture
-def atom_tensors(atom_spec: TensorSpec) -> AtomTensors:
-    """Build positions and mask for the spec's geometry and layout.
-
-    Atom37 slot indices are used for both layouts: in atom5 the first five
-    slots are N, CA, C, CB, O, so ``ATOM37_*`` stays inside the five.
-
-    Args:
-        atom_spec: Geometry, batch size, residue count and layout.
+        atom_scenario: Geometry, batch size, residue count and layout; the
+            requesting test parametrizes it.
 
     Returns:
         The built tensors.
     """
-    n_atoms = atom_spec.representation.value
+    spec: TensorSpec = atom_scenario.value
+    n_atoms = spec.representation.value
     standard = {
-        ATOM37_N: (1.0, 0.0, 0.0),
-        ATOM37_CA: (0.0, 0.0, 0.0),
-        ATOM37_C: (0.0, 1.0, 0.0),
-        ATOM37_O: (1.0, 1.0, 0.0),
+        NamedAtom.n: (1.0, 0.0, 0.0),
+        NamedAtom.ca: (0.0, 0.0, 0.0),
+        NamedAtom.c: (0.0, 1.0, 0.0),
+        NamedAtom.o: (1.0, 1.0, 0.0),
     }
     geometry = {
-        TensorCase.standard: standard | {ATOM37_CB: (0.0, 0.0, 1.0)},
+        TensorCase.standard: standard | {NamedAtom.cb: (0.0, 0.0, 1.0)},
         TensorCase.no_beta_carbon: standard,
         TensorCase.collinear: {
-            ATOM37_N: (0.0, 0.0, 0.0),
-            ATOM37_CA: (1.0, 0.0, 0.0),
-            ATOM37_C: (2.0, 0.0, 0.0),
-            ATOM37_O: (2.0, 1.0, 0.0),
+            NamedAtom.n: (0.0, 0.0, 0.0),
+            NamedAtom.ca: (1.0, 0.0, 0.0),
+            NamedAtom.c: (2.0, 0.0, 0.0),
+            NamedAtom.o: (2.0, 1.0, 0.0),
         },
-    }.get(atom_spec.content, {})
+    }.get(spec.content, {})
     per_residue = torch.zeros(n_atoms, 3)
-    for slot, xyz in geometry.items():
-        per_residue[slot] = torch.tensor(xyz)
+    for atom, xyz in geometry.items():
+        per_residue[spec.slot(atom)] = torch.tensor(xyz)
     positions = einops.repeat(
         per_residue,
         "a d -> b n a d",
-        b=atom_spec.batch,
-        n=atom_spec.n_res,
+        b=spec.batch,
+        n=spec.n_res,
     )
-    mask = torch.ones(atom_spec.batch, atom_spec.n_res, n_atoms)
-    if atom_spec.content is TensorCase.half_mask:
-        mask[:, : atom_spec.n_res // 2] = 0
-    if atom_spec.content in {TensorCase.no_beta_carbon, TensorCase.collinear}:
-        mask[..., ATOM37_CB] = 0
+    mask = torch.ones(spec.batch, spec.n_res, n_atoms)
+    if spec.content is TensorCase.half_mask:
+        mask[:, : spec.n_res // 2] = 0
+    if spec.content in {TensorCase.no_beta_carbon, TensorCase.collinear}:
+        mask[..., spec.slot(NamedAtom.cb)] = 0
     return AtomTensors(positions=positions, mask=mask)
 
 
@@ -651,19 +714,6 @@ def valid_protein() -> Protein:
 
 
 @pytest.fixture
-def protein_break(request: pytest.FixtureRequest) -> ProteinBreak:
-    """Return the break of the ``InvalidProteinShape`` routed in via param.
-
-    Args:
-        request: Pytest request carrying the scenario in ``param``.
-
-    Returns:
-        Field and malformation to apply.
-    """
-    return cast(InvalidProteinShape, request.param).value
-
-
-@pytest.fixture
 def coords_dict() -> dict[str, list[list[float]]]:
     """Return backbone coordinates for 6 residues, as JSONL entries hold them.
 
@@ -680,19 +730,6 @@ def coords_dict() -> dict[str, list[list[float]]]:
 
 
 @pytest.fixture
-def center_scenario(request: pytest.FixtureRequest) -> CenterPositionsScenario:
-    """Return the ``CenterPositionsScenario`` routed in via indirect param.
-
-    Args:
-        request: Pytest request carrying the scenario in ``param``.
-
-    Returns:
-        The scenario under test.
-    """
-    return cast(CenterPositionsScenario, request.param)
-
-
-@pytest.fixture
 def np_example_to_center(center_scenario: CenterPositionsScenario) -> Example:
     """Build the input mapping for a ``center_positions`` scenario.
 
@@ -700,7 +737,8 @@ def np_example_to_center(center_scenario: CenterPositionsScenario) -> Example:
     ``atom_positions`` key.
 
     Args:
-        center_scenario: Residue count and present atoms.
+        center_scenario: Residue count and present atoms; the requesting test
+            parametrizes it.
 
     Returns:
         Deterministic ``atom_positions`` and ``atom_mask``.
@@ -725,7 +763,8 @@ def expected_centered_positions(
     """Shift the input by the scenario's CA centre and zero absent atoms.
 
     Args:
-        center_scenario: Supplies the hand-derived CA centre.
+        center_scenario: Supplies the hand-derived CA centre; the
+            requesting test parametrizes it.
         np_example_to_center: Input mapping.
 
     Returns:
@@ -768,29 +807,14 @@ def roundtrip_protein() -> Protein:
 
 
 @pytest.fixture
-def resize_scenario(
-    request: pytest.FixtureRequest,
-) -> FixedSizeScenario | TruncateScenario:
-    """Return the resize scenario routed in via indirect param.
-
-    Args:
-        request: Pytest request carrying a ``FixedSizeScenario`` or
-            ``TruncateScenario`` member.
-
-    Returns:
-        The scenario under test.
-    """
-    return cast(FixedSizeScenario | TruncateScenario, request.param)
-
-
-@pytest.fixture
 def resize_input(
     resize_scenario: FixedSizeScenario | TruncateScenario,
 ) -> Example:
     """Return the scenario's input mapping.
 
     Args:
-        resize_scenario: Residue count before resizing.
+        resize_scenario: Residue count before resizing; the requesting test
+            parametrizes it.
 
     Returns:
         A fresh ``n_res``-residue mapping, which the test resizes in place.
@@ -805,7 +829,8 @@ def resize_reference(
     """Return the mapping of just the residues the resize must keep.
 
     Args:
-        resize_scenario: Number of residues kept.
+        resize_scenario: Number of residues kept; the requesting test
+            parametrizes it.
 
     Returns:
         A ``kept``-residue mapping.
@@ -814,24 +839,12 @@ def resize_reference(
 
 
 @pytest.fixture
-def ter_scenario(request: pytest.FixtureRequest) -> TerScenario:
-    """Return the ``TerScenario`` member routed in via indirect param.
-
-    Args:
-        request: Pytest request carrying the scenario in ``param``.
-
-    Returns:
-        The scenario under test.
-    """
-    return cast(TerScenario, request.param)
-
-
-@pytest.fixture
 def to_pdb_protein(to_pdb_scenario: ToPdbScenario) -> Protein:
     """Build the alanine protein a ``to_pdb`` scenario describes.
 
     Args:
-        to_pdb_scenario: Present atoms and chains.
+        to_pdb_scenario: Present atoms and chains; the requesting test
+            parametrizes it.
 
     Returns:
         The protein.
@@ -841,24 +854,12 @@ def to_pdb_protein(to_pdb_scenario: ToPdbScenario) -> Protein:
 
 
 @pytest.fixture
-def unwritable_scenario(request: pytest.FixtureRequest) -> UnwritableScenario:
-    """Return the ``UnwritableScenario`` member routed in via indirect param.
-
-    Args:
-        request: Pytest request carrying the scenario in ``param``.
-
-    Returns:
-        The scenario under test.
-    """
-    return cast(UnwritableScenario, request.param)
-
-
-@pytest.fixture
 def unwritable_protein(unwritable_scenario: UnwritableScenario) -> Protein:
     """Build a protein with the scenario's residue type and chains.
 
     Args:
-        unwritable_scenario: Residue type and chains to write.
+        unwritable_scenario: Residue type and chains to write; the
+            requesting test parametrizes it.
 
     Returns:
         A protein ``to_pdb`` must refuse.
@@ -878,7 +879,8 @@ def scenario_pdb(
     """Write the scenario's records to a PDB file.
 
     Args:
-        pdb_scenario: Records to write.
+        pdb_scenario: Records to write; the requesting test
+            parametrizes it.
         tmp_path: Per-test directory.
 
     Returns:
@@ -888,21 +890,18 @@ def scenario_pdb(
 
 
 @pytest.fixture
-def hetatm_pdb(
-    request: pytest.FixtureRequest,
-    tmp_path: pathlib.Path,
-) -> pathlib.Path:
-    """Write two ATOM residues followed by the routed-in HETATM record.
+def hetatm_pdb(hetatm_record: str, tmp_path: pathlib.Path) -> pathlib.Path:
+    """Write two ATOM residues followed by ``hetatm_record``.
 
     Args:
-        request: Pytest request carrying the HETATM record in ``param``.
+        hetatm_record: The HETATM record, in ``write_pdb``'s format; the
+            requesting test parametrizes it.
         tmp_path: Per-test directory.
 
     Returns:
         The file path.
     """
-    hetatm = cast(str, request.param)
-    records = f"N ALA A1;N GLY A2;{hetatm}"
+    records = f"N ALA A1;N GLY A2;{hetatm_record}"
     return write_pdb(tmp_path / "model.pdb", records)
 
 
@@ -919,53 +918,13 @@ def gapped_pdb(tmp_path: pathlib.Path) -> pathlib.Path:
     return write_pdb(tmp_path / "model.pdb", "N ALA A5;N ALA A10")
 
 
-@pytest.fixture
-def pdb_scenario(request: pytest.FixtureRequest) -> PdbScenario:
-    """Return the ``PdbScenario`` member routed in via indirect param.
-
-    Args:
-        request: Pytest request carrying the scenario in ``param``.
-
-    Returns:
-        The scenario under test.
-    """
-    return cast(PdbScenario, request.param)
-
-
-@pytest.fixture
-def to_pdb_scenario(request: pytest.FixtureRequest) -> ToPdbScenario:
-    """Return the ``ToPdbScenario`` member routed in via indirect param.
-
-    Args:
-        request: Pytest request carrying the scenario in ``param``.
-
-    Returns:
-        The scenario under test.
-    """
-    return cast(ToPdbScenario, request.param)
-
-
-@pytest.fixture
-def wrong_shape(request: pytest.FixtureRequest) -> WrongShape:
-    """Return the case of the ``WrongAtomShape`` routed in via param.
-
-    Args:
-        request: Pytest request carrying the scenario in ``param``.
-
-    Returns:
-        Conversion and shapes.
-    """
-    return cast(WrongAtomShape, request.param).value
-
-
 @pytest.mark.parametrize(
-    "atom_spec",
+    "atom_scenario",
     list(Atom37ToAtom5Scenario),
     ids=[case.name for case in Atom37ToAtom5Scenario],
-    indirect=True,
 )
 def test_atom37_to_atom5_copies_the_five_backbone_slots(
-    atom_spec: TensorSpec,
+    atom_scenario: Atom37ToAtom5Scenario,
     atom_tensors: AtomTensors,
 ) -> None:
     """Each atom5 slot holds its atom37 atom's position and mask, same dtype.
@@ -973,9 +932,10 @@ def test_atom37_to_atom5_copies_the_five_backbone_slots(
     A CB absent in atom37 stays absent in atom5.
 
     Args:
-        atom_spec: Batch and residue counts.
+        atom_scenario: Batch and residue counts.
         atom_tensors: Atom37 positions and mask.
     """
+    atom_spec = atom_scenario.value
     x = atom_tensors
     positions, mask = atom37_to_atom5(x.positions, x.mask)
     atom5 = [ATOM5_N, ATOM5_CA, ATOM5_C, ATOM5_O, ATOM5_CB]
@@ -989,13 +949,12 @@ def test_atom37_to_atom5_copies_the_five_backbone_slots(
 
 
 @pytest.mark.parametrize(
-    "atom_spec",
+    "atom_scenario",
     list(Atom5ToAtom37Scenario),
     ids=[case.name for case in Atom5ToAtom37Scenario],
-    indirect=True,
 )
 def test_atom5_to_atom37_scatters_into_backbone_slots_only(
-    atom_spec: Atom5Spec,
+    atom_scenario: Atom5ToAtom37Scenario,
     atom_tensors: AtomTensors,
 ) -> None:
     """Each atom5 slot lands at its atom37 index; every other slot is zero.
@@ -1003,9 +962,10 @@ def test_atom5_to_atom37_scatters_into_backbone_slots_only(
     With no mask passed, the backbone slots are marked present.
 
     Args:
-        atom_spec: Sizes and whether to pass the mask.
+        atom_scenario: Sizes and whether to pass the mask.
         atom_tensors: Atom5 positions and mask.
     """
+    atom_spec = atom_scenario.value
     x = atom_tensors
     mask_in = x.mask if atom_spec.provide_mask else None
     expected_mask = (
@@ -1024,25 +984,26 @@ def test_atom5_to_atom37_scatters_into_backbone_slots_only(
 
 
 @pytest.mark.parametrize(
-    "atom_spec",
+    "atom_scenario",
     list(Atom37ToCbScenario),
     ids=[case.name for case in Atom37ToCbScenario],
-    indirect=True,
 )
 def test_atom37_to_cb_uses_cb_when_present_and_a_pseudo_cb_otherwise(
-    atom_spec: CbSpec,
+    atom_scenario: Atom37ToCbScenario,
     atom_tensors: AtomTensors,
 ) -> None:
     """Present CBs are copied; absent ones become a finite pseudo-Cβ.
 
     Where the backbone is non-degenerate, the pseudo-Cβ is a new point,
     neither the empty CB slot nor CA. Collinear N, CA, C make the cross
-    product vanish; the epsilon in the normalisation must keep it finite.
+    product vanish; the pseudo-Cβ must still be finite.
 
     Args:
-        atom_spec: Where CB is present and whether the fallback is distinct.
+        atom_scenario: Where CB is present and whether the fallback is
+            distinct.
         atom_tensors: Atom37 positions and mask.
     """
+    atom_spec = atom_scenario.value
     x = atom_tensors
     cb, present = atom37_to_cb(x.positions, x.mask)
     expected = torch.zeros(atom_spec.batch, atom_spec.n_res, dtype=torch.bool)
@@ -1060,17 +1021,19 @@ def test_atom37_to_cb_uses_cb_when_present_and_a_pseudo_cb_otherwise(
 
 
 @pytest.mark.parametrize(
-    "wrong_shape",
+    "wrong_atom_shape",
     list(WrongAtomShape),
     ids=[case.name for case in WrongAtomShape],
-    indirect=True,
 )
-def test_atom_conversions_reject_wrong_shapes(wrong_shape: WrongShape) -> None:
+def test_atom_conversions_reject_wrong_shapes(
+    wrong_atom_shape: WrongAtomShape,
+) -> None:
     """Each conversion's contract rejects positions of the wrong shape.
 
     Args:
-        wrong_shape: Conversion and shapes.
+        wrong_atom_shape: Conversion and shapes.
     """
+    wrong_shape = wrong_atom_shape.value
     positions = torch.zeros(wrong_shape.positions_shape)
     mask = torch.ones(wrong_shape.mask_shape)
     with pytest.raises(TypeCheckError):
@@ -1078,14 +1041,13 @@ def test_atom_conversions_reject_wrong_shapes(wrong_shape: WrongShape) -> None:
 
 
 @pytest.mark.parametrize(
-    "protein_break",
+    "invalid_protein_shape",
     list(InvalidProteinShape),
     ids=[case.name for case in InvalidProteinShape],
-    indirect=True,
 )
 def test_protein_rejects_invalid_shapes(
     valid_protein: Protein,
-    protein_break: ProteinBreak,
+    invalid_protein_shape: InvalidProteinShape,
 ) -> None:
     """Rebuilding a valid Protein with one malformed field raises.
 
@@ -1094,8 +1056,9 @@ def test_protein_rejects_invalid_shapes(
 
     Args:
         valid_protein: Protein whose other fields stay valid.
-        protein_break: Field and malformation.
+        invalid_protein_shape: Field and malformation.
     """
+    protein_break = invalid_protein_shape.value
     old = cast(Array, getattr(valid_protein, protein_break.field))
     with pytest.raises(TypeCheckError):
         _ = dataclasses.replace(
@@ -1174,7 +1137,6 @@ def test_make_np_example_masks_and_zeroes_nan_coordinates(
     "resize_scenario",
     list(FixedSizeScenario),
     ids=[case.name for case in FixedSizeScenario],
-    indirect=True,
 )
 def test_make_fixed_size_pads_or_truncates_to_ten(
     resize_scenario: FixedSizeScenario,
@@ -1201,7 +1163,6 @@ def test_make_fixed_size_pads_or_truncates_to_ten(
     "resize_scenario",
     list(TruncateScenario),
     ids=[case.name for case in TruncateScenario],
-    indirect=True,
 )
 def test_truncate_to_length_cuts_but_never_pads(
     resize_input: Example,
@@ -1223,7 +1184,6 @@ def test_truncate_to_length_cuts_but_never_pads(
     "center_scenario",
     list(CenterPositionsScenario),
     ids=[case.name for case in CenterPositionsScenario],
-    indirect=True,
 )
 def test_center_positions(
     np_example_to_center: Example,
@@ -1250,7 +1210,6 @@ def test_center_positions(
     "ter_scenario",
     list(TerScenario),
     ids=[case.name for case in TerScenario],
-    indirect=True,
 )
 def test_chain_end_formats_a_ter_record(ter_scenario: TerScenario) -> None:
     """``chain_end`` lays out serial, residue, chain and number in columns.
@@ -1267,7 +1226,6 @@ def test_chain_end_formats_a_ter_record(ter_scenario: TerScenario) -> None:
     "to_pdb_scenario",
     list(ToPdbScenario),
     ids=[case.name for case in ToPdbScenario],
-    indirect=True,
 )
 def test_to_pdb_writes_one_atom_line_per_present_atom(
     to_pdb_scenario: ToPdbScenario,
@@ -1295,7 +1253,6 @@ def test_to_pdb_writes_one_atom_line_per_present_atom(
     "unwritable_scenario",
     list(UnwritableScenario),
     ids=[case.name for case in UnwritableScenario],
-    indirect=True,
 )
 def test_to_pdb_rejects_unwritable_proteins(
     unwritable_scenario: UnwritableScenario,
@@ -1345,7 +1302,6 @@ def test_to_pdb_and_protein_from_pdb_round_trip(
     "pdb_scenario",
     list(PdbScenario),
     ids=[case.name for case in PdbScenario],
-    indirect=True,
 )
 def test_protein_from_pdb_classifies_molecules_and_chains(
     pdb_scenario: PdbScenario,
@@ -1377,10 +1333,9 @@ def test_protein_from_pdb_classifies_molecules_and_chains(
 
 
 @pytest.mark.parametrize(
-    "hetatm_pdb",
+    "hetatm_record",
     ["HETATM O HOH A100", "HETATM MG MG A200", "HETATM N1 ATP A300"],
     ids=["water", "ion", "ligand"],
-    indirect=True,
 )
 def test_protein_from_pdb_skips_hetatm_records(
     hetatm_pdb: pathlib.Path,
@@ -1520,3 +1475,166 @@ def test_nucleotide_tables_are_read_only(table: Mapping[str, object]) -> None:
     assert isinstance(table, MappingProxyType)
     with pytest.raises(TypeError, match="does not support item assignment"):
         writable["XX"] = 0
+
+
+@pytest.fixture
+def dataset_residue_count() -> int:
+    """Number of identical residues in the dataset-shaped entry.
+
+    Three residues is the smallest entry with an interior residue; every
+    residue is the same ideal alanine, so the count only checks that each
+    residue is handled, not any residue-to-residue geometry.
+
+    Returns:
+        The residue count.
+    """
+    return 3
+
+
+@pytest.fixture
+def dataset_atom37(
+    ideal_alanine_atom5: Float[torch.Tensor, "5 3"],
+    dataset_residue_count: int,
+) -> AtomTensors:
+    """Run a dataset-shaped entry of ideal alanines through make_np_example.
+
+    The entry carries coordinates for every atom whose ``in_dataset`` flag
+    is set (N, CA, C and O) and none for CB, like the training data.
+
+    Args:
+        ideal_alanine_atom5: Ideal alanine positions in atom5 order.
+        dataset_residue_count: Number of residues in the entry.
+
+    Returns:
+        Batched atom37 positions and mask, batch size 1.
+    """
+    coords = {
+        atom.value.atom_name: [
+            [
+                float(axis)
+                for axis in ideal_alanine_atom5[atom.value.atom5_index]
+            ],
+        ]
+        * dataset_residue_count
+        for atom in NamedAtom
+        if atom.value.in_dataset
+    }
+    example = make_np_example(coords)
+    positions = torch.as_tensor(example["atom_positions"], dtype=torch.float64)
+    mask = torch.as_tensor(example["atom_mask"], dtype=torch.float64)
+    return AtomTensors(
+        positions=einops.rearrange(positions, "n a d -> 1 n a d"),
+        mask=einops.rearrange(mask, "n a -> 1 n a"),
+    )
+
+
+@pytest.fixture
+def expected_atom5_slot(
+    named_atom: NamedAtom,
+    ideal_alanine_atom5: Float[torch.Tensor, "5 3"],
+    dataset_residue_count: int,
+) -> SlotContents:
+    """What the named atom's atom5 slot must hold after the dataset round trip.
+
+    Atoms present in the dataset keep their ideal position with mask 1; CB,
+    which the dataset never carries, stays at the origin with mask 0.
+
+    Args:
+        named_atom: The atom whose slot is checked; the requesting test
+            parametrizes it.
+        ideal_alanine_atom5: Ideal alanine positions in atom5 order.
+        dataset_residue_count: Number of residues in the entry.
+
+    Returns:
+        The expected per-residue positions and mask of that slot.
+    """
+    present = float(named_atom.value.in_dataset)
+    position = ideal_alanine_atom5[named_atom.value.atom5_index] * present
+    return SlotContents(
+        positions=einops.repeat(
+            position.to(torch.float64),
+            "d -> n d",
+            n=dataset_residue_count,
+        ),
+        mask=torch.full(
+            (dataset_residue_count,),
+            present,
+            dtype=torch.float64,
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "named_atom",
+    list(NamedAtom),
+    ids=[atom.name for atom in NamedAtom],
+)
+def test_atom_index_constants_match_atom_names(named_atom: NamedAtom) -> None:
+    """Index constants agree with the ordered name lists they index into.
+
+    Looks each atom up by name in ``atom_types`` and ``ATOM5_NAMES`` rather
+    than through other constants, so constants that agree with each other but
+    not with the data order fail here.
+
+    Args:
+        named_atom: The atom whose constants are being checked.
+    """
+    slot = named_atom.value
+
+    assert atom_types[slot.atom37_index] == slot.atom_name
+    assert ATOM5_NAMES[slot.atom5_index] == slot.atom_name
+    assert ATOM5_TO_ATOM37[slot.atom5_index] == slot.atom37_index
+
+
+@pytest.mark.parametrize(
+    "named_atom",
+    list(NamedAtom),
+    ids=[atom.name for atom in NamedAtom],
+)
+def test_make_np_example_atoms_reach_named_atom5_slots(
+    named_atom: NamedAtom,
+    dataset_atom37: AtomTensors,
+    expected_atom5_slot: SlotContents,
+) -> None:
+    """Dataset atoms land in the atom5 slot with their name, CB stays empty.
+
+    The slot is found with ``ATOM5_NAMES.index`` rather than the index
+    constant, so a constant pointing at the wrong slot cannot hide itself.
+
+    Args:
+        named_atom: The atom whose atom5 slot is being checked.
+        dataset_atom37: The atom37 tensors built from a dataset-shaped entry.
+        expected_atom5_slot: What that slot must hold for each residue.
+    """
+    atom5_positions, atom5_mask = atom37_to_atom5(
+        dataset_atom37.positions,
+        dataset_atom37.mask,
+    )
+
+    slot = ATOM5_NAMES.index(named_atom.value.atom_name)
+    assert torch.equal(
+        atom5_positions[0, :, slot],
+        expected_atom5_slot.positions,
+    )
+    assert torch.equal(atom5_mask[0, :, slot], expected_atom5_slot.mask)
+
+
+def test_atom37_to_cb_places_ideal_cb_for_dataset_entries(
+    ideal_alanine_cb: Float[torch.Tensor, "3"],
+    dataset_atom37: AtomTensors,
+) -> None:
+    """Dataset entries get a pseudo-Cβ at the ideal alanine Cβ position.
+
+    Dataset entries have no CB, so this path produces every residue's Cβ in
+    training. It is not parametrized because one ideal residue pins the
+    geometry: the expected point comes from the residue's known CB, and being
+    near it rules out returning the O atom instead.
+
+    Args:
+        ideal_alanine_cb: The ideal alanine's known Cβ.
+        dataset_atom37: The atom37 tensors built from a dataset-shaped entry.
+    """
+    cb, cb_present = atom37_to_cb(dataset_atom37.positions, dataset_atom37.mask)
+
+    assert not cb_present.any()
+    assert torch.allclose(cb, ideal_alanine_cb.to(torch.float64), atol=0.01)

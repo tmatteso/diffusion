@@ -24,19 +24,34 @@ import torch
 from architecture.main_trunk import MainTrunk, PredictedOutputs
 from einops import rearrange, reduce, repeat
 from helpers.alignment import masked_com
-from helpers.atom_utils import RESTYPE_NUM_NO_X, Protein, restype_order
-from helpers.data import Distogram, FeaturizedBatch
+from helpers.atom_utils import (
+    ATOM5_CB,
+    ATOM5_NAMES,
+    ATOM5_TO_ATOM37,
+    ATOM37_CB,
+    RESTYPE_NUM_NO_X,
+    Protein,
+    ResidueRepresentation,
+    restype_order,
+)
+from helpers.data import (
+    Distogram,
+    FeaturizedBatch,
+    normalized_time_from_sigma,
+)
 from helpers.useful_objects import manual_seed
-from jaxtyping import Bool, Float, Shaped, TypeCheckError
+from jaxtyping import Bool, Float, Int, Shaped, TypeCheckError
 from sample.sample_config import SamplerParams
 from sample.sampling import (
     NATOM,
     AllAtomContext,
     EDMSampler,
     TemplateContext,
+    backbone_cb_positions,
     build_aa_context,
     build_sampling_context,
     build_template_context,
+    sampled_structure_to_pdb,
 )
 from train.train_config import NoiseScheduleParams
 
@@ -294,6 +309,20 @@ class ScheduleCase:
     rho: float
 
     @property
+    def noise(self) -> NoiseScheduleParams:
+        """Noise schedule parameters holding this case's values.
+
+        Returns:
+            The schedule parameters.
+        """
+        return NoiseScheduleParams(
+            sigma_data=self.sigma_data,
+            sigma_min=self.sigma_min,
+            sigma_max=self.sigma_max,
+            rho=self.rho,
+        )
+
+    @property
     def sigma_at_zero(self) -> float:
         """Noise level the schedule must give at ``t = 0``.
 
@@ -498,19 +527,6 @@ def context(atom_disto: Distogram, templ_disto: Distogram) -> FeaturizedBatch:
 
 
 @pytest.fixture
-def context_scenario(request: pytest.FixtureRequest) -> ContextScenario:
-    """Return the ``ContextScenario`` member routed in via indirect param.
-
-    Args:
-        request: Pytest request carrying the scenario in ``param``.
-
-    Returns:
-        The scenario under test.
-    """
-    return cast(ContextScenario, request.param)
-
-
-@pytest.fixture
 def scenario_context(
     context_scenario: ContextScenario,
     atom_disto: Distogram,
@@ -518,7 +534,8 @@ def scenario_context(
     """Build an unconditional context at the scenario's size.
 
     Args:
-        context_scenario: Residue count and template width.
+        context_scenario: Residue count and template width; the
+            requesting test parametrizes it.
         atom_disto: Atom distogram.
 
     Returns:
@@ -595,19 +612,6 @@ def identity_sampler(
 
 
 @pytest.fixture
-def churn_scenario(request: pytest.FixtureRequest) -> ChurnScenario:
-    """Return the ``ChurnScenario`` member routed in via indirect param.
-
-    Args:
-        request: Pytest request carrying the scenario in ``param``.
-
-    Returns:
-        The scenario under test.
-    """
-    return cast(ChurnScenario, request.param)
-
-
-@pytest.fixture
 def churned_sampler(
     churn_scenario: ChurnScenario,
     context: FeaturizedBatch,
@@ -617,7 +621,8 @@ def churned_sampler(
     """Build a four-step sampler over ``D(z) = z`` with the scenario's churn.
 
     Args:
-        churn_scenario: ``S_churn`` and ``S_tmin``.
+        churn_scenario: ``S_churn`` and ``S_tmin``; the requesting test
+            parametrizes it.
         context: Unconditional context.
         templ_disto: Template distogram.
         default_noise: Noise schedule.
@@ -681,7 +686,7 @@ def rho_schedules(
     Args:
         context: Unconditional context.
         templ_disto: Template distogram.
-        default_noise: Noise schedule.
+        default_noise: Noise schedule, with ``rho`` replaced per curve.
 
     Returns:
         Both curves.
@@ -694,8 +699,8 @@ def rho_schedules(
                     ScaledDenoiser(0.0),
                     context,
                     templ_disto,
-                    SamplerParams(rho=rho),
-                    default_noise,
+                    SamplerParams(),
+                    default_noise.model_copy(update={"rho": rho}),
                 ).noise_schedule(t)
                 for t in grid
             ],
@@ -707,7 +712,7 @@ def rho_schedules(
 
 @pytest.fixture
 def schedule_curve(
-    request: pytest.FixtureRequest,
+    schedule_scenario: ScheduleScenario,
     context: FeaturizedBatch,
     templ_disto: Distogram,
 ) -> ScheduleCurve:
@@ -717,24 +722,21 @@ def schedule_curve(
     sampler's schedule parameters.
 
     Args:
-        request: Pytest request carrying a ``ScheduleScenario``.
+        schedule_scenario: Schedule to evaluate; the requesting test
+            parametrizes it.
         context: Unconditional context.
         templ_disto: Template distogram.
 
     Returns:
         The scenario's parameters and its noise levels on the grid.
     """
-    case = cast(ScheduleScenario, request.param).value
+    case = schedule_scenario.value
     sampler = build_sampler(
         ScaledDenoiser(0.0),
         context,
         templ_disto,
-        SamplerParams(rho=case.rho),
-        NoiseScheduleParams(
-            sigma_data=case.sigma_data,
-            sigma_min=case.sigma_min,
-            sigma_max=case.sigma_max,
-        ),
+        SamplerParams(),
+        case.noise,
     )
     grid = torch.linspace(0, 1, 21)
     sigmas = torch.stack([sampler.noise_schedule(t) for t in grid])
@@ -743,7 +745,7 @@ def schedule_curve(
 
 @pytest.fixture
 def sampler_trajectory(
-    request: pytest.FixtureRequest,
+    trajectory_scenario: TrajectoryScenario | ProductionTrajectory,
     context: FeaturizedBatch,
     templ_disto: Distogram,
     monkeypatch: pytest.MonkeyPatch,
@@ -772,7 +774,8 @@ def sampler_trajectory(
     denoised prediction), so ratios cover every step but the last.
 
     Args:
-        request: Pytest request carrying a trajectory scenario.
+        trajectory_scenario: Steps, jitter and step scale to run; the
+            requesting test parametrizes it.
         context: Shared context, for the atom mask and count.
         templ_disto: Template distogram.
         monkeypatch: Pins ``torch.rand`` and replaces the augmentation.
@@ -780,7 +783,7 @@ def sampler_trajectory(
     Returns:
         The recorded trajectory and its expectations.
     """
-    case = cast(TrajectoryScenario | ProductionTrajectory, request.param).value
+    case = trajectory_scenario.value
     shape = (1, context.r_gt.shape[1], 3)
     delta_t = 1 / case.ddim_steps
     denoiser = ScaledDenoiser(0.0)
@@ -862,24 +865,12 @@ def template_ctx(templ_disto: Distogram) -> TemplateContext:
 
 
 @pytest.fixture
-def aa_batch_size(request: pytest.FixtureRequest) -> int:
-    """Return the batch size routed in via indirect param.
-
-    Args:
-        request: Pytest request carrying the batch size in ``param``.
-
-    Returns:
-        Copies of the protein in the batch.
-    """
-    return cast(int, request.param)
-
-
-@pytest.fixture
 def batched_aa_ctx(aa_batch_size: int, atom_disto: Distogram) -> AllAtomContext:
     """Build an all-atom context for ``ACDEFG`` at the routed-in batch size.
 
     Args:
-        aa_batch_size: Copies of the protein in the batch.
+        aa_batch_size: Copies of the protein in the batch; the
+            requesting test parametrizes it.
         atom_disto: Atom distogram.
 
     Returns:
@@ -940,7 +931,6 @@ def spread_template_ctx(templ_disto: Distogram) -> TemplateContext:
     "context_scenario",
     list(ContextScenario),
     ids=[case.name for case in ContextScenario],
-    indirect=True,
 )
 def test_build_sampling_context_shapes_and_index_maps(
     context_scenario: ContextScenario,
@@ -981,16 +971,17 @@ def test_build_sampling_context_shapes_and_index_maps(
     "context_scenario",
     list(ContextScenario),
     ids=[case.name for case in ContextScenario],
-    indirect=True,
 )
 def test_build_sampling_context_holds_unconditional_placeholders(
     scenario_context: FeaturizedBatch,
 ) -> None:
     """The context is a finite all-alanine chain at the origin, all present.
 
-    The template distogram peaks in bin 0, each atom has one element, and
-    ``t_hat = 1`` and ``t_normalized = 0.5`` are the placeholders the
-    sampler overwrites.
+    The template distogram is the all-zero null rather than a binned
+    structure, each atom has one element, and ``t_hat = 1`` and
+    ``t_normalized = 0.5`` are the placeholders the sampler overwrites.
+    Binning the zero coordinates would put every pair in bin 0, a one-hot
+    claiming every residue sits within 3.25 Å of every other.
 
     Args:
         scenario_context: The context.
@@ -1006,7 +997,7 @@ def test_build_sampling_context_holds_unconditional_placeholders(
             elements,
             torch.ones_like(elements),
         ),
-        "distogram_in_bin_0": not x.noised_res_distogram.argmax(-1).any(),
+        "null_template": not x.noised_res_distogram.any(),
         "all_alanine": not x.aa_indices.any(),
         "at_origin": not x.r_gt.any(),
         "atoms_present": bool(x.atom5_mask.all()),
@@ -1022,10 +1013,9 @@ def test_build_sampling_context_holds_unconditional_placeholders(
 
 
 @pytest.mark.parametrize(
-    "schedule_curve",
+    "schedule_scenario",
     list(ScheduleScenario),
     ids=[case.name for case in ScheduleScenario],
-    indirect=True,
 )
 def test_noise_schedule_rises_from_sigma_min_at_zero_to_sigma_max_at_one(
     schedule_curve: ScheduleCurve,
@@ -1064,10 +1054,9 @@ def test_noise_schedule_rho_changes_only_the_interior(
 
 
 @pytest.mark.parametrize(
-    "sampler_trajectory",
+    "trajectory_scenario",
     list(TrajectoryScenario),
     ids=[case.name for case in TrajectoryScenario],
-    indirect=True,
 )
 def test_edm_sampler_calls_model_twice_per_step(
     sampler_trajectory: SamplerTrajectory,
@@ -1087,10 +1076,9 @@ def test_edm_sampler_calls_model_twice_per_step(
 
 
 @pytest.mark.parametrize(
-    "sampler_trajectory",
+    "trajectory_scenario",
     [*TrajectoryScenario, *ProductionTrajectory],
     ids=[case.name for case in [*TrajectoryScenario, *ProductionTrajectory]],
-    indirect=True,
 )
 def test_edm_sampler_visits_noise_levels_from_max_to_min(
     sampler_trajectory: SamplerTrajectory,
@@ -1110,10 +1098,9 @@ def test_edm_sampler_visits_noise_levels_from_max_to_min(
 
 
 @pytest.mark.parametrize(
-    "sampler_trajectory",
+    "trajectory_scenario",
     list(TrajectoryScenario),
     ids=[case.name for case in TrajectoryScenario],
-    indirect=True,
 )
 def test_edm_sampler_initial_noise_matches_first_step(
     sampler_trajectory: SamplerTrajectory,
@@ -1134,10 +1121,9 @@ def test_edm_sampler_initial_noise_matches_first_step(
 
 
 @pytest.mark.parametrize(
-    "sampler_trajectory",
+    "trajectory_scenario",
     list(TrajectoryScenario),
     ids=[case.name for case in TrajectoryScenario],
-    indirect=True,
 )
 def test_edm_sampler_euler_steps_target_next_lower_noise_level(
     sampler_trajectory: SamplerTrajectory,
@@ -1211,7 +1197,6 @@ def test_edm_sampler_identity_denoiser_gives_finite_centred_output(
     "churn_scenario",
     list(ChurnScenario),
     ids=[case.name for case in ChurnScenario],
-    indirect=True,
 )
 def test_edm_sampler_churn_applies_only_inside_its_window(
     churn_scenario: ChurnScenario,
@@ -1286,7 +1271,7 @@ def test_edm_sampler_step_count_changes_a_nontrivial_trajectory(
     assert not torch.allclose(four, ten)
 
 
-@pytest.mark.parametrize("aa_batch_size", [1, 2], indirect=True)
+@pytest.mark.parametrize("aa_batch_size", [1, 2])
 def test_build_aa_context_shapes_follow_batch_and_protein(
     aa_batch_size: int,
     batched_aa_ctx: AllAtomContext,
@@ -1433,3 +1418,323 @@ def test_template_context_rejects_a_distogram_without_bins(
     flat = template_ctx.f_template_distogram[..., 0]
     with pytest.raises(TypeCheckError):
         _ = dataclasses.replace(template_ctx, f_template_distogram=flat)
+
+
+@dataclasses.dataclass(frozen=True)
+class ScheduleRoundTrip:
+    """Times pushed through the schedule and back.
+
+    Attributes:
+        times: Normalized times fed to ``noise_schedule``.
+        recovered: ``normalized_time_from_sigma`` of each resulting sigma.
+    """
+
+    times: Float[torch.Tensor, " T"]
+    recovered: Float[torch.Tensor, " T"]
+
+
+@pytest.fixture
+def schedule_round_trip(
+    schedule_scenario: ScheduleScenario,
+    context: FeaturizedBatch,
+    templ_disto: Distogram,
+) -> ScheduleRoundTrip:
+    """Push a float64 grid of times through the schedule and invert it.
+
+    The denoiser is never called; ``noise_schedule`` only reads the
+    sampler's schedule parameters.
+
+    Args:
+        schedule_scenario: Schedule to invert; the requesting test
+            parametrizes it.
+        context: Unconditional context.
+        templ_disto: Template distogram.
+
+    Returns:
+        The input time grid and the times recovered from its sigmas.
+    """
+    noise = schedule_scenario.value.noise
+    sampler = build_sampler(
+        ScaledDenoiser(0.0),
+        context,
+        templ_disto,
+        SamplerParams(),
+        noise,
+    )
+    times = torch.linspace(0.0, 1.0, 21, dtype=torch.float64)
+    recovered = torch.stack(
+        [
+            normalized_time_from_sigma(sampler.noise_schedule(t), noise)
+            for t in times
+        ],
+    )
+    return ScheduleRoundTrip(times=times, recovered=recovered)
+
+
+@pytest.mark.parametrize(
+    "schedule_scenario",
+    list(ScheduleScenario),
+    ids=[case.name for case in ScheduleScenario],
+)
+def test_normalized_time_inverts_noise_schedule(
+    schedule_round_trip: ScheduleRoundTrip,
+) -> None:
+    """``normalized_time_from_sigma(noise_schedule(t))`` recovers ``t``.
+
+    This pins training and sampling to the same definition of the template
+    weight: any disagreement in ``rho``, ``sigma_data`` or the sigma bounds
+    between the inverse and the schedule breaks the round trip.
+
+    Args:
+        schedule_round_trip: The time grid and the times recovered from it.
+    """
+    torch.testing.assert_close(
+        schedule_round_trip.recovered,
+        schedule_round_trip.times,
+        atol=1e-9,
+        rtol=0.0,
+    )
+
+
+@dataclasses.dataclass(frozen=True)
+class ChurnedTemplateTimes:
+    """Loop times and the template weights churn turns them into.
+
+    Attributes:
+        t_p: The sampler loop's normalized times, ``0.1, 0.2, ..., 0.9``.
+        template_time: ``normalized_time_from_sigma`` of each ``t_p``'s
+            scheduled sigma after churn raises it by ``1 + gamma``.
+    """
+
+    t_p: Float[torch.Tensor, " T"]
+    template_time: Float[torch.Tensor, " T"]
+
+
+@pytest.fixture
+def churned_template_times(
+    churn_gamma: float,
+    context: FeaturizedBatch,
+    templ_disto: Distogram,
+) -> ChurnedTemplateTimes:
+    """Template weights for churned noise levels along a grid of ``t_p``.
+
+    Raises each scheduled sigma by ``1 + gamma``, as the sampler's churn
+    does, and maps it back to normalized time with the production schedule.
+
+    Args:
+        churn_gamma: Churn amount; the requesting test parametrizes it.
+        context: Unconditional context.
+        templ_disto: Template distogram.
+
+    Returns:
+        The ``t_p`` grid and the template weight at each of its points.
+    """
+    noise = NoiseScheduleParams()
+    sampler = build_sampler(
+        ScaledDenoiser(0.0),
+        context,
+        templ_disto,
+        SamplerParams(),
+        noise,
+    )
+    t_p = torch.linspace(0.1, 0.9, 9, dtype=torch.float64)
+    template_time = torch.stack(
+        [
+            normalized_time_from_sigma(
+                sampler.noise_schedule(t) * (1 + churn_gamma),
+                noise,
+            )
+            for t in t_p
+        ],
+    )
+    return ChurnedTemplateTimes(t_p=t_p, template_time=template_time)
+
+
+@pytest.mark.parametrize(
+    "churn_gamma",
+    [
+        pytest.param(0.2, id="pallatom_churn"),
+        pytest.param(1.0, id="doubled_sigma"),
+    ],
+)
+def test_churn_raises_template_time_above_t_p(
+    churned_template_times: ChurnedTemplateTimes,
+) -> None:
+    """Churn makes the template weight exceed the loop's ``t_p``.
+
+    This is why the sampler no longer passes ``t_p`` as the template weight:
+    churn raises ``t_hat`` above ``noise_schedule(t_p)``, so ``t_p``
+    understates the noise the model actually sees on every churned step.
+
+    Args:
+        churned_template_times: The ``t_p`` grid and its churned weights.
+    """
+    times = churned_template_times
+    assert (times.template_time > times.t_p).all()
+
+
+@pytest.fixture
+def sampled_residue_count() -> int:
+    """Number of identical residues in the sampled structure.
+
+    Three residues gives two peptide bonds and an interior residue; every
+    residue is the same ideal alanine, so the count only checks that each
+    residue is written, not any residue-to-residue geometry.
+
+    Returns:
+        The residue count.
+    """
+    return 3
+
+
+@pytest.fixture
+def sampled_atom37_positions(
+    ideal_alanine_atom5: Float[torch.Tensor, "5 3"],
+    cb_slot_value: float,
+) -> Float[torch.Tensor, "1 1 37 3"]:
+    """Build one ideal alanine in atom37 layout with a chosen CB slot value.
+
+    Args:
+        ideal_alanine_atom5: Ideal alanine positions in atom5 order.
+        cb_slot_value: Value written to every axis of the CB slot; the
+            requesting test parametrizes it.
+
+    Returns:
+        Atom37 positions shaped like a sampled structure.
+    """
+    positions = torch.zeros(1, 1, ResidueRepresentation.atom37, 3)
+    positions[0, 0, ATOM5_TO_ATOM37] = ideal_alanine_atom5
+    positions[0, 0, ATOM37_CB] = cb_slot_value
+    return positions
+
+
+@pytest.fixture
+def sampled_atom37_mask(
+    sampled_atom37_positions: Float[torch.Tensor, "1 1 37 3"],
+) -> Float[torch.Tensor, "1 1 37"]:
+    """Mark every atom37 slot present, as the sampler does.
+
+    Args:
+        sampled_atom37_positions: Positions the mask belongs to.
+
+    Returns:
+        An all-ones mask matching the positions.
+    """
+    return torch.ones_like(sampled_atom37_positions[..., 0])
+
+
+@pytest.fixture
+def sampled_atom5_positions(
+    ideal_alanine_atom5: Float[torch.Tensor, "5 3"],
+    cb_slot_value: float,
+    sampled_residue_count: int,
+) -> Float[torch.Tensor, "N_res 5 3"]:
+    """Build a chain of ideal alanines with a chosen CB slot value.
+
+    Args:
+        ideal_alanine_atom5: Ideal alanine positions in atom5 order.
+        cb_slot_value: Value written to every axis of each CB slot; the
+            requesting test parametrizes it.
+        sampled_residue_count: Number of residues in the chain.
+
+    Returns:
+        Atom5 positions shaped like one sampled structure.
+    """
+    positions = repeat(
+        ideal_alanine_atom5,
+        "a d -> n a d",
+        n=sampled_residue_count,
+    ).clone()
+    positions[:, ATOM5_CB] = cb_slot_value
+    return positions
+
+
+@pytest.fixture
+def alanine_aatype(sampled_residue_count: int) -> Int[torch.Tensor, " N_res"]:
+    """Residue types for an all-alanine chain.
+
+    Args:
+        sampled_residue_count: Number of residues in the chain.
+
+    Returns:
+        The alanine residue index for every residue.
+    """
+    return torch.full((sampled_residue_count,), restype_order["A"])
+
+
+@pytest.fixture
+def expected_backbone_atom_names(sampled_residue_count: int) -> str:
+    """The ATOM record names a CB-free backbone PDB must list, in order.
+
+    Args:
+        sampled_residue_count: Number of residues in the chain.
+
+    Returns:
+        N, CA, C and O repeated once per residue, joined by spaces.
+    """
+    backbone = [
+        name for slot, name in enumerate(ATOM5_NAMES) if slot != ATOM5_CB
+    ]
+    return " ".join(backbone * sampled_residue_count)
+
+
+@pytest.mark.parametrize(
+    "cb_slot_value",
+    [
+        pytest.param(0.0, id="zero_cb_slot"),
+        pytest.param(99.0, id="far_cb_slot"),
+    ],
+)
+def test_backbone_cb_positions_ignores_cb_slot(
+    sampled_atom37_positions: Float[torch.Tensor, "1 1 37 3"],
+    sampled_atom37_mask: Float[torch.Tensor, "1 1 37"],
+    ideal_alanine_cb: Float[torch.Tensor, "3"],
+) -> None:
+    """Self-conditioning Cβ comes from the backbone, not the CB slot.
+
+    The model's CB slot is unsupervised and sampling marks every atom as
+    present, so whatever that slot holds must not reach the template.
+
+    Args:
+        sampled_atom37_positions: Ideal alanine with a chosen CB slot value.
+        sampled_atom37_mask: All-present mask, as the sampler builds it.
+        ideal_alanine_cb: The ideal alanine's known Cβ.
+    """
+    cb_positions = backbone_cb_positions(
+        sampled_atom37_positions,
+        sampled_atom37_mask,
+    )
+
+    assert torch.allclose(cb_positions, ideal_alanine_cb, atol=0.01)
+
+
+@pytest.mark.parametrize(
+    "cb_slot_value",
+    [
+        pytest.param(0.0, id="zero_cb_slot"),
+        pytest.param(99.0, id="far_cb_slot"),
+    ],
+)
+def test_sampled_structure_to_pdb_writes_backbone_without_cb(
+    sampled_atom5_positions: Float[torch.Tensor, "N_res 5 3"],
+    alanine_aatype: Int[torch.Tensor, " N_res"],
+    expected_backbone_atom_names: str,
+) -> None:
+    """Sampled PDBs hold N, CA, C and O per residue and no CB.
+
+    The model's CB slot is unsupervised, so whatever value it holds, zero or
+    far off, must not reach the PDB.
+
+    Args:
+        sampled_atom5_positions: Ideal alanines with a chosen CB slot value.
+        alanine_aatype: Residue types for the chain.
+        expected_backbone_atom_names: ATOM names the PDB must list, in order.
+    """
+    pdb = sampled_structure_to_pdb(sampled_atom5_positions, alanine_aatype)
+
+    atom_names = " ".join(
+        line[12:16].strip()
+        for line in pdb.splitlines()
+        if line.startswith("ATOM")
+    )
+    assert atom_names == expected_backbone_atom_names

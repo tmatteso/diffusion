@@ -14,7 +14,6 @@ are exact integer matrices, so every expected value is hand-checkable.
 import dataclasses
 import enum
 from collections.abc import Callable
-from typing import cast
 
 import pytest
 import torch
@@ -198,45 +197,6 @@ def keep(cloud: Coords) -> Keep:
 
 
 @pytest.fixture
-def rigid_scenario(request: pytest.FixtureRequest) -> RigidScenario:
-    """Return the ``RigidScenario`` member routed in via indirect param.
-
-    Args:
-        request: Pytest request carrying the scenario in ``param``.
-
-    Returns:
-        The scenario under test.
-    """
-    return cast(RigidScenario, request.param)
-
-
-@pytest.fixture
-def select_scenario(request: pytest.FixtureRequest) -> SelectScenario:
-    """Return the ``SelectScenario`` member routed in via indirect param.
-
-    Args:
-        request: Pytest request carrying the scenario in ``param``.
-
-    Returns:
-        The scenario under test.
-    """
-    return cast(SelectScenario, request.param)
-
-
-@pytest.fixture
-def rmsd_scenario(request: pytest.FixtureRequest) -> RmsdScenario:
-    """Return the ``RmsdScenario`` member routed in via indirect param.
-
-    Args:
-        request: Pytest request carrying the scenario in ``param``.
-
-    Returns:
-        The scenario under test.
-    """
-    return cast(RmsdScenario, request.param)
-
-
-@pytest.fixture
 def com_coords() -> BatchCoords:
     """Return four real atoms followed by two zero-padded ones.
 
@@ -277,19 +237,6 @@ def four_coord_cloud(cloud: Coords) -> Float[torch.Tensor, "N 4"]:
 
 
 @pytest.fixture
-def mask_scenario(request: pytest.FixtureRequest) -> MaskScenario:
-    """Return the ``MaskScenario`` member routed in via indirect param.
-
-    Args:
-        request: Pytest request carrying the scenario in ``param``.
-
-    Returns:
-        The scenario under test.
-    """
-    return cast(MaskScenario, request.param)
-
-
-@pytest.fixture
 def augment_mask(
     mask_scenario: MaskScenario,
     padding: Bool[torch.Tensor, "B N"],
@@ -297,7 +244,8 @@ def augment_mask(
     """Return the mask the scenario passes to ``centre_random_augment``.
 
     Args:
-        mask_scenario: Whether to mark padding.
+        mask_scenario: Whether to mark padding; the requesting test
+            parametrizes it.
         padding: True for the 8 real atoms of each 12.
 
     Returns:
@@ -367,7 +315,6 @@ def augmented(
     "rigid_scenario",
     list(RigidScenario),
     ids=[case.name for case in RigidScenario],
-    indirect=True,
 )
 def test_kabsch_undoes_a_rigid_motion(
     rigid_scenario: RigidScenario,
@@ -436,7 +383,6 @@ def test_kabsch_does_not_superimpose_a_mirror_image(cloud: Coords) -> None:
     "select_scenario",
     list(SelectScenario),
     ids=[case.name for case in SelectScenario],
-    indirect=True,
 )
 def test_kabsch_rmsd_ignores_deselected_atoms(
     select_scenario: SelectScenario,
@@ -465,7 +411,6 @@ def test_kabsch_rmsd_ignores_deselected_atoms(
     "rmsd_scenario",
     list(RmsdScenario),
     ids=[case.name for case in RmsdScenario],
-    indirect=True,
 )
 def test_rmsd_matches_hand_computed_value(
     rmsd_scenario: RmsdScenario,
@@ -590,7 +535,6 @@ def test_masked_com_averages_only_valid_atoms(
     "mask_scenario",
     list(MaskScenario),
     ids=[case.name for case in MaskScenario],
-    indirect=True,
 )
 def test_centre_random_augment_centres_before_rotating(
     aug_coords: BatchCoords,
