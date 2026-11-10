@@ -13,10 +13,10 @@ what lets the trajectory tests compute every expected value; a real trunk's
 output could not be predicted.
 """
 
+import abc
 import dataclasses
 import enum
-from collections.abc import Callable
-from typing import cast
+from typing import cast, override
 
 import numpy as np
 import pytest
@@ -417,19 +417,82 @@ class ProductionTrajectory(enum.Enum):
 
 
 @dataclasses.dataclass(frozen=True)
-class FieldBreak:
+class FieldBreak(abc.ABC):
     """An AllAtomContext field replaced by a tensor with one axis wrong.
 
     Attributes:
         field: Name of the field to replace.
-        malform: Maps the valid tensor to the malformed one.
     """
 
     field: str
-    malform: Callable[
-        [Shaped[torch.Tensor, "..."]],
-        Shaped[torch.Tensor, "..."],
-    ]
+
+    @abc.abstractmethod
+    def malform(
+        self,
+        tensor: Shaped[torch.Tensor, "..."],
+    ) -> Shaped[torch.Tensor, "..."]:
+        """Map the field's valid tensor to the malformed one.
+
+        Args:
+            tensor: The field's valid value.
+
+        Returns:
+            The malformed replacement.
+        """
+
+
+@dataclasses.dataclass(frozen=True)
+class SelectBreak(FieldBreak):
+    """Keep one index of an axis, removing that axis.
+
+    Attributes:
+        dim: Axis to select from.
+        index: Position along ``dim`` to keep.
+    """
+
+    dim: int
+    index: int
+
+    @override
+    def malform(
+        self,
+        tensor: Shaped[torch.Tensor, "..."],
+    ) -> Shaped[torch.Tensor, "..."]:
+        """Select ``index`` along ``dim``.
+
+        Args:
+            tensor: The field's valid value.
+
+        Returns:
+            ``tensor`` with axis ``dim`` removed.
+        """
+        return tensor.select(self.dim, self.index)
+
+
+@dataclasses.dataclass(frozen=True)
+class DropFirstBreak(FieldBreak):
+    """Remove the first entry of an axis, shortening it by one.
+
+    Attributes:
+        dim: Axis to shorten.
+    """
+
+    dim: int
+
+    @override
+    def malform(
+        self,
+        tensor: Shaped[torch.Tensor, "..."],
+    ) -> Shaped[torch.Tensor, "..."]:
+        """Drop index 0 along ``dim``.
+
+        Args:
+            tensor: The field's valid value.
+
+        Returns:
+            ``tensor`` with ``dim`` one shorter.
+        """
+        return tensor.narrow(self.dim, 1, tensor.shape[self.dim] - 1)
 
 
 class ContextBreak(enum.Enum):
@@ -441,8 +504,8 @@ class ContextBreak(enum.Enum):
             residue mask.
     """
 
-    r_gt_flat = FieldBreak("r_gt", lambda t: t[..., 0])
-    aa_residue_drift = FieldBreak("aa_indices", lambda t: t[:, 1:])
+    r_gt_flat = SelectBreak("r_gt", dim=-1, index=0)
+    aa_residue_drift = DropFirstBreak("aa_indices", dim=1)
 
 
 @dataclasses.dataclass(frozen=True)
