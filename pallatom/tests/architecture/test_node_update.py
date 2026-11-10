@@ -133,7 +133,9 @@ class MalformedCall(abc.ABC):
 
     @abc.abstractmethod
     def call(
-        self, node_modules: NodeModules, dense_inputs: NodeInputs,
+        self,
+        node_modules: NodeModules,
+        dense_inputs: NodeInputs,
     ) -> object:
         """Call one module with ``dense_inputs.s`` cut to ``(B, N_res)``.
 
@@ -152,7 +154,9 @@ class MalformedAdaLN(MalformedCall):
 
     @override
     def call(
-        self, node_modules: NodeModules, dense_inputs: NodeInputs,
+        self,
+        node_modules: NodeModules,
+        dense_inputs: NodeInputs,
     ) -> object:
         """Call ``AdaLN`` with a 2-D ``a``.
 
@@ -172,7 +176,9 @@ class MalformedAttention(MalformedCall):
 
     @override
     def call(
-        self, node_modules: NodeModules, dense_inputs: NodeInputs,
+        self,
+        node_modules: NodeModules,
+        dense_inputs: NodeInputs,
     ) -> object:
         """Call ``AttentionPairBias`` with a 2-D ``a``.
 
@@ -192,7 +198,9 @@ class MalformedNodeUpdate(MalformedCall):
 
     @override
     def call(
-        self, node_modules: NodeModules, dense_inputs: NodeInputs,
+        self,
+        node_modules: NodeModules,
+        dense_inputs: NodeInputs,
     ) -> object:
         """Call ``NodeUpdate`` with a 2-D ``s``.
 
@@ -204,7 +212,9 @@ class MalformedNodeUpdate(MalformedCall):
             The module's output.
         """
         return node_modules.node(
-            dense_inputs.s[..., 0], dense_inputs.t, dense_inputs.z,
+            dense_inputs.s[..., 0],
+            dense_inputs.t,
+            dense_inputs.z,
         )
 
 
