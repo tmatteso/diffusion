@@ -290,12 +290,51 @@ metrics and sample quality. Wall-clock time is reported separately.
 | `sf-coords-layers` | 0.25 | Arm A, (k_s, k_t) ∈ {(2,8), (3,6)} | check sensitivity to the layer pair |
 | `sf-coords-p` | 0.25, `apply_prob = 0.5` | Arm A | train/inference mismatch fallback (§3.2.1); run if `dual-t` < `baseline` |
 
-"Sucks or not" criterion: `sf-coords` should beat `dual-t` on validation
-Kabsch MSE and lDDT at matched steps, and `dual-t` should be at least as good
-as `baseline`. If `dual-t` falls short of `baseline`, revisit the
-mixed-noise loss weighting first (§9.2), before judging the teacher loss. The overhead should be under 35% per step. With a no-grad
-forward at about one third of forward plus checkpointed backward, the expected
-overhead is about 25–30%, plus CPU time to featurize the second view.
+### 6.1 Compare each arm at its own best noise level
+
+The BFL FLUX.2 latent-space study (§10.4) found two things that bear on this
+comparison:
+
+- The choice of noise-level shift alone moved FID by 61–86%, and comparing at
+  a fixed shift *reversed* the ranking of two representations.
+- A REPA-style representation objective lowers the best shift.
+
+Self-Flow is a REPA-style objective, so a Self-Flow arm may prefer a lower
+`P_mean` than `baseline`. Comparing both at `P_mean = −1.2` could then
+understate Self-Flow, or overstate it.
+
+**Protocol:**
+
+1. Run `baseline` and the leading Self-Flow arm (`sf-coords`, or `sf-latents`
+   if it wins the first pass) at `P_mean ∈ {−1.7, −1.2, −0.7}`.
+2. Compare each arm at its own best `P_mean`.
+3. Run the other rows of the table at `P_mean = −1.2` only. They are relative
+   comparisons within Self-Flow.
+
+This is a global shift (§10.1 with `β = 0`). The length-dependent shift stays
+out of this matrix (§10.5).
+
+### 6.2 Sampling-shift sweep (no retraining)
+
+Every representation in the BFL study did best at sampling with a slightly
+*higher* shift than its training shift, and the best value depended on the
+sampler. Add an `α` multiplier to `noise_schedule` in `sample/sampling.py`,
+so that `t_hat ← α · t_hat` with `α = 1` as the default. Sweep
+`α ∈ {1, 1.25, 1.5, 2}` on each final checkpoint. This needs no retraining, so
+it is the cheapest experiment in this doc. Report sample metrics at each arm's
+best sampling `α`, and also at `α = 1`.
+
+### 6.3 Success criterion
+
+"Sucks or not" criterion: at each arm's best `P_mean` (§6.1), `sf-coords`
+should beat `dual-t` on validation Kabsch MSE and lDDT at matched steps, and
+`dual-t` should be at least as good as `baseline`. If `dual-t` falls short of
+`baseline`, revisit the mixed-noise loss weighting first (§9.2), before
+judging the teacher loss.
+
+The overhead should be under 35% per step. With a no-grad forward at about
+one third of forward plus checkpointed backward, the expected overhead is
+about 25–30%, plus CPU time to featurize the second view.
 
 ## 7. Implementation phases (separate PRs)
 
@@ -386,13 +425,34 @@ atoms. Each group then contributes in proportion to its size, whatever its λ.
 **Test (either way):** with `R_M = 0`, the per-atom form must reproduce
 `main`'s `atom_loss` and `med_loss` exactly. This belongs in phase 1 (§7).
 
-## 10. Interaction with length-dependent timestep shifting
+## 10. Interaction with timestep shifting
 
-**Reference:** Esser et al., *Scaling Rectified Flow Transformers for
-High-Resolution Image Synthesis* (ICML 2024, arXiv
-[2403.03206](https://arxiv.org/abs/2403.03206)), §5.3.2. FLUX uses the same
-shift, with `log α` linear in token count: 0.5 at 256 tokens and 1.15 at
-4096 tokens.
+**References:**
+
+- Esser et al., *Scaling Rectified Flow Transformers for High-Resolution
+  Image Synthesis* (ICML 2024, arXiv
+  [2403.03206](https://arxiv.org/abs/2403.03206)), §5.3.2. FLUX uses the same
+  shift, with `log α` linear in token count: 0.5 at 256 tokens and 1.15 at
+  4096 tokens.
+- Black Forest Labs, *FLUX.2: Analyzing and Enhancing the Latent Space of
+  FLUX* ([techblog](https://bfl.ai/techblog/representation-comparison/),
+  November 2025).
+
+Both use the same shift formula. They apply it along different axes:
+
+| | Esser et al. (SD3) | BFL FLUX.2 study |
+|---|---|---|
+| Axis | number of **tokens** (resolution) | **channels per token** (dimension of the representation), with tokens fixed at 256 |
+| Heuristic | `α = √(m/n)`, m and n = pixel counts | `α = √(m/n)`, m and n = channels per token (SD-VAE's 16 as the baseline) |
+| Chosen by | derived, then tuned (α = 3 at 1024²) | swept `α ∈ {1, 1.78, 2.95, 4.63, 6.93}`, separately for training and sampling |
+| Question | how to train at a higher resolution | which latent space to diffuse in |
+
+The common principle: **the right noise level depends on how redundant the
+representation is.** Redundancy can come from the number of tokens or the
+number of channels per token. Redundancy, not the raw size of the
+representation, sets the shift. For pallatom, protein length is the token
+axis (§10.1–§10.3), and the per-residue atom representation is the channel
+axis (§10.4).
 
 ### 10.1 The shift in EDM terms
 
@@ -450,12 +510,61 @@ what a length shift corrects is that preconditioning mismatch.
 5. **Validation must match.** The uniform-σ validation, and the sampler, must
    use the same shift setting as the run they are compared against.
 
-### 10.3 Experiment ordering
+### 10.3 Our sampler already uses the recommended distribution family
 
-Do not introduce the shift inside the §6 matrix. Changing both at once would
-confound the results.
+Since `σ = t/(1−t)`, we have `ln σ = logit(t)`. Our log-normal over σ is
+therefore a logit-normal over t, with `P_mean` ↔ μ and `P_std` ↔ s. The BFL
+study found that a shifted logit-normal, and its plateau variant, always beat
+a shifted uniform distribution. So we are already in the preferred family,
+and any shift is a change to `P_mean` alone.
 
-1. Run the §6 Self-Flow matrix with no shift.
-2. Run the shift on its own: `β ∈ {0, 0.25, 0.5}` against `baseline`, with
-   the sampler schedule shifted to match.
-3. Only if both help, run a 2×2 (shift × Self-Flow, Arm A).
+### 10.4 The channel axis: BFL's findings and what they mean here
+
+**What the study found** (ImageNet 256², DiT-XL, latent flow matching):
+
+- **The heuristic fits RAE but not FLUX.2.** RAE's best training shift was
+  6.93 = `√(768/16)`. FLUX.2 preferred 4.63 against a predicted 2.83. The
+  study attributes the gap to the FLUX.2 latent having a higher intrinsic
+  dimension, i.e. less redundancy across channels. The simple model does not
+  predict which way such a gap moves the optimum, so `√(m/n)` is a starting
+  point for a sweep, not a value to use directly.
+- **The best sampling shift is above the best training shift** for every
+  representation (6.93 for FLUX.2 and RAE), and is "very dependent on the
+  number of sampling steps and choice of sampler."
+- **The shift can reverse a comparison.** With each representation at its
+  own best shift, RAE beats FLUX.2 (gFID 3.10 vs 3.70). Without shifting, the
+  order reverses. The best vs worst training shift changed FID by 61–86%.
+- **REPA lowers the best shift** ("generally results in a small reduction of
+  the optimal shifting value").
+
+**What it means for pallatom:**
+
+1. **The channel axis is fixed today.** We diffuse raw atom5 coordinates, 15
+   numbers per residue, for every protein. It becomes the relevant axis if
+   the representation changes: atom14 or atom37, or a learned protein latent.
+2. **The channel count overstates the information.** Given the backbone
+   frame, N, C and Cβ are almost fully determined by ideal geometry. The real
+   information per residue is about 6 numbers for the rigid frame plus a few
+   torsions, not 15. That is the same kind of mismatch between channel count
+   and intrinsic dimension that moved FLUX.2 off `√(m/n)`. Any change of
+   representation should come with a shift sweep, not a computed shift.
+3. **Self-Flow will probably move the best shift.** It is a REPA-style
+   objective, so it likely lowers the best `P_mean`. That is why §6.1
+   compares arms at their own best `P_mean`.
+4. **Sampling and training shifts are separate settings.** That is why §6.2
+   adds the sampling-only sweep.
+
+### 10.5 Experiment ordering
+
+The *global* `P_mean` sweep belongs inside the §6 matrix (§6.1), because a
+fair comparison needs it. The *length-dependent* shift (`β > 0`) stays out of
+that matrix. Changing both at once would confound the results.
+
+1. Run the sampling-shift sweep (§6.2) on the current best checkpoint. It is
+   free.
+2. Run the §6 Self-Flow matrix, with the §6.1 per-arm `P_mean` sweep and
+   `β = 0`.
+3. Run the length shift on its own: `β ∈ {0, 0.25, 0.5}` against `baseline`
+   at its best `P_mean`, with the sampler schedule shifted to match.
+4. Only if both help, run a 2×2 (length shift × Self-Flow, best arm), at each
+   cell's best global `P_mean`.
