@@ -61,7 +61,12 @@ from pydantic import (
 )
 from structlog.typing import FilteringBoundLogger
 from torch.utils.data.distributed import DistributedSampler
-from train.train_config import DistogramParams, TrainArgs, TrainConfig
+from train.train_config import (
+    DistogramParams,
+    NoiseScheduleParams,
+    TrainArgs,
+    TrainConfig,
+)
 from webdataset.writer import TarWriter
 
 
@@ -530,6 +535,68 @@ def ref_pos_for_residue(resname: str) -> Float[torch.Tensor, "5 3"]:
 
 
 @jaxtyped(typechecker=beartype)
+def null_template_distogram(
+    shape: torch.Size,
+    device: torch.device | str,
+) -> Float[torch.Tensor, "B N_res N_res n_templ_bins"]:
+    """Build the all-zero template distogram that means "no template".
+
+    Every real distogram is a one-hot over the bin axis, so it sums to one
+    there. An all-zero tensor sums to zero, which tells it apart from any
+    binned structure and lets the trunk learn "no information" as its own
+    case. Zeros also pass through the template embedder's bias-free
+    projection as exactly zero, so only the mask and time channels remain.
+
+    The old no-template path binned all-zero coordinates instead. Zero
+    distance falls below the first bin edge for every pair, so it produced a
+    confident one-hot in bin 0: every residue within 3.25 Å of every other.
+
+    Args:
+        shape: Target shape ``(B, N_res, N_res, n_templ_bins)``.
+        device: Device for the returned tensor.
+
+    Returns:
+        An all-zero template distogram of the requested shape.
+    """
+    return torch.zeros(shape, device=device)
+
+
+@jaxtyped(typechecker=beartype)
+def normalized_time_from_sigma(
+    t_hat: Float[torch.Tensor, ""],
+    noise_params: NoiseScheduleParams,
+) -> Float[torch.Tensor, ""]:
+    """Invert the rho-spaced noise schedule to recover normalized time.
+
+    The exact inverse of ``EDMSampler.noise_schedule``, which maps t = 1
+    (maximum noise) to t = 0 (minimum). Training and sampling both use it
+    for the template weight ``t_normalized``, so the weight means the same
+    thing in both: the noise level the model is denoising from. The
+    sampler's loop variable ``t_p`` is not that quantity whenever churn is
+    active, because churn raises ``t_hat`` above ``noise_schedule(t_p)``.
+
+    Clamped to [0, 1] because the lognormal training distribution can draw
+    sigmas outside the schedule's ``[sigma_min, sigma_max]`` range.
+
+    Args:
+        t_hat: Noise level sigma.
+        noise_params: Schedule parameters supplying ``sigma_data``,
+            ``sigma_min``, ``sigma_max`` and ``rho``.
+
+    Returns:
+        Normalized time in [0, 1]; 1 is maximum noise, 0 is minimum.
+    """
+    inv_rho = 1.0 / noise_params.rho
+    sigma_min_r = math.pow(noise_params.sigma_min, inv_rho)
+    sigma_max_r = math.pow(noise_params.sigma_max, inv_rho)
+    ratio = (t_hat / noise_params.sigma_data) ** inv_rho
+    return ((ratio - sigma_min_r) / (sigma_max_r - sigma_min_r)).clamp(
+        0.0,
+        1.0,
+    )
+
+
+@jaxtyped(typechecker=beartype)
 def featurize_single_item(
     prot: Protein,
     template_distogram_fn: Distogram,
@@ -566,8 +633,8 @@ def featurize_single_item(
         FeaturizedItem holding flat atom positions (ground-truth and noised),
         atom and residue masks, GT and noised Cβ distogram targets, sparse
         atom-pair distogram targets, ALA reference geometry, sequence indices,
-        the sampled noise level ``t_hat``, and the uniform template weight
-        ``t_normalized``.
+        the sampled noise level ``t_hat``, and the template weight
+        ``t_normalized``, the normalized noise level of ``t_hat``.
     """
     noise_params = tcfg.noise
     window_size = tcfg.model.window_size
@@ -609,10 +676,10 @@ def featurize_single_item(
         torch.randn(()) * noise_params.P_std + noise_params.P_mean,
     )
 
-    # t_normalized is drawn from uniform(0, 1) and broadcast to every
-    # residue pair.
+    # t_normalized is the normalized noise level of t_hat, computed the same
+    # way the sampler computes it, and broadcast to every residue pair.
     t_template: Float[torch.Tensor, "N_res N_res"] = repeat(
-        torch.rand(()),
+        normalized_time_from_sigma(t_hat, noise_params),
         "-> n m",
         n=N_res,
         m=N_res,

@@ -12,7 +12,6 @@ from pathlib import Path
 from typing import cast
 
 import numpy as np
-import numpy.typing as npt
 import structlog
 import torch
 from architecture.atom_transformers import WINDOW_SIZE, build_sparse_pairs
@@ -21,8 +20,10 @@ from beartype import beartype
 from einops import rearrange, repeat
 from helpers.alignment import centre_random_augment, masked_com
 from helpers.atom_utils import (
+    ATOM5_CB,
     ATOM5_ELEMENTS,
     ATOM37_CA,
+    ATOM37_CB,
     Protein,
     atom5_to_atom37,
     atom37_to_atom5,
@@ -35,15 +36,15 @@ from helpers.data import (
     Distogram,
     FeaturizedBatch,
     build_distogram_module,
+    normalized_time_from_sigma,
+    null_template_distogram,
     ref_pos_for_residue,
 )
-from jaxtyping import Bool, Float, Int, jaxtyped
+from jaxtyping import Bool, Float, Int, Num, jaxtyped
 from sample.sample_config import SampleConfig, SamplerParams
 from structlog.typing import FilteringBoundLogger
 from train.train_config import NoiseScheduleParams
 
-# atom5 slot → atom37 index (used when writing PDB via atom37 representation)
-# atom5: N=0, CA=1, C=2, O=3, CB=4  →  atom37: N=0, CA=1, C=2, O=3, CB=4
 NATOM = 5  # atoms per residue
 
 
@@ -85,6 +86,71 @@ class TemplateContext:
 
     f_template_distogram: Float[torch.Tensor, "B N_RES N_RES N_TEMPL_BINS"]
     f_pseudo_beta_mask: Int[torch.Tensor, "B N_RES"]
+
+
+@jaxtyped(typechecker=beartype)
+def backbone_cb_positions(
+    atom37_positions: Float[torch.Tensor, "B N_res 37 3"],
+    atom37_mask: Float[torch.Tensor, "B N_res 37"],
+) -> Float[torch.Tensor, "B N_res 3"]:
+    """Derive Cβ positions from the backbone, ignoring any CB coordinates.
+
+    Training data has no CB atoms, so the model's CB slot is unsupervised and
+    the training template always uses pseudo-Cβ. Sampling marks every atom as
+    present, so masking CB here keeps self-conditioning matched to training.
+
+    Args:
+        atom37_positions: Atom37 coordinates (B, N_res, 37, 3).
+        atom37_mask: Atom37 presence mask (B, N_res, 37).
+
+    Returns:
+        Pseudo-Cβ positions (B, N_res, 3).
+    """
+    backbone_mask = atom37_mask.clone()
+    backbone_mask[:, :, ATOM37_CB] = 0.0
+    cb_positions, _ = atom37_to_cb(atom37_positions, backbone_mask)
+    return cb_positions
+
+
+@jaxtyped(typechecker=beartype)
+def sampled_structure_to_pdb(
+    atom5_positions: Float[torch.Tensor, "N_res 5 3"],
+    aatype: Num[torch.Tensor, "N_res"],
+) -> str:
+    """Write one sampled structure as a single-chain backbone PDB.
+
+    The model's CB slot is unsupervised, so its coordinates are arbitrary.
+    Masking it out leaves N, CA, C and O for every residue.
+
+    Args:
+        atom5_positions: Sampled atom5 coordinates (N_res, 5, 3).
+        aatype: Sampled residue types (N_res,).
+
+    Returns:
+        The structure as a PDB string.
+    """
+    n_res = atom5_positions.shape[0]
+    atom5_mask = torch.ones(1, n_res, NATOM, dtype=atom5_positions.dtype)
+    atom5_mask[:, :, ATOM5_CB] = 0.0
+    atom37_positions, atom37_mask = atom5_to_atom37(
+        rearrange(atom5_positions, "n a d -> 1 n a d"),
+        atom5_mask,
+    )
+    prot = Protein(
+        atom_positions=np.asarray(
+            rearrange(atom37_positions, "1 n a d -> n a d"),
+            dtype=np.float64,
+        ),
+        atom_mask=np.asarray(
+            rearrange(atom37_mask, "1 n a -> n a"),
+            dtype=np.float64,
+        ),
+        residue_index=np.arange(n_res, dtype=np.intp),
+        aatype=np.asarray(aatype, dtype=np.intp),
+        chain_index=np.zeros(n_res, dtype=np.intp),  # single chain
+        b_factors=np.ones((n_res, 37), dtype=np.float64),
+    )
+    return to_pdb(prot)
 
 
 @jaxtyped(typechecker=beartype)
@@ -334,7 +400,10 @@ def build_sampling_context(
 
     Args:
         pdb_file_path: Path to a PDB file used as template; None for no
-            template (zero-initialised coordinates are used instead).
+            template. Without a template the atom context is built from
+            zero-initialised coordinates and the template distogram is the
+            all-zero null from ``null_template_distogram``, the same null
+            training uses for its detached self-conditioning pass.
         atom_distogram_fn: Distogram for atom-level pairwise distances.
         templ_distogram_fn: Distogram for template Cβ pairwise distances.
         residue_number: Number of residues to generate.
@@ -374,6 +443,14 @@ def build_sampling_context(
             batch_size=B,
             device=device,
         )
+    template_distogram: Float[torch.Tensor, "B N_res N_res n_templ_bins"] = (
+        template_context.f_template_distogram
+        if pdb_file_path
+        else null_template_distogram(
+            template_context.f_template_distogram.shape,
+            device,
+        )
+    )
 
     # ── Ala reference conformer tiled over all residues ──────────────────────
     ala_ref_pos: Float[torch.Tensor, "5 3"] = ref_pos_for_residue("ALA").to(
@@ -442,7 +519,7 @@ def build_sampling_context(
             dtype=torch.long,
             device=device,
         ),
-        noised_res_distogram=template_context.f_template_distogram,
+        noised_res_distogram=template_distogram,
         f_pseudo_beta_mask=template_context.f_pseudo_beta_mask,
         r_gt=aa_ctx.r_gt,
         r_gt_noised=r_input,  # spoofed inputs, modified during sampling
@@ -464,7 +541,7 @@ class EDMSampler:
                 are replaced at every denoising step
     sigma_min : float  smallest noise level  (paper: 0.002)
     sigma_max : float  largest  noise level  (paper: 80.0)
-    rho       : float  schedule exponent     (paper: 7.0)
+    rho       : float  schedule exponent, read from noise_params (paper: 7.0)
     S_churn   : float  stochastic noise injected per step (0 = deterministic)
     S_tmin    : float  only inject noise while S_tmin <= timestep / ddim_steps
     S_tmax    : float  <= S_tmax; schedule time in [0, 1], 1 = maximum noise,
@@ -487,7 +564,8 @@ class EDMSampler:
         self.sigma_data: float = noise_params.sigma_data
         self.sigma_min: float = noise_params.sigma_min
         self.sigma_max: float = noise_params.sigma_max
-        self.rho: float = sampler_params.rho
+        self.noise_params: NoiseScheduleParams = noise_params
+        self.rho: float = noise_params.rho
         self.S_churn: float = sampler_params.S_churn
         self.S_tmin: float = sampler_params.S_tmin
         self.S_tmax: float = sampler_params.S_tmax
@@ -553,9 +631,9 @@ class EDMSampler:
             f_template_distogram: Optional template pairwise distance
                 distribution to inject into the batch; pass None to keep the
                 distogram already stored in the context.
-            normalized_timestep: Diffusion time in (0, 1] as a scalar tensor
-                (1 is maximum noise), broadcast to a (B, N_res, N_res) pair
-                field.
+            normalized_timestep: Normalized noise level of ``t_hat`` in
+                [0, 1] as a scalar tensor (1 is maximum noise), broadcast to a
+                (B, N_res, N_res) pair field.
             t_hat: Current noise level sigma as a scalar tensor.
 
         Returns:
@@ -663,6 +741,14 @@ class EDMSampler:
             # Select temporarily increased noise level t_hat
             t_hat: Float[torch.Tensor, ""] = c_T * (gamma + 1)
 
+            # The template weight is the normalized noise level of t_hat,
+            # computed exactly as training computes it. Under churn it sits
+            # above t_p, which understates the noise the model sees.
+            t_template: Float[torch.Tensor, ""] = normalized_time_from_sigma(
+                t_hat,
+                self.noise_params,
+            )
+
             # Add new noise to move from t_p to t_hat
             eps = torch.randn((shape), device=self.device)
             # zero the center of mass of the noise, over valid atoms only.
@@ -671,13 +757,14 @@ class EDMSampler:
                 self.S_noise * torch.sqrt(t_hat**2 - c_T**2) * eps
             )
 
-            # update the self condition feature
-            # the self-condition template distogram is init earlier.
+            # Self-conditioning pass against the context's template: the null
+            # template when sampling unconditionally, matching the detached
+            # pass training runs before every step.
             r_denoised, seq_logits = self.denoise(
                 r_noisy=noisy_r_l,
                 f_template_distogram=None,
                 t_hat=t_hat,
-                normalized_timestep=t_p,
+                normalized_timestep=t_template,
             )
 
             atom37_positions: Float[torch.Tensor, "B N_res 37 3"]
@@ -690,8 +777,9 @@ class EDMSampler:
                     a=NATOM,
                 ).float(),
             )
-            cb_positions: Float[torch.Tensor, "B N_res 3"]
-            cb_positions, _ = atom37_to_cb(atom37_positions, atom37_mask)
+            cb_positions: Float[torch.Tensor, "B N_res 3"] = (
+                backbone_cb_positions(atom37_positions, atom37_mask)
+            )
             self_condition_residue_mask: Bool[torch.Tensor, "B N_res"] = (
                 self.context.f_pseudo_beta_mask.bool()
             )
@@ -705,7 +793,7 @@ class EDMSampler:
                 r_noisy=noisy_r_l,
                 f_template_distogram=f_template_distogram,
                 t_hat=t_hat,
-                normalized_timestep=t_p,
+                normalized_timestep=t_template,
             )
             # Evaluate dx/dt at t_hat
             delta_l = (noisy_r_l - r_denoised) / t_hat
@@ -869,36 +957,17 @@ def main(args: SamplingArgs, scfg: SampleConfig, device: str) -> None:
         )
         log.info("sampling complete", n_res=N_RES, n_samples=B_SAMPLE)
 
-        pdb_strings: list[str] = []
-        for b in range(B_SAMPLE):
-            coords_t: Float[torch.Tensor, "1 N_res 5 3"] = rearrange(
-                coords_batch[b].cpu(),
-                "(n a) d -> 1 n a d",
-                n=N_RES,
-                a=NATOM,
+        pdb_strings: list[str] = [
+            sampled_structure_to_pdb(
+                rearrange(coords, "(n a) d -> n a d", n=N_RES, a=NATOM),
+                seqs,
             )
-            x_37_b, mask_37_b = atom5_to_atom37(coords_t)
-            atom_positions: npt.NDArray[np.float64] = np.asarray(
-                rearrange(x_37_b, "1 n a d -> n a d"),
-                dtype=np.float64,
+            for coords, seqs in zip(
+                coords_batch.cpu(),
+                seqs_batch.cpu(),
+                strict=True,
             )
-            atom_mask: npt.NDArray[np.float64] = np.asarray(
-                rearrange(mask_37_b, "1 n a -> n a"),
-                dtype=np.float64,
-            )
-            aatype: npt.NDArray[np.intp] = np.asarray(
-                seqs_batch[b].cpu(),
-                dtype=np.intp,
-            )
-            prot = Protein(
-                atom_positions=atom_positions,
-                atom_mask=atom_mask,
-                residue_index=np.arange(N_RES, dtype=np.intp),
-                aatype=aatype,
-                chain_index=np.zeros(N_RES, dtype=np.intp),  # single chain
-                b_factors=np.ones((N_RES, 37), dtype=np.float64),
-            )
-            pdb_strings.append(to_pdb(prot))
+        ]
 
         _ = Path(scfg.output.output_path).write_text(
             json.dumps(pdb_strings),
