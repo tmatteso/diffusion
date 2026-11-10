@@ -9,10 +9,11 @@ Every input is deterministic and every scenario enum's value is a frozen
 dataclass, so each case reads as one row of named fields.
 """
 
+import abc
 import dataclasses
 import enum
 import pathlib
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from types import MappingProxyType
 from typing import ClassVar, cast, override
 
@@ -73,7 +74,6 @@ from jaxtyping import Float, TypeCheckError
 type Array = npt.NDArray[np.float64] | npt.NDArray[np.intp]
 type Example = dict[str, Array]
 type AnyFloat = Float[torch.Tensor, "..."]
-type Convert = Callable[[AnyFloat, AnyFloat], object]
 
 
 def feature_example(n: int) -> Example:
@@ -369,16 +369,125 @@ class SlotContents:
 
 
 @dataclasses.dataclass(frozen=True)
-class ProteinBreak:
+class ProteinBreak(abc.ABC):
     """A Protein field replaced by an array with one axis wrong.
 
     Attributes:
         field: Name of the Protein field to replace.
-        malform: Maps the valid array to the malformed one.
     """
 
     field: str
-    malform: Callable[[Array], Array]
+
+    @abc.abstractmethod
+    def malform(self, array: Array) -> Array:
+        """Map the field's valid array to the malformed one.
+
+        Args:
+            array: The field's valid value.
+
+        Returns:
+            The malformed replacement.
+        """
+
+
+@dataclasses.dataclass(frozen=True)
+class SelectBreak(ProteinBreak):
+    """Keep one index of an axis, removing that axis.
+
+    Attributes:
+        axis: Axis to select from.
+        index: Position along ``axis`` to keep.
+    """
+
+    axis: int
+    index: int
+
+    @override
+    def malform(self, array: Array) -> Array:
+        """Select ``index`` along ``axis``.
+
+        Args:
+            array: The field's valid value.
+
+        Returns:
+            ``array`` with ``axis`` removed.
+        """
+        return cast(Array, np.take(array, self.index, axis=self.axis))
+
+
+@dataclasses.dataclass(frozen=True)
+class DropFirstBreak(ProteinBreak):
+    """Remove the first entry of an axis, shortening it by one.
+
+    Attributes:
+        axis: Axis to shorten.
+    """
+
+    axis: int
+
+    @override
+    def malform(self, array: Array) -> Array:
+        """Drop index 0 along ``axis``.
+
+        Args:
+            array: The field's valid value.
+
+        Returns:
+            ``array`` with ``axis`` one shorter.
+        """
+        return np.delete(array, 0, axis=self.axis)
+
+
+@dataclasses.dataclass(frozen=True)
+class RepeatFirstBreak(ProteinBreak):
+    """Append a copy of an axis's first entry, lengthening it by one.
+
+    Attributes:
+        axis: Axis to lengthen.
+    """
+
+    axis: int
+
+    @override
+    def malform(self, array: Array) -> Array:
+        """Append index 0 along ``axis`` to the end.
+
+        Args:
+            array: The field's valid value.
+
+        Returns:
+            ``array`` with ``axis`` one longer.
+        """
+        return cast(
+            Array,
+            np.concatenate(
+                [array, np.take(array, [0], axis=self.axis)],
+                axis=self.axis,
+            ),
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class AddAxisBreak(ProteinBreak):
+    """Insert a length-one axis.
+
+    Attributes:
+        axis: Position of the new axis.
+    """
+
+    axis: int
+
+    @override
+    def malform(self, array: Array) -> Array:
+        """Insert a new axis at ``axis``.
+
+        Args:
+            array: The field's valid value.
+
+        Returns:
+            ``array`` with one more axis.
+        """
+        return cast(Array, np.expand_dims(array, self.axis))
 
 
 class InvalidProteinShape(enum.Enum):
@@ -402,14 +511,14 @@ class InvalidProteinShape(enum.Enum):
         residue_index_drift: ``residue_index`` lost a residue on its own.
     """
 
-    no_coord_axis = ProteinBreak("atom_positions", lambda a: a[..., 0])
-    extra_coord = ProteinBreak("atom_positions", lambda a: a[..., [0, 1, 2, 2]])
-    res_drift = ProteinBreak("atom_positions", lambda a: a[1:])
-    atom_drift = ProteinBreak("atom_positions", lambda a: a[:, 1:])
-    mask_no_atom_axis = ProteinBreak("atom_mask", lambda a: a[:, 0])
-    mask_atom_drift = ProteinBreak("atom_mask", lambda a: a[:, 1:])
-    aatype_column_vector = ProteinBreak("aatype", lambda a: a[:, None])
-    residue_index_drift = ProteinBreak("residue_index", lambda a: a[1:])
+    no_coord_axis = SelectBreak("atom_positions", axis=-1, index=0)
+    extra_coord = RepeatFirstBreak("atom_positions", axis=-1)
+    res_drift = DropFirstBreak("atom_positions", axis=0)
+    atom_drift = DropFirstBreak("atom_positions", axis=1)
+    mask_no_atom_axis = SelectBreak("atom_mask", axis=1, index=0)
+    mask_atom_drift = DropFirstBreak("atom_mask", axis=1)
+    aatype_column_vector = AddAxisBreak("aatype", axis=1)
+    residue_index_drift = DropFirstBreak("residue_index", axis=0)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -445,18 +554,82 @@ class CenterPositionsScenario(enum.Enum):
 
 
 @dataclasses.dataclass(frozen=True)
-class WrongShape:
+class WrongShape(abc.ABC):
     """An atom conversion and positions of a deliberately wrong shape.
 
     Attributes:
-        convert: Conversion under test, called as ``convert(pos, mask)``.
         positions_shape: Invalid shape for the positions.
         mask_shape: Valid shape for the mask.
     """
 
-    convert: Convert
     positions_shape: tuple[int, ...]
     mask_shape: tuple[int, ...]
+
+    @abc.abstractmethod
+    def convert(self, positions: AnyFloat, mask: AnyFloat) -> object:
+        """Run the conversion under test.
+
+        Args:
+            positions: Positions of ``positions_shape``.
+            mask: Mask of ``mask_shape``.
+
+        Returns:
+            The conversion's result; the test expects it to raise.
+        """
+
+
+@dataclasses.dataclass(frozen=True)
+class Atom37ToAtom5Shape(WrongShape):
+    """Calls ``atom37_to_atom5(positions, mask)``."""
+
+    @override
+    def convert(self, positions: AnyFloat, mask: AnyFloat) -> object:
+        """Call ``atom37_to_atom5``.
+
+        Args:
+            positions: Positions of ``positions_shape``.
+            mask: Mask of ``mask_shape``.
+
+        Returns:
+            The converted tensors.
+        """
+        return atom37_to_atom5(positions, mask)
+
+
+@dataclasses.dataclass(frozen=True)
+class Atom5ToAtom37Shape(WrongShape):
+    """Calls ``atom5_to_atom37(positions, mask)``."""
+
+    @override
+    def convert(self, positions: AnyFloat, mask: AnyFloat) -> object:
+        """Call ``atom5_to_atom37``.
+
+        Args:
+            positions: Positions of ``positions_shape``.
+            mask: Mask of ``mask_shape``.
+
+        Returns:
+            The converted tensors.
+        """
+        return atom5_to_atom37(positions, mask)
+
+
+@dataclasses.dataclass(frozen=True)
+class Atom37ToCbShape(WrongShape):
+    """Calls ``atom37_to_cb(positions, mask)``."""
+
+    @override
+    def convert(self, positions: AnyFloat, mask: AnyFloat) -> object:
+        """Call ``atom37_to_cb``.
+
+        Args:
+            positions: Positions of ``positions_shape``.
+            mask: Mask of ``mask_shape``.
+
+        Returns:
+            The converted tensors.
+        """
+        return atom37_to_cb(positions, mask)
 
 
 class WrongAtomShape(enum.Enum):
@@ -471,9 +644,9 @@ class WrongAtomShape(enum.Enum):
         cb_width: ``atom37_to_cb`` given 4-component points.
     """
 
-    atom37_width = WrongShape(atom37_to_atom5, (2, 10, 37, 4), (2, 10, 37))
-    atom5_count = WrongShape(atom5_to_atom37, (2, 10, 4, 3), (2, 10, 5))
-    cb_width = WrongShape(atom37_to_cb, (2, 10, 37, 4), (2, 10, 37))
+    atom37_width = Atom37ToAtom5Shape((2, 10, 37, 4), (2, 10, 37))
+    atom5_count = Atom5ToAtom37Shape((2, 10, 4, 3), (2, 10, 5))
+    cb_width = Atom37ToCbShape((2, 10, 37, 4), (2, 10, 37))
 
 
 @dataclasses.dataclass(frozen=True)
