@@ -40,8 +40,6 @@ from sample.sampling import (
 )
 from train.train_config import NoiseScheduleParams
 
-type SamplerFactory = Callable[[float, SamplerParams], EDMSampler]
-
 
 @dataclasses.dataclass
 class ScaledDenoiser:
@@ -78,6 +76,177 @@ class ScaledDenoiser:
             intermediate_denoised_coord_stack=[],
             intermediate_pred_aa_logit_stack=[],
         )
+
+
+@dataclasses.dataclass(frozen=True)
+class FixedRand:
+    """Stand-in for ``torch.rand`` that returns one fixed value.
+
+    The sampler draws ``torch.rand()`` only for its per-step time offset,
+    so pinning it makes the visited times exact.
+
+    Attributes:
+        value: Value every draw returns.
+    """
+
+    value: float
+
+    def __call__(
+        self,
+        size: tuple[int, ...],
+        device: torch.device,
+    ) -> Float[torch.Tensor, "..."]:
+        """Return a tensor of ``size`` filled with ``value``.
+
+        Args:
+            size: Requested output shape.
+            device: Requested output device.
+
+        Returns:
+            The filled tensor.
+        """
+        return torch.full(size, self.value, device=device)
+
+
+def centre_only(
+    coords: Float[torch.Tensor, "B N_atom 3"],
+    mask: Bool[torch.Tensor, "B N_atom"],
+) -> Float[torch.Tensor, "B N_atom 3"]:
+    """Stand in for ``centre_random_augment``: centre, no rotation.
+
+    Args:
+        coords: Batched atom coordinates.
+        mask: Valid-atom mask for the centroid.
+
+    Returns:
+        ``coords`` with their masked centroid at the origin.
+    """
+    return coords - masked_com(coords, mask=mask)
+
+
+def centred_rms(
+    coords: Float[torch.Tensor, "B N 3"],
+) -> Float[torch.Tensor, ""]:
+    """Return the RMS of ``coords`` about their centroid.
+
+    Args:
+        coords: Batched atom coordinates.
+
+    Returns:
+        Scalar RMS distance from the centroid.
+    """
+    centred = coords - reduce(coords, "b n d -> b 1 d", "mean")
+    return torch.sqrt(reduce(centred**2, "b n d -> ", "mean"))
+
+
+def build_sampler(
+    denoiser: ScaledDenoiser,
+    sampling_context: FeaturizedBatch,
+    template_distogram: Distogram,
+    params: SamplerParams,
+    noise: NoiseScheduleParams,
+) -> EDMSampler:
+    """Build an EDMSampler whose trunk is ``denoiser``.
+
+    Args:
+        denoiser: Trunk stand-in.
+        sampling_context: Unconditional context.
+        template_distogram: Template distogram for self-conditioning.
+        params: Sampler settings.
+        noise: Noise schedule.
+
+    Returns:
+        The sampler.
+    """
+    return EDMSampler(
+        cast(MainTrunk, cast(object, denoiser)),
+        sampling_context,
+        template_distogram,
+        params,
+        noise,
+    )
+
+
+def aa_protein(sequence: str) -> Protein:
+    """Build a fully present protein with the given sequence.
+
+    Residue ``r``'s atom ``a`` sits at ``(r + 0.1 a, sin(r + a), 0)``.
+
+    Args:
+        sequence: One-letter codes; ``X`` is the unknown residue.
+
+    Returns:
+        The protein.
+    """
+    n = len(sequence)
+    r = rearrange(np.arange(n, dtype=np.float64), "r -> r 1")
+    a = rearrange(np.arange(37, dtype=np.float64), "a -> 1 a")
+    positions = np.stack(
+        [r + 0.1 * a, np.sin(r + a), np.zeros((n, 37))],
+        axis=-1,
+    )
+    return Protein(
+        atom_positions=positions,
+        aatype=np.array([restype_order[c] for c in sequence], dtype=np.intp),
+        atom_mask=np.ones((n, 37)),
+        residue_index=np.arange(n, dtype=np.intp),
+        chain_index=np.zeros(n, dtype=np.intp),
+        b_factors=np.zeros((n, 37)),
+    )
+
+
+@dataclasses.dataclass(frozen=True)
+class ChurnCase:
+    """Churn settings and whether the run must match the churn-free one.
+
+    Attributes:
+        churn: ``S_churn`` of the stochastic run.
+        s_tmin: ``S_tmin`` of the stochastic run.
+        matches_ode: Whether it must equal the ``S_churn = 0`` run.
+    """
+
+    churn: float
+    s_tmin: float
+    matches_ode: bool
+
+
+class ChurnScenario(enum.Enum):
+    """Churn windows that do and do not cover any step.
+
+    Members:
+        churn_in_window: ``S_tmin = 0.05``, so churn reaches most steps.
+        window_above_one: ``S_tmin = 800`` exceeds every
+            ``timestep / ddim_steps``, so churn never applies.
+    """
+
+    churn_in_window = ChurnCase(2.0, 0.05, matches_ode=False)
+    window_above_one = ChurnCase(2.0, 800.0, matches_ode=True)
+
+
+@dataclasses.dataclass(frozen=True)
+class RhoCurves:
+    """The noise schedule on 11 even points for two values of ``rho``.
+
+    Attributes:
+        rho_7: Noise levels with ``rho = 7``.
+        rho_3: Noise levels with ``rho = 3``.
+    """
+
+    rho_7: Float[torch.Tensor, " n_t"]
+    rho_3: Float[torch.Tensor, " n_t"]
+
+
+@dataclasses.dataclass(frozen=True)
+class HalvingSamplers:
+    """Two samplers over ``D(z) = z / 2`` that differ only in step count.
+
+    Attributes:
+        four_steps: ``ddim_steps = 4``.
+        ten_steps: ``ddim_steps = 10``.
+    """
+
+    four_steps: EDMSampler
+    ten_steps: EDMSampler
 
 
 @dataclasses.dataclass(frozen=True)
@@ -374,53 +543,173 @@ def scenario_context(
 
 
 @pytest.fixture
-def make_sampler(
+def default_noise() -> NoiseScheduleParams:
+    """Return the 0.002 to 80 noise schedule most sampler tests run on.
+
+    Returns:
+        The schedule parameters.
+    """
+    return NoiseScheduleParams(sigma_min=0.002, sigma_max=80.0)
+
+
+@pytest.fixture
+def zero_sampler(
     context: FeaturizedBatch,
     templ_disto: Distogram,
-) -> Callable[..., EDMSampler]:
-    """Return a factory for EDMSamplers over a ``ScaledDenoiser``.
-
-    ``make(denoiser, params, noise=...)`` builds a sampler on the shared
-    context. ``noise`` defaults to a schedule from 0.002 to 80.
+    default_noise: NoiseScheduleParams,
+) -> EDMSampler:
+    """Build a four-step, churn-free sampler over ``D(z) = 0``.
 
     Args:
         context: Unconditional context.
-        templ_disto: Template distogram for self-conditioning.
+        templ_disto: Template distogram.
+        default_noise: Noise schedule.
 
     Returns:
-        The factory.
+        The sampler.
     """
+    params = SamplerParams(S_churn=0.0, ddim_steps=4)
+    denoiser = ScaledDenoiser(0.0)
+    return build_sampler(denoiser, context, templ_disto, params, default_noise)
 
-    def make(
-        denoiser: ScaledDenoiser,
-        params: SamplerParams,
-        noise: NoiseScheduleParams | None = None,
-    ) -> EDMSampler:
-        """Build the sampler.
 
-        Args:
-            denoiser: Trunk stand-in.
-            params: Sampler settings.
-            noise: Noise schedule; the 0.002 to 80 one if omitted.
+@pytest.fixture
+def identity_sampler(
+    context: FeaturizedBatch,
+    templ_disto: Distogram,
+    default_noise: NoiseScheduleParams,
+) -> EDMSampler:
+    """Build a four-step, churn-free sampler over ``D(z) = z``.
 
-        Returns:
-            The sampler.
-        """
-        return EDMSampler(
-            cast(MainTrunk, cast(object, denoiser)),
+    Args:
+        context: Unconditional context.
+        templ_disto: Template distogram.
+        default_noise: Noise schedule.
+
+    Returns:
+        The sampler.
+    """
+    params = SamplerParams(S_churn=0.0, ddim_steps=4)
+    denoiser = ScaledDenoiser(1.0)
+    return build_sampler(denoiser, context, templ_disto, params, default_noise)
+
+
+@pytest.fixture
+def churn_scenario(request: pytest.FixtureRequest) -> ChurnScenario:
+    """Return the ``ChurnScenario`` member routed in via indirect param.
+
+    Args:
+        request: Pytest request carrying the scenario in ``param``.
+
+    Returns:
+        The scenario under test.
+    """
+    return cast(ChurnScenario, request.param)
+
+
+@pytest.fixture
+def churned_sampler(
+    churn_scenario: ChurnScenario,
+    context: FeaturizedBatch,
+    templ_disto: Distogram,
+    default_noise: NoiseScheduleParams,
+) -> EDMSampler:
+    """Build a four-step sampler over ``D(z) = z`` with the scenario's churn.
+
+    Args:
+        churn_scenario: ``S_churn`` and ``S_tmin``.
+        context: Unconditional context.
+        templ_disto: Template distogram.
+        default_noise: Noise schedule.
+
+    Returns:
+        The sampler.
+    """
+    case = churn_scenario.value
+    params = SamplerParams(S_churn=case.churn, S_tmin=case.s_tmin, ddim_steps=4)
+    denoiser = ScaledDenoiser(1.0)
+    return build_sampler(denoiser, context, templ_disto, params, default_noise)
+
+
+@pytest.fixture
+def halving_samplers(
+    context: FeaturizedBatch,
+    templ_disto: Distogram,
+    default_noise: NoiseScheduleParams,
+) -> HalvingSamplers:
+    """Build churn-free samplers over ``D(z) = z / 2`` at 4 and 10 steps.
+
+    Args:
+        context: Unconditional context.
+        templ_disto: Template distogram.
+        default_noise: Noise schedule.
+
+    Returns:
+        Both samplers.
+    """
+    four = SamplerParams(S_churn=0.0, ddim_steps=4)
+    ten = SamplerParams(S_churn=0.0, ddim_steps=10)
+    return HalvingSamplers(
+        four_steps=build_sampler(
+            ScaledDenoiser(0.5),
             context,
             templ_disto,
-            params,
-            noise or NoiseScheduleParams(sigma_min=0.002, sigma_max=80.0),
-        )
+            four,
+            default_noise,
+        ),
+        ten_steps=build_sampler(
+            ScaledDenoiser(0.5),
+            context,
+            templ_disto,
+            ten,
+            default_noise,
+        ),
+    )
 
-    return make
+
+@pytest.fixture
+def rho_schedules(
+    context: FeaturizedBatch,
+    templ_disto: Distogram,
+    default_noise: NoiseScheduleParams,
+) -> RhoCurves:
+    """Evaluate the schedule with ``rho = 7`` and ``rho = 3`` on 11 points.
+
+    The denoiser is never called; ``noise_schedule`` only reads the
+    sampler's schedule parameters.
+
+    Args:
+        context: Unconditional context.
+        templ_disto: Template distogram.
+        default_noise: Noise schedule.
+
+    Returns:
+        Both curves.
+    """
+    grid = torch.linspace(0, 1, 11)
+    curves = [
+        torch.stack(
+            [
+                build_sampler(
+                    ScaledDenoiser(0.0),
+                    context,
+                    templ_disto,
+                    SamplerParams(rho=rho),
+                    default_noise,
+                ).noise_schedule(t)
+                for t in grid
+            ],
+        )
+        for rho in (7.0, 3.0)
+    ]
+    return RhoCurves(rho_7=curves[0], rho_3=curves[1])
 
 
 @pytest.fixture
 def schedule_curve(
     request: pytest.FixtureRequest,
-    make_sampler: Callable[..., EDMSampler],
+    context: FeaturizedBatch,
+    templ_disto: Distogram,
 ) -> ScheduleCurve:
     """Evaluate a schedule scenario on 21 even points over ``[0, 1]``.
 
@@ -429,14 +718,17 @@ def schedule_curve(
 
     Args:
         request: Pytest request carrying a ``ScheduleScenario``.
-        make_sampler: Sampler factory.
+        context: Unconditional context.
+        templ_disto: Template distogram.
 
     Returns:
         The scenario's parameters and its noise levels on the grid.
     """
     case = cast(ScheduleScenario, request.param).value
-    sampler = make_sampler(
+    sampler = build_sampler(
         ScaledDenoiser(0.0),
+        context,
+        templ_disto,
         SamplerParams(rho=case.rho),
         NoiseScheduleParams(
             sigma_data=case.sigma_data,
@@ -452,8 +744,8 @@ def schedule_curve(
 @pytest.fixture
 def sampler_trajectory(
     request: pytest.FixtureRequest,
-    make_sampler: Callable[..., EDMSampler],
     context: FeaturizedBatch,
+    templ_disto: Distogram,
     monkeypatch: pytest.MonkeyPatch,
 ) -> SamplerTrajectory:
     """Run the sampler for one scenario and record every model input.
@@ -481,8 +773,8 @@ def sampler_trajectory(
 
     Args:
         request: Pytest request carrying a trajectory scenario.
-        make_sampler: Sampler factory.
         context: Shared context, for the atom mask and count.
+        templ_disto: Template distogram.
         monkeypatch: Pins ``torch.rand`` and replaces the augmentation.
 
     Returns:
@@ -492,8 +784,10 @@ def sampler_trajectory(
     shape = (1, context.r_gt.shape[1], 3)
     delta_t = 1 / case.ddim_steps
     denoiser = ScaledDenoiser(0.0)
-    sampler = make_sampler(
+    sampler = build_sampler(
         denoiser,
+        context,
+        templ_disto,
         SamplerParams(
             S_churn=0.0,
             ddim_steps=case.ddim_steps,
@@ -502,51 +796,7 @@ def sampler_trajectory(
         NoiseScheduleParams(),
     )
 
-    def fixed_jitter(
-        size: tuple[int, ...],
-        device: torch.device,
-    ) -> Float[torch.Tensor, "..."]:
-        """Stand in for ``torch.rand``, returning the scenario's jitter.
-
-        Args:
-            size: Requested output shape.
-            device: Requested output device.
-
-        Returns:
-            Tensor of ``size`` filled with the jitter.
-        """
-        return torch.full(size, case.jitter, device=device)
-
-    def centre_only(
-        coords: Float[torch.Tensor, "B N_atom 3"],
-        mask: Bool[torch.Tensor, "B N_atom"],
-    ) -> Float[torch.Tensor, "B N_atom 3"]:
-        """Stand in for ``centre_random_augment``: centre, no rotation.
-
-        Args:
-            coords: Batched atom coordinates.
-            mask: Valid-atom mask for the centroid.
-
-        Returns:
-            ``coords`` with their masked centroid at the origin.
-        """
-        return coords - masked_com(coords, mask=mask)
-
-    def centred_rms(
-        coords: Float[torch.Tensor, "B N 3"],
-    ) -> Float[torch.Tensor, ""]:
-        """RMS of ``coords`` about their centroid.
-
-        Args:
-            coords: Batched atom coordinates.
-
-        Returns:
-            Scalar RMS distance from the centroid.
-        """
-        centred = coords - reduce(coords, "b n d -> b 1 d", "mean")
-        return torch.sqrt(reduce(centred**2, "b n d -> ", "mean"))
-
-    monkeypatch.setattr(torch, "rand", fixed_jitter)
+    monkeypatch.setattr(torch, "rand", FixedRand(case.jitter))
     monkeypatch.setattr("sample.sampling.centre_random_augment", centre_only)
     _ = manual_seed(0)
     initial_draw = torch.randn(shape)
@@ -575,55 +825,10 @@ def sampler_trajectory(
 
 
 @pytest.fixture
-def make_aa_protein() -> Callable[[str], Protein]:
-    """Return a factory for fully present proteins of a given sequence.
-
-    Residue ``r``'s atom ``a`` sits at ``(r + 0.1 a, sin(r + a), 0)``.
-
-    Returns:
-        ``make(sequence)``, where ``X`` is the unknown residue.
-    """
-
-    def make(sequence: str) -> Protein:
-        """Build the protein.
-
-        Args:
-            sequence: One-letter codes.
-
-        Returns:
-            The protein.
-        """
-        n = len(sequence)
-        r = rearrange(np.arange(n, dtype=np.float64), "r -> r 1")
-        a = rearrange(np.arange(37, dtype=np.float64), "a -> 1 a")
-        positions = np.stack(
-            [r + 0.1 * a, np.sin(r + a), np.zeros((n, 37))],
-            axis=-1,
-        )
-        return Protein(
-            atom_positions=positions,
-            aatype=np.array(
-                [restype_order[c] for c in sequence],
-                dtype=np.intp,
-            ),
-            atom_mask=np.ones((n, 37)),
-            residue_index=np.arange(n, dtype=np.intp),
-            chain_index=np.zeros(n, dtype=np.intp),
-            b_factors=np.zeros((n, 37)),
-        )
-
-    return make
-
-
-@pytest.fixture
-def aa_ctx(
-    make_aa_protein: Callable[[str], Protein],
-    atom_disto: Distogram,
-) -> AllAtomContext:
+def aa_ctx(atom_disto: Distogram) -> AllAtomContext:
     """Build a batch-of-two all-atom context for the sequence ``ACDEFG``.
 
     Args:
-        make_aa_protein: Protein factory.
         atom_disto: Atom distogram.
 
     Returns:
@@ -631,7 +836,7 @@ def aa_ctx(
     """
     with torch.no_grad():
         return build_aa_context(
-            make_aa_protein("ACDEFG"),
+            aa_protein("ACDEFG"),
             atom_disto,
             batch_size=2,
             device="cpu",
@@ -639,21 +844,92 @@ def aa_ctx(
 
 
 @pytest.fixture
-def template_ctx(
-    make_aa_protein: Callable[[str], Protein],
-    templ_disto: Distogram,
-) -> TemplateContext:
+def template_ctx(templ_disto: Distogram) -> TemplateContext:
     """Build a template context from a 4-residue protein.
 
     Args:
-        make_aa_protein: Protein factory.
         templ_disto: Template distogram.
 
     Returns:
         The context.
     """
     return build_template_context(
-        make_aa_protein("ACDE"),
+        aa_protein("ACDE"),
+        batch_size=1,
+        distogram_fn=templ_disto,
+        device="cpu",
+    )
+
+
+@pytest.fixture
+def aa_batch_size(request: pytest.FixtureRequest) -> int:
+    """Return the batch size routed in via indirect param.
+
+    Args:
+        request: Pytest request carrying the batch size in ``param``.
+
+    Returns:
+        Copies of the protein in the batch.
+    """
+    return cast(int, request.param)
+
+
+@pytest.fixture
+def batched_aa_ctx(aa_batch_size: int, atom_disto: Distogram) -> AllAtomContext:
+    """Build an all-atom context for ``ACDEFG`` at the routed-in batch size.
+
+    Args:
+        aa_batch_size: Copies of the protein in the batch.
+        atom_disto: Atom distogram.
+
+    Returns:
+        The context.
+    """
+    with torch.no_grad():
+        return build_aa_context(
+            aa_protein("ACDEFG"),
+            atom_disto,
+            batch_size=aa_batch_size,
+            device="cpu",
+        )
+
+
+@pytest.fixture
+def unknown_aa_ctx(atom_disto: Distogram) -> AllAtomContext:
+    """Build an all-atom context for ``AXCX``, two of whose residues are X.
+
+    Args:
+        atom_disto: Atom distogram.
+
+    Returns:
+        The context.
+    """
+    with torch.no_grad():
+        return build_aa_context(
+            aa_protein("AXCX"),
+            atom_disto,
+            batch_size=1,
+            device="cpu",
+        )
+
+
+@pytest.fixture
+def spread_template_ctx(templ_disto: Distogram) -> TemplateContext:
+    """Build a template context from ``ACDE`` spread out 20 times.
+
+    Args:
+        templ_disto: Template distogram.
+
+    Returns:
+        The context.
+    """
+    protein = aa_protein("ACDE")
+    spread = dataclasses.replace(
+        protein,
+        atom_positions=20 * protein.atom_positions,
+    )
+    return build_template_context(
+        spread,
         batch_size=1,
         distogram_fn=templ_disto,
         device="cpu",
@@ -772,7 +1048,7 @@ def test_noise_schedule_rises_from_sigma_min_at_zero_to_sigma_max_at_one(
 
 
 def test_noise_schedule_rho_changes_only_the_interior(
-    make_sampler: Callable[..., EDMSampler],
+    rho_schedules: RhoCurves,
 ) -> None:
     """``rho = 7`` and ``rho = 3`` share endpoints but differ in between.
 
@@ -780,23 +1056,11 @@ def test_noise_schedule_rho_changes_only_the_interior(
     this compares two.
 
     Args:
-        make_sampler: Sampler factory.
+        rho_schedules: The schedule under both values of ``rho``.
     """
-    grid = torch.linspace(0, 1, 11)
-    curves = [
-        torch.stack(
-            [
-                make_sampler(
-                    ScaledDenoiser(0.0),
-                    SamplerParams(rho=rho),
-                ).noise_schedule(t)
-                for t in grid
-            ],
-        )
-        for rho in (7.0, 3.0)
-    ]
-    torch.testing.assert_close(curves[0][[0, -1]], curves[1][[0, -1]])
-    assert not torch.allclose(curves[0][1:-1], curves[1][1:-1])
+    rho_7, rho_3 = rho_schedules.rho_7, rho_schedules.rho_3
+    torch.testing.assert_close(rho_7[[0, -1]], rho_3[[0, -1]])
+    assert not torch.allclose(rho_7[1:-1], rho_3[1:-1])
 
 
 @pytest.mark.parametrize(
@@ -893,7 +1157,7 @@ def test_edm_sampler_euler_steps_target_next_lower_noise_level(
 
 
 def test_edm_sampler_zero_denoiser_drives_output_to_zero(
-    make_sampler: Callable[..., EDMSampler],
+    zero_sampler: EDMSampler,
     context: FeaturizedBatch,
 ) -> None:
     """With ``D(z, sigma) = 0`` each step scales ``z`` toward 0, ending at 0.
@@ -903,19 +1167,16 @@ def test_edm_sampler_zero_denoiser_drives_output_to_zero(
     depend on the step count.
 
     Args:
-        make_sampler: Sampler factory.
+        zero_sampler: Four-step sampler over ``D(z) = 0``.
         context: Supplies the atom count.
     """
-    params = SamplerParams(S_churn=0.0, ddim_steps=4)
-    out, seq = make_sampler(ScaledDenoiser(0.0), params).sample(
-        (1, context.r_gt.shape[1], 3),
-    )
+    out, seq = zero_sampler.sample((1, context.r_gt.shape[1], 3))
     torch.testing.assert_close(out, torch.zeros_like(out), atol=1e-5, rtol=0)
     assert torch.count_nonzero(seq) == 0
 
 
 def test_edm_sampler_identity_denoiser_gives_finite_centred_output(
-    make_sampler: Callable[..., EDMSampler],
+    identity_sampler: EDMSampler,
     context: FeaturizedBatch,
 ) -> None:
     """With an identity denoiser the output is finite and centred.
@@ -927,16 +1188,12 @@ def test_edm_sampler_identity_denoiser_gives_finite_centred_output(
     times the tolerance. Not parametrized: one seeded run shows both.
 
     Args:
-        make_sampler: Sampler factory.
+        identity_sampler: Four-step sampler over ``D(z) = z``.
         context: Supplies the atom count.
     """
     shape = (1, context.r_gt.shape[1], 3)
-    sampler = make_sampler(
-        ScaledDenoiser(1.0),
-        SamplerParams(S_churn=0.0, ddim_steps=4),
-    )
     _ = manual_seed(7)
-    out, seq = sampler.sample(shape)
+    out, seq = identity_sampler.sample(shape)
     centroid = reduce(out, "b n d -> b d", "mean")
     assert out.shape == shape
     assert torch.isfinite(out).all()
@@ -951,18 +1208,16 @@ def test_edm_sampler_identity_denoiser_gives_finite_centred_output(
 
 
 @pytest.mark.parametrize(
-    ("churn", "s_tmin", "matches_ode"),
-    [
-        pytest.param(2.0, 0.05, False, id="churn_in_window"),
-        pytest.param(2.0, 800.0, True, id="window_above_one"),
-    ],
+    "churn_scenario",
+    list(ChurnScenario),
+    ids=[case.name for case in ChurnScenario],
+    indirect=True,
 )
 def test_edm_sampler_churn_applies_only_inside_its_window(
-    make_sampler: Callable[..., EDMSampler],
+    churn_scenario: ChurnScenario,
+    identity_sampler: EDMSampler,
+    churned_sampler: EDMSampler,
     context: FeaturizedBatch,
-    churn: float,
-    s_tmin: float,
-    matches_ode: bool,  # noqa: FBT001
 ) -> None:
     """Churn changes the result, unless ``S_tmin`` puts every step outside.
 
@@ -972,31 +1227,23 @@ def test_edm_sampler_churn_applies_only_inside_its_window(
     injected noise is not filtered, so any injection shows.
 
     Args:
-        make_sampler: Sampler factory.
+        churn_scenario: Churn settings and whether the runs must match.
+        identity_sampler: The churn-free run.
+        churned_sampler: The same sampler with the scenario's churn.
         context: Supplies the atom count.
-        churn: ``S_churn`` of the stochastic run.
-        s_tmin: ``S_tmin`` of the stochastic run.
-        matches_ode: Whether it must equal the deterministic run.
     """
     shape = (1, context.r_gt.shape[1], 3)
-    ode = make_sampler(
-        ScaledDenoiser(1.0),
-        SamplerParams(S_churn=0.0, ddim_steps=4),
-    )
-    churned = make_sampler(
-        ScaledDenoiser(1.0),
-        SamplerParams(S_churn=churn, S_tmin=s_tmin, ddim_steps=4),
-    )
     _ = manual_seed(5)
-    out_ode, _ = ode.sample(shape)
+    out_ode, _ = identity_sampler.sample(shape)
     _ = manual_seed(5)
-    out_churned, seq = churned.sample(shape)
-    assert torch.allclose(out_ode, out_churned) == matches_ode
+    out_churned, seq = churned_sampler.sample(shape)
+    matches = torch.allclose(out_ode, out_churned)
+    assert matches == churn_scenario.value.matches_ode
     assert torch.isfinite(seq).all()
 
 
 def test_edm_sampler_repeats_exactly_under_the_same_seed(
-    make_sampler: Callable[..., EDMSampler],
+    identity_sampler: EDMSampler,
     context: FeaturizedBatch,
 ) -> None:
     """A second ``sample()`` with the same seed gives bit-identical output.
@@ -1005,24 +1252,20 @@ def test_edm_sampler_repeats_exactly_under_the_same_seed(
     Not parametrized: churn is off, so the seed fixes every draw.
 
     Args:
-        make_sampler: Sampler factory.
+        identity_sampler: Four-step sampler over ``D(z) = z``.
         context: Supplies the atom count.
     """
     shape = (1, context.r_gt.shape[1], 3)
-    sampler = make_sampler(
-        ScaledDenoiser(1.0),
-        SamplerParams(S_churn=0.0, ddim_steps=4),
-    )
     _ = manual_seed(3)
-    first = sampler.sample(shape)
+    first = identity_sampler.sample(shape)
     _ = manual_seed(3)
-    second = sampler.sample(shape)
+    second = identity_sampler.sample(shape)
     assert torch.equal(first[0], second[0])
     assert torch.equal(first[1], second[1])
 
 
 def test_edm_sampler_step_count_changes_a_nontrivial_trajectory(
-    make_sampler: Callable[..., EDMSampler],
+    halving_samplers: HalvingSamplers,
     context: FeaturizedBatch,
 ) -> None:
     """With ``D(z) = z / 2``, 4 and 10 steps integrate to different outputs.
@@ -1032,26 +1275,21 @@ def test_edm_sampler_step_count_changes_a_nontrivial_trajectory(
     two step counts suffice.
 
     Args:
-        make_sampler: Sampler factory.
+        halving_samplers: The same sampler at 4 and at 10 steps.
         context: Supplies the atom count.
     """
     shape = (1, context.r_gt.shape[1], 3)
-    outputs: list[Float[torch.Tensor, "1 N 3"]] = []
-    for steps in (4, 10):
-        _ = manual_seed(9)
-        sampler = make_sampler(
-            ScaledDenoiser(0.5),
-            SamplerParams(S_churn=0.0, ddim_steps=steps),
-        )
-        outputs.append(sampler.sample(shape)[0])
-    assert not torch.allclose(outputs[0], outputs[1])
+    _ = manual_seed(9)
+    four, _ = halving_samplers.four_steps.sample(shape)
+    _ = manual_seed(9)
+    ten, _ = halving_samplers.ten_steps.sample(shape)
+    assert not torch.allclose(four, ten)
 
 
-@pytest.mark.parametrize("batch_size", [1, 2])
+@pytest.mark.parametrize("aa_batch_size", [1, 2], indirect=True)
 def test_build_aa_context_shapes_follow_batch_and_protein(
-    make_aa_protein: Callable[[str], Protein],
-    atom_disto: Distogram,
-    batch_size: int,
+    aa_batch_size: int,
+    batched_aa_ctx: AllAtomContext,
 ) -> None:
     """Every field leads with ``batch_size``, then the atom or residue axis.
 
@@ -1059,18 +1297,11 @@ def test_build_aa_context_shapes_follow_batch_and_protein(
     itself and must match between the distogram and its mask.
 
     Args:
-        make_aa_protein: Protein factory.
-        atom_disto: Atom distogram.
-        batch_size: Copies of the protein in the batch.
+        aa_batch_size: Copies of the protein in the batch.
+        batched_aa_ctx: Context for ``ACDEFG`` at that batch size.
     """
-    with torch.no_grad():
-        ctx = build_aa_context(
-            make_aa_protein("ACDEFG"),
-            atom_disto,
-            batch_size=batch_size,
-            device="cpu",
-        )
-    b, n_res, n_atom = batch_size, 6, 6 * NATOM
+    ctx = batched_aa_ctx
+    b, n_res, n_atom = aa_batch_size, 6, 6 * NATOM
     k = ctx.gt_atom_distogram_sparse.shape[2]
     shapes = {
         f.name: tuple(cast(torch.Tensor, getattr(ctx, f.name)).shape)
@@ -1107,8 +1338,7 @@ def test_build_aa_context_tiles_the_protein_into_every_batch_item(
 
 
 def test_build_aa_context_keeps_unknown_residues_as_x(
-    make_aa_protein: Callable[[str], Protein],
-    atom_disto: Distogram,
+    unknown_aa_ctx: AllAtomContext,
 ) -> None:
     """An ``X`` residue reaches ``aa_indices`` as ``RESTYPE_NUM_NO_X``.
 
@@ -1117,16 +1347,9 @@ def test_build_aa_context_keeps_unknown_residues_as_x(
     parametrized: one mixed sequence covers known and unknown residues.
 
     Args:
-        make_aa_protein: Protein factory.
-        atom_disto: Atom distogram.
+        unknown_aa_ctx: Context for ``AXCX``.
     """
-    with torch.no_grad():
-        ctx = build_aa_context(
-            make_aa_protein("AXCX"),
-            atom_disto,
-            batch_size=1,
-            device="cpu",
-        )
+    ctx = unknown_aa_ctx
     a, c, x = restype_order["A"], restype_order["C"], RESTYPE_NUM_NO_X
     assert torch.equal(ctx.aa_indices[0], torch.tensor([a, x, c, x]))
 
@@ -1155,8 +1378,7 @@ def test_build_template_context_is_a_symmetric_one_hot_distogram(
 
 
 def test_build_template_context_follows_the_coordinates(
-    make_aa_protein: Callable[[str], Protein],
-    templ_disto: Distogram,
+    spread_template_ctx: TemplateContext,
     template_ctx: TemplateContext,
 ) -> None:
     """Spreading the same protein out 20 times changes its template distogram.
@@ -1165,23 +1387,11 @@ def test_build_template_context_follows_the_coordinates(
     parametrized: one rescaling shows the coordinates are read.
 
     Args:
-        make_aa_protein: Protein factory.
-        templ_disto: Template distogram.
+        spread_template_ctx: Context for the protein spread out 20 times.
         template_ctx: Context for the unscaled protein.
     """
-    protein = make_aa_protein("ACDE")
-    spread = dataclasses.replace(
-        protein,
-        atom_positions=20 * protein.atom_positions,
-    )
-    ctx = build_template_context(
-        spread,
-        batch_size=1,
-        distogram_fn=templ_disto,
-        device="cpu",
-    )
     assert not torch.equal(
-        ctx.f_template_distogram,
+        spread_template_ctx.f_template_distogram,
         template_ctx.f_template_distogram,
     )
 
