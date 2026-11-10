@@ -20,7 +20,6 @@ import hashlib
 import json
 import multiprocessing
 import pathlib
-from collections.abc import Callable
 from datetime import timedelta
 from multiprocessing.queues import SimpleQueue
 from typing import cast
@@ -1935,12 +1934,15 @@ class TrunkCall:
 class RecordingForward:
     """Stand-in ``forward`` that records each call, then runs the real one.
 
+    The real forward is reached through the class, ``MainTrunk.forward``,
+    which the instance attribute set by ``monkeypatch`` does not shadow.
+
     Attributes:
-        real_forward: The trunk's own bound ``forward``.
+        trunk: The trunk whose calls are recorded.
         calls: Receives one ``TrunkCall`` per call.
     """
 
-    real_forward: Callable[[FeaturizedBatch], PredictedOutputs]
+    trunk: MainTrunk
     calls: list[TrunkCall]
 
     def __call__(self, batch: FeaturizedBatch) -> PredictedOutputs:
@@ -1958,7 +1960,7 @@ class RecordingForward:
                 template=batch.noised_res_distogram.detach().clone(),
             ),
         )
-        return self.real_forward(batch)
+        return MainTrunk.forward(self.trunk, batch)
 
 
 @pytest.fixture
@@ -1987,7 +1989,7 @@ def recorded_trunk_calls(
         One ``TrunkCall`` per trunk forward made by the pass.
     """
     trunk = cast(MainTrunk, model_params.model)
-    recorder = RecordingForward(real_forward=trunk.forward, calls=[])
+    recorder = RecordingForward(trunk=trunk, calls=[])
     monkeypatch.setattr(trunk, "forward", recorder)
     _ = trunk.train()
     with torch.enable_grad():
