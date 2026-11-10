@@ -195,6 +195,11 @@ In short: every pre-commit hook runs a second time in CI against a clean contain
 image, once per push and PR. The GPU runner reruns only `basedpyright`, and the full
 test suite runs on both runners after their static checks pass.
 
+Both workflows set a `concurrency` group per pull request with
+`cancel-in-progress`, so pushing to a PR cancels that PR's older ARM64 and CUDA
+runs. This matters most for CUDA CI, which shares one self-hosted GPU runner
+across every branch. Pushes to `main` and manual runs are never cancelled.
+
 ---
 
 ### Practical rules for writing new code

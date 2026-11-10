@@ -3,7 +3,44 @@
 from collections.abc import Generator
 
 import pytest
+import torch
 import torch.distributed as dist
+from helpers.atom_utils import ATOM5_CB, ATOM5_NAMES, rigid_group_atom_positions
+from jaxtyping import Float
+
+
+@pytest.fixture
+def ideal_alanine_atom5() -> Float[torch.Tensor, "5 3"]:
+    """Ideal alanine backbone and Cβ positions, one row per atom5 slot.
+
+    Rows follow ``ATOM5_NAMES``. N, CA, C and CB share alanine's backbone
+    rigid frame, so CB sits where pseudo-Cβ construction must put it. O is
+    defined in a different rigid group, so its row only serves as a point
+    distinct from the others.
+
+    Returns:
+        Positions of shape (5, 3) in atom5 order.
+    """
+    by_name = {
+        atom_name: position
+        for atom_name, _, position in rigid_group_atom_positions["ALA"]
+    }
+    return torch.tensor([by_name[atom_name] for atom_name in ATOM5_NAMES])
+
+
+@pytest.fixture
+def ideal_alanine_cb(
+    ideal_alanine_atom5: Float[torch.Tensor, "5 3"],
+) -> Float[torch.Tensor, "3"]:
+    """The known Cβ of the ideal alanine, the target for pseudo-Cβ placement.
+
+    Args:
+        ideal_alanine_atom5: Ideal alanine positions in atom5 order.
+
+    Returns:
+        The Cβ position, shape (3,).
+    """
+    return ideal_alanine_atom5[ATOM5_CB]
 
 
 @pytest.fixture
