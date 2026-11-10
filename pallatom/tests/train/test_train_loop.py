@@ -20,6 +20,7 @@ import hashlib
 import json
 import multiprocessing
 import pathlib
+from collections.abc import Callable
 from datetime import timedelta
 from multiprocessing.queues import SimpleQueue
 from typing import cast
@@ -494,6 +495,30 @@ class CheckpointWriteScenario(enum.Enum):
     rank1 = CheckpointWriteCase(rank=1, writes=False)
 
 
+@dataclasses.dataclass(frozen=True)
+class SwapWrapCase:
+    """How the model is wrapped before its EMA weights are swapped in.
+
+    Attributes:
+        ddp: Wrap the model in one-rank DDP, so the swap must reach
+            ``.module``.
+    """
+
+    ddp: bool
+
+
+class SwapWrap(enum.Enum):
+    """Model wrappings the EMA swap must see through.
+
+    Members:
+        plain: The bare ``MainTrunk``.
+        ddp: The trunk inside one-rank DDP.
+    """
+
+    plain = SwapWrapCase(ddp=False)
+    ddp = SwapWrapCase(ddp=True)
+
+
 @pytest.fixture(scope="module")
 def model_config() -> TrainModelConfig:
     """Return the small model and distogram settings shared by every fixture.
@@ -756,15 +781,18 @@ def diverged_ema(model_params: ModelSetup) -> ModelSetup:
 @pytest.fixture
 def swap_setup(
     request: pytest.FixtureRequest,
+    swap_wrap: SwapWrap,
     diverged_ema: ModelSetup,
 ) -> SwapSetup:
-    """Prepare a swap, wrapping the model in one-rank DDP when the param asks.
+    """Prepare a swap, wrapping the model in one-rank DDP when asked.
 
     With DDP the swap must reach ``.module``, whose keys carry no
     ``module.`` prefix. Reference weights are cloned before any swap.
 
     Args:
-        request: Pytest request carrying whether to wrap in DDP.
+        request: Pytest request used to start the one-rank process group.
+        swap_wrap: Whether to wrap in DDP; the requesting test
+            parametrizes it.
         diverged_ema: Setup whose raw weights and shadow differ.
 
     Returns:
@@ -772,7 +800,7 @@ def swap_setup(
     """
     inner = cast(MainTrunk, diverged_ema.model)
     setup = diverged_ema
-    if cast(bool, request.param):
+    if swap_wrap.value.ddp:
         request.getfixturevalue("single_process_gloo_group")
         setup = dataclasses.replace(diverged_ema, model=DDP(inner))
     raw = {k: v.clone() for k, v in cast(StateDict, inner.state_dict()).items()}
@@ -821,21 +849,6 @@ def lr_scheduler(
     return build_lr_scheduler(lr_schedule_optimizer, lr_schedule_training)
 
 
-@pytest.fixture
-def checkpoint_write_scenario(
-    request: pytest.FixtureRequest,
-) -> CheckpointWriteScenario:
-    """Return the ``CheckpointWriteScenario`` routed in via indirect param.
-
-    Args:
-        request: Pytest request carrying the scenario in ``param``.
-
-    Returns:
-        The scenario under test.
-    """
-    return cast(CheckpointWriteScenario, request.param)
-
-
 @pytest.fixture(scope="module")
 def recorded_train_runs(
     tmp_path_factory: pytest.TempPathFactory,
@@ -855,22 +868,23 @@ def recorded_train_runs(
 
 @pytest.fixture
 def train_run(
-    request: pytest.FixtureRequest,
+    train_scenario: TrainScenario,
     recorded_train_runs: TrainRunCache,
 ) -> TrainRun:
-    """Return the shared record for the scenario routed in via param.
+    """Return the shared record for ``train_scenario``.
 
     The record is a frozen snapshot rather than live training state, so the
     tests sharing it stay order-independent.
 
     Args:
-        request: Pytest request carrying a ``TrainScenario``.
+        train_scenario: Run to look up; the requesting test parametrizes
+            it.
         recorded_train_runs: Module-wide cache of runs.
 
     Returns:
         The scenario's record.
     """
-    return recorded_train_runs.get(cast(TrainScenario, request.param))
+    return recorded_train_runs.get(train_scenario)
 
 
 def test_take_step_eval_reports_finite_metrics_without_gradients(
@@ -1089,10 +1103,9 @@ def test_evaluate_reports_finite_metrics_without_gradients(
 
 
 @pytest.mark.parametrize(
-    "swap_setup",
-    [False, True],
-    ids=["plain", "ddp"],
-    indirect=True,
+    "swap_wrap",
+    list(SwapWrap),
+    ids=[case.name for case in SwapWrap],
 )
 def test_swapped_in_ema_weights_swaps_in_and_back(
     swap_setup: SwapSetup,
@@ -1112,10 +1125,9 @@ def test_swapped_in_ema_weights_swaps_in_and_back(
 
 
 @pytest.mark.parametrize(
-    "swap_setup",
-    [False, True],
-    ids=["plain", "ddp"],
-    indirect=True,
+    "swap_wrap",
+    list(SwapWrap),
+    ids=[case.name for case in SwapWrap],
 )
 def test_swapped_in_ema_weights_restores_raw_weights_on_error(
     swap_setup: SwapSetup,
@@ -1146,7 +1158,6 @@ def test_swapped_in_ema_weights_restores_raw_weights_on_error(
     "checkpoint_write_scenario",
     list(CheckpointWriteScenario),
     ids=[case.name for case in CheckpointWriteScenario],
-    indirect=True,
 )
 def test_save_checkpoint_writes_only_on_rank_zero(
     model_params: ModelSetup,
@@ -1453,10 +1464,9 @@ def test_train_preflushes_before_an_oversized_batch(
 
 
 @pytest.mark.parametrize(
-    "train_run",
+    "train_scenario",
     list(TrainScenario),
     ids=[case.name for case in TrainScenario],
-    indirect=True,
 )
 def test_train_updates_model_parameters(train_run: TrainRun) -> None:
     """Training changes the model's parameters under every scenario.
@@ -1468,10 +1478,9 @@ def test_train_updates_model_parameters(train_run: TrainRun) -> None:
 
 
 @pytest.mark.parametrize(
-    "train_run",
+    "train_scenario",
     [TrainScenario.default_budget],
     ids=["default_budget"],
-    indirect=True,
 )
 def test_train_reduces_every_epoch_metric_across_ranks(
     train_run: TrainRun,
@@ -1498,10 +1507,9 @@ def test_train_reduces_every_epoch_metric_across_ranks(
 
 
 @pytest.mark.parametrize(
-    "train_run",
+    "train_scenario",
     [TrainScenario.default_budget, TrainScenario.no_grad_clip],
     ids=["default_budget", "no_grad_clip"],
-    indirect=True,
 )
 def test_train_does_not_call_wandb_when_disabled(train_run: TrainRun) -> None:
     """With ``use_wandb`` off, ``wandb.log`` is never called.
@@ -1513,10 +1521,9 @@ def test_train_does_not_call_wandb_when_disabled(train_run: TrainRun) -> None:
 
 
 @pytest.mark.parametrize(
-    "train_run",
+    "train_scenario",
     [TrainScenario.large_token_budget],
     ids=["large_token_budget"],
-    indirect=True,
 )
 def test_train_logs_nonzero_loss_under_large_token_budget(
     train_run: TrainRun,
@@ -1536,10 +1543,9 @@ def test_train_logs_nonzero_loss_under_large_token_budget(
 
 
 @pytest.mark.parametrize(
-    "train_run",
+    "train_scenario",
     [TrainScenario.default_budget],
     ids=["default_budget"],
-    indirect=True,
 )
 def test_train_checkpoint_holds_stepped_optimizer_and_scheduler(
     train_run: TrainRun,
@@ -1567,10 +1573,9 @@ def test_train_checkpoint_holds_stepped_optimizer_and_scheduler(
 
 
 @pytest.mark.parametrize(
-    "train_run",
+    "train_scenario",
     [TrainScenario.multi_epoch],
     ids=["multi_epoch"],
-    indirect=True,
 )
 def test_train_logs_once_per_epoch_with_the_epoch_advancing(
     train_run: TrainRun,
@@ -1779,20 +1784,6 @@ class LockstepScenario(enum.Enum):
 
 
 @pytest.fixture
-def lockstep_scenario(request: pytest.FixtureRequest) -> LockstepScenario:
-    """Expose the indirect scenario to the factories and the test.
-
-    Args:
-        request: Pytest fixture request whose ``.param`` attribute is a
-            LockstepScenario member.
-
-    Returns:
-        The scenario member for the current test case.
-    """
-    return cast(LockstepScenario, request.param)
-
-
-@pytest.fixture
 def lockstep_setup(
     lockstep_scenario: LockstepScenario,
     model_params: ModelSetup,
@@ -1804,7 +1795,8 @@ def lockstep_setup(
     scenario's ``budget_per_rank`` times its number of ranks.
 
     Args:
-        lockstep_scenario: Scenario naming the per-rank budget and, through
+        lockstep_scenario: Scenario, parametrized by the requesting test,
+            naming the per-rank budget and, through
             the length of ``residues.by_rank``, the number of ranks.
         model_params: Fixture providing the small model, optimizer,
             scheduler, EMA and base TrainConfig.
@@ -1843,7 +1835,8 @@ def lockstep_run(
     ``lockstep_scenario.value.residues.by_rank[r]``.
 
     Args:
-        lockstep_scenario: Scenario naming each rank's batch lengths.
+        lockstep_scenario: Scenario naming each rank's batch lengths; the
+            requesting test parametrizes it.
         lockstep_setup: Fixture providing the model setup with the
             scenario's token budget.
         tmp_path: Pytest-provided directory for the rendezvous store and the
@@ -1875,7 +1868,6 @@ def lockstep_run(
     "lockstep_scenario",
     list(LockstepScenario),
     ids=[case.name for case in LockstepScenario],
-    indirect=True,
 )
 def test_train_ddp_keeps_ranks_in_lockstep(
     lockstep_scenario: LockstepScenario,
@@ -1939,6 +1931,36 @@ class TrunkCall:
     template: Float[torch.Tensor, "B N_res N_res n_templ_bins"]
 
 
+@dataclasses.dataclass(frozen=True)
+class RecordingForward:
+    """Stand-in ``forward`` that records each call, then runs the real one.
+
+    Attributes:
+        real_forward: The trunk's own bound ``forward``.
+        calls: Receives one ``TrunkCall`` per call.
+    """
+
+    real_forward: Callable[[FeaturizedBatch], PredictedOutputs]
+    calls: list[TrunkCall]
+
+    def __call__(self, batch: FeaturizedBatch) -> PredictedOutputs:
+        """Record the autograd state and template, then run the trunk.
+
+        Args:
+            batch: The trunk's input.
+
+        Returns:
+            The real trunk's prediction.
+        """
+        self.calls.append(
+            TrunkCall(
+                grad_enabled=torch.is_grad_enabled(),
+                template=batch.noised_res_distogram.detach().clone(),
+            ),
+        )
+        return self.real_forward(batch)
+
+
 @pytest.fixture
 def recorded_trunk_calls(
     featurized_batch: FeaturizedBatch,
@@ -1964,25 +1986,13 @@ def recorded_trunk_calls(
     Returns:
         One ``TrunkCall`` per trunk forward made by the pass.
     """
-    calls: list[TrunkCall] = []
     trunk = cast(MainTrunk, model_params.model)
-    real_forward = trunk.forward
-
-    def recording_forward(batch: FeaturizedBatch) -> PredictedOutputs:
-        """Record the autograd state and template, then run the trunk."""
-        calls.append(
-            TrunkCall(
-                grad_enabled=torch.is_grad_enabled(),
-                template=batch.noised_res_distogram.detach().clone(),
-            ),
-        )
-        return real_forward(batch)
-
-    monkeypatch.setattr(trunk, "forward", recording_forward)
+    recorder = RecordingForward(real_forward=trunk.forward, calls=[])
+    monkeypatch.setattr(trunk, "forward", recorder)
     _ = trunk.train()
     with torch.enable_grad():
         _ = self_conditioned_template(featurized_batch, model_params)
-    return calls
+    return recorder.calls
 
 
 def test_self_conditioning_pass_runs_detached_on_null(
@@ -1995,6 +2005,9 @@ def test_self_conditioning_pass_runs_detached_on_null(
     not the featurizer's noised ground truth, which leaks true pair geometry
     the sampler never has. No parametrization: the caller's grad-enabled
     train mode is the one state in which either property can fail.
+
+    Args:
+        recorded_trunk_calls: What the trunk saw on each call.
     """
     assert len(recorded_trunk_calls) == 1
     assert not recorded_trunk_calls[0].grad_enabled
@@ -2053,6 +2066,10 @@ def test_self_conditioned_template_is_binned_prediction(
     a binned structure; changing with ``r_gt_noised`` shows that structure
     is the model's prediction. No parametrization: the batch's noisy
     coordinates are the only input the prediction is built from.
+
+    Args:
+        featurized_batch: Supplies the residue mask.
+        template_pair: Templates before and after the input moved.
     """
     residue_mask = featurized_batch.f_pseudo_beta_mask.bool()
     pair_mask = rearrange(residue_mask, "b i -> b i 1") & rearrange(
@@ -2080,7 +2097,7 @@ class TemplateSourceCase:
     self_condition: bool
 
 
-class TemplateSource(Enum):
+class TemplateSource(enum.Enum):
     """Where ``take_step`` gets the template it feeds the trunk.
 
     Members:
