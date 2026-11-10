@@ -246,61 +246,45 @@ def sparse_inputs(
 
 
 @pytest.fixture
-def module_call(
-    request: pytest.FixtureRequest,
-    modules: NodeModules,
-) -> ModuleCall:
-    """Return the ``(s, t, z)`` module named by the indirect param.
+def module_call(module_name: str, modules: NodeModules) -> ModuleCall:
+    """Return the ``(s, t, z)`` module named by ``module_name``.
 
     Args:
-        request: Pytest request carrying ``"attn"`` or ``"node"``.
+        module_name: ``"attn"`` or ``"node"``; the requesting test
+            parametrizes it.
         modules: Modules to pick from.
 
     Returns:
         The chosen module as a callable.
     """
-    return cast(ModuleCall, getattr(modules, cast(str, request.param)))
+    return cast(ModuleCall, getattr(modules, module_name))
 
 
 @pytest.fixture
 def sparse_beta(
-    request: pytest.FixtureRequest,
+    beta_scenario: BetaScenario,
     sparse_inputs: SparseInputs,
 ) -> Float[torch.Tensor, "B N K"] | None:
-    """Return the ``beta`` the routed-in ``BetaScenario`` asks for.
+    """Return the ``beta`` that ``beta_scenario`` asks for.
 
     Args:
-        request: Pytest request carrying a ``BetaScenario`` member.
+        beta_scenario: Whether to pass a ``beta``; the requesting test
+            parametrizes it.
         sparse_inputs: Inputs whose ``neighbor_idx`` sets the shape.
 
     Returns:
         Zeros shaped like ``neighbor_idx`` when the scenario passes a
         ``beta``, otherwise ``None``.
     """
-    scenario = cast(BetaScenario, request.param)
-    if not scenario.value.pass_beta:
+    if not beta_scenario.value.pass_beta:
         return None
     return torch.zeros(sparse_inputs.neighbor_idx.shape)
 
 
-@pytest.fixture
-def malformed_scenario(request: pytest.FixtureRequest) -> MalformedScenario:
-    """Return the ``MalformedScenario`` member routed in via indirect param.
-
-    Args:
-        request: Pytest request carrying the scenario in ``param``.
-
-    Returns:
-        The scenario under test.
-    """
-    return cast(MalformedScenario, request.param)
-
-
 @pytest.mark.parametrize(
-    "module_call",
+    "module_name",
     ["attn", "node"],
     ids=["attention_pair_bias", "node_update"],
-    indirect=True,
 )
 def test_dense_output_shape_dtype_and_finite(
     dims: NodeDims,
@@ -322,10 +306,9 @@ def test_dense_output_shape_dtype_and_finite(
 
 
 @pytest.mark.parametrize(
-    "sparse_beta",
+    "beta_scenario",
     list(BetaScenario),
     ids=[case.name for case in BetaScenario],
-    indirect=True,
 )
 def test_sparse_output_shape_and_finite(
     dims: NodeDims,
@@ -437,10 +420,9 @@ def test_sparse_gradient_reaches_node_embedding(
 
 
 @pytest.mark.parametrize(
-    "module_call",
+    "module_name",
     ["attn", "node"],
     ids=["attention_pair_bias", "node_update"],
-    indirect=True,
 )
 def test_every_parameter_receives_a_finite_gradient(
     inputs: NodeInputs,
@@ -682,7 +664,6 @@ def test_attention_rejects_heads_that_do_not_divide_width(
     "malformed_scenario",
     list(MalformedScenario),
     ids=[case.name for case in MalformedScenario],
-    indirect=True,
 )
 def test_forward_rejects_input_missing_channel_axis(
     malformed_scenario: MalformedScenario,
