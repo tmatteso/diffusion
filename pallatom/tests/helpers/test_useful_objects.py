@@ -105,6 +105,31 @@ class AllReduceRun:
 
 
 @dataclasses.dataclass(frozen=True)
+class ProcessGroupCase:
+    """Process-group state a single-process ``all_reduce_mean`` runs under.
+
+    Attributes:
+        group_active: Whether a one-rank gloo group is started first.
+    """
+
+    group_active: bool
+
+
+class ProcessGroup(enum.Enum):
+    """Single-process settings for ``all_reduce_mean``.
+
+    Members:
+        no_group: No process group exists, so the method must return before
+            any collective call.
+        single_rank_group: A one-rank gloo group exists, so the real
+            collective path runs over a world of one.
+    """
+
+    no_group = ProcessGroupCase(group_active=False)
+    single_rank_group = ProcessGroupCase(group_active=True)
+
+
+@dataclasses.dataclass(frozen=True)
 class FieldOverride:
     """One field of a metric dataclass and a replacement value for it.
 
@@ -251,20 +276,21 @@ def vector_field(metric_cls: type[TensorAccumulatorMixin]) -> FieldOverride:
     return FieldOverride(name=first_field.name, value=torch.tensor([1.0]))
 
 
-@pytest.fixture(params=[False, True], ids=["no_group", "single_rank_group"])
-def process_group_active(request: pytest.FixtureRequest) -> bool:
-    """Run the requesting test without and with a one-rank gloo group.
+@pytest.fixture
+def process_group(request: pytest.FixtureRequest) -> ProcessGroup:
+    """Start a one-rank gloo group when the scenario asks for one.
 
     Args:
-        request: Pytest request carrying whether to start the group.
+        request: Pytest request carrying the ``ProcessGroup`` member,
+            passed with ``indirect=True``.
 
     Returns:
-        Whether a process group is active for the test.
+        The scenario, with its group already started if it has one.
     """
-    active = cast(bool, request.param)
-    if active:
+    scenario = cast(ProcessGroup, request.param)
+    if scenario.value.group_active:
         request.getfixturevalue("single_process_gloo_group")
-    return active
+    return scenario
 
 
 @pytest.fixture
@@ -480,8 +506,14 @@ def test_metrics_reject_non_scalar_field(
         )
 
 
+@pytest.mark.parametrize(
+    "process_group",
+    list(ProcessGroup),
+    ids=[case.name for case in ProcessGroup],
+    indirect=True,
+)
 def test_all_reduce_mean_keeps_values_on_one_process(
-    process_group_active: bool,  # noqa: FBT001
+    process_group: ProcessGroup,
     metrics_of_ones: TensorAccumulatorMixin,
 ) -> None:
     """With no group or a one-rank group, every field stays at 1.0.
@@ -493,10 +525,10 @@ def test_all_reduce_mean_keeps_values_on_one_process(
     below does that.
 
     Args:
-        process_group_active: Whether a one-rank gloo group is active.
+        process_group: Whether a one-rank gloo group is active.
         metrics_of_ones: Instance with every field 1.0.
     """
-    assert dist.is_initialized() == process_group_active
+    assert dist.is_initialized() == process_group.value.group_active
     metrics_of_ones.all_reduce_mean()
     assert set(metrics_of_ones.to_float_dict().values()) == {1.0}
 
