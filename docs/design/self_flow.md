@@ -108,6 +108,24 @@ per-residue σ, `σ_i · (ε_i − CoM(ε))` does not have zero centre of mass.
 Center *after* scaling: `n = σ_atom ⊙ ε`, then `n − CoM(n)`. For uniform σ the
 two forms are identical, so the baseline is unchanged.
 
+#### 3.2.1 Train/inference mismatch
+
+With `R_M = 0.25`, the chance that no residue in a protein is masked is
+`0.75^N_res`. That is about 6·10⁻⁶ at `N_res = 50`. So under the
+dual-timestep schedule the student essentially never trains on uniform σ, yet
+every sampling step uses uniform σ. The paper applies the schedule to every
+sample and reports no problem on images. pallatom is more exposed to this,
+because per-residue σ also shapes the self-conditioning template distogram
+pair by pair.
+
+`SelfFlowParams.apply_prob` is the fraction of samples that get the
+dual-timestep schedule. The rest use `R_M = 0`, so the student and teacher
+inputs are identical. That case is the paper's "no masking, keep `L_rep`"
+ablation, so it is still a well-defined training signal. The default is 1.0,
+matching the paper. 0.5 is the first fallback if `dual-t` underperforms
+`baseline` (§6, §9.2). The uniform-σ validation run detects the mismatch, and
+this knob addresses it.
+
 ### 3.3 Model changes (per-residue σ)
 
 `t_hat` changes from `Float[Tensor, "B"]` to `Float[Tensor, "B N_res"]`
@@ -214,6 +232,7 @@ A new `SelfFlowParams` block in `train/train_config.py` (pydantic, validated):
 class SelfFlowParams(BaseModel):
     enabled: bool = False
     mask_ratio: float = Field(default=0.25, ge=0, le=0.5)      # R_M
+    apply_prob: float = Field(default=1.0, ge=0, le=1)         # §3.2.1
     student_unit_frac: float = Field(default=0.3, gt=0, lt=1)
     teacher_unit_frac: float = Field(default=0.7, gt=0, lt=1)
     target: Literal["coords", "latents"] = "coords"            # Arm A / B
@@ -240,6 +259,13 @@ enforces `k_s < k_t` after rounding.
   `r_noised`, `noised_res_distogram` and `t_hat`. `to()` and `pin_memory()`
   must pass it through. It is `None` when Self-Flow is disabled, and on
   validation and sampling batches.
+- **Memory.** The second template distogram is `B × N_res² × 39`. As
+  float32, that is about 41 MB per 512-residue item, and it is now paid
+  twice: in pinned CPU memory, in the host-to-device copy, and on the GPU.
+  Ship the teacher's noised Cβ coordinates (`[B, N_res, 3]`) or uint8 bin
+  indices in `NoisedView`, and build the one-hot distogram on the device
+  inside the training step. Measure collate throughput and peak memory in
+  phase 2 before choosing.
 - `LossMetrics`: add `self_flow_loss`, logged to wandb next to
   `intermediate_loss`. Add these diagnostics:
   - `self_flow_teacher_gt_mse`: the teacher's unit-6 error against GT. It
@@ -262,6 +288,7 @@ metrics and sample quality. Wall-clock time is reported separately.
 | `sf-latents` | 0.25 | Arm B | the paper's version |
 | `sf-coords-R` | {0.1, 0.5} | Arm A | protein residues have strong local redundancy along the chain, so the right `R_M` may be closer to video (0.1) than to images (0.25) |
 | `sf-coords-layers` | 0.25 | Arm A, (k_s, k_t) ∈ {(2,8), (3,6)} | check sensitivity to the layer pair |
+| `sf-coords-p` | 0.25, `apply_prob = 0.5` | Arm A | train/inference mismatch fallback (§3.2.1); run if `dual-t` < `baseline` |
 
 "Sucks or not" criterion: `sf-coords` should beat `dual-t` on validation
 Kabsch MSE and lDDT at matched steps, and `dual-t` should be at least as good
@@ -358,3 +385,77 @@ atoms. Each group then contributes in proportion to its size, whatever its λ.
 
 **Test (either way):** with `R_M = 0`, the per-atom form must reproduce
 `main`'s `atom_loss` and `med_loss` exactly. This belongs in phase 1 (§7).
+
+## 10. Interaction with length-dependent timestep shifting
+
+**Reference:** Esser et al., *Scaling Rectified Flow Transformers for
+High-Resolution Image Synthesis* (ICML 2024, arXiv
+[2403.03206](https://arxiv.org/abs/2403.03206)), §5.3.2. FLUX uses the same
+shift, with `log α` linear in token count: 0.5 at 256 tokens and 1.15 at
+4096 tokens.
+
+### 10.1 The shift in EDM terms
+
+The paper argues that with more tokens, a fixed noise level destroys less
+information, because the model can average over redundant tokens. So the
+schedule should move toward more noise as resolution grows. It uses
+`t' = α·t / (1 + (α−1)·t)` with `α = √(m/n)`.
+
+The rectified-flow input is `x_t = (1−t)·x0 + t·ε`. Dividing by `(1−t)` gives
+`x0 + σ·ε` with `σ = t/(1−t)`. Substituting `t'` gives
+
+```
+σ' = α · σ
+```
+
+So in EDM the shift is a multiplicative rescale of σ. For our log-normal
+sampler, that is an additive shift of `P_mean` by `ln α`. The global
+`P_mean = −1.2` is already a fixed version of this knob. The protein analogue
+is a length-dependent mean:
+
+```
+P_mean(N) = P_mean + β · ln(N_res / N_ref)
+```
+
+The sampler's `noise_schedule` needs the same `α(N)` multiplier, so that
+training and inference stay matched. FLUX applies the shift in both.
+
+The paper derives `β = ½` from a constant-image argument. That argument does
+not carry over directly: local protein geometry (3.8 Å Cα–Cα, bond angles)
+does not depend on length, and only the global fold becomes more redundant as
+`N` grows. Treat `β ∈ [0, ½]` as a tuned value. A related point: `σ_data = 16`
+is fixed, while coordinate spread grows with length (`R_g ∝ N^~0.4`). Part of
+what a length shift corrects is that preconditioning mismatch.
+
+### 10.2 Interactions with Self-Flow
+
+1. **The two compose cleanly.** Both σ draws come from the shifted
+   distribution, and `min(ασ_s, ασ_t) = α·min(σ_s, σ_t)`. So the teacher's
+   σ_min is shifted consistently, with no extra logic. The shift goes where σ
+   is drawn in `featurize_single_item`, before the dual-timestep split.
+   Nothing in §3–§5 changes.
+2. **Both are redundancy knobs that depend on length.** With a fixed `R_M`,
+   long proteins have more clean anchor residues in absolute terms, so the
+   student's task gets easier as `N` grows. That is the same effect the shift
+   counteracts. Without a shift, expect Self-Flow's benefit to be concentrated
+   on short proteins. With a shift, long proteins move to higher σ, where the
+   information gap between student and teacher is largest.
+3. **The shift confounds the §9 diagnostics.** Under a shift, short proteins
+   are over-represented in the low-σ buckets. Both the §9.1 low-σ dominance
+   check and the §9.2 group-share check would then partly measure length.
+   Bucket by the unshifted `σ/α(N)`, or by (σ, length bin).
+4. **The teacher gets weaker on long proteins.** At higher σ the teacher's
+   prediction is less accurate in absolute terms, which may cancel the gain
+   from point 2. Log `L_sf` and `self_flow_teacher_gt_mse` by length bin.
+5. **Validation must match.** The uniform-σ validation, and the sampler, must
+   use the same shift setting as the run they are compared against.
+
+### 10.3 Experiment ordering
+
+Do not introduce the shift inside the §6 matrix. Changing both at once would
+confound the results.
+
+1. Run the §6 Self-Flow matrix with no shift.
+2. Run the shift on its own: `β ∈ {0, 0.25, 0.5}` against `baseline`, with
+   the sampler schedule shifted to match.
+3. Only if both help, run a 2×2 (shift × Self-Flow, Arm A).
