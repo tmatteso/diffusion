@@ -1205,7 +1205,11 @@ def main(args: TrainArgs, tcfg: TrainConfig) -> None:
             ),
         )
 
-        distogram_template = build_distogram_module(tcfg.distogram_template)
+        # On the training device: self_conditioned_template bins the trunk's
+        # on-device prediction with it every step.
+        distogram_template = build_distogram_module(
+            tcfg.distogram_template,
+        ).to(device)
         distogram_residue = build_distogram_module(tcfg.distogram_residue)
         distogram_atom = build_distogram_module(tcfg.distogram_atom)
 
