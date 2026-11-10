@@ -28,7 +28,7 @@ from helpers.useful_objects import (
     TensorAccumulatorMixin,
     ThroughputStatistics,
 )
-from jaxtyping import TypeCheckError
+from jaxtyping import Float, TypeCheckError
 
 
 @dataclasses.dataclass(frozen=True)
@@ -104,14 +104,50 @@ class AllReduceRun:
     reports: tuple[RankReport, ...]
 
 
+@dataclasses.dataclass(frozen=True)
+class FieldOverride:
+    """One field of a metric dataclass and a replacement value for it.
+
+    Attributes:
+        name: Name of the field to replace.
+        value: Replacement tensor; 1-D, so it breaks the field's scalar
+            shape contract.
+    """
+
+    name: str
+    value: Float[torch.Tensor, " n"]
+
+
+def metrics_filled_with(
+    metric_class: type[TensorAccumulatorMixin],
+    value: float,
+) -> TensorAccumulatorMixin:
+    """Build ``metric_class`` with every field a separate 0-D ``value``.
+
+    The instance comes from the class's own ``zero_init``, and each field
+    is then set to a fresh ``torch.tensor(value)``.
+
+    Args:
+        metric_class: Metric dataclass to build.
+        value: Starting value of every field.
+
+    Returns:
+        Instance whose fields are all ``torch.tensor(value)``.
+    """
+    metrics = metric_class.zero_init(torch.device("cpu"))
+    for field in dataclasses.fields(metrics):
+        setattr(metrics, field.name, torch.tensor(value))
+    return metrics
+
+
 def reduce_at_rank(
     metric_class: type[TensorAccumulatorMixin],
     rank: int,
 ) -> dict[str, float]:
     """Build ``metric_class`` with every field at ``rank`` and reduce it.
 
-    The instance comes from the class's own ``zero_init``, and each field
-    is then set to ``float(rank)``, so every rank contributes its own
+    ``metrics_filled_with`` sets each field to ``float(rank)``, so every
+    rank contributes its own
     number to the mean. Called by ``all_reduce_mean_worker`` inside a
     spawned rank, after the process group exists.
 
@@ -122,9 +158,7 @@ def reduce_at_rank(
     Returns:
         The reduced instance's ``to_float_dict``.
     """
-    metrics = metric_class.zero_init(torch.device("cpu"))
-    for field in dataclasses.fields(metrics):
-        setattr(metrics, field.name, torch.tensor(float(rank)))
+    metrics = metrics_filled_with(metric_class, float(rank))
     metrics.all_reduce_mean()
     return metrics.to_float_dict()
 
@@ -196,31 +230,25 @@ def metrics_of_ones(
     Returns:
         Instance whose fields are all ``torch.tensor(1.0)``.
     """
-    constructor: Callable[..., TensorAccumulatorMixin] = metric_cls
-    names = [f.name for f in dataclasses.fields(metric_cls)]
-    return constructor(**{name: torch.tensor(1.0) for name in names})
+    return metrics_filled_with(metric_cls, 1.0)
 
 
 @pytest.fixture
-def build_with_vector_field(
-    metric_cls: type[TensorAccumulatorMixin],
-) -> Callable[[], TensorAccumulatorMixin]:
-    """Return a thunk building ``metric_cls`` with its first field 1-D.
+def vector_field(metric_cls: type[TensorAccumulatorMixin]) -> FieldOverride:
+    """Return a 1-D tensor aimed at the first scalar field of ``metric_cls``.
 
-    Every other field is a valid 0-D tensor, so the only contract broken is
-    the scalar shape of one field.
+    Only that one field is replaced, and every other field stays a valid
+    0-D tensor, so the scalar shape of one field is the only contract the
+    test breaks.
 
     Args:
-        metric_cls: Metric dataclass to build.
+        metric_cls: Metric dataclass whose first field is targeted.
 
     Returns:
-        Zero-argument callable that attempts the construction.
+        The first field's name with the 1-D tensor ``[1.0]``.
     """
-    constructor: Callable[..., TensorAccumulatorMixin] = metric_cls
-    names = [f.name for f in dataclasses.fields(metric_cls)]
-    kwargs = {name: torch.tensor(1.0) for name in names}
-    kwargs[names[0]] = torch.tensor([1.0])
-    return lambda: constructor(**kwargs)
+    first_field = dataclasses.fields(metric_cls)[0]
+    return FieldOverride(name=first_field.name, value=torch.tensor([1.0]))
 
 
 @pytest.fixture(params=[False, True], ids=["no_group", "single_rank_group"])
@@ -240,78 +268,41 @@ def process_group_active(request: pytest.FixtureRequest) -> bool:
 
 
 @pytest.fixture
-def make_throughput() -> (
-    Callable[[float, float, float, float], ThroughputStatistics]
-):
-    """Return a factory for ThroughputStatistics from four field values.
-
-    ``make(a, b, c, d)`` sets ``avg_batch_size``, ``token_pack_rate``,
-    ``residues_per_sec`` and ``atoms_per_sec`` in that order, the class's
-    field order.
-
-    Returns:
-        The factory.
-    """
-
-    def make(a: float, b: float, c: float, d: float) -> ThroughputStatistics:
-        """Build the metrics; each value becomes a 0-D float32 tensor.
-
-        Args:
-            a: ``avg_batch_size``.
-            b: ``token_pack_rate``.
-            c: ``residues_per_sec``.
-            d: ``atoms_per_sec``.
-
-        Returns:
-            The metrics, shape-checked by the class's ``@jaxtyped``.
-        """
-        return ThroughputStatistics(
-            avg_batch_size=torch.tensor(a),
-            token_pack_rate=torch.tensor(b),
-            residues_per_sec=torch.tensor(c),
-            atoms_per_sec=torch.tensor(d),
-        )
-
-    return make
-
-
-@pytest.fixture
-def left(
-    make_throughput: Callable[
-        [float, float, float, float],
-        ThroughputStatistics,
-    ],
-) -> ThroughputStatistics:
+def left() -> ThroughputStatistics:
     """Return the left operand ``(1, 2, 3, 4)``.
 
     Distinct values per field catch an operation applied to the wrong
-    field.
-
-    Args:
-        make_throughput: Metrics factory.
+    field. Built by hand rather than from a factory fixture: ``left`` and
+    ``right`` are the only two instances, both fixed, and naming each
+    field beside its value is easier to check than a factory's positional
+    arguments.
 
     Returns:
         Fresh metrics; operations may mutate them in place.
     """
-    return make_throughput(1.0, 2.0, 3.0, 4.0)
+    return ThroughputStatistics(
+        avg_batch_size=torch.tensor(1.0),
+        token_pack_rate=torch.tensor(2.0),
+        residues_per_sec=torch.tensor(3.0),
+        atoms_per_sec=torch.tensor(4.0),
+    )
 
 
 @pytest.fixture
-def right(
-    make_throughput: Callable[
-        [float, float, float, float],
-        ThroughputStatistics,
-    ],
-) -> ThroughputStatistics:
+def right() -> ThroughputStatistics:
     """Return the right operand ``(10, 20, 30, 40)``.
 
-    Args:
-        make_throughput: Metrics factory.
+    Built by hand for the same reason as ``left``.
 
     Returns:
         Fresh metrics.
     """
-    return make_throughput(10.0, 20.0, 30.0, 40.0)
+    return ThroughputStatistics(
+        avg_batch_size=torch.tensor(10.0),
+        token_pack_rate=torch.tensor(20.0),
+        residues_per_sec=torch.tensor(30.0),
+        atoms_per_sec=torch.tensor(40.0),
+    )
 
 
 @pytest.fixture
@@ -468,18 +459,25 @@ def test_metrics_zero_init_fields_are_float32_scalars(
 
 
 def test_metrics_reject_non_scalar_field(
-    build_with_vector_field: Callable[[], TensorAccumulatorMixin],
+    metrics_of_ones: TensorAccumulatorMixin,
+    vector_field: FieldOverride,
 ) -> None:
     """``@jaxtyped`` rejects a 1-D tensor in a scalar field at construction.
 
     Parametrized over the real metric classes through ``metric_cls``.
+    ``dataclasses.replace`` builds a new instance through the class's
+    ``@jaxtyped`` ``__init__`` with one field swapped for the 1-D tensor,
+    so the construction expected to raise happens inside ``pytest.raises``.
 
     Args:
-        build_with_vector_field: Thunk building an instance with one 1-D
-            field.
+        metrics_of_ones: Valid instance whose other fields are kept.
+        vector_field: Name of the field to replace and its 1-D tensor.
     """
     with pytest.raises(TypeCheckError):
-        _ = build_with_vector_field()
+        _ = dataclasses.replace(
+            metrics_of_ones,
+            **{vector_field.name: vector_field.value},
+        )
 
 
 def test_all_reduce_mean_keeps_values_on_one_process(
