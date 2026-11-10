@@ -9,8 +9,8 @@ seq_ce_loss's handling of padding and the unknown token, plus every
 function's shape contract.
 
 Uniform logits give a cross-entropy of exactly ``log(n_classes)``, which
-anchors most expected values. Coordinates come from the shared
-``make_cloud`` fixture.
+anchors most expected values. Coordinates come from
+``tests.patterns.chiral_cloud``.
 """
 
 import dataclasses
@@ -56,8 +56,8 @@ from helpers.data import (
     build_distogram_module,
     featurize_single_item,
 )
-from jaxtyping import Float, Int, TypeCheckError
-from tests.conftest import CloudFactory, PatternFactory
+from jaxtyping import Bool, Float, Int, TypeCheckError
+from tests.patterns import chiral_cloud, sine_pattern
 from train.train_config import (
     AtomDistogramParams,
     LossParams,
@@ -109,6 +109,82 @@ class RigidCase:
 
     rotation: tuple[tuple[int, int, int], ...]
     translation: tuple[float, float, float]
+
+    def apply(self, x: Coords) -> Coords:
+        """Rotate then translate every structure in ``x``.
+
+        Args:
+            x: Batched coordinates to move.
+
+        Returns:
+            ``x R + t``.
+        """
+        rotation = torch.tensor(self.rotation, dtype=torch.float32)
+        moved = einsum(x, rotation, "b n d, d e -> b n e")
+        return moved + torch.tensor(self.translation)
+
+
+@dataclasses.dataclass(frozen=True)
+class TargetCase:
+    """How distogram targets are encoded.
+
+    Attributes:
+        one_hot: One-hot float targets when true, integer bin indices when
+            false.
+    """
+
+    one_hot: bool
+
+
+class TargetForm(enum.Enum):
+    """Target encodings both distogram losses accept.
+
+    Members:
+        index: Integer bin per pair.
+        one_hot: One-hot float vector over the bins per pair.
+    """
+
+    index = TargetCase(one_hot=False)
+    one_hot = TargetCase(one_hot=True)
+
+
+@dataclasses.dataclass(frozen=True)
+class MaskCase:
+    """Whether a distogram loss is given a mask, and whether that is buggy.
+
+    Attributes:
+        masked: Pass a mask when true, ``None`` when false.
+        divisor_bug: The case hits the known ``distogram_loss_atom``
+            normalisation bug, so its fixture marks it strict ``xfail``.
+    """
+
+    masked: bool
+    divisor_bug: bool
+
+
+class ResidueMask(enum.Enum):
+    """Residue masks for ``distogram_loss_residue``.
+
+    Members:
+        unmasked: No mask.
+        masked: The last residue is masked out.
+    """
+
+    unmasked = MaskCase(masked=False, divisor_bug=False)
+    masked = MaskCase(masked=True, divisor_bug=False)
+
+
+class AtomMask(enum.Enum):
+    """Slot masks for ``distogram_loss_atom``.
+
+    Members:
+        masked: An all-valid slot mask.
+        unmasked: No mask. Fails today: without a mask the loss divides
+            by ``q.shape[-2] ** 2 = K**2`` instead of ``N_atom * K``.
+    """
+
+    masked = MaskCase(masked=True, divisor_bug=False)
+    unmasked = MaskCase(masked=False, divisor_bug=True)
 
 
 class RigidScenario(enum.Enum):
@@ -222,33 +298,33 @@ def dims() -> LossDims:
 
 
 @pytest.fixture
-def gt(dims: LossDims, make_cloud: CloudFactory) -> Coords:
+def gt(dims: LossDims) -> Coords:
     """Return non-planar ground-truth structures spanning about 10 angstroms.
 
     Args:
         dims: Structure sizes.
-        make_cloud: Point-cloud factory.
 
     Returns:
         ``(B, N_atom, 3)`` coordinates.
     """
-    return 5 * make_cloud(dims.batch, dims.n_atom)
+    return 5 * chiral_cloud(dims.batch, dims.n_atom)
 
 
 @pytest.fixture
-def perturbed(gt: Coords, make_cloud: CloudFactory) -> Coords:
+def perturbed(gt: Coords) -> Coords:
     """Return ``gt`` plus a fixed non-rigid perturbation of about 1 angstrom.
+
+    The perturbation is a chiral cloud offset by one structure in the
+    sequence, so it is unrelated to ``gt``.
 
     Args:
         gt: Ground truth.
-        make_cloud: Supplies the perturbation, offset in the sequence so it
-            is unrelated to ``gt``.
 
     Returns:
         A prediction that no rigid motion maps onto ``gt``.
     """
     b, n, _ = gt.shape
-    return gt + make_cloud(b + 1, n)[1:]
+    return gt + chiral_cloud(b + 1, n)[1:]
 
 
 @pytest.fixture
@@ -280,28 +356,113 @@ def ones_weight(dims: LossDims) -> Float[torch.Tensor, " B"]:
 
 
 @pytest.fixture
-def move() -> Callable[[Coords, RigidCase], Coords]:
-    """Return a function applying a ``RigidCase`` to batched coordinates.
+def target_form(request: pytest.FixtureRequest) -> TargetForm:
+    """Return the ``TargetForm`` member routed in via indirect param.
+
+    Args:
+        request: Pytest request carrying the member in ``param``.
 
     Returns:
-        ``move(x, case) = x R + t``.
+        The target encoding under test.
     """
+    return cast(TargetForm, request.param)
 
-    def apply(x: Coords, case: RigidCase) -> Coords:
-        """Rotate then translate ``x``.
 
-        Args:
-            x: Coordinates to move.
-            case: Motion to apply.
+@pytest.fixture
+def residue_target(
+    target_form: TargetForm,
+    dims: LossDims,
+    residue_bins: Int[torch.Tensor, "B N_res N_res"],
+) -> (
+    Int[torch.Tensor, "B N_res N_res"] | Float[torch.Tensor, "B N_res N_res n"]
+):
+    """Return ``residue_bins`` in the scenario's encoding.
 
-        Returns:
-            Moved coordinates.
-        """
-        rotation = torch.tensor(case.rotation, dtype=torch.float32)
-        moved = einsum(x, rotation, "b n d, d e -> b n e")
-        return moved + torch.tensor(case.translation)
+    Args:
+        target_form: Index or one-hot.
+        dims: Supplies ``n_bins``.
+        residue_bins: Target bins.
 
-    return apply
+    Returns:
+        The bins themselves, or their one-hot encoding.
+    """
+    if not target_form.value.one_hot:
+        return residue_bins
+    return F.one_hot(residue_bins, dims.n_bins).float()
+
+
+@pytest.fixture
+def atom_target(
+    target_form: TargetForm,
+    dims: LossDims,
+    atom_bins: Int[torch.Tensor, "B N_atom K"],
+) -> Int[torch.Tensor, "B N_atom K"] | Float[torch.Tensor, "B N_atom K n"]:
+    """Return ``atom_bins`` in the scenario's encoding.
+
+    Args:
+        target_form: Index or one-hot.
+        dims: Supplies ``n_bins``.
+        atom_bins: Target bins.
+
+    Returns:
+        The bins themselves, or their one-hot encoding.
+    """
+    if not target_form.value.one_hot:
+        return atom_bins
+    return F.one_hot(atom_bins, dims.n_bins).float()
+
+
+@pytest.fixture
+def residue_mask(
+    request: pytest.FixtureRequest,
+    dims: LossDims,
+) -> Float[torch.Tensor, "B N_res"] | None:
+    """Return the residue mask the routed-in ``ResidueMask`` asks for.
+
+    Args:
+        request: Pytest request carrying a ``ResidueMask`` member.
+        dims: Supplies the batch and residue counts.
+
+    Returns:
+        A mask hiding the last residue, or ``None``.
+    """
+    scenario = cast(ResidueMask, request.param)
+    if not scenario.value.masked:
+        return None
+    mask = torch.ones(dims.batch, dims.n_res)
+    mask[:, -1] = 0
+    return mask
+
+
+@pytest.fixture
+def atom_mask(
+    request: pytest.FixtureRequest,
+    atom_bins: Int[torch.Tensor, "B N_atom K"],
+) -> Bool[torch.Tensor, "B N_atom K"] | None:
+    """Return the slot mask the routed-in ``AtomMask`` asks for.
+
+    A case flagged ``divisor_bug`` gets a strict ``xfail`` marker, so it
+    must fail today and the marker must come off once the loss is fixed.
+    Marks cannot ride on enum members, so the fixture applies it.
+
+    Args:
+        request: Pytest request carrying an ``AtomMask`` member.
+        atom_bins: Supplies the slot layout.
+
+    Returns:
+        An all-valid slot mask, or ``None``.
+    """
+    scenario = cast(AtomMask, request.param)
+    if scenario.value.divisor_bug:
+        request.applymarker(
+            pytest.mark.xfail(
+                strict=True,
+                reason="unmasked distogram_loss_atom divides by K**2",
+            ),
+        )
+    if not scenario.value.masked:
+        return None
+    return torch.ones(atom_bins.shape, dtype=torch.bool)
 
 
 @pytest.fixture
@@ -488,7 +649,6 @@ def test_atom_loss_is_zero_for_a_rigid_copy(
     gt: Coords,
     aa_indices: Int[torch.Tensor, "B N_res"],
     ones_weight: Float[torch.Tensor, " B"],
-    move: Callable[[Coords, RigidCase], Coords],
 ) -> None:
     """Predicting a rigidly moved ground truth costs nothing after alignment.
 
@@ -497,9 +657,8 @@ def test_atom_loss_is_zero_for_a_rigid_copy(
         gt: Ground truth.
         aa_indices: Residue types.
         ones_weight: EDM weight of 1.
-        move: Applies the motion.
     """
-    pred = move(gt, rigid_scenario.value)
+    pred = rigid_scenario.value.apply(gt)
     loss = atom_loss(
         pred,
         gt,
@@ -521,7 +680,6 @@ def test_atom_loss_ignores_rigid_motion_of_the_target(
     perturbed: Coords,
     aa_indices: Int[torch.Tensor, "B N_res"],
     ones_weight: Float[torch.Tensor, " B"],
-    move: Callable[[Coords, RigidCase], Coords],
 ) -> None:
     """Moving the ground truth rigidly leaves a nonzero loss unchanged.
 
@@ -534,11 +692,10 @@ def test_atom_loss_ignores_rigid_motion_of_the_target(
         perturbed: Non-rigidly perturbed prediction.
         aa_indices: Residue types.
         ones_weight: EDM weight of 1.
-        move: Applies the motion.
     """
     kwargs = {"aa_indices": aa_indices, "lambda_sigma_weight": ones_weight}
     base = atom_loss(perturbed, gt, **kwargs)
-    moved = atom_loss(perturbed, move(gt, rigid_scenario.value), **kwargs)
+    moved = atom_loss(perturbed, rigid_scenario.value.apply(gt), **kwargs)
     assert bool((base > 0).all())
     torch.testing.assert_close(moved, base, atol=1e-4, rtol=1e-4)
 
@@ -1035,31 +1192,37 @@ def test_pairwise_dist_on_a_3_4_5_triangle(
     )
 
 
-@pytest.mark.parametrize("one_hot", [False, True], ids=["index", "one_hot"])
-@pytest.mark.parametrize("masked", [False, True], ids=["unmasked", "masked"])
+@pytest.mark.parametrize(
+    "target_form",
+    list(TargetForm),
+    ids=[case.name for case in TargetForm],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "residue_mask",
+    list(ResidueMask),
+    ids=[case.name for case in ResidueMask],
+    indirect=True,
+)
 def test_distogram_loss_residue_uniform_logits_give_log_bins(
     dims: LossDims,
     residue_bins: Int[torch.Tensor, "B N_res N_res"],
-    one_hot: bool,  # noqa: FBT001
-    masked: bool,  # noqa: FBT001
+    residue_target: (
+        Int[torch.Tensor, "B N_res N_res"]
+        | Float[torch.Tensor, "B N_res N_res n"]
+    ),
+    residue_mask: Float[torch.Tensor, "B N_res"] | None,
 ) -> None:
     """Uniform logits give ``log(n_bins)`` per item for any target and mask.
 
     Args:
         dims: Supplies ``n_bins``.
-        residue_bins: Target bins.
-        one_hot: Whether targets are one-hot rather than indices.
-        masked: Whether to mask out the last residue.
+        residue_bins: Supplies the pair layout for the logits.
+        residue_target: Target bins as indices or one-hot.
+        residue_mask: Mask hiding the last residue, or ``None``.
     """
     logits = torch.zeros(*residue_bins.shape, dims.n_bins)
-    target = (
-        F.one_hot(residue_bins, dims.n_bins).float()
-        if one_hot
-        else residue_bins
-    )
-    mask = torch.ones(dims.batch, dims.n_res)
-    mask[:, -1] = 0
-    loss = distogram_loss_residue(logits, target, mask if masked else None)
+    loss = distogram_loss_residue(logits, residue_target, residue_mask)
     expected = torch.full((dims.batch,), math.log(dims.n_bins))
     torch.testing.assert_close(loss, expected)
 
@@ -1096,46 +1259,41 @@ def test_distogram_loss_residue_mask_hides_wrong_pairs(
     assert bool((unmasked > 1).all())
 
 
-@pytest.mark.parametrize("one_hot", [False, True], ids=["index", "one_hot"])
 @pytest.mark.parametrize(
-    "masked",
-    [
-        pytest.param(True, id="masked"),
-        pytest.param(
-            False,
-            id="unmasked",
-            marks=pytest.mark.xfail(
-                strict=True,
-                reason=(
-                    "distogram_loss_atom without a mask divides by "
-                    "q.shape[-2] ** 2 = K**2, not N_atom * K"
-                ),
-            ),
-        ),
-    ],
+    "target_form",
+    list(TargetForm),
+    ids=[case.name for case in TargetForm],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "atom_mask",
+    list(AtomMask),
+    ids=[case.name for case in AtomMask],
+    indirect=True,
 )
 def test_distogram_loss_atom_uniform_logits_give_log_bins(
     dims: LossDims,
     atom_bins: Int[torch.Tensor, "B N_atom K"],
-    one_hot: bool,  # noqa: FBT001
-    masked: bool,  # noqa: FBT001
+    atom_target: (
+        Int[torch.Tensor, "B N_atom K"] | Float[torch.Tensor, "B N_atom K n"]
+    ),
+    atom_mask: Bool[torch.Tensor, "B N_atom K"] | None,
 ) -> None:
     """Uniform logits give ``log(n_bins)`` per item for any target and mask.
 
     The documented loss is ``-1/(N_atom K) sum``, so with ``K = 5`` slots for
     12 atoms the unmasked case fails today: it divides by ``K²`` and
-    returns ``(12/5) log(n_bins)``.
+    returns ``(12/5) log(n_bins)``. ``atom_mask`` marks that case strict
+    ``xfail``.
 
     Args:
         dims: Supplies ``n_bins``.
-        atom_bins: Target bins for 12 atoms by 5 slots.
-        one_hot: Whether targets are one-hot rather than indices.
-        masked: Whether to pass an all-valid slot mask.
+        atom_bins: Supplies the slot layout for the logits.
+        atom_target: Target bins as indices or one-hot.
+        atom_mask: All-valid slot mask, or ``None``.
     """
     logits = torch.zeros(*atom_bins.shape, dims.n_bins)
-    target = F.one_hot(atom_bins, dims.n_bins).float() if one_hot else atom_bins
-    mask = torch.ones(atom_bins.shape, dtype=torch.bool)
-    loss = distogram_loss_atom(logits, target, mask if masked else None)
+    loss = distogram_loss_atom(logits, atom_target, atom_mask)
     expected = torch.full((dims.batch,), math.log(dims.n_bins))
     torch.testing.assert_close(loss, expected)
 
@@ -1165,7 +1323,6 @@ def test_distogram_loss_one_hot_and_index_targets_agree(
     dims: LossDims,
     residue_bins: Int[torch.Tensor, "B N_res N_res"],
     atom_bins: Int[torch.Tensor, "B N_atom K"],
-    make_pattern: PatternFactory,
 ) -> None:
     """Both losses give the same value for one-hot and index targets.
 
@@ -1176,10 +1333,9 @@ def test_distogram_loss_one_hot_and_index_targets_agree(
         dims: Supplies ``n_bins``.
         residue_bins: Residue targets.
         atom_bins: Atom targets.
-        make_pattern: Builds the logits.
     """
-    res_logits = 3 * make_pattern((*residue_bins.shape, dims.n_bins), 0.37)
-    atom_logits = 3 * make_pattern((*atom_bins.shape, dims.n_bins), 0.53)
+    res_logits = 3 * sine_pattern((*residue_bins.shape, dims.n_bins), 0.37)
+    atom_logits = 3 * sine_pattern((*atom_bins.shape, dims.n_bins), 0.53)
     mask = torch.ones(atom_bins.shape, dtype=torch.bool)
     torch.testing.assert_close(
         distogram_loss_residue(res_logits, residue_bins),
