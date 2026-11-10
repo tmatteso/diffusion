@@ -5,6 +5,7 @@ dataclass, make_np_example, make_fixed_size, center_positions, chain_end,
 to_pdb, protein_from_pdb, truncate_to_length, and molecule-type constants.
 """
 
+import dataclasses
 import enum
 import pathlib
 from collections.abc import Callable, Mapping
@@ -107,6 +108,69 @@ class TensorCase(enum.Enum):
     collinear = "collinear"
 
 
+@dataclasses.dataclass(frozen=True)
+class AtomSlot:
+    """One backbone atom's name, its index constants, and dataset presence.
+
+    Attributes:
+        atom_name: PDB atom name.
+        atom37_index: Index constant for this atom in the atom37 layout.
+        atom5_index: Index constant for this atom in the atom5 layout.
+        in_dataset: Whether dataset entries carry coordinates for this atom.
+            Entries hold N, CA, C and O only, so CB is always built as a
+            pseudo-Cβ from the backbone.
+    """
+
+    atom_name: str
+    atom37_index: int
+    atom5_index: int
+    in_dataset: bool
+
+
+class NamedAtom(enum.Enum):
+    """Backbone atoms with the index constants that must agree with their name.
+
+    Members:
+        n: Backbone nitrogen.
+        ca: Alpha carbon.
+        c: Carbonyl carbon.
+        o: Carbonyl oxygen.
+        cb: Beta carbon, which dataset entries never include.
+    """
+
+    n = AtomSlot("N", ATOM37_N, ATOM5_N, in_dataset=True)
+    ca = AtomSlot("CA", ATOM37_CA, ATOM5_CA, in_dataset=True)
+    c = AtomSlot("C", ATOM37_C, ATOM5_C, in_dataset=True)
+    o = AtomSlot("O", ATOM37_O, ATOM5_O, in_dataset=True)
+    cb = AtomSlot("CB", ATOM37_CB, ATOM5_CB, in_dataset=False)
+
+
+@dataclasses.dataclass(frozen=True)
+class AtomTensors:
+    """Batched atom positions and their presence mask.
+
+    Attributes:
+        positions: Atom coordinates (B, N_res, N_atoms, 3).
+        mask: Atom presence mask (B, N_res, N_atoms).
+    """
+
+    positions: Float[torch.Tensor, "B N_res N_atoms 3"]
+    mask: Float[torch.Tensor, "B N_res N_atoms"]
+
+
+@dataclasses.dataclass(frozen=True)
+class SlotContents:
+    """Coordinates and mask values held by one atom slot across residues.
+
+    Attributes:
+        positions: The slot's coordinates for each residue (N_res, 3).
+        mask: The slot's mask value for each residue (N_res,).
+    """
+
+    positions: Float[torch.Tensor, "N_res 3"]
+    mask: Float[torch.Tensor, "N_res"]
+
+
 class AtomTensorScenario(enum.Enum):
     """Base for per-test scenarios built by the atom tensor factory.
 
@@ -130,6 +194,17 @@ class AtomTensorScenario(enum.Enum):
     def residue_number(self) -> int:
         """Residue dimension of the tensors to build."""
         return cast(int, self.value[2])
+
+    def slot(self, atom: NamedAtom) -> int:
+        """Index of ``atom`` in this scenario's atom layout.
+
+        Args:
+            atom: Backbone atom to locate.
+
+        Returns:
+            The atom's index along the atom axis of the built tensors.
+        """
+        return atom.value.atom37_index
 
     @property
     def representation(self) -> ResidueRepresentation:
@@ -183,6 +258,18 @@ class Atom5ToAtom37Scenario(AtomTensorScenario):
     def representation(self) -> ResidueRepresentation:
         """Atom layout of the tensors built for this scenario."""
         return ResidueRepresentation.atom5
+
+    @override
+    def slot(self, atom: NamedAtom) -> int:
+        """Index of ``atom`` in this scenario's atom layout.
+
+        Args:
+            atom: Backbone atom to locate.
+
+        Returns:
+            The atom's index along the atom axis of the built tensors.
+        """
+        return atom.value.atom5_index
 
     @property
     def provide_mask(self) -> bool:
@@ -258,6 +345,7 @@ def atom_position_and_mask_factory(
         Tuple of (atom_positions, atom_mask) with shapes
         ``(B, N_res, atom_rep, 3)`` and ``(B, N_res, atom_rep)``.
     """
+    slot = atom_scenario.slot
     tensor_content = atom_scenario.tensor_content
     batch_size = atom_scenario.batch_size
     residue_number = atom_scenario.residue_number
@@ -268,18 +356,18 @@ def atom_position_and_mask_factory(
         TensorCase.standard,
         TensorCase.no_beta_carbon,
     ):
-        per_residue[ATOM37_N] = torch.tensor([1.0, 0.0, 0.0])
-        per_residue[ATOM37_CA] = torch.tensor([0.0, 0.0, 0.0])
-        per_residue[ATOM37_C] = torch.tensor([0.0, 1.0, 0.0])
-        per_residue[ATOM37_O] = torch.tensor([1.0, 1.0, 0.0])
+        per_residue[slot(NamedAtom.n)] = torch.tensor([1.0, 0.0, 0.0])
+        per_residue[slot(NamedAtom.ca)] = torch.tensor([0.0, 0.0, 0.0])
+        per_residue[slot(NamedAtom.c)] = torch.tensor([0.0, 1.0, 0.0])
+        per_residue[slot(NamedAtom.o)] = torch.tensor([1.0, 1.0, 0.0])
         if tensor_content == TensorCase.standard:
-            per_residue[ATOM37_CB] = torch.tensor([0.0, 0.0, 1.0])
+            per_residue[slot(NamedAtom.cb)] = torch.tensor([0.0, 0.0, 1.0])
     elif tensor_content == TensorCase.collinear:
         # N, CA, C on the x-axis: cross(CA-N, C-CA) = [0,0,0]
-        per_residue[ATOM37_N] = torch.tensor([0.0, 0.0, 0.0])
-        per_residue[ATOM37_CA] = torch.tensor([1.0, 0.0, 0.0])
-        per_residue[ATOM37_C] = torch.tensor([2.0, 0.0, 0.0])
-        per_residue[ATOM37_O] = torch.tensor([2.0, 1.0, 0.0])
+        per_residue[slot(NamedAtom.n)] = torch.tensor([0.0, 0.0, 0.0])
+        per_residue[slot(NamedAtom.ca)] = torch.tensor([1.0, 0.0, 0.0])
+        per_residue[slot(NamedAtom.c)] = torch.tensor([2.0, 0.0, 0.0])
+        per_residue[slot(NamedAtom.o)] = torch.tensor([2.0, 1.0, 0.0])
         # CB slot stays zero; mask will be zeroed below
 
     atom_positions = einops.repeat(
@@ -293,7 +381,7 @@ def atom_position_and_mask_factory(
     if tensor_content == TensorCase.half_mask:
         atom_mask[:, : residue_number // 2, :] = 0
     if tensor_content in (TensorCase.no_beta_carbon, TensorCase.collinear):
-        atom_mask[:, :, ATOM37_CB] = 0
+        atom_mask[:, :, slot(NamedAtom.cb)] = 0
 
     return atom_positions, atom_mask
 
@@ -475,8 +563,7 @@ def test_atom37_to_cb(
     4. Verifies that the virtual Cβ position is not simply a copy of CA atom,
        for cases with non-degenerate backbone geometry to fall back on.
     5. Verifies that pseudo_cb is finite when N, CA, C are collinear
-        (cross product is zero). The epsilon guard in linalg.norm must prevent
-        NaN in the normalised output.
+        (cross product is zero).
 
     Args:
         atom_position_and_mask_factory: Fixture-produced (atom37_positions,
@@ -1163,6 +1250,189 @@ def test_to_pdb_protein_from_pdb_roundtrip(
             recovered.b_factors == float(MOL_TYPE_PROTEIN),
         ),
     )
+
+
+# ---------------------------------------------------------------------------
+# Atom index constants and dataset atom placement
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def named_atom(request: pytest.FixtureRequest) -> NamedAtom:
+    """Expose the indirect NamedAtom parameter to the test.
+
+    Args:
+        request: Pytest fixture request whose ``.param`` attribute is a
+            NamedAtom member.
+
+    Returns:
+        The atom for the current test case.
+    """
+    return cast(NamedAtom, request.param)
+
+
+@pytest.fixture
+def dataset_residue_count() -> int:
+    """Number of identical residues in the dataset-shaped entry.
+
+    Three residues is the smallest entry with an interior residue; every
+    residue is the same ideal alanine, so the count only checks that each
+    residue is handled, not any residue-to-residue geometry.
+
+    Returns:
+        The residue count.
+    """
+    return 3
+
+
+@pytest.fixture
+def dataset_atom37(
+    ideal_alanine_atom5: Float[torch.Tensor, "5 3"],
+    dataset_residue_count: int,
+) -> AtomTensors:
+    """Run a dataset-shaped entry of ideal alanines through make_np_example.
+
+    The entry carries coordinates for every atom whose ``in_dataset`` flag
+    is set (N, CA, C and O) and none for CB, like the training data.
+
+    Args:
+        ideal_alanine_atom5: Ideal alanine positions in atom5 order.
+        dataset_residue_count: Number of residues in the entry.
+
+    Returns:
+        Batched atom37 positions and mask, batch size 1.
+    """
+    coords = {
+        atom.value.atom_name: [
+            [
+                float(axis)
+                for axis in ideal_alanine_atom5[atom.value.atom5_index]
+            ],
+        ]
+        * dataset_residue_count
+        for atom in NamedAtom
+        if atom.value.in_dataset
+    }
+    example = make_np_example(coords)
+    positions = torch.as_tensor(example["atom_positions"], dtype=torch.float64)
+    mask = torch.as_tensor(example["atom_mask"], dtype=torch.float64)
+    return AtomTensors(
+        positions=einops.rearrange(positions, "n a d -> 1 n a d"),
+        mask=einops.rearrange(mask, "n a -> 1 n a"),
+    )
+
+
+@pytest.fixture
+def expected_atom5_slot(
+    named_atom: NamedAtom,
+    ideal_alanine_atom5: Float[torch.Tensor, "5 3"],
+    dataset_residue_count: int,
+) -> SlotContents:
+    """What the named atom's atom5 slot must hold after the dataset round trip.
+
+    Atoms present in the dataset keep their ideal position with mask 1; CB,
+    which the dataset never carries, stays at the origin with mask 0.
+
+    Args:
+        named_atom: The atom whose slot is checked.
+        ideal_alanine_atom5: Ideal alanine positions in atom5 order.
+        dataset_residue_count: Number of residues in the entry.
+
+    Returns:
+        The expected per-residue positions and mask of that slot.
+    """
+    present = float(named_atom.value.in_dataset)
+    position = ideal_alanine_atom5[named_atom.value.atom5_index] * present
+    return SlotContents(
+        positions=einops.repeat(
+            position.to(torch.float64),
+            "d -> n d",
+            n=dataset_residue_count,
+        ),
+        mask=torch.full(
+            (dataset_residue_count,),
+            present,
+            dtype=torch.float64,
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "named_atom",
+    list(NamedAtom),
+    ids=[atom.name for atom in NamedAtom],
+    indirect=True,
+)
+def test_atom_index_constants_match_atom_names(named_atom: NamedAtom) -> None:
+    """Index constants agree with the ordered name lists they index into.
+
+    Looks each atom up by name in ``atom_types`` and ``ATOM5_NAMES`` rather
+    than through other constants, so constants that agree with each other but
+    not with the data order fail here.
+
+    Args:
+        named_atom: The atom whose constants are being checked.
+    """
+    slot = named_atom.value
+
+    assert atom_types[slot.atom37_index] == slot.atom_name
+    assert ATOM5_NAMES[slot.atom5_index] == slot.atom_name
+    assert ATOM5_TO_ATOM37[slot.atom5_index] == slot.atom37_index
+
+
+@pytest.mark.parametrize(
+    "named_atom",
+    list(NamedAtom),
+    ids=[atom.name for atom in NamedAtom],
+    indirect=True,
+)
+def test_make_np_example_atoms_reach_named_atom5_slots(
+    named_atom: NamedAtom,
+    dataset_atom37: AtomTensors,
+    expected_atom5_slot: SlotContents,
+) -> None:
+    """Dataset atoms land in the atom5 slot with their name, CB stays empty.
+
+    The slot is found with ``ATOM5_NAMES.index`` rather than the index
+    constant, so a constant pointing at the wrong slot cannot hide itself.
+
+    Args:
+        named_atom: The atom whose atom5 slot is being checked.
+        dataset_atom37: The atom37 tensors built from a dataset-shaped entry.
+        expected_atom5_slot: What that slot must hold for each residue.
+    """
+    atom5_positions, atom5_mask = atom37_to_atom5(
+        dataset_atom37.positions,
+        dataset_atom37.mask,
+    )
+
+    slot = ATOM5_NAMES.index(named_atom.value.atom_name)
+    assert torch.equal(
+        atom5_positions[0, :, slot],
+        expected_atom5_slot.positions,
+    )
+    assert torch.equal(atom5_mask[0, :, slot], expected_atom5_slot.mask)
+
+
+def test_atom37_to_cb_places_ideal_cb_for_dataset_entries(
+    ideal_alanine_cb: Float[torch.Tensor, "3"],
+    dataset_atom37: AtomTensors,
+) -> None:
+    """Dataset entries get a pseudo-Cβ at the ideal alanine Cβ position.
+
+    Dataset entries have no CB, so this path produces every residue's Cβ in
+    training. It is not parametrized because one ideal residue pins the
+    geometry: the expected point comes from the residue's known CB, and being
+    near it rules out returning the O atom instead.
+
+    Args:
+        ideal_alanine_cb: The ideal alanine's known Cβ.
+        dataset_atom37: The atom37 tensors built from a dataset-shaped entry.
+    """
+    cb, cb_present = atom37_to_cb(dataset_atom37.positions, dataset_atom37.mask)
+
+    assert not cb_present.any()
+    assert torch.allclose(cb, ideal_alanine_cb.to(torch.float64), atol=0.01)
 
 
 # ---------------------------------------------------------------------------

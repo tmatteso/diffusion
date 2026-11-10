@@ -407,19 +407,6 @@ def submodule_grads(
 
 
 @pytest.fixture
-def rel_pos_scenario(request: pytest.FixtureRequest) -> RelPosScenario:
-    """Return the ``RelPosScenario`` member routed in via indirect param.
-
-    Args:
-        request: Pytest request carrying the scenario in ``param``.
-
-    Returns:
-        The scenario under test.
-    """
-    return cast(RelPosScenario, request.param)
-
-
-@pytest.fixture
 def rel_pos_encodings(
     rel_pos_scenario: RelPosScenario,
     dims: TrunkDims,
@@ -427,7 +414,8 @@ def rel_pos_encodings(
     """Encode the scenario's base layout and its edited copy.
 
     Args:
-        rel_pos_scenario: Base layout and the change to apply.
+        rel_pos_scenario: Base layout and the change to apply; the
+            requesting test parametrizes it.
         dims: Supplies the pair width.
 
     Returns:
@@ -511,7 +499,6 @@ def test_relative_position_encoding_shape_and_finite(
     "rel_pos_scenario",
     list(RelPosScenario),
     ids=[case.name for case in RelPosScenario],
-    indirect=True,
 )
 def test_relative_position_encoding_reads_the_right_features(
     rel_pos_scenario: RelPosScenario,

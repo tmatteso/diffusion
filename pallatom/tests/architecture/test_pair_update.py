@@ -13,7 +13,6 @@ built under a fixed seed, so each test is reproducible on its own.
 import abc
 import dataclasses
 import enum
-import math
 from typing import cast, override
 
 import pytest
@@ -153,35 +152,41 @@ class PairUpdateProbe(PairProbe):
 
 @dataclasses.dataclass(frozen=True)
 class RbfCase:
-    """A distance from the first RBF centre and that centre's feature.
+    """One distance and the exact activation one basis must give for it.
 
     Attributes:
-        offset_in_sigmas: Distance from the first centre, in sigmas.
-        expected: Value of the first centre's feature.
-        formula_bug: Whether the case hits the known precedence bug in
-            ``TransformRBF``, so the ``rbf_scenario`` fixture marks it
-            strict ``xfail``.
+        distance: Input distance in Å.
+        basis: Index of the RBF centre whose activation is checked.
+        expected: Closed-form value
+            ``exp(-(distance - centre)**2 / (2 * sigma**2))`` for the
+            default ``ParamsForRBF`` (centres 3.25 to 50.75 Å, 1.25 Å
+            apart, ``sigma`` = 5.0 Å).
     """
 
-    offset_in_sigmas: float
+    distance: float
+    basis: int
     expected: float
-    formula_bug: bool
 
 
 class RbfScenario(enum.Enum):
-    """Distances at which the RBF feature has a known value.
+    """Distances at known offsets from a centre, in sigmas or spacings.
 
     Members:
-        at_centre: On the centre, the feature is 1.
-        one_sigma: One ``sigma`` away, the feature is ``exp(-1/2)``. Fails
-            today: ``TransformRBF`` computes
-            ``exp(-(d - c)**2 / 2 * sigma**2)``, so operator precedence
-            multiplies by ``sigma**2`` instead of dividing by
-            ``2 * sigma**2``.
+        on_first_centre: Exactly on centre 0 (3.25 Å), so the activation
+            is 1.
+        half_spacing: Halfway between centres 0 and 1 (0.625 Å past
+            centre 0). The old precedence bug, which multiplied by
+            ``sigma**2`` instead of dividing, gave 0.0076 here.
+        one_sigma: One ``sigma`` (5 Å) past centre 0, so the activation is
+            ``exp(-0.5)``.
+        two_sigma_last: Two ``sigma`` (10 Å) before the last centre
+            (50.75 Å), so the activation is ``exp(-2)``.
     """
 
-    at_centre = RbfCase(0.0, 1.0, formula_bug=False)
-    one_sigma = RbfCase(1.0, math.exp(-0.5), formula_bug=True)
+    on_first_centre = RbfCase(3.25, 0, 1.0)
+    half_spacing = RbfCase(3.875, 0, 0.992218)
+    one_sigma = RbfCase(8.25, 0, 0.606531)
+    two_sigma_last = RbfCase(40.75, 38, 0.135335)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -339,19 +344,6 @@ def pair_update(dims: PairDims) -> PairUpdate:
 
 
 @pytest.fixture
-def triangle_scenario(request: pytest.FixtureRequest) -> TriangleScenario:
-    """Return the ``TriangleScenario`` member routed in via indirect param.
-
-    Args:
-        request: Pytest request carrying the scenario in ``param``.
-
-    Returns:
-        The scenario under test.
-    """
-    return cast(TriangleScenario, request.param)
-
-
-@pytest.fixture
 def triangle(
     triangle_scenario: TriangleScenario,
     dims: PairDims,
@@ -359,7 +351,8 @@ def triangle(
     """Build the scenario's triangle attention under a fixed seed.
 
     Args:
-        triangle_scenario: Direction to build.
+        triangle_scenario: Direction to build; the requesting test
+            parametrizes it.
         dims: Module sizes.
 
     Returns:
@@ -447,99 +440,85 @@ def flat_input(dims: PairDims) -> Float[torch.Tensor, "N_res c"]:
 
 
 @pytest.fixture
-def rbf_scenario(request: pytest.FixtureRequest) -> RbfScenario:
-    """Return the ``RbfScenario`` member, marking known failures ``xfail``.
-
-    A case flagged ``formula_bug`` gets a strict ``xfail`` marker, so it
-    must fail today and the marker must come off once ``TransformRBF``
-    is fixed. Marks cannot ride on enum members, so the fixture applies
-    the marker.
-
-    Args:
-        request: Pytest request carrying the scenario in ``param``.
+def rbf() -> TransformRBF:
+    """Build a ``TransformRBF`` with the default ``ParamsForRBF``.
 
     Returns:
-        The scenario under test.
+        The module; it has no parameters or dropout to seed.
     """
-    scenario = cast(RbfScenario, request.param)
-    if scenario.value.formula_bug:
-        request.applymarker(
-            pytest.mark.xfail(
-                strict=True,
-                reason="TransformRBF precedence bug, see RbfScenario",
-            ),
-        )
-    return scenario
+    return TransformRBF(ParamsForRBF())
 
 
 @pytest.fixture
-def pair_probe(request: pytest.FixtureRequest) -> PairProbe:
-    """Return the probe fixture named by the indirect param.
+def single_distance(rbf_scenario: RbfScenario) -> Float[torch.Tensor, "1 1 1"]:
+    """Build a one-pair distance matrix holding the scenario's distance.
 
     Args:
-        request: Pytest request carrying a ``*_probe`` fixture name.
+        rbf_scenario: Scenario whose ``distance`` fills the matrix; the
+            requesting test parametrizes it.
+
+    Returns:
+        A ``(1, 1, 1)`` tensor containing only that distance.
+    """
+    return torch.tensor([[[rbf_scenario.value.distance]]])
+
+
+@pytest.fixture
+def pair_probe(
+    request: pytest.FixtureRequest,
+    pair_probe_name: str,
+) -> PairProbe:
+    """Return the probe fixture named by ``pair_probe_name``.
+
+    Args:
+        request: Pytest request used to look up the named fixture.
+        pair_probe_name: A ``*_probe`` fixture name; the requesting test
+            parametrizes it.
 
     Returns:
         The named probe.
     """
-    return cast(PairProbe, request.getfixturevalue(cast(str, request.param)))
-
-
-@pytest.fixture
-def dropout_scenario(request: pytest.FixtureRequest) -> DropoutScenario:
-    """Return the ``DropoutScenario`` member routed in via indirect param.
-
-    Args:
-        request: Pytest request carrying the scenario in ``param``.
-
-    Returns:
-        The scenario under test.
-    """
-    return cast(DropoutScenario, request.param)
-
-
-@pytest.fixture
-def rigid_scenario(request: pytest.FixtureRequest) -> RigidScenario:
-    """Return the ``RigidScenario`` member routed in via indirect param.
-
-    Args:
-        request: Pytest request carrying the scenario in ``param``.
-
-    Returns:
-        The scenario under test.
-    """
-    return cast(RigidScenario, request.param)
+    return cast(PairProbe, request.getfixturevalue(pair_probe_name))
 
 
 @pytest.mark.parametrize(
     "rbf_scenario",
     list(RbfScenario),
     ids=[case.name for case in RbfScenario],
-    indirect=True,
 )
-def test_transform_rbf_is_a_gaussian_of_width_sigma(
+def test_transform_rbf_matches_gaussian_closed_form(
+    rbf: TransformRBF,
+    single_distance: Float[torch.Tensor, "1 1 1"],
     rbf_scenario: RbfScenario,
 ) -> None:
-    """At ``sigma`` from a centre, that centre's feature is ``exp(-1/2)``.
+    """Each basis is a Gaussian whose standard deviation is ``sigma``.
 
-    The documented basis is ``exp(-(d - c)**2 / (2 * sigma**2))``, so a
-    distance on a centre gives 1 and one ``sigma`` away gives
-    ``exp(-0.5)``. The second case fails today; ``rbf_scenario`` marks it
-    strict ``xfail`` so the marker must be removed once the formula is
-    fixed.
+    Checks the activation of one basis against
+    ``exp(-(d - c)**2 / (2 * sigma**2))`` at distances placed on a centre,
+    half a centre spacing away, and one and two ``sigma`` away. Symmetry,
+    range and shape checks hold for any positive width, so they cannot
+    tell ``sigma`` from ``1 / sigma``; these exact values can, and they
+    fail under the old formula, which multiplied by ``sigma**2`` and made
+    each basis about 0.2 Å wide instead of 5 Å.
 
     Args:
-        rbf_scenario: Distance from the first centre and expected value.
+        rbf: Module under test.
+        single_distance: One-pair distance matrix.
+        rbf_scenario: Basis to read and its expected activation.
     """
     case = rbf_scenario.value
-    params = ParamsForRBF()
-    distance = params.d_min + case.offset_in_sigmas * params.sigma
-    out = TransformRBF(params)(torch.full((1, 1, 1), distance))
-    assert out.shape == (1, 1, 1, params.n_rbf)
-    torch.testing.assert_close(out[0, 0, 0, 0], torch.tensor(case.expected))
+    with torch.no_grad():
+        out = rbf(single_distance)
+    torch.testing.assert_close(
+        out[0, 0, 0, case.basis],
+        torch.tensor(case.expected),
+        atol=1e-6,
+        rtol=0,
+    )
 
 
 def test_transform_rbf_rejects_distances_missing_an_axis(
+    rbf: TransformRBF,
     dims: PairDims,
 ) -> None:
     """A ``(B, N_res)`` distance tensor fails the ``(B, N, N)`` contract.
@@ -547,16 +526,16 @@ def test_transform_rbf_rejects_distances_missing_an_axis(
     Not parametrized: ``forward`` takes a single tensor argument.
 
     Args:
+        rbf: Module under test.
         dims: Tensor sizes.
     """
     with pytest.raises(TypeCheckError):
-        _ = TransformRBF(ParamsForRBF())(torch.zeros(dims.batch, dims.n_res))
+        _ = rbf(torch.zeros(dims.batch, dims.n_res))
 
 
 @pytest.mark.parametrize(
-    "pair_probe",
+    "pair_probe_name",
     ["starting_probe", "ending_probe", "transition_probe", "pair_update_probe"],
-    indirect=True,
 )
 def test_output_shape_and_finite(z: Pair, pair_probe: PairProbe) -> None:
     """Each module maps the pair embedding to a finite tensor of its shape.
@@ -572,9 +551,8 @@ def test_output_shape_and_finite(z: Pair, pair_probe: PairProbe) -> None:
 
 
 @pytest.mark.parametrize(
-    "pair_probe",
+    "pair_probe_name",
     ["starting_probe", "ending_probe", "transition_probe", "pair_update_probe"],
-    indirect=True,
 )
 def test_gradient_reaches_pair_embedding(
     z: Pair,
@@ -594,9 +572,8 @@ def test_gradient_reaches_pair_embedding(
 
 
 @pytest.mark.parametrize(
-    "pair_probe",
+    "pair_probe_name",
     ["starting_probe", "ending_probe", "pair_update_probe"],
-    indirect=True,
 )
 def test_forward_rejects_pair_missing_channel_axis(
     z: Pair,
@@ -639,7 +616,6 @@ def test_transition_accepts_any_leading_shape(
     "triangle_scenario",
     list(TriangleScenario),
     ids=[case.name for case in TriangleScenario],
-    indirect=True,
 )
 def test_triangle_attention_keeps_its_axis_independent(
     triangle_scenario: TriangleScenario,
@@ -672,7 +648,6 @@ def test_triangle_attention_keeps_its_axis_independent(
     "triangle_scenario",
     list(TriangleScenario),
     ids=[case.name for case in TriangleScenario],
-    indirect=True,
 )
 def test_triangle_attention_reads_its_bias(
     triangle: TriangleAttention,
@@ -696,7 +671,6 @@ def test_triangle_attention_reads_its_bias(
     "dropout_scenario",
     list(DropoutScenario),
     ids=[case.name for case in DropoutScenario],
-    indirect=True,
 )
 def test_dropout_is_identity_in_eval(
     dropout_scenario: DropoutScenario,
@@ -716,7 +690,6 @@ def test_dropout_is_identity_in_eval(
     "dropout_scenario",
     list(DropoutScenario),
     ids=[case.name for case in DropoutScenario],
-    indirect=True,
 )
 def test_dropout_drops_whole_slices_and_rescales(
     dropout_scenario: DropoutScenario,
@@ -791,7 +764,6 @@ def test_pair_update_coordinate_gradient_is_finite(
     "rigid_scenario",
     list(RigidScenario),
     ids=[case.name for case in RigidScenario],
-    indirect=True,
 )
 def test_pair_update_is_invariant_to_rigid_motion(
     rigid_scenario: RigidScenario,
