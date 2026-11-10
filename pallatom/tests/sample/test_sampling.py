@@ -1709,7 +1709,7 @@ class ScheduleRoundTrip:
 
 @pytest.fixture
 def schedule_round_trip(
-    request: pytest.FixtureRequest,
+    schedule_inverse_scenario: ScheduleInverseScenario,
     zero_denoiser_mock: MagicMock,
     context: FeaturizedBatch,
     templ_disto: Distogram,
@@ -1717,7 +1717,8 @@ def schedule_round_trip(
     """Push a grid of times through the sampler's schedule and invert it.
 
     Args:
-        request: Carries the ``ScheduleInverseScenario`` member.
+        schedule_inverse_scenario: Schedule to invert, parametrized directly
+            by the requesting test.
         zero_denoiser_mock: Denoiser required to build the sampler; unused.
         context: Sampling context required to build the sampler.
         templ_disto: Template distogram module required by the sampler.
@@ -1725,7 +1726,7 @@ def schedule_round_trip(
     Returns:
         The input time grid and the times recovered from its sigmas.
     """
-    case = cast(ScheduleInverseScenario, request.param).value
+    case = schedule_inverse_scenario.value
     noise = NoiseScheduleParams(
         sigma_data=case.sigma_data,
         sigma_min=case.sigma_min,
@@ -1750,10 +1751,9 @@ def schedule_round_trip(
 
 
 @pytest.mark.parametrize(
-    "schedule_round_trip",
+    "schedule_inverse_scenario",
     list(ScheduleInverseScenario),
     ids=[case.name for case in ScheduleInverseScenario],
-    indirect=True,
 )
 def test_normalized_time_inverts_noise_schedule(
     schedule_round_trip: ScheduleRoundTrip,

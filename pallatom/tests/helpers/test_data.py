@@ -2326,29 +2326,14 @@ class NullTemplateScenario(enum.Enum):
 
 
 @pytest.fixture
-def null_template_scenario(
-    request: pytest.FixtureRequest,
-) -> NullTemplateScenario:
-    """Expose the indirect NullTemplateScenario parameter to the test.
-
-    Args:
-        request: Pytest fixture request whose ``.param`` attribute is a
-            NullTemplateScenario member.
-
-    Returns:
-        The scenario for the current test case.
-    """
-    return cast(NullTemplateScenario, request.param)
-
-
-@pytest.fixture
 def null_template(
     null_template_scenario: NullTemplateScenario,
 ) -> Float[torch.Tensor, "B N_res N_res n_templ_bins"]:
     """Build the scenario's null template distogram on the CPU.
 
     Args:
-        null_template_scenario: Scenario holding the shape to request.
+        null_template_scenario: Scenario holding the shape to request,
+            parametrized directly by the requesting test.
 
     Returns:
         The output of ``null_template_distogram`` for that shape.
@@ -2360,7 +2345,6 @@ def null_template(
     "null_template_scenario",
     list(NullTemplateScenario),
     ids=[case.name for case in NullTemplateScenario],
-    indirect=True,
 )
 def test_null_template_distogram_is_all_zero(
     null_template: Float[torch.Tensor, "B N_res N_res n_templ_bins"],
