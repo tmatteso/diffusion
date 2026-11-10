@@ -9,10 +9,10 @@ is built under a fixed seed inside its fixture, so every test is
 reproducible on its own regardless of run order.
 """
 
+import abc
 import dataclasses
 import enum
-from collections.abc import Callable
-from typing import cast
+from typing import cast, override
 
 import pytest
 import torch
@@ -70,19 +70,31 @@ class EmbedderInputs:
 
 
 @dataclasses.dataclass(frozen=True)
-class InputEdit:
+class InputEdit(abc.ABC):
     """A change to one embedder input, applied to the base inputs.
+
+    Each subclass names one kind of change and holds its settings as plain
+    fields, so every scenario reads as data.
 
     Attributes:
         field: Name of the ``EmbedderInputs`` field to change.
-        transform: Maps that field's tensor to its replacement.
     """
 
     field: str
-    transform: Callable[
-        [Float[torch.Tensor, "..."]],
-        Float[torch.Tensor, "..."],
-    ]
+
+    @abc.abstractmethod
+    def transform(
+        self,
+        tensor: Float[torch.Tensor, "..."],
+    ) -> Float[torch.Tensor, "..."]:
+        """Return the replacement for the field's tensor.
+
+        Args:
+            tensor: The field's current value.
+
+        Returns:
+            The tensor to store in ``field``.
+        """
 
     def apply(self, inputs: EmbedderInputs) -> EmbedderInputs:
         """Return a copy of ``inputs`` with ``field`` transformed.
@@ -97,6 +109,106 @@ class InputEdit:
         return dataclasses.replace(inputs, **{self.field: self.transform(old)})
 
 
+@dataclasses.dataclass(frozen=True)
+class ScaleEdit(InputEdit):
+    """Multiply the field by a constant.
+
+    Attributes:
+        factor: Multiplier applied to every element.
+    """
+
+    factor: float
+
+    @override
+    def transform(
+        self,
+        tensor: Float[torch.Tensor, "..."],
+    ) -> Float[torch.Tensor, "..."]:
+        """Scale ``tensor`` by ``factor``.
+
+        Args:
+            tensor: The field's current value.
+
+        Returns:
+            ``tensor * factor``.
+        """
+        return tensor * self.factor
+
+
+@dataclasses.dataclass(frozen=True)
+class ShiftBinsEdit(InputEdit):
+    """Move every entry one step up the last axis, wrapping the top bin."""
+
+    @override
+    def transform(
+        self,
+        tensor: Float[torch.Tensor, "..."],
+    ) -> Float[torch.Tensor, "..."]:
+        """Roll ``tensor`` by one along its last axis.
+
+        Args:
+            tensor: The field's current value.
+
+        Returns:
+            The rolled tensor; a one-hot bin ``k`` becomes bin ``k + 1``.
+        """
+        return tensor.roll(1, -1)
+
+
+@dataclasses.dataclass(frozen=True)
+class SelectEdit(InputEdit):
+    """Keep one index of an axis, removing that axis.
+
+    Attributes:
+        dim: Axis to select from.
+        index: Position along ``dim`` to keep.
+    """
+
+    dim: int
+    index: int
+
+    @override
+    def transform(
+        self,
+        tensor: Float[torch.Tensor, "..."],
+    ) -> Float[torch.Tensor, "..."]:
+        """Select ``index`` along ``dim``.
+
+        Args:
+            tensor: The field's current value.
+
+        Returns:
+            ``tensor`` with axis ``dim`` removed.
+        """
+        return tensor.select(self.dim, self.index)
+
+
+@dataclasses.dataclass(frozen=True)
+class DropFirstEdit(InputEdit):
+    """Remove the first entry of an axis, shortening it by one.
+
+    Attributes:
+        dim: Axis to shorten.
+    """
+
+    dim: int
+
+    @override
+    def transform(
+        self,
+        tensor: Float[torch.Tensor, "..."],
+    ) -> Float[torch.Tensor, "..."]:
+        """Drop index 0 along ``dim``.
+
+        Args:
+            tensor: The field's current value.
+
+        Returns:
+            ``tensor`` with ``dim`` one shorter.
+        """
+        return tensor.narrow(self.dim, 1, tensor.shape[self.dim] - 1)
+
+
 class ConditioningScenario(enum.Enum):
     """Changes to a single input that must change the embedding.
 
@@ -107,10 +219,10 @@ class ConditioningScenario(enum.Enum):
         pair_embedding: ``z_ij`` is negated.
     """
 
-    time = InputEdit("t", lambda t: t * 2)
-    mask = InputEdit("f_pseudo_beta_mask", lambda m: m * 0)
-    distogram = InputEdit("f_distogram", lambda d: d.roll(1, -1))
-    pair_embedding = InputEdit("z_ij", lambda z: -z)
+    time = ScaleEdit("t", factor=2.0)
+    mask = ScaleEdit("f_pseudo_beta_mask", factor=0.0)
+    distogram = ShiftBinsEdit("f_distogram")
+    pair_embedding = ScaleEdit("z_ij", factor=-1.0)
 
 
 class MalformedScenario(enum.Enum):
@@ -123,9 +235,9 @@ class MalformedScenario(enum.Enum):
         time_per_residue: ``t`` is ``(B, N_res)`` instead of per pair.
     """
 
-    distogram_missing_bins = InputEdit("f_distogram", lambda d: d[..., 0])
-    mask_too_short = InputEdit("f_pseudo_beta_mask", lambda m: m[:, 1:])
-    time_per_residue = InputEdit("t", lambda t: t[:, 0])
+    distogram_missing_bins = SelectEdit("f_distogram", dim=-1, index=0)
+    mask_too_short = DropFirstEdit("f_pseudo_beta_mask", dim=1)
+    time_per_residue = SelectEdit("t", dim=1, index=0)
 
 
 @pytest.fixture
