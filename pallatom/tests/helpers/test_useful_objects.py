@@ -1,7 +1,8 @@
 """Tests for TensorAccumulatorMixin and the metric dataclasses built on it.
 
 Covers the mixin's field-wise arithmetic, ``weighted_avg``, ``zero_init`` and
-``to_float_dict`` with exact values; the scalar shape contract that
+``to_float_dict`` with exact values on ThroughputStatistics, whose four
+fields hold distinct values; the scalar shape contract that
 ``@jaxtyped`` enforces on LossMetrics, ThroughputStatistics and
 ComponentNorms; and ``all_reduce_mean`` with no process group, a one-rank
 group, and three real processes.
@@ -11,6 +12,7 @@ compared with ``==`` rather than a tolerance.
 """
 
 import dataclasses
+import enum
 import multiprocessing as mp
 import os
 import socket
@@ -29,42 +31,168 @@ from helpers.useful_objects import (
 from jaxtyping import Float, TypeCheckError
 
 
-@dataclasses.dataclass
-class PairMetrics(TensorAccumulatorMixin):
-    """Two-field accumulator so mixin arithmetic can be checked by hand.
-
-    The mixin's behaviour does not depend on which fields a subclass
-    declares, so two fields holding distinct values are enough to catch a
-    field mix-up.
+@dataclasses.dataclass(frozen=True)
+class ScalarCase:
+    """A mixin operator with a scalar operand and the values it must give.
 
     Attributes:
-        first: First scalar field.
-        second: Second scalar field.
+        operation: Unbound operator, called as ``operation(left, scalar)``
+            with ``left = (1, 2, 3, 4)``.
+        scalar: Scalar operand.
+        expected: Field values of the result, in field order.
     """
 
-    first: Float[torch.Tensor, ""]
-    second: Float[torch.Tensor, ""]
+    operation: Callable[[ThroughputStatistics, float], ThroughputStatistics]
+    scalar: float
+    expected: tuple[float, ...]
+
+
+class ScalarScenario(enum.Enum):
+    """Scalar operators of TensorAccumulatorMixin.
+
+    Members:
+        divide: ``left /= 2`` halves every field in place.
+        multiply: ``left * 3`` scales every field into a new instance.
+    """
+
+    divide = ScalarCase(ThroughputStatistics.__itruediv__, 2, (0.5, 1, 1.5, 2))
+    multiply = ScalarCase(ThroughputStatistics.__mul__, 3, (3, 6, 9, 12))
+
+
+@dataclasses.dataclass(frozen=True)
+class RankReport:
+    """Reduced field values one spawned rank sent back, by reduction.
+
+    Each field maps metric names to values, as ``to_float_dict`` returns
+    them.
+
+    Attributes:
+        rank: Rank that sent the report; every field it reduced started
+            at ``float(rank)``.
+        fresh_loss: LossMetrics reduced on the freshly created group.
+        loss: LossMetrics reduced after the scratch ``all_reduce`` calls.
+        throughput: ThroughputStatistics reduced after the scratch calls.
+        norms: ComponentNorms reduced after the scratch calls.
+    """
+
+    rank: int
+    fresh_loss: dict[str, float]
+    loss: dict[str, float]
+    throughput: dict[str, float]
+    norms: dict[str, float]
+
+    def values(self) -> set[float]:
+        """Return every reduced value in the report.
+
+        Returns:
+            The values of all four reductions, merged into one set.
+        """
+        reductions = (self.fresh_loss, self.loss, self.throughput, self.norms)
+        return {v for reduction in reductions for v in reduction.values()}
 
 
 @dataclasses.dataclass(frozen=True)
 class AllReduceRun:
-    """Field values every spawned rank reported after reducing.
+    """Reports from every spawned rank after reducing.
 
     Attributes:
-        world_size: Number of ranks spawned; rank ``r`` started at ``r``.
-        rank_reports: One tuple of reduced field values per rank.
+        world_size: Number of ranks spawned.
+        reports: One report per rank, in the order they reached the queue.
     """
 
     world_size: int
-    rank_reports: tuple[tuple[float, ...], ...]
+    reports: tuple[RankReport, ...]
+
+
+@dataclasses.dataclass(frozen=True)
+class ProcessGroupCase:
+    """Process-group state a single-process ``all_reduce_mean`` runs under.
+
+    Attributes:
+        group_active: Whether a one-rank gloo group is started first.
+    """
+
+    group_active: bool
+
+
+class ProcessGroup(enum.Enum):
+    """Single-process settings for ``all_reduce_mean``.
+
+    Members:
+        no_group: No process group exists, so the method must return before
+            any collective call.
+        single_rank_group: A one-rank gloo group exists, so the real
+            collective path runs over a world of one.
+    """
+
+    no_group = ProcessGroupCase(group_active=False)
+    single_rank_group = ProcessGroupCase(group_active=True)
+
+
+@dataclasses.dataclass(frozen=True)
+class FieldOverride:
+    """One field of a metric dataclass and a replacement value for it.
+
+    Attributes:
+        name: Name of the field to replace.
+        value: Replacement tensor; 1-D, so it breaks the field's scalar
+            shape contract.
+    """
+
+    name: str
+    value: Float[torch.Tensor, " n"]
+
+
+def metrics_filled_with(
+    metric_class: type[TensorAccumulatorMixin],
+    value: float,
+) -> TensorAccumulatorMixin:
+    """Build ``metric_class`` with every field a separate 0-D ``value``.
+
+    The instance comes from the class's own ``zero_init``, and each field
+    is then set to a fresh ``torch.tensor(value)``.
+
+    Args:
+        metric_class: Metric dataclass to build.
+        value: Starting value of every field.
+
+    Returns:
+        Instance whose fields are all ``torch.tensor(value)``.
+    """
+    metrics = metric_class.zero_init(torch.device("cpu"))
+    for field in dataclasses.fields(metrics):
+        setattr(metrics, field.name, torch.tensor(value))
+    return metrics
+
+
+def reduce_at_rank(
+    metric_class: type[TensorAccumulatorMixin],
+    rank: int,
+) -> dict[str, float]:
+    """Build ``metric_class`` with every field at ``rank`` and reduce it.
+
+    ``metrics_filled_with`` sets each field to ``float(rank)``, so every
+    rank contributes its own
+    number to the mean. Called by ``all_reduce_mean_worker`` inside a
+    spawned rank, after the process group exists.
+
+    Args:
+        metric_class: Metric dataclass to build and reduce.
+        rank: This process's rank, used as every field's starting value.
+
+    Returns:
+        The reduced instance's ``to_float_dict``.
+    """
+    metrics = metrics_filled_with(metric_class, float(rank))
+    metrics.all_reduce_mean()
+    return metrics.to_float_dict()
 
 
 def all_reduce_mean_worker(
     rank: int,
     world_size: int,
     port: int,
-    metric_classes: tuple[type[TensorAccumulatorMixin], ...],
-    result_queue: "mp.Queue[tuple[float, ...]]",
+    result_queue: "mp.Queue[RankReport]",
 ) -> None:
     """Spawned rank for ``test_all_reduce_mean_averages_across_real_ranks``.
 
@@ -72,43 +200,30 @@ def all_reduce_mean_worker(
     the target by its qualified name. The rank first reduces a LossMetrics
     on the fresh group, then runs three plain ``all_reduce`` calls on
     scratch tensors, as gradient syncs would during backward, and then
-    reduces one instance of each class in ``metric_classes``. Every field
-    of every instance starts at this rank's own value. The same sequence
-    of collectives runs on every rank, as collectives require.
+    reduces a LossMetrics, a ThroughputStatistics and a ComponentNorms.
+    Every field of every instance starts at this rank's own value. The
+    same sequence of collectives runs on every rank, as collectives
+    require.
 
     Args:
         rank: This process's rank.
         world_size: Total number of ranks in the process group.
         port: TCP port used for process-group rendezvous.
-        metric_classes: Classes to build and reduce after the scratch calls.
-        result_queue: Receives every reduced field value from this rank.
+        result_queue: Receives this rank's report.
     """
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(port)
     dist.init_process_group(backend="gloo", rank=rank, world_size=world_size)
-    reduced: list[float] = []
-
-    def reduce_fields(metric_class: type[TensorAccumulatorMixin]) -> None:
-        """Build ``metric_class`` at this rank's value, reduce, record fields.
-
-        Args:
-            metric_class: Metric dataclass to build and reduce.
-        """
-        constructor: Callable[..., TensorAccumulatorMixin] = metric_class
-        names = [f.name for f in dataclasses.fields(metric_class)]
-        metrics = constructor(**{n: torch.tensor(float(rank)) for n in names})
-        metrics.all_reduce_mean()
-        reduced.extend(metrics.to_float_dict().values())
-
-    reduce_fields(LossMetrics)
+    fresh_loss = reduce_at_rank(LossMetrics, rank)
     for _ in range(3):
         _ = dist.all_reduce(  # pyright: ignore[reportUnknownMemberType]
             torch.tensor(float(rank)),
             op=dist.ReduceOp.SUM,
         )
-    for metric_class in metric_classes:
-        reduce_fields(metric_class)
-    result_queue.put(tuple(reduced))
+    loss = reduce_at_rank(LossMetrics, rank)
+    throughput = reduce_at_rank(ThroughputStatistics, rank)
+    norms = reduce_at_rank(ComponentNorms, rank)
+    result_queue.put(RankReport(rank, fresh_loss, loss, throughput, norms))
     dist.destroy_process_group()
 
 
@@ -140,67 +255,80 @@ def metrics_of_ones(
     Returns:
         Instance whose fields are all ``torch.tensor(1.0)``.
     """
-    constructor: Callable[..., TensorAccumulatorMixin] = metric_cls
-    names = [f.name for f in dataclasses.fields(metric_cls)]
-    return constructor(**{name: torch.tensor(1.0) for name in names})
+    return metrics_filled_with(metric_cls, 1.0)
 
 
 @pytest.fixture
-def build_with_vector_field(
-    metric_cls: type[TensorAccumulatorMixin],
-) -> Callable[[], TensorAccumulatorMixin]:
-    """Return a thunk building ``metric_cls`` with its first field 1-D.
+def vector_field(metric_cls: type[TensorAccumulatorMixin]) -> FieldOverride:
+    """Return a 1-D tensor aimed at the first scalar field of ``metric_cls``.
 
-    Every other field is a valid 0-D tensor, so the only contract broken is
-    the scalar shape of one field.
-
-    Args:
-        metric_cls: Metric dataclass to build.
-
-    Returns:
-        Zero-argument callable that attempts the construction.
-    """
-    constructor: Callable[..., TensorAccumulatorMixin] = metric_cls
-    names = [f.name for f in dataclasses.fields(metric_cls)]
-    kwargs = {name: torch.tensor(1.0) for name in names}
-    kwargs[names[0]] = torch.tensor([1.0])
-    return lambda: constructor(**kwargs)
-
-
-@pytest.fixture(params=[False, True], ids=["no_group", "single_rank_group"])
-def process_group_active(request: pytest.FixtureRequest) -> bool:
-    """Run the requesting test without and with a one-rank gloo group.
+    Only that one field is replaced, and every other field stays a valid
+    0-D tensor, so the scalar shape of one field is the only contract the
+    test breaks.
 
     Args:
-        request: Pytest request carrying whether to start the group.
+        metric_cls: Metric dataclass whose first field is targeted.
 
     Returns:
-        Whether a process group is active for the test.
+        The first field's name with the 1-D tensor ``[1.0]``.
     """
-    active = cast(bool, request.param)
-    if active:
+    first_field = dataclasses.fields(metric_cls)[0]
+    return FieldOverride(name=first_field.name, value=torch.tensor([1.0]))
+
+
+@pytest.fixture
+def process_group(request: pytest.FixtureRequest) -> ProcessGroup:
+    """Start a one-rank gloo group when the scenario asks for one.
+
+    Args:
+        request: Pytest request carrying the ``ProcessGroup`` member,
+            passed with ``indirect=True``.
+
+    Returns:
+        The scenario, with its group already started if it has one.
+    """
+    scenario = cast(ProcessGroup, request.param)
+    if scenario.value.group_active:
         request.getfixturevalue("single_process_gloo_group")
-    return active
+    return scenario
 
 
 @pytest.fixture
-def pair_left() -> PairMetrics:
-    """Return the left operand ``(first=1, second=2)``.
+def left() -> ThroughputStatistics:
+    """Return the left operand ``(1, 2, 3, 4)``.
+
+    Distinct values per field catch an operation applied to the wrong
+    field. Built by hand rather than from a factory fixture: ``left`` and
+    ``right`` are the only two instances, both fixed, and naming each
+    field beside its value is easier to check than a factory's positional
+    arguments.
 
     Returns:
-        Fresh PairMetrics; operations may mutate it in place.
+        Fresh metrics; operations may mutate them in place.
     """
-    return PairMetrics(first=torch.tensor(1.0), second=torch.tensor(2.0))
+    return ThroughputStatistics(
+        avg_batch_size=torch.tensor(1.0),
+        token_pack_rate=torch.tensor(2.0),
+        residues_per_sec=torch.tensor(3.0),
+        atoms_per_sec=torch.tensor(4.0),
+    )
 
 
 @pytest.fixture
-def pair_right() -> PairMetrics:
-    """Return the right operand ``(first=10, second=20)``.
+def right() -> ThroughputStatistics:
+    """Return the right operand ``(10, 20, 30, 40)``.
+
+    Built by hand for the same reason as ``left``.
 
     Returns:
-        Fresh PairMetrics.
+        Fresh metrics.
     """
-    return PairMetrics(first=torch.tensor(10.0), second=torch.tensor(20.0))
+    return ThroughputStatistics(
+        avg_batch_size=torch.tensor(10.0),
+        token_pack_rate=torch.tensor(20.0),
+        residues_per_sec=torch.tensor(30.0),
+        atoms_per_sec=torch.tensor(40.0),
+    )
 
 
 @pytest.fixture
@@ -227,16 +355,15 @@ def all_reduce_run(free_port: int) -> AllReduceRun:
         free_port: Port for the ranks' rendezvous.
 
     Returns:
-        Every rank's reported field values.
+        Every rank's report.
     """
     world_size = 3
     ctx = mp.get_context("spawn")
-    result_queue: "mp.Queue[tuple[float, ...]]" = ctx.Queue()
-    classes = (LossMetrics, ThroughputStatistics, ComponentNorms)
+    result_queue: "mp.Queue[RankReport]" = ctx.Queue()
     processes = [
         ctx.Process(
             target=all_reduce_mean_worker,
-            args=(rank, world_size, free_port, classes, result_queue),
+            args=(rank, world_size, free_port, result_queue),
         )
         for rank in range(world_size)
     ]
@@ -249,100 +376,90 @@ def all_reduce_run(free_port: int) -> AllReduceRun:
             process.join(timeout=60)
             if process.is_alive():
                 process.terminate()
-    return AllReduceRun(world_size=world_size, rank_reports=reports)
+    return AllReduceRun(world_size=world_size, reports=reports)
 
 
 def test_in_place_add_sums_field_wise(
-    pair_left: PairMetrics,
-    pair_right: PairMetrics,
+    left: ThroughputStatistics,
+    right: ThroughputStatistics,
 ) -> None:
     """``left += right`` adds each field of ``right`` to the same field.
 
-    Not parametrized: the two operands already hold distinct values in each
-    field, so a field mix-up or a non-additive result would both show.
+    Not parametrized: every field holds a distinct value, so a field
+    mix-up or a non-additive result would both show.
 
     Args:
-        pair_left: Left operand ``(1, 2)``, updated in place.
-        pair_right: Right operand ``(10, 20)``.
+        left: Left operand ``(1, 2, 3, 4)``, updated in place.
+        right: Right operand ``(10, 20, 30, 40)``.
     """
-    pair_left += pair_right
-    assert tuple(pair_left.to_float_dict().values()) == (11.0, 22.0)
+    left += right
+    assert tuple(left.to_float_dict().values()) == (11.0, 22.0, 33.0, 44.0)
 
 
 @pytest.mark.parametrize(
-    ("operation", "scalar", "expected"),
-    [
-        pytest.param(PairMetrics.__itruediv__, 2.0, (0.5, 1.0), id="divide"),
-        pytest.param(PairMetrics.__mul__, 3.0, (3.0, 6.0), id="multiply"),
-    ],
+    "scalar_scenario",
+    list(ScalarScenario),
+    ids=[case.name for case in ScalarScenario],
 )
 def test_scalar_operations_scale_every_field(
-    pair_left: PairMetrics,
-    operation: Callable[[PairMetrics, float], PairMetrics],
-    scalar: float,
-    expected: tuple[float, float],
+    left: ThroughputStatistics,
+    scalar_scenario: ScalarScenario,
 ) -> None:
     """``/= scalar`` and ``* scalar`` apply the scalar to every field.
 
     Args:
-        pair_left: Operand ``(1, 2)``.
-        operation: Unbound mixin operator, called as ``operation(left, s)``.
-        scalar: Scalar operand.
-        expected: ``(first, second)`` of the result.
+        left: Operand ``(1, 2, 3, 4)``.
+        scalar_scenario: Operator, scalar and expected field values.
     """
-    result = operation(pair_left, scalar)
-    assert tuple(result.to_float_dict().values()) == expected
+    case = scalar_scenario.value
+    result = case.operation(left, case.scalar)
+    assert tuple(result.to_float_dict().values()) == case.expected
 
 
 @pytest.mark.parametrize(
     ("weights", "expected"),
     [
-        pytest.param([1, 1], (5.5, 11.0), id="equal_weights"),
-        pytest.param([2, 1], (4.0, 8.0), id="left_weighted_twice"),
-        pytest.param([0, 1], (10.0, 20.0), id="left_weight_zero"),
+        pytest.param([1, 1], (5.5, 11.0, 16.5, 22.0), id="equal_weights"),
+        pytest.param([2, 1], (4.0, 8.0, 12.0, 16.0), id="left_weighted_twice"),
+        pytest.param([0, 1], (10.0, 20.0, 30.0, 40.0), id="left_weight_zero"),
     ],
 )
 def test_weighted_avg_weights_each_instance_by_protein_count(
-    pair_left: PairMetrics,
-    pair_right: PairMetrics,
+    left: ThroughputStatistics,
+    right: ThroughputStatistics,
     weights: list[int],
-    expected: tuple[float, float],
+    expected: tuple[float, float, float, float],
 ) -> None:
     """``weighted_avg`` returns the protein-count-weighted mean per field.
 
-    With left ``(1, 2)`` and right ``(10, 20)``, weights 2 and 1 give
-    ``(2*1 + 10) / 3 = 4``; a zero weight drops that instance entirely.
+    With left ``(1, 2, 3, 4)`` and right ``(10, 20, 30, 40)``, weights 2
+    and 1 give ``(2 * 1 + 10) / 3 = 4`` in the first field; a zero weight
+    drops that instance entirely. The result is built through the class's
+    ``@jaxtyped`` constructor, so a wrongly shaped field would raise.
 
     Args:
-        pair_left: First instance ``(1, 2)``.
-        pair_right: Second instance ``(10, 20)``.
+        left: First instance ``(1, 2, 3, 4)``.
+        right: Second instance ``(10, 20, 30, 40)``.
         weights: Protein count for each instance.
-        expected: ``(first, second)`` of the weighted mean.
+        expected: Field values of the weighted mean, in field order.
     """
-    result = PairMetrics.weighted_avg([pair_left, pair_right], weights)
+    result = ThroughputStatistics.weighted_avg([left, right], weights)
     assert tuple(result.to_float_dict().values()) == expected
 
 
-@pytest.mark.parametrize(
-    ("prefix", "expected_keys"),
-    [
-        pytest.param("", ["first", "second"], id="no_prefix"),
-        pytest.param("train/", ["train/first", "train/second"], id="train"),
-    ],
-)
+@pytest.mark.parametrize("prefix", ["", "train/"], ids=["no_prefix", "train"])
 def test_to_float_dict_prefixes_every_key(
-    pair_left: PairMetrics,
+    left: ThroughputStatistics,
     prefix: str,
-    expected_keys: list[str],
 ) -> None:
-    """``to_float_dict(prefix)`` namespaces every key, in field order.
+    """``to_float_dict(prefix)`` keys each field ``prefix + name``, in order.
 
     Args:
-        pair_left: Instance to convert.
+        left: Instance to convert.
         prefix: String prepended to each field name.
-        expected_keys: Keys the dict must have, in order.
     """
-    assert list(pair_left.to_float_dict(prefix)) == expected_keys
+    names = [f.name for f in dataclasses.fields(ThroughputStatistics)]
+    assert list(left.to_float_dict(prefix)) == [prefix + n for n in names]
 
 
 def test_metrics_zero_init_fields_are_float32_scalars(
@@ -368,22 +485,35 @@ def test_metrics_zero_init_fields_are_float32_scalars(
 
 
 def test_metrics_reject_non_scalar_field(
-    build_with_vector_field: Callable[[], TensorAccumulatorMixin],
+    metrics_of_ones: TensorAccumulatorMixin,
+    vector_field: FieldOverride,
 ) -> None:
     """``@jaxtyped`` rejects a 1-D tensor in a scalar field at construction.
 
     Parametrized over the real metric classes through ``metric_cls``.
+    ``dataclasses.replace`` builds a new instance through the class's
+    ``@jaxtyped`` ``__init__`` with one field swapped for the 1-D tensor,
+    so the construction expected to raise happens inside ``pytest.raises``.
 
     Args:
-        build_with_vector_field: Thunk building an instance with one 1-D
-            field.
+        metrics_of_ones: Valid instance whose other fields are kept.
+        vector_field: Name of the field to replace and its 1-D tensor.
     """
     with pytest.raises(TypeCheckError):
-        _ = build_with_vector_field()
+        _ = dataclasses.replace(
+            metrics_of_ones,
+            **{vector_field.name: vector_field.value},
+        )
 
 
+@pytest.mark.parametrize(
+    "process_group",
+    list(ProcessGroup),
+    ids=[case.name for case in ProcessGroup],
+    indirect=True,
+)
 def test_all_reduce_mean_keeps_values_on_one_process(
-    process_group_active: bool,  # noqa: FBT001
+    process_group: ProcessGroup,
     metrics_of_ones: TensorAccumulatorMixin,
 ) -> None:
     """With no group or a one-rank group, every field stays at 1.0.
@@ -395,10 +525,10 @@ def test_all_reduce_mean_keeps_values_on_one_process(
     below does that.
 
     Args:
-        process_group_active: Whether a one-rank gloo group is active.
+        process_group: Whether a one-rank gloo group is active.
         metrics_of_ones: Instance with every field 1.0.
     """
-    assert dist.is_initialized() == process_group_active
+    assert dist.is_initialized() == process_group.value.group_active
     metrics_of_ones.all_reduce_mean()
     assert set(metrics_of_ones.to_float_dict().values()) == {1.0}
 
@@ -418,5 +548,6 @@ def test_all_reduce_mean_averages_across_real_ranks(
     """
     world_size = all_reduce_run.world_size
     expected = sum(range(world_size)) / world_size
-    assert len(all_reduce_run.rank_reports) == world_size
-    assert {v for r in all_reduce_run.rank_reports for v in r} == {expected}
+    reports = all_reduce_run.reports
+    assert sorted(report.rank for report in reports) == list(range(world_size))
+    assert {v for report in reports for v in report.values()} == {expected}
