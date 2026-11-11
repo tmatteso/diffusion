@@ -19,12 +19,11 @@ from typing import cast, override
 import pytest
 import torch
 from architecture.errors import InvalidPairHeadDimensionError
-from architecture.pairformer_stack import PairformerBlock, PairformerStack
 from architecture.pairformer_stack import (
-    TriangleMultiplicationIncoming as TMI,
-)
-from architecture.pairformer_stack import (
-    TriangleMultiplicationOutgoing as TMO,
+    PairformerBlock,
+    PairformerStack,
+    TriangleMultiplicationIncoming,
+    TriangleMultiplicationOutgoing,
 )
 from einops import rearrange, reduce
 from helpers.useful_objects import manual_seed
@@ -56,7 +55,7 @@ class PairDims:
 
 
 @dataclasses.dataclass(frozen=True)
-class TriangleCase:
+class TriangleCase(abc.ABC):
     """A triangle multiplication direction and where ``z[0, 1]`` reaches.
 
     Perturbing the single entry ``z[:, 0, 1, :]`` changes exactly the
@@ -67,16 +66,74 @@ class TriangleCase:
     the outer gate at ``(0, 1)`` itself.
 
     Attributes:
-        module_cls: The triangle multiplication class.
         rows: Output rows that change in full.
         cols: Output columns that change in full.
         points: Further single output entries ``(i, j)`` that change.
     """
 
-    module_cls: type[TMO | TMI]
     rows: tuple[int, ...]
     cols: tuple[int, ...]
     points: tuple[tuple[int, int], ...]
+
+    @abc.abstractmethod
+    def build(
+        self,
+        c: int,
+        c_hidden: int | None,
+    ) -> TriangleMultiplicationOutgoing | TriangleMultiplicationIncoming:
+        """Build this direction's triangle multiplication.
+
+        Args:
+            c: Pair embedding width.
+            c_hidden: Hidden width, or ``None`` for the module's default.
+
+        Returns:
+            The module, in training mode.
+        """
+
+
+@dataclasses.dataclass(frozen=True)
+class OutgoingCase(TriangleCase):
+    """``TriangleMultiplicationOutgoing`` and where ``z[0, 1]`` reaches."""
+
+    @override
+    def build(
+        self,
+        c: int,
+        c_hidden: int | None,
+    ) -> TriangleMultiplicationOutgoing:
+        """Build a ``TriangleMultiplicationOutgoing``.
+
+        Args:
+            c: Pair embedding width.
+            c_hidden: Hidden width, or ``None`` for the module's default.
+
+        Returns:
+            The module, in training mode.
+        """
+        return TriangleMultiplicationOutgoing(c=c, c_hidden=c_hidden)
+
+
+@dataclasses.dataclass(frozen=True)
+class IncomingCase(TriangleCase):
+    """``TriangleMultiplicationIncoming`` and where ``z[0, 1]`` reaches."""
+
+    @override
+    def build(
+        self,
+        c: int,
+        c_hidden: int | None,
+    ) -> TriangleMultiplicationIncoming:
+        """Build a ``TriangleMultiplicationIncoming``.
+
+        Args:
+            c: Pair embedding width.
+            c_hidden: Hidden width, or ``None`` for the module's default.
+
+        Returns:
+            The module, in training mode.
+        """
+        return TriangleMultiplicationIncoming(c=c, c_hidden=c_hidden)
 
 
 class TriangleScenario(enum.Enum):
@@ -87,8 +144,8 @@ class TriangleScenario(enum.Enum):
         incoming: ``TriangleMultiplicationIncoming`` (Algorithm 17 step 3).
     """
 
-    outgoing = TriangleCase(TMO, (0,), (1,), ())
-    incoming = TriangleCase(TMI, (1,), (0,), ((0, 1),))
+    outgoing = OutgoingCase((0,), (1,), ())
+    incoming = IncomingCase((1,), (0,), ((0, 1),))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -250,7 +307,10 @@ def s(
 
 
 @pytest.fixture
-def triangle(triangle_scenario: TriangleScenario, dims: PairDims) -> TMO | TMI:
+def triangle(
+    triangle_scenario: TriangleScenario,
+    dims: PairDims,
+) -> TriangleMultiplicationOutgoing | TriangleMultiplicationIncoming:
     """Build the scenario's triangle multiplication under a fixed seed.
 
     Args:
@@ -262,12 +322,11 @@ def triangle(triangle_scenario: TriangleScenario, dims: PairDims) -> TMO | TMI:
         The module in eval mode.
     """
     _ = manual_seed(0)
-    module_cls = triangle_scenario.value.module_cls
-    return module_cls(c=dims.c, c_hidden=dims.c_hidden).eval()
+    return triangle_scenario.value.build(dims.c, dims.c_hidden).eval()
 
 
 @pytest.fixture
-def tmo(dims: PairDims) -> TMO:
+def tmo(dims: PairDims) -> TriangleMultiplicationOutgoing:
     """Build a TriangleMultiplicationOutgoing under a fixed seed.
 
     Args:
@@ -277,11 +336,17 @@ def tmo(dims: PairDims) -> TMO:
         The module in eval mode.
     """
     _ = manual_seed(0)
-    return TMO(c=dims.c, c_hidden=dims.c_hidden).eval()
+    return TriangleMultiplicationOutgoing(
+        c=dims.c,
+        c_hidden=dims.c_hidden,
+    ).eval()
 
 
 @pytest.fixture
-def tmi(tmo: TMO, dims: PairDims) -> TMI:
+def tmi(
+    tmo: TriangleMultiplicationOutgoing,
+    dims: PairDims,
+) -> TriangleMultiplicationIncoming:
     """Build a TriangleMultiplicationIncoming sharing ``tmo``'s weights.
 
     The two classes have identical parameters, so copying the state dict
@@ -294,7 +359,10 @@ def tmi(tmo: TMO, dims: PairDims) -> TMI:
     Returns:
         The module in eval mode.
     """
-    module = TMI(c=dims.c, c_hidden=dims.c_hidden).eval()
+    module = TriangleMultiplicationIncoming(
+        c=dims.c,
+        c_hidden=dims.c_hidden,
+    ).eval()
     _ = module.load_state_dict(tmo.state_dict())
     return module
 
@@ -342,7 +410,11 @@ def stack(dims: PairDims) -> PairformerStack:
 
 
 def pair_forward(
-    module: TMO | TMI | PairformerStack,
+    module: (
+        TriangleMultiplicationOutgoing
+        | TriangleMultiplicationIncoming
+        | PairformerStack
+    ),
     pair: Float[torch.Tensor, "B N_res N_res c"],
 ) -> Float[torch.Tensor, "B N_res N_res c"]:
     """Run ``module`` on ``pair`` alone and return its output pair tensor.
@@ -367,7 +439,11 @@ def pair_forward(
 def pair_module(
     request: pytest.FixtureRequest,
     pair_module_name: str,
-) -> TMO | TMI | PairformerStack:
+) -> (
+    TriangleMultiplicationOutgoing
+    | TriangleMultiplicationIncoming
+    | PairformerStack
+):
     """Return the module fixture named by ``pair_module_name``.
 
     A pair-only ``PairformerBlock`` is covered through the stack, which
@@ -382,7 +458,9 @@ def pair_module(
         The module under test.
     """
     return cast(
-        TMO | TMI | PairformerStack,
+        TriangleMultiplicationOutgoing
+        | TriangleMultiplicationIncoming
+        | PairformerStack,
         request.getfixturevalue(pair_module_name),
     )
 
@@ -439,7 +517,11 @@ def direction_input(
 )
 def test_output_shape_dtype_and_finite(
     z: Float[torch.Tensor, "B N_res N_res c"],
-    pair_module: TMO | TMI | PairformerStack,
+    pair_module: (
+        TriangleMultiplicationOutgoing
+        | TriangleMultiplicationIncoming
+        | PairformerStack
+    ),
 ) -> None:
     """Each module maps ``(B, N, N, c)`` float32 to the same, all finite.
 
@@ -461,7 +543,11 @@ def test_output_shape_dtype_and_finite(
 )
 def test_gradient_reaches_input(
     z: Float[torch.Tensor, "B N_res N_res c"],
-    pair_module: TMO | TMI | PairformerStack,
+    pair_module: (
+        TriangleMultiplicationOutgoing
+        | TriangleMultiplicationIncoming
+        | PairformerStack
+    ),
 ) -> None:
     """The summed output has a finite, nonzero gradient with respect to ``z``.
 
@@ -483,7 +569,11 @@ def test_gradient_reaches_input(
 )
 def test_batch_items_are_independent(
     z: Float[torch.Tensor, "B N_res N_res c"],
-    pair_module: TMO | TMI | PairformerStack,
+    pair_module: (
+        TriangleMultiplicationOutgoing
+        | TriangleMultiplicationIncoming
+        | PairformerStack
+    ),
 ) -> None:
     """Running each batch item alone matches its slice of the batched run.
 
@@ -511,7 +601,11 @@ def test_batch_items_are_independent(
 )
 def test_forward_rejects_malformed_pair(
     z: Float[torch.Tensor, "B N_res N_res c"],
-    pair_module: TMO | TMI | PairformerStack,
+    pair_module: (
+        TriangleMultiplicationOutgoing
+        | TriangleMultiplicationIncoming
+        | PairformerStack
+    ),
     malformed_scenario: MalformedScenario,
 ) -> None:
     """Each module's jaxtyping contract rejects every malformed layout.
@@ -532,7 +626,7 @@ def test_forward_rejects_malformed_pair(
     ids=[case.name for case in TriangleScenario],
 )
 def test_triangle_single_entry_reaches_exactly_its_row_and_column(
-    triangle: TMO | TMI,
+    triangle: TriangleMultiplicationOutgoing | TriangleMultiplicationIncoming,
     z: Float[torch.Tensor, "B N_res N_res c"],
     changed_mask: Bool[torch.Tensor, "N_res N_res"],
 ) -> None:
@@ -562,7 +656,7 @@ def test_triangle_single_entry_reaches_exactly_its_row_and_column(
     ids=[case.name for case in TriangleScenario],
 )
 def test_triangle_closed_outer_gate_suppresses_output(
-    triangle: TMO | TMI,
+    triangle: TriangleMultiplicationOutgoing | TriangleMultiplicationIncoming,
     z: Float[torch.Tensor, "B N_res N_res c"],
 ) -> None:
     """With the outer gate pinned near 0, the output is near 0 everywhere.
@@ -584,7 +678,7 @@ def test_triangle_closed_outer_gate_suppresses_output(
     ids=[case.name for case in TriangleScenario],
 )
 def test_triangle_outer_gate_sees_unnormalised_input(
-    triangle: TMO | TMI,
+    triangle: TriangleMultiplicationOutgoing | TriangleMultiplicationIncoming,
     z: Float[torch.Tensor, "B N_res N_res c"],
 ) -> None:
     """With inner gates pinned open, scaling ``z`` by 100 changes the output.
@@ -611,7 +705,7 @@ def test_triangle_outer_gate_sees_unnormalised_input(
     ids=[case.name for case in TriangleScenario],
 )
 def test_triangle_projections_are_scale_invariant(
-    triangle: TMO | TMI,
+    triangle: TriangleMultiplicationOutgoing | TriangleMultiplicationIncoming,
     z: Float[torch.Tensor, "B N_res N_res c"],
 ) -> None:
     """With the outer gate pinned open, ``z`` and ``2 z`` give equal output.
@@ -658,7 +752,7 @@ def test_triangle_c_hidden_sets_internal_width_only(
         c_hidden: Value passed to the constructor.
         expected_hidden: Internal width the module must use.
     """
-    module = triangle_scenario.value.module_cls(c=dims.c, c_hidden=c_hidden)
+    module = triangle_scenario.value.build(dims.c, c_hidden)
     with torch.no_grad():
         out = module.eval()(z)
     assert module.proj_a.weight.shape == (expected_hidden, dims.c)
@@ -673,8 +767,8 @@ def test_triangle_c_hidden_sets_internal_width_only(
     ids=[case.name for case in SymmetryScenario],
 )
 def test_directions_agree_only_on_symmetric_input(
-    tmo: TMO,
-    tmi: TMI,
+    tmo: TriangleMultiplicationOutgoing,
+    tmi: TriangleMultiplicationIncoming,
     symmetry_scenario: SymmetryScenario,
     direction_input: Float[torch.Tensor, "B N_res N_res c"],
 ) -> None:
@@ -700,8 +794,8 @@ def test_directions_agree_only_on_symmetric_input(
 
 
 def test_incoming_equals_outgoing_of_transpose_with_gates_pinned(
-    tmo: TMO,
-    tmi: TMI,
+    tmo: TriangleMultiplicationOutgoing,
+    tmi: TriangleMultiplicationIncoming,
     z: Float[torch.Tensor, "B N_res N_res c"],
 ) -> None:
     """``incoming(z) == outgoing(zᵀ)`` once all gates are constant.
