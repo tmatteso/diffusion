@@ -31,9 +31,6 @@ from helpers.useful_objects import manual_seed
 from jaxtyping import Bool, Float, TypeCheckError
 from tests.patterns import sine_pattern
 
-type Pair = Float[torch.Tensor, "B N_res N_res c"]
-type PairModule = TMO | TMI | PairformerStack
-
 
 @dataclasses.dataclass(frozen=True)
 class PairDims:
@@ -124,7 +121,10 @@ class MalformedPair(abc.ABC):
     """A reshaping of a valid pair tensor that breaks the shape contract."""
 
     @abc.abstractmethod
-    def malform(self, pair: Pair) -> Float[torch.Tensor, "..."]:
+    def malform(
+        self,
+        pair: Float[torch.Tensor, "B N_res N_res c"],
+    ) -> Float[torch.Tensor, "..."]:
         """Map a valid ``(B, N, N, c)`` tensor to a malformed one.
 
         Args:
@@ -148,7 +148,10 @@ class SelectIndex(MalformedPair):
     index: int
 
     @override
-    def malform(self, pair: Pair) -> Float[torch.Tensor, "..."]:
+    def malform(
+        self,
+        pair: Float[torch.Tensor, "B N_res N_res c"],
+    ) -> Float[torch.Tensor, "..."]:
         """Select ``index`` along ``dim``.
 
         Args:
@@ -171,7 +174,10 @@ class DropFirst(MalformedPair):
     dim: int
 
     @override
-    def malform(self, pair: Pair) -> Float[torch.Tensor, "..."]:
+    def malform(
+        self,
+        pair: Float[torch.Tensor, "B N_res N_res c"],
+    ) -> Float[torch.Tensor, "..."]:
         """Drop index 0 along ``dim``.
 
         Args:
@@ -216,7 +222,7 @@ def dims() -> PairDims:
 
 
 @pytest.fixture
-def z(dims: PairDims) -> Pair:
+def z(dims: PairDims) -> Float[torch.Tensor, "B N_res N_res c"]:
     """Return a deterministic, asymmetric pair embedding.
 
     Args:
@@ -335,7 +341,10 @@ def stack(dims: PairDims) -> PairformerStack:
     return PairformerStack(dims.c, dims.n_blocks, dims.n_heads).eval()
 
 
-def pair_forward(module: PairModule, pair: Pair) -> Pair:
+def pair_forward(
+    module: TMO | TMI | PairformerStack,
+    pair: Float[torch.Tensor, "B N_res N_res c"],
+) -> Float[torch.Tensor, "B N_res N_res c"]:
     """Run ``module`` on ``pair`` alone and return its output pair tensor.
 
     ``PairformerStack`` takes the single embedding first, and passing
@@ -358,7 +367,7 @@ def pair_forward(module: PairModule, pair: Pair) -> Pair:
 def pair_module(
     request: pytest.FixtureRequest,
     pair_module_name: str,
-) -> PairModule:
+) -> TMO | TMI | PairformerStack:
     """Return the module fixture named by ``pair_module_name``.
 
     A pair-only ``PairformerBlock`` is covered through the stack, which
@@ -372,7 +381,10 @@ def pair_module(
     Returns:
         The module under test.
     """
-    return cast(PairModule, request.getfixturevalue(pair_module_name))
+    return cast(
+        TMO | TMI | PairformerStack,
+        request.getfixturevalue(pair_module_name),
+    )
 
 
 @pytest.fixture
@@ -400,7 +412,10 @@ def changed_mask(
 
 
 @pytest.fixture
-def direction_input(symmetry_scenario: SymmetryScenario, z: Pair) -> Pair:
+def direction_input(
+    symmetry_scenario: SymmetryScenario,
+    z: Float[torch.Tensor, "B N_res N_res c"],
+) -> Float[torch.Tensor, "B N_res N_res c"]:
     """Return ``z``, or ``z`` averaged with its transpose, per the scenario.
 
     Args:
@@ -423,8 +438,8 @@ def direction_input(symmetry_scenario: SymmetryScenario, z: Pair) -> Pair:
     ids=["outgoing", "incoming", "stack"],
 )
 def test_output_shape_dtype_and_finite(
-    z: Pair,
-    pair_module: PairModule,
+    z: Float[torch.Tensor, "B N_res N_res c"],
+    pair_module: TMO | TMI | PairformerStack,
 ) -> None:
     """Each module maps ``(B, N, N, c)`` float32 to the same, all finite.
 
@@ -444,7 +459,10 @@ def test_output_shape_dtype_and_finite(
     ["tmo", "tmi", "stack"],
     ids=["outgoing", "incoming", "stack"],
 )
-def test_gradient_reaches_input(z: Pair, pair_module: PairModule) -> None:
+def test_gradient_reaches_input(
+    z: Float[torch.Tensor, "B N_res N_res c"],
+    pair_module: TMO | TMI | PairformerStack,
+) -> None:
     """The summed output has a finite, nonzero gradient with respect to ``z``.
 
     Args:
@@ -463,7 +481,10 @@ def test_gradient_reaches_input(z: Pair, pair_module: PairModule) -> None:
     ["tmo", "tmi", "stack"],
     ids=["outgoing", "incoming", "stack"],
 )
-def test_batch_items_are_independent(z: Pair, pair_module: PairModule) -> None:
+def test_batch_items_are_independent(
+    z: Float[torch.Tensor, "B N_res N_res c"],
+    pair_module: TMO | TMI | PairformerStack,
+) -> None:
     """Running each batch item alone matches its slice of the batched run.
 
     Args:
@@ -489,8 +510,8 @@ def test_batch_items_are_independent(z: Pair, pair_module: PairModule) -> None:
     ids=[case.name for case in MalformedScenario],
 )
 def test_forward_rejects_malformed_pair(
-    z: Pair,
-    pair_module: PairModule,
+    z: Float[torch.Tensor, "B N_res N_res c"],
+    pair_module: TMO | TMI | PairformerStack,
     malformed_scenario: MalformedScenario,
 ) -> None:
     """Each module's jaxtyping contract rejects every malformed layout.
@@ -512,7 +533,7 @@ def test_forward_rejects_malformed_pair(
 )
 def test_triangle_single_entry_reaches_exactly_its_row_and_column(
     triangle: TMO | TMI,
-    z: Pair,
+    z: Float[torch.Tensor, "B N_res N_res c"],
     changed_mask: Bool[torch.Tensor, "N_res N_res"],
 ) -> None:
     """Perturbing ``z[0, 1]`` changes exactly the positions the scenario lists.
@@ -542,7 +563,7 @@ def test_triangle_single_entry_reaches_exactly_its_row_and_column(
 )
 def test_triangle_closed_outer_gate_suppresses_output(
     triangle: TMO | TMI,
-    z: Pair,
+    z: Float[torch.Tensor, "B N_res N_res c"],
 ) -> None:
     """With the outer gate pinned near 0, the output is near 0 everywhere.
 
@@ -564,7 +585,7 @@ def test_triangle_closed_outer_gate_suppresses_output(
 )
 def test_triangle_outer_gate_sees_unnormalised_input(
     triangle: TMO | TMI,
-    z: Pair,
+    z: Float[torch.Tensor, "B N_res N_res c"],
 ) -> None:
     """With inner gates pinned open, scaling ``z`` by 100 changes the output.
 
@@ -591,7 +612,7 @@ def test_triangle_outer_gate_sees_unnormalised_input(
 )
 def test_triangle_projections_are_scale_invariant(
     triangle: TMO | TMI,
-    z: Pair,
+    z: Float[torch.Tensor, "B N_res N_res c"],
 ) -> None:
     """With the outer gate pinned open, ``z`` and ``2 z`` give equal output.
 
@@ -622,7 +643,7 @@ def test_triangle_projections_are_scale_invariant(
 def test_triangle_c_hidden_sets_internal_width_only(
     triangle_scenario: TriangleScenario,
     dims: PairDims,
-    z: Pair,
+    z: Float[torch.Tensor, "B N_res N_res c"],
     c_hidden: int | None,
     expected_hidden: int,
 ) -> None:
@@ -655,7 +676,7 @@ def test_directions_agree_only_on_symmetric_input(
     tmo: TMO,
     tmi: TMI,
     symmetry_scenario: SymmetryScenario,
-    direction_input: Pair,
+    direction_input: Float[torch.Tensor, "B N_res N_res c"],
 ) -> None:
     """With shared weights, outgoing equals incoming iff ``z`` is symmetric.
 
@@ -681,7 +702,7 @@ def test_directions_agree_only_on_symmetric_input(
 def test_incoming_equals_outgoing_of_transpose_with_gates_pinned(
     tmo: TMO,
     tmi: TMI,
-    z: Pair,
+    z: Float[torch.Tensor, "B N_res N_res c"],
 ) -> None:
     """``incoming(z) == outgoing(zᵀ)`` once all gates are constant.
 
@@ -708,7 +729,7 @@ def test_incoming_equals_outgoing_of_transpose_with_gates_pinned(
 
 def test_block_pair_only_changes_z_and_returns_no_single(
     block: PairformerBlock,
-    z: Pair,
+    z: Float[torch.Tensor, "B N_res N_res c"],
 ) -> None:
     """With ``s=None`` the block returns ``(None, z_out)`` with ``z_out != z``.
 
@@ -730,7 +751,7 @@ def test_block_single_track_updates_s(
     dims: PairDims,
     single_track_block: PairformerBlock,
     s: Float[torch.Tensor, "B N_res c_res"],
-    z: Pair,
+    z: Float[torch.Tensor, "B N_res N_res c"],
 ) -> None:
     """With ``c_res`` set, the block also returns an updated, finite ``s``.
 
@@ -755,7 +776,7 @@ def test_block_single_track_updates_s(
 def test_stack_applies_its_blocks_in_order(
     dims: PairDims,
     stack: PairformerStack,
-    z: Pair,
+    z: Float[torch.Tensor, "B N_res N_res c"],
 ) -> None:
     """The stack equals running its own blocks one after another.
 
