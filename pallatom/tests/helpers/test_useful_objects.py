@@ -11,13 +11,13 @@ Every expected value is exactly representable in float32, so results are
 compared with ``==`` rather than a tolerance.
 """
 
+import abc
 import dataclasses
 import enum
 import multiprocessing as mp
 import os
 import socket
-from collections.abc import Callable
-from typing import cast
+from typing import cast, override
 
 import pytest
 import torch
@@ -32,19 +32,63 @@ from jaxtyping import Float, TypeCheckError
 
 
 @dataclasses.dataclass(frozen=True)
-class ScalarCase:
+class ScalarCase(abc.ABC):
     """A mixin operator with a scalar operand and the values it must give.
 
     Attributes:
-        operation: Unbound operator, called as ``operation(left, scalar)``
-            with ``left = (1, 2, 3, 4)``.
         scalar: Scalar operand.
-        expected: Field values of the result, in field order.
+        expected: Field values of the result, in field order, for
+            ``left = (1, 2, 3, 4)``.
     """
 
-    operation: Callable[[ThroughputStatistics, float], ThroughputStatistics]
     scalar: float
     expected: tuple[float, ...]
+
+    @abc.abstractmethod
+    def apply(self, operand: ThroughputStatistics) -> ThroughputStatistics:
+        """Apply the operator to ``operand`` and ``scalar``.
+
+        Args:
+            operand: Left operand.
+
+        Returns:
+            The operator's result.
+        """
+
+
+@dataclasses.dataclass(frozen=True)
+class DivideInPlace(ScalarCase):
+    """``operand /= scalar``, which must update ``operand`` in place."""
+
+    @override
+    def apply(self, operand: ThroughputStatistics) -> ThroughputStatistics:
+        """Divide ``operand`` by ``scalar`` in place.
+
+        Args:
+            operand: Left operand, modified in place.
+
+        Returns:
+            ``operand`` after the division.
+        """
+        operand /= self.scalar
+        return operand
+
+
+@dataclasses.dataclass(frozen=True)
+class Multiply(ScalarCase):
+    """``operand * scalar``, which must return a new instance."""
+
+    @override
+    def apply(self, operand: ThroughputStatistics) -> ThroughputStatistics:
+        """Multiply ``operand`` by ``scalar``.
+
+        Args:
+            operand: Left operand.
+
+        Returns:
+            The product.
+        """
+        return operand * self.scalar
 
 
 class ScalarScenario(enum.Enum):
@@ -55,8 +99,8 @@ class ScalarScenario(enum.Enum):
         multiply: ``left * 3`` scales every field into a new instance.
     """
 
-    divide = ScalarCase(ThroughputStatistics.__itruediv__, 2, (0.5, 1, 1.5, 2))
-    multiply = ScalarCase(ThroughputStatistics.__mul__, 3, (3, 6, 9, 12))
+    divide = DivideInPlace(2, (0.5, 1, 1.5, 2))
+    multiply = Multiply(3, (3, 6, 9, 12))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -412,7 +456,7 @@ def test_scalar_operations_scale_every_field(
         scalar_scenario: Operator, scalar and expected field values.
     """
     case = scalar_scenario.value
-    result = case.operation(left, case.scalar)
+    result = case.apply(left)
     assert tuple(result.to_float_dict().values()) == case.expected
 
 
