@@ -53,8 +53,8 @@ from helpers.data import (
 from helpers.useful_objects import manual_seed
 from jaxtyping import Float, Shaped, TypeCheckError
 from tests.patterns import sine_pattern
-from train.train_config import LoaderConfig as EvalLoaderConfig
 from train.train_config import (
+    LoaderConfig,
     NoiseScheduleParams,
     TrainArgs,
     TrainConfig,
@@ -941,7 +941,7 @@ def bucketed_cfg() -> TrainConfig:
             epoch_prefetch_depth=1,
             n_shards=1,
         ),
-        test_loader=EvalLoaderConfig(batch_size=2, max_seq_length=8),
+        test_loader=LoaderConfig(batch_size=2, max_seq_length=8),
     )
 
 
