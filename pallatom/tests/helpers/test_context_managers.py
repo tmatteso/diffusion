@@ -9,7 +9,6 @@ import dataclasses
 import enum
 import json
 import pathlib
-from collections.abc import Callable
 from typing import cast
 
 import pytest
@@ -38,7 +37,7 @@ class Reach(enum.Flag):
 class LoggedRun:
     """Where the two events logged through a StructlogConfig ended up.
 
-    ``run_logging`` logs ``info_event`` at INFO level and then
+    ``log_two_events`` logs ``info_event`` at INFO level and then
     ``warning_event`` at WARNING level, exits the config, and reads back
     both the log file and the captured console output.
 
@@ -87,6 +86,58 @@ class RankScenario(enum.Enum):
     other_rank = RankCase(1, Reach.nowhere, Reach.console, file_created=False)
 
 
+def event_reach(event: str, in_file: set[str], console: str) -> Reach:
+    """Combine where ``event`` was found.
+
+    Args:
+        event: Event name to look for.
+        in_file: Event names read back from the log file.
+        console: Captured stdout and stderr.
+
+    Returns:
+        The file and console flags the event earned.
+    """
+    file = Reach.file if event in in_file else Reach.nowhere
+    shown = Reach.console if event in console else Reach.nowhere
+    return file | shown
+
+
+def log_two_events(
+    config: StructlogConfig,
+    path: pathlib.Path,
+    capture: pytest.CaptureFixture[str],
+) -> LoggedRun:
+    """Log one INFO and one WARNING event through ``config``.
+
+    Enters the config, logs ``info_event`` at INFO and ``warning_event`` at
+    WARNING through ``structlog.get_logger()``, exits, then reads back the
+    log file and the captured console output.
+
+    Args:
+        config: Unentered config to log through.
+        path: File the config writes to.
+        capture: Captures console output from ``ConsoleRenderer``.
+
+    Returns:
+        Where each event ended up, and what the file holds.
+    """
+    with config:
+        log = cast(FilteringBoundLogger, structlog.get_logger())
+        log.info("info_event")
+        log.warning("warning_event")
+    captured = capture.readouterr()
+    console = captured.out + captured.err
+    created = path.exists()
+    lines = path.read_text().splitlines() if created else []
+    in_file = {cast(str, json.loads(line)["event"]) for line in lines}
+    return LoggedRun(
+        info=event_reach("info_event", in_file, console),
+        warning=event_reach("warning_event", in_file, console),
+        file_created=created,
+        file_lines=len(lines),
+    )
+
+
 @pytest.fixture
 def log_path(tmp_path: pathlib.Path) -> pathlib.Path:
     """Return the JSONL path StructlogConfig writes to; not created yet.
@@ -115,19 +166,6 @@ def stale_log_path(log_path: pathlib.Path) -> pathlib.Path:
 
 
 @pytest.fixture
-def rank_scenario(request: pytest.FixtureRequest) -> RankScenario:
-    """Return the ``RankScenario`` member routed in via indirect param.
-
-    Args:
-        request: Pytest request carrying the scenario in ``param``.
-
-    Returns:
-        The scenario under test.
-    """
-    return cast(RankScenario, request.param)
-
-
-@pytest.fixture
 def rank_config(
     rank_scenario: RankScenario,
     log_path: pathlib.Path,
@@ -135,7 +173,8 @@ def rank_config(
     """Build an unentered StructlogConfig for the scenario's rank.
 
     Args:
-        rank_scenario: Scenario supplying the rank.
+        rank_scenario: Scenario supplying the rank; the requesting test
+            parametrizes it.
         log_path: Path the config writes to.
 
     Returns:
@@ -161,64 +200,54 @@ def rank_zero_config(log_path: pathlib.Path) -> StructlogConfig:
 
 
 @pytest.fixture
-def run_logging(
+def rank_run(
+    rank_config: StructlogConfig,
     log_path: pathlib.Path,
     capsys: pytest.CaptureFixture[str],
-) -> Callable[[StructlogConfig], LoggedRun]:
-    """Factory that logs one INFO and one WARNING event through a config.
-
-    The returned callable enters the config, logs ``info_event`` at INFO
-    and ``warning_event`` at WARNING through ``structlog.get_logger()``,
-    exits, then reads back the log file and the captured console output.
+) -> LoggedRun:
+    """Log the two events through the scenario's rank config.
 
     Args:
-        log_path: Path the configs passed in write to.
-        capsys: Captures console output from ``ConsoleRenderer``.
+        rank_config: Config built for the scenario's rank.
+        log_path: File the config writes to.
+        capsys: Captures console output.
 
     Returns:
-        Callable mapping a config to the ``LoggedRun`` it produced.
+        Where each event ended up.
     """
+    return log_two_events(rank_config, log_path, capsys)
 
-    def run(config: StructlogConfig) -> LoggedRun:
-        """Log through ``config`` and collect what it wrote.
 
-        Args:
-            config: Unentered config to log through.
+@pytest.fixture
+def stale_config(stale_log_path: pathlib.Path) -> StructlogConfig:
+    """Build an unentered rank-zero config over a file with stale lines.
 
-        Returns:
-            Where each event ended up, and what the file holds.
-        """
-        with config:
-            log = cast(FilteringBoundLogger, structlog.get_logger())
-            log.info("info_event")
-            log.warning("warning_event")
-        captured = capsys.readouterr()
-        console = captured.out + captured.err
-        created = log_path.exists()
-        lines = log_path.read_text().splitlines() if created else []
-        in_file = {cast(str, json.loads(line)["event"]) for line in lines}
+    Args:
+        stale_log_path: Log path already holding stale lines.
 
-        def reach(event: str) -> Reach:
-            """Combine where ``event`` was found.
+    Returns:
+        The config, not yet entered.
+    """
+    return StructlogConfig(is_rank_zero=True, log_file=stale_log_path)
 
-            Args:
-                event: Event name to look for.
 
-            Returns:
-                The file and console flags the event earned.
-            """
-            file = Reach.file if event in in_file else Reach.nowhere
-            shown = Reach.console if event in console else Reach.nowhere
-            return file | shown
+@pytest.fixture
+def stale_run(
+    stale_config: StructlogConfig,
+    stale_log_path: pathlib.Path,
+    capsys: pytest.CaptureFixture[str],
+) -> LoggedRun:
+    """Log the two events through a config whose file starts stale.
 
-        return LoggedRun(
-            info=reach("info_event"),
-            warning=reach("warning_event"),
-            file_created=created,
-            file_lines=len(lines),
-        )
+    Args:
+        stale_config: Rank-zero config over the stale file.
+        stale_log_path: File the config writes to.
+        capsys: Captures console output.
 
-    return run
+    Returns:
+        Where each event ended up, and how many lines the file holds.
+    """
+    return log_two_events(stale_config, stale_log_path, capsys)
 
 
 @pytest.fixture
@@ -244,12 +273,10 @@ def lines_before_exit(
     "rank_scenario",
     list(RankScenario),
     ids=[case.name for case in RankScenario],
-    indirect=True,
 )
 def test_structlog_config_routes_events_by_rank(
     rank_scenario: RankScenario,
-    rank_config: StructlogConfig,
-    run_logging: Callable[[StructlogConfig], LoggedRun],
+    rank_run: LoggedRun,
 ) -> None:
     """Each rank sends events to the file and console its scenario expects.
 
@@ -258,19 +285,17 @@ def test_structlog_config_routes_events_by_rank(
 
     Args:
         rank_scenario: Scenario holding where each event must end up.
-        rank_config: Config built for the scenario's rank.
-        run_logging: Factory that logs through a config.
+        rank_run: Where each event ended up for the scenario's rank.
     """
     case = rank_scenario.value
-    logged = run_logging(rank_config)
+    logged = rank_run
     assert logged.info == case.info
     assert logged.warning == case.warning
     assert logged.file_created == case.file_created
 
 
 def test_structlog_config_truncates_existing_file(
-    stale_log_path: pathlib.Path,
-    run_logging: Callable[[StructlogConfig], LoggedRun],
+    stale_run: LoggedRun,
 ) -> None:
     """A pre-existing log file is truncated on entry rather than appended to.
 
@@ -279,11 +304,9 @@ def test_structlog_config_truncates_existing_file(
     case applies, since no other rank opens the file.
 
     Args:
-        stale_log_path: Log path already holding stale lines.
-        run_logging: Factory that logs through a config.
+        stale_run: What logging through the stale file left behind.
     """
-    config = StructlogConfig(is_rank_zero=True, log_file=stale_log_path)
-    logged = run_logging(config)
+    logged = stale_run
     in_file = [Reach.file in reach for reach in (logged.info, logged.warning)]
     assert all(in_file)
     assert logged.file_lines == sum(in_file)
