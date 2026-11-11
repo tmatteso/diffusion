@@ -6,6 +6,7 @@ that are threaded through training and evaluation passes.
 """
 
 import dataclasses
+import functools
 from typing import NoReturn, Self, cast
 
 import torch
@@ -230,6 +231,14 @@ class LossMetrics(TensorAccumulatorMixin):
         atom_distogram_loss: Atom-level sparse distogram cross-entropy loss.
         intermediate_loss: Auxiliary loss from intermediate decoder outputs.
         RMSD: Root-mean-square deviation of predicted vs ground-truth positions.
+        low_sigma_loss_share: Share of the EDM-weighted Kabsch MSE that comes
+            from residues at the lowest noise level in their protein, averaged
+            over proteins. 1 when every residue shares one noise level.
+        low_sigma_weight_share: Those residues' share of the residue-type
+            loss weights, averaged over proteins. If per-atom EDM weighting
+            balances residues at different noise levels, it matches
+            ``low_sigma_loss_share``. Both default to 0 so callers that
+            predate them can omit them.
     """
 
     total_loss: Float[torch.Tensor, ""]
@@ -240,6 +249,12 @@ class LossMetrics(TensorAccumulatorMixin):
     atom_distogram_loss: Float[torch.Tensor, ""]
     intermediate_loss: Float[torch.Tensor, ""]
     RMSD: Float[torch.Tensor, ""]
+    low_sigma_loss_share: Float[torch.Tensor, ""] = dataclasses.field(
+        default_factory=functools.partial(torch.tensor, 0.0),
+    )
+    low_sigma_weight_share: Float[torch.Tensor, ""] = dataclasses.field(
+        default_factory=functools.partial(torch.tensor, 0.0),
+    )
 
 
 @jaxtyped(typechecker=beartype)

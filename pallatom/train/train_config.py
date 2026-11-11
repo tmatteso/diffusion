@@ -328,6 +328,34 @@ class LossParams(BaseModel):
     smooth_lddt_cutoff: int = Field(default=15, gt=0)
 
 
+class SelfFlowParams(BaseModel):
+    """Dual-timestep noising for Self-Flow training (Chefer et al. 2026).
+
+    When enabled, training noises each protein twice. The student view gives
+    every residue one of two independently drawn noise levels, chosen per
+    residue by a random mask. The teacher view noises every residue at the
+    lowest level any valid residue received. Both views share one noise
+    sample. Validation and test batches always use a single uniform noise
+    level, so their metrics stay comparable with runs that have this off.
+
+    Attributes:
+        model_config: Pydantic config — frozen to prevent mutation after init.
+        enabled: Whether training batches carry the dual-timestep views.
+        mask_ratio: Probability that a residue takes the second noise level
+            (``R_M`` in the paper, which keeps it at or below 0.5).
+        apply_prob: Fraction of training proteins that get a residue mask at
+            all; the rest have every residue at the first noise level, so
+            the student and teacher views coincide. Lowering it exposes the
+            model to the uniform noise it sees at sampling time.
+    """
+
+    model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True)
+
+    enabled: bool = False
+    mask_ratio: float = Field(default=0.25, ge=0, le=0.5)
+    apply_prob: float = Field(default=1.0, ge=0, le=1)
+
+
 class CheckpointParams(BaseModel):
     """Checkpoint file path and save frequency.
 
@@ -443,6 +471,7 @@ class TrainConfig(BaseModel):
             head and its training target.
         distogram_atom: Binning config for the atom-pair distogram.
         loss: Weights and thresholds for the composite training loss.
+        self_flow: Dual-timestep noising for Self-Flow training.
         checkpoint: Checkpoint path and save frequency.
         logging: Logging and W&B project settings.
         train_loader: DataLoader settings used for the training split.
@@ -464,6 +493,7 @@ class TrainConfig(BaseModel):
         default_factory=AtomDistogramParams,
     )
     loss: LossParams = Field(default_factory=LossParams)
+    self_flow: SelfFlowParams = Field(default_factory=SelfFlowParams)
     checkpoint: CheckpointParams = Field(default_factory=CheckpointParams)
     logging: LoggingParams = Field(default_factory=LoggingParams)
     train_loader: TrainLoaderConfig = Field(default_factory=TrainLoaderConfig)

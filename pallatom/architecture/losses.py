@@ -5,6 +5,8 @@ atom distogram cross-entropy, intermediate (L_med) supervision, and sequence
 cross-entropy losses.
 """
 
+import dataclasses
+
 import torch
 import torch.nn.functional as F
 from architecture.errors import (
@@ -207,6 +209,90 @@ def atom_loss(
         raise LossComputationError
 
     return loss
+
+
+@jaxtyped(typechecker=beartype)
+@dataclasses.dataclass(frozen=True)
+class NoiseGroupShares:
+    """How the EDM-weighted structure loss splits between noise levels.
+
+    Attributes:
+        loss_share: Share of the EDM-weighted Kabsch MSE from residues at
+            their protein's lowest noise level, averaged over proteins.
+        weight_share: Those residues' share of the residue-type loss
+            weights, averaged over proteins.
+    """
+
+    loss_share: Float[torch.Tensor, ""]
+    weight_share: Float[torch.Tensor, ""]
+
+
+@jaxtyped(typechecker=beartype)
+def noise_group_shares(
+    r_denoised: Float[torch.Tensor, "B N_atom 3"],
+    batch: FeaturizedBatch,
+    lambda_sigma_weight: Float[torch.Tensor, "B N_atom"],
+) -> NoiseGroupShares:
+    """Split the EDM-weighted structure loss between low and high noise.
+
+    The low group is every residue at its protein's lowest noise level: the
+    teacher view's level when the batch has one, otherwise every residue.
+    ``atom_loss`` is linear in its per-point weight, so the low group's
+    share is the loss with the weight zeroed outside the group divided by
+    the full loss. Per-atom EDM weighting balances the groups when this
+    share matches the group's share of the residue-type weights.
+
+    Args:
+        r_denoised: Predicted coordinates; detached here.
+        batch: Batch supplying ground truth, masks and per-residue sigma.
+        lambda_sigma_weight: Per-atom EDM loss weight used in training.
+
+    Returns:
+        The low group's loss share and weight share.
+    """
+    n_res = batch.t_hat.shape[1]
+    points_per_residue = r_denoised.shape[1] // n_res
+    lowest = (
+        batch.teacher_view.t_hat
+        if batch.teacher_view is not None
+        else batch.t_hat
+    )
+    low_atoms: Float[torch.Tensor, "B N_atom"] = repeat(
+        (batch.t_hat <= lowest).float(),
+        "b n -> b (n p)",
+        p=points_per_residue,
+    )
+    mask = batch.atom5_mask.float()
+    with torch.no_grad():
+        full = atom_loss(
+            r_denoised.detach(),
+            batch.r_gt,
+            mask,
+            aa_indices=batch.aa_indices,
+            lambda_sigma_weight=lambda_sigma_weight,
+        )
+        low = atom_loss(
+            r_denoised.detach(),
+            batch.r_gt,
+            mask,
+            aa_indices=batch.aa_indices,
+            lambda_sigma_weight=lambda_sigma_weight * low_atoms,
+        )
+        weights = (
+            repeat(
+                residue_type_weight(batch.aa_indices),
+                "b n -> b (n p)",
+                p=points_per_residue,
+            )
+            * mask
+        )
+        weight_share = (weights * low_atoms).sum(dim=-1) / weights.sum(
+            dim=-1,
+        ).clamp(min=1e-12)
+    return NoiseGroupShares(
+        loss_share=(low / full.clamp(min=1e-12)).mean(),
+        weight_share=weight_share.mean(),
+    )
 
 
 def med_loss(

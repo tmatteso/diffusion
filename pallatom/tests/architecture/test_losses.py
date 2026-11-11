@@ -28,6 +28,7 @@ from architecture.losses import (
     distogram_loss_residue,
     edm_loss_weight,
     med_loss,
+    noise_group_shares,
     pairwise_dist,
     residue_type_weight,
     seq_ce_loss,
@@ -49,6 +50,7 @@ from helpers.data import (
     build_distogram_module,
     featurize_single_item,
 )
+from helpers.self_flow import NoisedViewBatch
 from helpers.useful_objects import manual_seed
 from jaxtyping import Bool, Float, Int, TypeCheckError, jaxtyped
 from train.train_config import (
@@ -1663,3 +1665,173 @@ def test_edm_loss_weight_repeats_each_residue_weight_over_its_points(
         expected_edm_weight: Hand-computed per-point weights.
     """
     torch.testing.assert_close(edm_weight, expected_edm_weight)
+
+
+# ---------------------------------------------------------------------------
+# noise_group_shares
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class GroupShareCase:
+    """Uniform student and teacher noise levels and the shares they give.
+
+    Attributes:
+        student_sigma: Noise level of every student residue.
+        teacher_sigma: Teacher noise level, or None for no teacher view.
+        expected_share: Expected loss share and weight share alike.
+    """
+
+    student_sigma: float
+    teacher_sigma: float | None
+    expected_share: float
+
+
+class GroupShare(enum.Enum):
+    """Batches where every residue is, or none is, in the low group.
+
+    Members:
+        no_teacher: Without a teacher view every residue is low.
+        teacher_equal: A teacher at the student's level; every residue low.
+        teacher_below: A teacher below every residue; none is low.
+    """
+
+    no_teacher = GroupShareCase(2.0, None, 1.0)
+    teacher_equal = GroupShareCase(2.0, 2.0, 1.0)
+    teacher_below = GroupShareCase(2.0, 1.0, 0.0)
+
+
+@pytest.fixture
+def denoised_near_gt(
+    r_gt: Float[torch.Tensor, "B N_atoms 3"],
+) -> Float[torch.Tensor, "B N_atoms 3"]:
+    """``r_gt`` with sigma 0.5 noise, so the structure loss is non-zero.
+
+    Args:
+        r_gt: Ground-truth coordinates of the ``batch`` fixture.
+
+    Returns:
+        The perturbed coordinates.
+    """
+    return make_noisy(r_gt, sigma=0.5)
+
+
+@pytest.fixture
+def unit_lambda() -> Float[torch.Tensor, "B N_atoms"]:
+    """EDM weight of 1 on every point.
+
+    Returns:
+        A tensor of ones.
+    """
+    return torch.ones(B, N)
+
+
+@pytest.fixture
+def group_batch(
+    group_share_scenario: GroupShare,
+    batch: FeaturizedBatch,
+) -> FeaturizedBatch:
+    """``batch`` with the scenario's uniform student and teacher levels.
+
+    Args:
+        group_share_scenario: Noise levels; the requesting test
+            parametrizes it.
+        batch: Base batch; one point per residue.
+
+    Returns:
+        The batch with ``t_hat`` and ``teacher_view`` set.
+    """
+    case = group_share_scenario.value
+    teacher = (
+        None
+        if case.teacher_sigma is None
+        else NoisedViewBatch(
+            r_noised=batch.r_gt_noised,
+            noised_res_distogram=batch.noised_res_distogram,
+            t_hat=torch.full((B, N), case.teacher_sigma),
+            t_normalized=batch.t_normalized,
+        )
+    )
+    return dataclasses.replace(
+        batch,
+        t_hat=torch.full((B, N), case.student_sigma),
+        teacher_view=teacher,
+    )
+
+
+@pytest.mark.parametrize(
+    "group_share_scenario",
+    list(GroupShare),
+    ids=[case.name for case in GroupShare],
+)
+def test_noise_group_shares_all_or_nothing(
+    group_batch: FeaturizedBatch,
+    denoised_near_gt: Float[torch.Tensor, "B N_atoms 3"],
+    unit_lambda: Float[torch.Tensor, "B N_atoms"],
+    group_share_scenario: GroupShare,
+) -> None:
+    """Shares are 1 when every residue is low and 0 when none is.
+
+    Arrange: uniform student and teacher noise levels.
+    Act: ``noise_group_shares``.
+    Assert: the loss share and the weight share both equal the expected
+    value, so batches without Self-Flow log 1 for both.
+
+    Args:
+        group_batch: Batch with the scenario's noise levels.
+        denoised_near_gt: Predicted coordinates.
+        unit_lambda: EDM weight of 1 everywhere.
+        group_share_scenario: Expected share; parametrized.
+    """
+    shares = noise_group_shares(denoised_near_gt, group_batch, unit_lambda)
+    expected = torch.tensor(group_share_scenario.value.expected_share)
+    torch.testing.assert_close(shares.loss_share, expected)
+    torch.testing.assert_close(shares.weight_share, expected)
+
+
+@pytest.fixture
+def half_low_batch(batch: FeaturizedBatch) -> FeaturizedBatch:
+    """All-alanine ``batch``, its first half of residues at the teacher level.
+
+    Alanine everywhere makes every residue-type weight equal, so the low
+    group's weight share is exactly one half.
+
+    Args:
+        batch: Base batch; one point per residue.
+
+    Returns:
+        The batch with mixed student levels 1 and 2 and a teacher at 1.
+    """
+    t_hat = torch.full((B, N), 2.0)
+    t_hat[:, : N // 2] = 1.0
+    return dataclasses.replace(
+        batch,
+        aa_indices=torch.zeros_like(batch.aa_indices),
+        t_hat=t_hat,
+        teacher_view=NoisedViewBatch(
+            r_noised=batch.r_gt_noised,
+            noised_res_distogram=batch.noised_res_distogram,
+            t_hat=torch.ones(B, N),
+            t_normalized=batch.t_normalized,
+        ),
+    )
+
+
+def test_noise_group_shares_split_batch(
+    half_low_batch: FeaturizedBatch,
+    denoised_near_gt: Float[torch.Tensor, "B N_atoms 3"],
+    unit_lambda: Float[torch.Tensor, "B N_atoms"],
+) -> None:
+    """Half the residues low gives a weight share of 1/2 and a partial loss.
+
+    No other cases: the all-or-nothing cases are covered above; this checks
+    that a real split lands strictly between them.
+
+    Args:
+        half_low_batch: Batch with half its residues at the teacher's level.
+        denoised_near_gt: Predicted coordinates.
+        unit_lambda: EDM weight of 1 everywhere.
+    """
+    shares = noise_group_shares(denoised_near_gt, half_low_batch, unit_lambda)
+    torch.testing.assert_close(shares.weight_share, torch.tensor(0.5))
+    assert 0.0 < float(shares.loss_share) < 1.0
