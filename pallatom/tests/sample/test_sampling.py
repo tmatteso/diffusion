@@ -941,7 +941,7 @@ def sampler_trajectory(
         cast(FeaturizedBatch, call.args[0])
         for call in zero_denoiser_mock.call_args_list
     ][::2]
-    step_sigmas = torch.stack([batch.t_hat[0] for batch in step_batches])
+    step_sigmas = torch.stack([batch.t_hat[0, 0] for batch in step_batches])
     step_rms = torch.stack(
         [centred_rms(batch.r_gt_noised) for batch in step_batches],
     )
