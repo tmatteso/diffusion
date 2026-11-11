@@ -289,7 +289,7 @@ def featurized_batch(
             "r -> b r",
             b=b,
         ),
-        t_hat=torch.tensor([0.5, 1.5]),
+        t_hat=repeat(torch.tensor([0.5, 1.5]), "b -> b r", r=r),
         t_normalized=sine_pattern((b, r, r), 0.29),
         tok_idx=repeat(tok, "n -> b n", b=b),
         center_uid=repeat(centres, "n -> b n", b=b),
@@ -342,8 +342,8 @@ def submodule_grads(
     """
     x = featurized_batch
     pred: PredictedOutputs = model.train()(x)
-    weight = torch.ones(x.t_hat.shape)
     mask = x.atom5_mask
+    weight = torch.ones(mask.shape)
     units = list(
         zip(
             pred.intermediate_denoised_coord_stack,

@@ -24,6 +24,7 @@ from architecture.losses import (
     atom_loss,
     distogram_loss_atom,
     distogram_loss_residue,
+    edm_loss_weight,
     med_loss,
     seq_ce_loss,
     smooth_lddt_loss,
@@ -304,10 +305,15 @@ def take_step(
                     model_params,
                 ),
             )
-        # Elucidating diffusion model loss weighting:
-        lambda_sigma_loss_weight: Float[torch.Tensor, "B"] = (
-            featurized_batch.t_hat**2 + sigma_data**2
-        ) / (featurized_batch.t_hat * sigma_data) ** 2
+        # Elucidating diffusion model loss weighting, one weight per atom
+        # from its residue's noise level:
+        lambda_sigma_loss_weight: Float[torch.Tensor, "B N_atom"] = (
+            edm_loss_weight(
+                featurized_batch.t_hat,
+                sigma_data,
+                points_per_residue=featurized_batch.r_gt.shape[1] // n_res,
+            )
+        )
 
         pred_outputs = cast(
             PredictedOutputs,
