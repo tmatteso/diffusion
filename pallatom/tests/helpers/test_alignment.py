@@ -201,7 +201,7 @@ def test_atom_loss_perfect_prediction_near_zero(
             r,
             r,
             aa_indices=uniform_aa_indices,
-            lambda_sigma_weight=torch.ones(B),
+            lambda_sigma_weight=torch.ones(B, N),
         )
         .mean()
         .item()
@@ -227,7 +227,7 @@ def test_atom_loss_noisy_prediction_positive_and_finite(
         r,
         r_noisy,
         aa_indices=uniform_aa_indices,
-        lambda_sigma_weight=torch.ones(B),
+        lambda_sigma_weight=torch.ones(B, N),
     )
     assert (loss > 0).all()
     assert torch.isfinite(loss).all()
