@@ -36,6 +36,7 @@ from helpers.atom_utils import (
     ATOM5_CA,
     ATOM5_ELEMENTS,
     ATOM5_NAMES,
+    ATOMS_PER_RES,
     Protein,
     atom5_to_atom37,
     atom37_to_atom5,
@@ -51,6 +52,15 @@ from helpers.context_managers import (
     FatalOnError,
     ShardWorkerNotInitializedError,
     ShardWorkerState,
+)
+from helpers.self_flow import (
+    NoisedView,
+    NoisedViewBatch,
+    centered_noise_displacement,
+    dual_timestep_sigmas,
+    pair_template_time,
+    per_atom_sigma,
+    sample_residue_mask,
 )
 from jaxtyping import Bool, Float, Int, jaxtyped
 from pydantic import (
@@ -116,6 +126,9 @@ class FeaturizedItem:
             into ``n_atom_bins`` distance categories.
         gt_atom_distogram_mask_sparse: Boolean mask indicating valid neighbour
             entries in ``gt_atom_distogram_sparse``.
+        teacher_view: Self-Flow teacher view, noised at the lowest residue
+            sigma of the student view (the fields above). None unless
+            Self-Flow is enabled for this featurization.
     """
 
     r_gt: Float[torch.Tensor, "N_atom 3"]
@@ -135,6 +148,7 @@ class FeaturizedItem:
     center_uid: Int[torch.Tensor, "N_atom"]
     gt_atom_distogram_sparse: Int[torch.Tensor, "N_atom K"]
     gt_atom_distogram_mask_sparse: Bool[torch.Tensor, "N_atom K"]
+    teacher_view: NoisedView | None = None
 
 
 @jaxtyped(typechecker=beartype)
@@ -186,6 +200,9 @@ class FeaturizedBatch:
             batch dimension prepended.
         gt_atom_distogram_mask_sparse: Boolean mask for valid entries in
             ``gt_atom_distogram_sparse`` with batch dimension prepended.
+        teacher_view: Self-Flow teacher views of the batch, or None when
+            Self-Flow is off (always None for validation, test and sampling
+            batches). The noised fields above are then the student view.
     """
 
     ref_pos: Float[torch.Tensor, "B N_atom 3"]
@@ -205,6 +222,7 @@ class FeaturizedBatch:
     center_uid: Int[torch.Tensor, "B N_atom"]
     gt_atom_distogram_sparse: Int[torch.Tensor, "B N_atom K"]
     gt_atom_distogram_mask_sparse: Bool[torch.Tensor, "B N_atom K"]
+    teacher_view: NoisedViewBatch | None = None
 
     def to(
         self,
@@ -268,6 +286,11 @@ class FeaturizedBatch:
                     non_blocking=non_blocking,
                 )
             ),
+            teacher_view=(
+                None
+                if self.teacher_view is None
+                else self.teacher_view.to(device, non_blocking=non_blocking)
+            ),
         )
 
     def pin_memory(self) -> "FeaturizedBatch":
@@ -300,6 +323,11 @@ class FeaturizedBatch:
             gt_atom_distogram_sparse=self.gt_atom_distogram_sparse.pin_memory(),
             gt_atom_distogram_mask_sparse=(
                 self.gt_atom_distogram_mask_sparse.pin_memory()
+            ),
+            teacher_view=(
+                None
+                if self.teacher_view is None
+                else self.teacher_view.pin_memory()
             ),
         )
 
@@ -567,9 +595,9 @@ def null_template_distogram(
 
 @jaxtyped(typechecker=beartype)
 def normalized_time_from_sigma(
-    t_hat: Float[torch.Tensor, ""],
+    t_hat: Float[torch.Tensor, "*shape"],
     noise_params: NoiseScheduleParams,
-) -> Float[torch.Tensor, ""]:
+) -> Float[torch.Tensor, "*shape"]:
     """Invert the rho-spaced noise schedule to recover normalized time.
 
     The exact inverse of ``EDMSampler.noise_schedule``, which maps t = 1
@@ -583,7 +611,7 @@ def normalized_time_from_sigma(
     sigmas outside the schedule's ``[sigma_min, sigma_max]`` range.
 
     Args:
-        t_hat: Noise level sigma.
+        t_hat: Noise level sigma, of any shape; applied elementwise.
         noise_params: Schedule parameters supplying ``sigma_data``,
             ``sigma_min``, ``sigma_max`` and ``rho``.
 
@@ -598,6 +626,222 @@ def normalized_time_from_sigma(
         0.0,
         1.0,
     )
+
+
+@jaxtyped(typechecker=beartype)
+@dataclasses.dataclass(frozen=True)
+class NoisingGeometry:
+    """Clean geometry of one protein that every noised view is built from.
+
+    Attributes:
+        flat_pos: Augmented ground-truth atom5 positions, flat layout.
+        atom_mask_flat: True for atoms that exist.
+        atom5_mask: Atom5 presence per residue.
+        atom37_mask: Atom37 presence per residue, used to place Cβ.
+        residue_mask: True for residues that exist (not padding).
+    """
+
+    flat_pos: Float[torch.Tensor, "N_atom 3"]
+    atom_mask_flat: Bool[torch.Tensor, "N_atom"]
+    atom5_mask: Float[torch.Tensor, "N_res 5"]
+    atom37_mask: Float[torch.Tensor, "N_res 37"]
+    residue_mask: Bool[torch.Tensor, "N_res"]
+
+
+@jaxtyped(typechecker=beartype)
+def sample_training_sigma(
+    noise_params: NoiseScheduleParams,
+) -> Float[torch.Tensor, ""]:
+    """Draw one training noise level from the EDM log-normal.
+
+    ``ln(sigma / sigma_data) ~ N(P_mean, P_std^2)``, drawn with the
+    reparameterization trick as in AF3.
+
+    Args:
+        noise_params: Schedule supplying ``sigma_data``, ``P_mean`` and
+            ``P_std``.
+
+    Returns:
+        The sampled sigma.
+    """
+    return noise_params.sigma_data * torch.exp(
+        torch.randn(()) * noise_params.P_std + noise_params.P_mean,
+    )
+
+
+@jaxtyped(typechecker=beartype)
+def noised_template(
+    geometry: NoisingGeometry,
+    r_noised: Float[torch.Tensor, "N_atom 3"],
+    template_distogram_fn: Distogram,
+) -> Float[torch.Tensor, "N_res N_res n_templ_bins"]:
+    """Bin the Cβ distances of noised coordinates into a template distogram.
+
+    Args:
+        geometry: Masks of the protein being noised.
+        r_noised: Noised atom5 positions, flat layout.
+        template_distogram_fn: Template distogram module.
+
+    Returns:
+        One-hot template distogram of the noised Cβ positions.
+    """
+    atom37_noised, _ = atom5_to_atom37(
+        rearrange(r_noised, "(n a) d -> 1 n a d", a=ATOMS_PER_RES),
+        rearrange(geometry.atom5_mask, "n a -> 1 n a"),
+    )
+    c_beta_pos_noised, _ = atom37_to_cb(
+        atom37_noised,
+        rearrange(geometry.atom37_mask, "n a -> 1 n a"),
+    )
+    template, _ = template_distogram_fn(
+        rearrange(c_beta_pos_noised, "1 n d -> n d"),
+        geometry.residue_mask,
+    )
+    return template
+
+
+@jaxtyped(typechecker=beartype)
+def single_noised_view(
+    geometry: NoisingGeometry,
+    noise: Float[torch.Tensor, "N_atom 3"],
+    sigma: Float[torch.Tensor, ""],
+    template_distogram_fn: Distogram,
+    noise_params: NoiseScheduleParams,
+) -> NoisedView:
+    """Noise every residue of a protein at one level (the default path).
+
+    Args:
+        geometry: Clean geometry and masks of the protein.
+        noise: Unit Gaussian noise, one draw per atom coordinate.
+        sigma: The protein's noise level.
+        template_distogram_fn: Template distogram module.
+        noise_params: Schedule used to normalize the template time.
+
+    Returns:
+        The noised view; every residue carries ``sigma``.
+    """
+    n_res = geometry.residue_mask.shape[0]
+    # zero CoM over valid atoms only, so padded atom slots don't bias it
+    r_noised = geometry.flat_pos + sigma * (
+        noise
+        - rearrange(
+            masked_com(
+                rearrange(noise, "n d -> 1 n d"),
+                mask=rearrange(geometry.atom_mask_flat, "n -> 1 n"),
+            ),
+            "1 1 d -> 1 d",
+        )
+    )
+    return NoisedView(
+        r_noised=r_noised,
+        noised_res_distogram=noised_template(
+            geometry,
+            r_noised,
+            template_distogram_fn,
+        ),
+        t_hat=repeat(sigma, "-> n", n=n_res),
+        t_normalized=repeat(
+            normalized_time_from_sigma(sigma, noise_params),
+            "-> n m",
+            n=n_res,
+            m=n_res,
+        ),
+    )
+
+
+@jaxtyped(typechecker=beartype)
+def per_residue_noised_view(
+    geometry: NoisingGeometry,
+    noise: Float[torch.Tensor, "N_atom 3"],
+    residue_sigma: Float[torch.Tensor, "N_res"],
+    template_distogram_fn: Distogram,
+    noise_params: NoiseScheduleParams,
+) -> NoisedView:
+    """Noise each residue of a protein at its own level.
+
+    Noise is centred after scaling, so the view keeps a zero centre of mass
+    even when residues carry different levels. Each pair's template time is
+    the noisier residue's time.
+
+    Args:
+        geometry: Clean geometry and masks of the protein.
+        noise: Unit Gaussian noise, one draw per atom coordinate.
+        residue_sigma: Noise level of each residue.
+        template_distogram_fn: Template distogram module.
+        noise_params: Schedule used to normalize the template time.
+
+    Returns:
+        The noised view.
+    """
+    r_noised = geometry.flat_pos + centered_noise_displacement(
+        per_atom_sigma(residue_sigma, ATOMS_PER_RES) * noise,
+        geometry.atom_mask_flat,
+    )
+    return NoisedView(
+        r_noised=r_noised,
+        noised_res_distogram=noised_template(
+            geometry,
+            r_noised,
+            template_distogram_fn,
+        ),
+        t_hat=residue_sigma,
+        t_normalized=pair_template_time(
+            normalized_time_from_sigma(residue_sigma, noise_params),
+        ),
+    )
+
+
+@jaxtyped(typechecker=beartype)
+def self_flow_views(
+    geometry: NoisingGeometry,
+    noise: Float[torch.Tensor, "N_atom 3"],
+    first_sigma: Float[torch.Tensor, ""],
+    template_distogram_fn: Distogram,
+    tcfg: TrainConfig,
+) -> tuple[NoisedView, NoisedView]:
+    """Build the Self-Flow student and teacher views of one protein.
+
+    Draws a second noise level and a residue mask (``tcfg.self_flow``), then
+    noises the student per residue and the teacher at the lowest valid
+    student level, both from the same unit noise.
+
+    Args:
+        geometry: Clean geometry and masks of the protein.
+        noise: Unit Gaussian noise shared by both views.
+        first_sigma: Noise level of unmasked residues.
+        template_distogram_fn: Template distogram module.
+        tcfg: Training config supplying the noise schedule and Self-Flow
+            settings.
+
+    Returns:
+        The student view and the teacher view.
+    """
+    n_res = geometry.residue_mask.shape[0]
+    sigmas = dual_timestep_sigmas(
+        first_sigma,
+        sample_training_sigma(tcfg.noise),
+        sample_residue_mask(
+            n_res,
+            tcfg.self_flow.mask_ratio,
+            tcfg.self_flow.apply_prob,
+        ),
+        geometry.residue_mask,
+    )
+    student = per_residue_noised_view(
+        geometry,
+        noise,
+        sigmas.student,
+        template_distogram_fn,
+        tcfg.noise,
+    )
+    teacher = per_residue_noised_view(
+        geometry,
+        noise,
+        repeat(sigmas.teacher, "-> n", n=n_res),
+        template_distogram_fn,
+        tcfg.noise,
+    )
+    return student, teacher
 
 
 @jaxtyped(typechecker=beartype)
@@ -677,18 +921,7 @@ def featurize_single_item(
     # Pmean = -1.2, Pstd = 1.5, sigma_data = 16,
     # ~ N(0, I) * Pstd + Pmean == ~ N(Pmean, Pstd**2).
     # The reparameterization trick. sigma is the sampled noise level per AF3.
-    sigma: Float[torch.Tensor, ""] = noise_params.sigma_data * torch.exp(
-        torch.randn(()) * noise_params.P_std + noise_params.P_mean,
-    )
-
-    # t_normalized is the normalized noise level of sigma, computed the same
-    # way the sampler computes it, and broadcast to every residue pair.
-    t_template: Float[torch.Tensor, "N_res N_res"] = repeat(
-        normalized_time_from_sigma(sigma, noise_params),
-        "-> n m",
-        n=N_res,
-        m=N_res,
-    )
+    sigma: Float[torch.Tensor, ""] = sample_training_sigma(noise_params)
 
     atom5_pos, atom5_mask = atom37_to_atom5(
         rearrange(atom37_positions, "n a d -> 1 n a d"),
@@ -737,33 +970,29 @@ def featurize_single_item(
         gt_res_disto_onehot.argmax(dim=-1)
     )
     noise = torch.randn_like(flat_pos)  # (N_atom, 3)
-    # zero CoM over valid atoms only, so padded atom slots don't bias it
-    r_gt_noised = flat_pos + sigma * (
-        noise
-        - rearrange(
-            masked_com(
-                rearrange(noise, "n d -> 1 n d"),
-                mask=rearrange(atom_mask_flat, "n -> 1 n"),
+    geometry = NoisingGeometry(
+        flat_pos=flat_pos,
+        atom_mask_flat=atom_mask_flat,
+        atom5_mask=atom5_mask,
+        atom37_mask=atom37_mask,
+        residue_mask=residue_mask,
+    )
+    # One view at sigma, or the Self-Flow student and teacher views. The
+    # template is the noised Cβ distogram of each view; t_normalized is its
+    # normalized noise level, computed the same way the sampler computes it.
+    student, teacher = (
+        self_flow_views(geometry, noise, sigma, template_distogram_fn, tcfg)
+        if tcfg.self_flow.enabled
+        else (
+            single_noised_view(
+                geometry,
+                noise,
+                sigma,
+                template_distogram_fn,
+                noise_params,
             ),
-            "1 1 d -> 1 d",
+            None,
         )
-    )
-
-    # Noised Cβ → self-conditioning template
-    atom37_noised, _ = atom5_to_atom37(
-        rearrange(r_gt_noised, "(n a) d -> 1 n a d", a=Natom),  # add B=1
-        rearrange(atom5_mask, "n a -> 1 n a"),  # add B=1
-    )
-    atom37_noised = rearrange(atom37_noised, "1 n a d -> n a d")  # strip B
-
-    c_beta_pos_noised, _ = atom37_to_cb(
-        rearrange(atom37_noised, "n a d -> 1 n a d"),
-        rearrange(atom37_mask, "n a -> 1 n a"),
-    )
-    c_beta_pos_noised = rearrange(c_beta_pos_noised, "1 n d -> n d")
-    noised_res_distogram, _ = template_distogram_fn(
-        c_beta_pos_noised,
-        residue_mask,
     )
 
     ref_pos: Float[torch.Tensor, "N_atom 3"] = rearrange(
@@ -837,22 +1066,23 @@ def featurize_single_item(
 
     return FeaturizedItem(
         r_gt=flat_pos,
-        r_gt_noised=r_gt_noised,
+        r_gt_noised=student.r_noised,
         atom5_mask=atom_mask_flat,
         f_pseudo_beta_mask=residue_mask.long(),
         gt_res_distogram_indices=gt_res_distogram_indices,
-        noised_res_distogram=noised_res_distogram,
+        noised_res_distogram=student.noised_res_distogram,
         aa_indices=aa_indices,
         ref_pos=ref_pos,
         ref_element=ref_elem,
         f_residue_idx=f_residue_idx,
-        t_hat=repeat(sigma, "-> n", n=N_res),  # every residue shares sigma
-        t_normalized=t_template,
+        t_hat=student.t_hat,
+        t_normalized=student.t_normalized,
         ref_space_uid=ref_space_uid,
         tok_idx=token_idx,
         center_uid=center_single,
         gt_atom_distogram_sparse=gt_atom_distogram_sparse,
         gt_atom_distogram_mask_sparse=gt_atom_distogram_mask_sparse,
+        teacher_view=teacher,
     )
 
 
@@ -903,6 +1133,7 @@ def featurize_batch(
     packed = {
         f.name: torch.stack([getattr(it, f.name) for it in items])
         for f in dataclasses.fields(items[0])
+        if isinstance(getattr(items[0], f.name), torch.Tensor)
     }
     return FeaturizedBatch(
         ref_pos=packed["ref_pos"],
@@ -922,6 +1153,9 @@ def featurize_batch(
         center_uid=packed["center_uid"],
         gt_atom_distogram_sparse=packed["gt_atom_distogram_sparse"],
         gt_atom_distogram_mask_sparse=packed["gt_atom_distogram_mask_sparse"],
+        teacher_view=NoisedViewBatch.stack_optional(
+            [it.teacher_view for it in items],
+        ),
     )
 
 
@@ -2062,6 +2296,26 @@ class ShardDataLoader(torch.utils.data.DataLoader[FeaturizedBatch]):
             self.queue_watcher.shutdown(wait=False)
 
 
+def without_self_flow(cfg: TrainConfig) -> TrainConfig:
+    """Return ``cfg`` with Self-Flow's dual-timestep noising turned off.
+
+    Every other setting, including the other Self-Flow fields, is kept.
+    Validation and test loaders featurize with this config, so they always
+    see one uniform noise level per protein.
+
+    Args:
+        cfg: Training configuration, Self-Flow on or off.
+
+    Returns:
+        The same configuration with ``self_flow.enabled`` False.
+    """
+    return cfg.model_copy(
+        update={
+            "self_flow": cfg.self_flow.model_copy(update={"enabled": False}),
+        },
+    )
+
+
 def make_bucketed_data_loaders(
     *,
     cfg: TrainConfig,
@@ -2110,6 +2364,12 @@ def make_bucketed_data_loaders(
         distogram_template=distogram_template,
         distogram_residue=distogram_residue,
         distogram_atom=distogram_atom,
+    )
+    # Validation and test always see one uniform noise level per protein, so
+    # their metrics stay comparable with runs that have Self-Flow off.
+    eval_collate: FeaturizeCollate = dataclasses.replace(
+        collate,
+        tcfg=without_self_flow(cfg),
     )
 
     val_set = ProteinDataset(
@@ -2195,7 +2455,7 @@ def make_bucketed_data_loaders(
             sampler=val_sampler,
             num_workers=cfg.test_loader.num_workers,
             pin_memory=True,
-            collate_fn=collate,
+            collate_fn=eval_collate,
         )
         test_loader = torch.utils.data.DataLoader(
             test_set,
@@ -2203,7 +2463,7 @@ def make_bucketed_data_loaders(
             sampler=test_sampler,
             num_workers=cfg.test_loader.num_workers,
             pin_memory=True,
-            collate_fn=collate,
+            collate_fn=eval_collate,
         )
     else:
         train_loader = torch.utils.data.DataLoader(
@@ -2219,7 +2479,7 @@ def make_bucketed_data_loaders(
             shuffle=False,
             num_workers=cfg.test_loader.num_workers,
             pin_memory=True,
-            collate_fn=collate,
+            collate_fn=eval_collate,
         )
         test_loader = torch.utils.data.DataLoader(
             test_set,
@@ -2227,7 +2487,7 @@ def make_bucketed_data_loaders(
             shuffle=False,
             num_workers=cfg.test_loader.num_workers,
             pin_memory=True,
-            collate_fn=collate,
+            collate_fn=eval_collate,
         )
 
     return (

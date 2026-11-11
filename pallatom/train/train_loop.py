@@ -26,6 +26,7 @@ from architecture.losses import (
     distogram_loss_residue,
     edm_loss_weight,
     med_loss,
+    noise_group_shares,
     seq_ce_loss,
     smooth_lddt_loss,
 )
@@ -61,7 +62,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import Adam
 from torch.optim.lr_scheduler import LambdaLR
 from tqdm import tqdm
-from train.train_config import TrainArgs, TrainConfig
+from train.train_config import TrainArgs, TrainConfig, TrainingParams
 
 CUDA_DEVICE_TYPE = "cuda"
 
@@ -335,6 +336,11 @@ def take_step(
             lambda_sigma_weight=lambda_sigma_loss_weight,
         ).mean()
 
+        noise_shares = noise_group_shares(
+            pred_outputs.r_denoised,
+            featurized_batch,
+            lambda_sigma_loss_weight,
+        )
         intermediate_loss = med_loss(
             r_denoised_blocks=pred_outputs.intermediate_denoised_coord_stack,
             logits_aa_blocks=pred_outputs.intermediate_pred_aa_logit_stack,
@@ -421,6 +427,8 @@ def take_step(
         atom_distogram_loss=atom_distogram_loss.detach(),
         intermediate_loss=intermediate_loss.detach(),
         RMSD=rmsd,
+        low_sigma_loss_share=noise_shares.loss_share,
+        low_sigma_weight_share=noise_shares.weight_share,
     ), ThroughputStatistics(
         avg_batch_size=torch.tensor(float(b_size), device=device),
         token_pack_rate=torch.tensor(
@@ -1151,6 +1159,28 @@ def alphafold_lr_lambda(
     return decay_factor ** ((step - warmup_steps) // decay_steps)
 
 
+def build_scheduler(optimizer: Adam, training: TrainingParams) -> LambdaLR:
+    """Build the AlphaFold-style warmup-then-decay learning-rate schedule.
+
+    Args:
+        optimizer: Optimizer whose learning rate the schedule scales.
+        training: Settings supplying the warmup length, decay interval and
+            decay factor.
+
+    Returns:
+        A ``LambdaLR`` applying ``alphafold_lr_lambda`` with those settings.
+    """
+    return LambdaLR(
+        optimizer,
+        lr_lambda=functools.partial(
+            alphafold_lr_lambda,
+            warmup_steps=training.lr_warmup_steps,
+            decay_steps=training.lr_decay_steps,
+            decay_factor=training.lr_decay_factor,
+        ),
+    )
+
+
 def main(args: TrainArgs, tcfg: TrainConfig) -> None:
     """Entry point for training; dispatches to DDP or not based on args.ddp.
 
@@ -1201,15 +1231,7 @@ def main(args: TrainArgs, tcfg: TrainConfig) -> None:
             lr=tp.lr,
             weight_decay=tp.weight_decay,
         )
-        scheduler = LambdaLR(
-            optimizer,
-            lr_lambda=functools.partial(
-                alphafold_lr_lambda,
-                warmup_steps=tp.lr_warmup_steps,
-                decay_steps=tp.lr_decay_steps,
-                decay_factor=tp.lr_decay_factor,
-            ),
-        )
+        scheduler = build_scheduler(optimizer, tp)
 
         # On the training device: self_conditioned_template bins the trunk's
         # on-device prediction with it every step.

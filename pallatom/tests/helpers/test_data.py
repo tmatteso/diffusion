@@ -25,13 +25,19 @@ import torch
 import torch.nn as nn
 from architecture.main_trunk import EMA, MainTrunk
 from einops import rearrange, reduce, repeat
-from helpers.atom_utils import RESTYPE_NUM_NO_X, Protein, restype_order
+from helpers.atom_utils import (
+    ATOMS_PER_RES,
+    RESTYPE_NUM_NO_X,
+    Protein,
+    restype_order,
+)
 from helpers.data import (
     DatasetSplitsManifest,
     Distogram,
     FeaturizeCollate,
     FeaturizedBatch,
     FeaturizedItem,
+    NoisingGeometry,
     ProteinDataset,
     ProteinShardDataset,
     ShardBudgetParameters,
@@ -41,10 +47,16 @@ from helpers.data import (
     featurize_batch,
     featurize_single_item,
     make_bucketed_data_loaders,
+    noised_template,
     normalized_time_from_sigma,
     null_template_distogram,
+    per_residue_noised_view,
     ref_pos_for_residue,
+    sample_training_sigma,
+    self_flow_views,
+    single_noised_view,
     sinusoidal_encoding,
+    without_self_flow,
 )
 from helpers.useful_objects import ModelSetup, manual_seed
 from jaxtyping import Bool, Float, TypeCheckError
@@ -55,6 +67,7 @@ from train.train_config import (
 )
 from train.train_config import (
     NoiseScheduleParams,
+    SelfFlowParams,
     TrainArgs,
     TrainConfig,
     TrainLoaderConfig,
@@ -2365,3 +2378,467 @@ def test_null_template_distogram_is_all_zero(
     assert null_template.shape == null_template_scenario.value.shape
     assert null_template.dtype == torch.float32
     assert not null_template.any()
+
+
+# ---------------------------------------------------------------------------
+# Self-Flow dual-timestep views
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def ramp_proteins() -> list[Protein]:
+    """Two all-alanine proteins of six and four residues on a coordinate ramp.
+
+    A hard-coded data fixture: every Self-Flow featurization test needs the
+    same small batch with padding (the second protein is padded by two
+    residues), and evenly spaced coordinates keep it deterministic.
+
+    Returns:
+        The two proteins.
+    """
+    return [
+        Protein(
+            atom_positions=rearrange(
+                0.5 * np.arange(n_res * 37 * 3, dtype=np.float64),
+                "(n a d) -> n a d",
+                a=37,
+                d=3,
+            ),
+            aatype=np.zeros(n_res, dtype=np.intp),
+            atom_mask=np.ones((n_res, 37), dtype=np.float64),
+            residue_index=np.arange(n_res, dtype=np.intp),
+            chain_index=np.zeros(n_res, dtype=np.intp),
+            b_factors=np.zeros((n_res, 37), dtype=np.float64),
+        )
+        for n_res in (6, 4)
+    ]
+
+
+@pytest.fixture
+def self_flow_tcfg() -> TrainConfig:
+    """Default config with Self-Flow on and half the residues masked.
+
+    Returns:
+        A TrainConfig with ``self_flow.enabled`` and ``mask_ratio`` 0.5.
+    """
+    return TrainConfig(
+        self_flow=SelfFlowParams(enabled=True, mask_ratio=0.5),
+    )
+
+
+@pytest.fixture
+def self_flow_batch(
+    ramp_proteins: list[Protein],
+    self_flow_tcfg: TrainConfig,
+    template_distogram_fn: Distogram,
+    residue_distogram_fn: Distogram,
+    atom_distogram_fn: Distogram,
+) -> FeaturizedBatch:
+    """Seeded Self-Flow featurization of ``ramp_proteins``.
+
+    Seed 1 masks some, but not all, residues of both proteins with these
+    settings, so each student view mixes two noise levels.
+
+    Args:
+        ramp_proteins: Proteins to featurize.
+        self_flow_tcfg: Config with Self-Flow on.
+        template_distogram_fn: Template distogram module.
+        residue_distogram_fn: Residue distogram module.
+        atom_distogram_fn: Atom distogram module.
+
+    Returns:
+        The featurized batch with its teacher view.
+    """
+    _ = manual_seed(1)
+    return featurize_batch(
+        ramp_proteins,
+        self_flow_tcfg,
+        template_distogram_fn,
+        residue_distogram_fn,
+        atom_distogram_fn,
+    )
+
+
+@pytest.fixture
+def plain_batch(
+    ramp_proteins: list[Protein],
+    tcfg: TrainConfig,
+    template_distogram_fn: Distogram,
+    residue_distogram_fn: Distogram,
+    atom_distogram_fn: Distogram,
+) -> FeaturizedBatch:
+    """Featurization of ``ramp_proteins`` with the default config.
+
+    Args:
+        ramp_proteins: Proteins to featurize.
+        tcfg: Default config, Self-Flow off.
+        template_distogram_fn: Template distogram module.
+        residue_distogram_fn: Residue distogram module.
+        atom_distogram_fn: Atom distogram module.
+
+    Returns:
+        The featurized batch.
+    """
+    _ = manual_seed(1)
+    return featurize_batch(
+        ramp_proteins,
+        tcfg,
+        template_distogram_fn,
+        residue_distogram_fn,
+        atom_distogram_fn,
+    )
+
+
+@pytest.fixture
+def residue_valid(
+    self_flow_batch: FeaturizedBatch,
+) -> Bool[torch.Tensor, "B N"]:
+    """Which residues of ``self_flow_batch`` exist (are not padding).
+
+    Args:
+        self_flow_batch: The Self-Flow batch.
+
+    Returns:
+        True for real residues.
+    """
+    return self_flow_batch.f_pseudo_beta_mask.bool()
+
+
+def test_featurize_batch_has_no_teacher_view_when_self_flow_is_off(
+    plain_batch: FeaturizedBatch,
+) -> None:
+    """The default config featurizes one view, as before Self-Flow.
+
+    No other cases: Self-Flow off is the single default configuration.
+
+    Args:
+        plain_batch: Batch featurized with the default config.
+    """
+    assert plain_batch.teacher_view is None
+
+
+def test_self_flow_teacher_view_matches_the_student_shapes(
+    self_flow_batch: FeaturizedBatch,
+) -> None:
+    """Self-Flow batches carry a teacher view shaped like the student.
+
+    No other cases: the shapes follow from the batch alone.
+
+    Args:
+        self_flow_batch: Batch featurized with Self-Flow on.
+    """
+    teacher = self_flow_batch.teacher_view
+    assert teacher is not None
+    assert teacher.r_noised.shape == self_flow_batch.r_gt_noised.shape
+    assert teacher.t_hat.shape == self_flow_batch.t_hat.shape
+    assert teacher.t_normalized.shape == self_flow_batch.t_normalized.shape
+    assert (
+        teacher.noised_res_distogram.shape
+        == self_flow_batch.noised_res_distogram.shape
+    )
+
+
+def test_self_flow_teacher_takes_the_lowest_valid_student_sigma(
+    self_flow_batch: FeaturizedBatch,
+    residue_valid: Bool[torch.Tensor, "B N"],
+) -> None:
+    """The teacher noises every residue at the student's lowest valid level.
+
+    Arrange: a seeded Self-Flow batch with a padded protein.
+    Act: compare the teacher's sigma with the student's per-residue sigma.
+    Assert: each protein's teacher sigma is uniform and equals the minimum
+    of the student's sigma over real residues, and the student mixes more
+    than one level in each protein (seed 1 masks some residues of each).
+
+    Args:
+        self_flow_batch: Batch featurized with Self-Flow on.
+        residue_valid: True for real residues.
+    """
+    teacher = self_flow_batch.teacher_view
+    assert teacher is not None
+    student = self_flow_batch.t_hat
+    lowest = torch.where(residue_valid, student, torch.inf).amin(dim=-1)
+    torch.testing.assert_close(
+        teacher.t_hat,
+        repeat(lowest, "b -> b n", n=student.shape[1]),
+    )
+    for sample in range(student.shape[0]):
+        levels = student[sample][residue_valid[sample]]
+        assert bool((levels != levels[0]).any())
+
+
+def test_self_flow_views_share_one_noise_sample(
+    self_flow_batch: FeaturizedBatch,
+) -> None:
+    """Residues at the teacher's level are noised identically in both views.
+
+    Arrange: a seeded Self-Flow batch.
+    Act: subtract the teacher's noised coordinates from the student's.
+    Assert: over the valid atoms of residues whose student sigma equals the
+    teacher's, the difference is one constant vector per protein (the two
+    views' different centre-of-mass corrections). So both views scale the
+    same unit noise sample.
+
+    Args:
+        self_flow_batch: Batch featurized with Self-Flow on.
+    """
+    teacher = self_flow_batch.teacher_view
+    assert teacher is not None
+    low_atoms = (
+        repeat(
+            self_flow_batch.t_hat == teacher.t_hat,
+            "b n -> b (n a)",
+            a=ATOMS_PER_RES,
+        )
+        & self_flow_batch.atom5_mask
+    )
+    difference = self_flow_batch.r_gt_noised - teacher.r_noised
+    for sample in range(difference.shape[0]):
+        rows = difference[sample][low_atoms[sample]]
+        torch.testing.assert_close(
+            rows,
+            repeat(rows[0], "d -> n d", n=len(rows)),
+        )
+
+
+def test_self_flow_views_keep_zero_noise_centre_of_mass(
+    self_flow_batch: FeaturizedBatch,
+) -> None:
+    """Both views' noise has zero centre of mass over valid atoms.
+
+    No other cases: the property holds per view, and both views are checked.
+    Noise is centred after per-residue scaling, which keeps this true even
+    though the student's residues carry different noise levels.
+
+    Args:
+        self_flow_batch: Batch featurized with Self-Flow on.
+    """
+    teacher = self_flow_batch.teacher_view
+    assert teacher is not None
+    valid = rearrange(self_flow_batch.atom5_mask.float(), "b n -> b n 1")
+    for noised in (self_flow_batch.r_gt_noised, teacher.r_noised):
+        com = reduce(
+            (noised - self_flow_batch.r_gt) * valid,
+            "b n d -> b d",
+            "sum",
+        ) / reduce(valid, "b n d -> b d", "sum")
+        torch.testing.assert_close(com, torch.zeros_like(com))
+
+
+def test_without_self_flow_turns_off_only_the_enabled_flag(
+    self_flow_tcfg: TrainConfig,
+) -> None:
+    """The evaluation config keeps every setting except ``enabled``.
+
+    No other cases: the function changes one field of one config.
+
+    Args:
+        self_flow_tcfg: Config with Self-Flow on and a non-default ratio.
+    """
+    evaluation = without_self_flow(self_flow_tcfg)
+    assert not evaluation.self_flow.enabled
+    assert (
+        evaluation.self_flow.mask_ratio == self_flow_tcfg.self_flow.mask_ratio
+    )
+    assert evaluation.noise == self_flow_tcfg.noise
+
+
+@pytest.fixture
+def log_sigma_ratios(tcfg: TrainConfig) -> Float[torch.Tensor, "n"]:
+    """``ln(sigma / sigma_data)`` for 4000 seeded training sigma draws.
+
+    Args:
+        tcfg: Default config supplying the noise schedule.
+
+    Returns:
+        The log ratios.
+    """
+    _ = manual_seed(0)
+    draws = torch.stack(
+        [sample_training_sigma(tcfg.noise) for _ in range(4000)],
+    )
+    return torch.log(draws / tcfg.noise.sigma_data)
+
+
+def test_sample_training_sigma_follows_the_edm_log_normal(
+    log_sigma_ratios: Float[torch.Tensor, "n"],
+    tcfg: TrainConfig,
+) -> None:
+    """``ln(sigma / sigma_data)`` has mean ``P_mean`` and std ``P_std``.
+
+    No other cases: the default schedule is the one training uses. 4000
+    draws put both estimates within 0.1 of their targets.
+
+    Args:
+        log_sigma_ratios: Log ratios of sampled sigmas.
+        tcfg: Default config with the target ``P_mean`` and ``P_std``.
+    """
+    tolerance = 0.1
+    assert abs(float(log_sigma_ratios.mean()) - tcfg.noise.P_mean) < tolerance
+    assert abs(float(log_sigma_ratios.std()) - tcfg.noise.P_std) < tolerance
+
+
+@pytest.fixture
+def clean_geometry() -> NoisingGeometry:
+    """Two complete alanine residues on a coordinate ramp, no padding.
+
+    Returns:
+        Geometry with every atom and residue present.
+    """
+    return NoisingGeometry(
+        flat_pos=rearrange(
+            0.5 * torch.arange(2 * 5 * 3, dtype=torch.float32),
+            "(n d) -> n d",
+            d=3,
+        ),
+        atom_mask_flat=torch.ones(10, dtype=torch.bool),
+        atom5_mask=torch.ones(2, 5),
+        atom37_mask=torch.ones(2, 37),
+        residue_mask=torch.ones(2, dtype=torch.bool),
+    )
+
+
+@pytest.fixture
+def zero_noise(clean_geometry: NoisingGeometry) -> Float[torch.Tensor, "N 3"]:
+    """All-zero unit noise for ``clean_geometry``.
+
+    Args:
+        clean_geometry: Geometry the noise is shaped for.
+
+    Returns:
+        Zeros shaped like the flat positions.
+    """
+    return torch.zeros_like(clean_geometry.flat_pos)
+
+
+def test_single_noised_view_without_noise_is_the_clean_structure(
+    clean_geometry: NoisingGeometry,
+    zero_noise: Float[torch.Tensor, "N 3"],
+    template_distogram_fn: Distogram,
+    tcfg: TrainConfig,
+) -> None:
+    """With zero noise the single view is the clean protein at its sigma.
+
+    No other cases: zero noise isolates the bookkeeping from the noise.
+
+    Args:
+        clean_geometry: Clean geometry.
+        zero_noise: Zero unit noise.
+        template_distogram_fn: Template distogram module.
+        tcfg: Default config supplying the schedule.
+    """
+    sigma = torch.tensor(2.0)
+    view = single_noised_view(
+        clean_geometry,
+        zero_noise,
+        sigma,
+        template_distogram_fn,
+        tcfg.noise,
+    )
+    torch.testing.assert_close(view.r_noised, clean_geometry.flat_pos)
+    torch.testing.assert_close(view.t_hat, torch.full((2,), 2.0))
+    torch.testing.assert_close(
+        view.t_normalized,
+        torch.full(
+            (2, 2),
+            float(normalized_time_from_sigma(sigma, tcfg.noise)),
+        ),
+    )
+    torch.testing.assert_close(
+        view.noised_res_distogram,
+        noised_template(
+            clean_geometry,
+            clean_geometry.flat_pos,
+            template_distogram_fn,
+        ),
+    )
+
+
+def test_self_flow_views_without_noise_are_both_the_clean_structure(
+    clean_geometry: NoisingGeometry,
+    zero_noise: Float[torch.Tensor, "N 3"],
+    template_distogram_fn: Distogram,
+    self_flow_tcfg: TrainConfig,
+) -> None:
+    """With zero noise both views are the clean protein; sigma differs only.
+
+    No other cases: zero noise isolates the bookkeeping from the noise, and
+    the masking draw only changes which sigma each residue carries.
+
+    Args:
+        clean_geometry: Clean geometry.
+        zero_noise: Zero unit noise.
+        template_distogram_fn: Template distogram module.
+        self_flow_tcfg: Config with Self-Flow on.
+    """
+    _ = manual_seed(0)
+    student, teacher = self_flow_views(
+        clean_geometry,
+        zero_noise,
+        torch.tensor(2.0),
+        template_distogram_fn,
+        self_flow_tcfg,
+    )
+    torch.testing.assert_close(student.r_noised, clean_geometry.flat_pos)
+    torch.testing.assert_close(teacher.r_noised, clean_geometry.flat_pos)
+    assert bool((teacher.t_hat == student.t_hat.amin()).all())
+
+
+@pytest.fixture
+def ramp_noise(clean_geometry: NoisingGeometry) -> Float[torch.Tensor, "N 3"]:
+    """Deterministic, non-zero unit noise for ``clean_geometry``.
+
+    A centred linear ramp, scaled to a few tenths, so centring and scaling
+    both have something to act on without random draws.
+
+    Returns:
+        Noise shaped like the flat positions.
+
+    Args:
+        clean_geometry: Geometry the noise is shaped for.
+    """
+    n_values = clean_geometry.flat_pos.numel()
+    ramp = torch.linspace(-1.0, 1.0, n_values)
+    return rearrange(0.3 * ramp, "(n d) -> n d", d=3)
+
+
+def test_per_residue_view_with_uniform_sigma_matches_the_single_view(
+    clean_geometry: NoisingGeometry,
+    ramp_noise: Float[torch.Tensor, "N 3"],
+    template_distogram_fn: Distogram,
+    tcfg: TrainConfig,
+) -> None:
+    """Per-residue noising at one shared sigma is the default single view.
+
+    No other cases: with every residue at the same sigma the two code paths
+    must agree. They differ only in whether noise is centred before or
+    after scaling, which is the same up to float rounding.
+
+    Args:
+        clean_geometry: Clean geometry.
+        ramp_noise: Deterministic unit noise.
+        template_distogram_fn: Template distogram module.
+        tcfg: Default config supplying the schedule.
+    """
+    sigma = torch.tensor(3.0)
+    single = single_noised_view(
+        clean_geometry,
+        ramp_noise,
+        sigma,
+        template_distogram_fn,
+        tcfg.noise,
+    )
+    per_residue = per_residue_noised_view(
+        clean_geometry,
+        ramp_noise,
+        repeat(sigma, "-> n", n=clean_geometry.residue_mask.shape[0]),
+        template_distogram_fn,
+        tcfg.noise,
+    )
+    torch.testing.assert_close(per_residue.r_noised, single.r_noised)
+    torch.testing.assert_close(per_residue.t_hat, single.t_hat)
+    torch.testing.assert_close(per_residue.t_normalized, single.t_normalized)
+    torch.testing.assert_close(
+        per_residue.noised_res_distogram,
+        single.noised_res_distogram,
+    )
