@@ -32,9 +32,8 @@ from architecture.losses import (
 )
 from architecture.main_trunk import EMA, MainTrunk, PredictedOutputs
 from beartype import beartype
-from einops import rearrange, reduce
+from einops import reduce
 from helpers.alignment import kabsch_align
-from helpers.atom_utils import ATOMS_PER_RES, atom5_to_atom37, atom37_to_cb
 from helpers.context_managers import (
     DDPNoSync,
     DistProcessGroup,
@@ -62,6 +61,11 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import Adam
 from torch.optim.lr_scheduler import LambdaLR
 from tqdm import tqdm
+from train.self_flow import (
+    SelfFlowTerms,
+    self_flow_terms,
+    template_from_prediction,
+)
 from train.train_config import TrainArgs, TrainConfig, TrainingParams
 
 CUDA_DEVICE_TYPE = "cuda"
@@ -235,24 +239,11 @@ def self_conditioned_template(
                 ),
             ),
         )
-        atom37_positions, atom37_mask = atom5_to_atom37(
-            rearrange(
-                pred.r_denoised,
-                "b (n a) d -> b n a d",
-                a=ATOMS_PER_RES,
-            ),
-            rearrange(
-                batch.atom5_mask,
-                "b (n a) -> b n a",
-                a=ATOMS_PER_RES,
-            ).float(),
+        return template_from_prediction(
+            pred,
+            batch,
+            model_params.distogram_template,
         )
-        cb_positions, _ = atom37_to_cb(atom37_positions, atom37_mask)
-        template, _ = model_params.distogram_template(
-            cb_positions,
-            batch.f_pseudo_beta_mask.bool(),
-        )
-    return template
 
 
 @jaxtyped(typechecker=beartype)
@@ -382,6 +373,22 @@ def take_step(
             featurized_batch.aa_indices,
         )
 
+        # Self-Flow: align a student unit to the EMA teacher's deeper unit.
+        # Only training steps on batches with a teacher view run the teacher,
+        # and alpha_5 = 0 (the dual-timestep-only control) skips it.
+        self_flow: SelfFlowTerms = (
+            self_flow_terms(
+                model_params,
+                featurized_batch,
+                pred_outputs,
+                lambda_sigma_loss_weight,
+            )
+            if train_mode
+            and featurized_batch.teacher_view is not None
+            and lp.alpha_5 > 0
+            else SelfFlowTerms.zero(model_params.device)
+        )
+
         total_loss: Float[torch.Tensor, ""] = (
             lp.lam * Kabsch_aligned_MSE_loss
             + lp.alpha_0 * CE_loss
@@ -389,6 +396,7 @@ def take_step(
             + lp.alpha_2 * residue_distogram_loss
             + lp.alpha_3 * atom_distogram_loss
             + lp.alpha_4 * intermediate_loss
+            + lp.alpha_5 * self_flow.loss
         )
     if train_mode:
         torch.autograd.backward([total_loss / grad_scale])
@@ -429,6 +437,11 @@ def take_step(
         RMSD=rmsd,
         low_sigma_loss_share=noise_shares.loss_share,
         low_sigma_weight_share=noise_shares.weight_share,
+        self_flow_loss=self_flow.loss.detach(),
+        self_flow_teacher_gt_mse=self_flow.teacher_gt_mse,
+        self_flow_student_gt_mse=self_flow.student_gt_mse,
+        self_flow_low_sigma_loss_share=self_flow.low_sigma_loss_share,
+        self_flow_low_sigma_sample_share=self_flow.low_sigma_sample_share,
     ), ThroughputStatistics(
         avg_batch_size=torch.tensor(float(b_size), device=device),
         token_pack_rate=torch.tensor(

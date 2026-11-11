@@ -239,6 +239,15 @@ class LossMetrics(TensorAccumulatorMixin):
             balances residues at different noise levels, it matches
             ``low_sigma_loss_share``. Both default to 0 so callers that
             predate them can omit them.
+        self_flow_loss: Self-Flow loss, the EDM-weighted Kabsch MSE between
+            the student decoder unit and the EMA teacher's deeper unit. 0 on
+            steps without a teacher pass, like the four fields below.
+        self_flow_teacher_gt_mse: Unweighted Kabsch MSE of the teacher unit
+            against ground truth.
+        self_flow_student_gt_mse: The same for the student unit.
+        self_flow_low_sigma_loss_share: Share of the Self-Flow loss from
+            proteins whose teacher noise level is below 1 Å.
+        self_flow_low_sigma_sample_share: Share of proteins below 1 Å.
     """
 
     total_loss: Float[torch.Tensor, ""]
@@ -254,6 +263,21 @@ class LossMetrics(TensorAccumulatorMixin):
     )
     low_sigma_weight_share: Float[torch.Tensor, ""] = dataclasses.field(
         default_factory=functools.partial(torch.tensor, 0.0),
+    )
+    self_flow_loss: Float[torch.Tensor, ""] = dataclasses.field(
+        default_factory=functools.partial(torch.tensor, 0.0),
+    )
+    self_flow_teacher_gt_mse: Float[torch.Tensor, ""] = dataclasses.field(
+        default_factory=functools.partial(torch.tensor, 0.0),
+    )
+    self_flow_student_gt_mse: Float[torch.Tensor, ""] = dataclasses.field(
+        default_factory=functools.partial(torch.tensor, 0.0),
+    )
+    self_flow_low_sigma_loss_share: Float[torch.Tensor, ""] = dataclasses.field(
+        default_factory=functools.partial(torch.tensor, 0.0),
+    )
+    self_flow_low_sigma_sample_share: Float[torch.Tensor, ""] = (
+        dataclasses.field(default_factory=functools.partial(torch.tensor, 0.0))
     )
 
 
