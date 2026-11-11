@@ -22,6 +22,12 @@ jobs:
       image-name: devcontainer-cuda
       static-checks-cmd: uv run --no-sync basedpyright pallatom
       cleanup-stale-container: true
+      # The GPUs are shared with training jobs; pytest needs none of them.
+      # Static checks and the CUDA assertion below still see the GPUs.
+      hide-gpus-from-pytest: true
+      # The host's 34 cores are shared with training too; torch's default of
+      # one thread per core oversubscribes them and slows tests ~10x.
+      pytest-cpu-threads: "8"
       build-run-cmd: |
         show-platform
         python3 -c "import torch; assert torch.cuda.is_available(), 'CUDA not available'"
