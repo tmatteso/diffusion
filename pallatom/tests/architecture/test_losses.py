@@ -37,6 +37,7 @@ from architecture.losses import (
     atom_loss,
     distogram_loss_atom,
     distogram_loss_residue,
+    edm_loss_weight,
     med_loss,
     pairwise_dist,
     residue_type_weight,
@@ -433,16 +434,16 @@ def aa_indices(dims: LossDims) -> Int[torch.Tensor, "B N_res"]:
 
 
 @pytest.fixture
-def ones_weight(dims: LossDims) -> Float[torch.Tensor, " B"]:
-    """Return an EDM noise weight of 1 for every batch item.
+def ones_weight(dims: LossDims) -> Float[torch.Tensor, "B N_atom"]:
+    """Return an EDM noise weight of 1 for every atom of every batch item.
 
     Args:
-        dims: Supplies the batch size.
+        dims: Supplies the batch size and atom count.
 
     Returns:
-        ``(B,)`` ones.
+        ``(B, N_atom)`` ones.
     """
-    return torch.ones(dims.batch)
+    return torch.ones(dims.batch, dims.n_atom)
 
 
 @pytest.fixture
@@ -579,7 +580,7 @@ def batch(
         r_gt_noised=gt.clone(),
         atom5_mask=torch.ones(b, n, dtype=torch.bool),
         aa_indices=aa_indices,
-        t_hat=torch.ones(b),
+        t_hat=torch.ones(b, r),
         t_normalized=torch.zeros(b, r, r),
         tok_idx=repeat(
             torch.repeat_interleave(torch.arange(r), dims.atoms_per_res),
@@ -689,7 +690,7 @@ def test_atom_loss_is_zero_for_a_rigid_copy(
     rigid_scenario: RigidScenario,
     gt: Coords,
     aa_indices: Int[torch.Tensor, "B N_res"],
-    ones_weight: Float[torch.Tensor, " B"],
+    ones_weight: Float[torch.Tensor, "B N_atom"],
 ) -> None:
     """Predicting a rigidly moved ground truth costs nothing after alignment.
 
@@ -719,7 +720,7 @@ def test_atom_loss_ignores_rigid_motion_of_the_target(
     gt: Coords,
     perturbed: Coords,
     aa_indices: Int[torch.Tensor, "B N_res"],
-    ones_weight: Float[torch.Tensor, " B"],
+    ones_weight: Float[torch.Tensor, "B N_atom"],
 ) -> None:
     """Moving the ground truth rigidly leaves a nonzero loss unchanged.
 
@@ -744,7 +745,7 @@ def test_atom_loss_grows_with_deviation(
     gt: Coords,
     perturbed: Coords,
     aa_indices: Int[torch.Tensor, "B N_res"],
-    ones_weight: Float[torch.Tensor, " B"],
+    ones_weight: Float[torch.Tensor, "B N_atom"],
 ) -> None:
     """Scaling a non-rigid deviation by 0.1, 1 and 5 strictly raises the loss.
 
@@ -774,12 +775,13 @@ def test_atom_loss_scales_linearly_with_the_noise_weight(
     gt: Coords,
     perturbed: Coords,
     aa_indices: Int[torch.Tensor, "B N_res"],
-    ones_weight: Float[torch.Tensor, " B"],
+    ones_weight: Float[torch.Tensor, "B N_atom"],
 ) -> None:
-    """Each item's loss is multiplied by its own ``lambda_sigma_weight``.
+    """Each item's loss is multiplied by a weight constant over its atoms.
 
-    Not parametrized: two different weights in one batch show both the
-    scaling and that it is per item.
+    When ``lambda_sigma_weight`` is the same for every atom of an item it
+    factors out of the weighted mean. Not parametrized: two different
+    weights in one batch show both the scaling and that it is per item.
 
     Args:
         gt: Ground truth.
@@ -787,7 +789,8 @@ def test_atom_loss_scales_linearly_with_the_noise_weight(
         aa_indices: Residue types.
         ones_weight: EDM weight of 1, the baseline.
     """
-    weight = torch.tensor([2.0, 0.5])
+    per_item = torch.tensor([2.0, 0.5])
+    weight = repeat(per_item, "b -> b n", n=ones_weight.shape[1])
     unit = atom_loss(
         perturbed,
         gt,
@@ -800,14 +803,14 @@ def test_atom_loss_scales_linearly_with_the_noise_weight(
         aa_indices=aa_indices,
         lambda_sigma_weight=weight,
     )
-    torch.testing.assert_close(weighted, weight * unit)
+    torch.testing.assert_close(weighted, per_item * unit)
 
 
 def test_atom_loss_gradient_reaches_prediction_only(
     gt: Coords,
     perturbed: Coords,
     aa_indices: Int[torch.Tensor, "B N_res"],
-    ones_weight: Float[torch.Tensor, " B"],
+    ones_weight: Float[torch.Tensor, "B N_atom"],
 ) -> None:
     """The prediction gets a finite, nonzero gradient; the target gets none.
 
@@ -882,7 +885,7 @@ def test_atom_loss_weights_each_residue_by_polarity(
         perturbed,
         gt,
         aa_indices=aa,
-        lambda_sigma_weight=torch.ones(dims.batch),
+        lambda_sigma_weight=torch.ones(dims.batch, dims.n_atom),
     )
     torch.testing.assert_close(loss, expected, atol=1e-4, rtol=1e-4)
 
@@ -890,7 +893,7 @@ def test_atom_loss_weights_each_residue_by_polarity(
 def test_atom_loss_masked_atoms_count_for_nothing(
     gt: Coords,
     aa_indices: Int[torch.Tensor, "B N_res"],
-    ones_weight: Float[torch.Tensor, " B"],
+    ones_weight: Float[torch.Tensor, "B N_atom"],
 ) -> None:
     """A huge error on masked atoms leaves the loss at zero.
 
@@ -922,7 +925,7 @@ def test_atom_loss_all_ones_mask_matches_no_mask(
     gt: Coords,
     perturbed: Coords,
     aa_indices: Int[torch.Tensor, "B N_res"],
-    ones_weight: Float[torch.Tensor, " B"],
+    ones_weight: Float[torch.Tensor, "B N_atom"],
 ) -> None:
     """An all-ones mask gives the same loss as omitting the mask.
 
@@ -942,7 +945,7 @@ def test_atom_loss_all_ones_mask_matches_no_mask(
 
 def test_atom_loss_rejects_atoms_not_divisible_by_residues(
     gt: Coords,
-    ones_weight: Float[torch.Tensor, " B"],
+    ones_weight: Float[torch.Tensor, "B N_atom"],
 ) -> None:
     """12 atoms with 5 residue types cannot be split evenly and raise.
 
@@ -960,7 +963,7 @@ def test_atom_loss_rejects_atoms_not_divisible_by_residues(
 def test_atom_loss_rejects_four_coordinate_atoms(
     malformed_inputs: MalformedInputs,
     aa_indices: Int[torch.Tensor, "B N_res"],
-    ones_weight: Float[torch.Tensor, " B"],
+    ones_weight: Float[torch.Tensor, "B N_atom"],
 ) -> None:
     """A ``(B, N, 4)`` prediction fails the jaxtyping contract.
 
@@ -1035,7 +1038,7 @@ def test_med_loss_matches_closed_form(
     med_scenario: MedScenario,
     batch: FeaturizedBatch,
     perturbed: Coords,
-    ones_weight: Float[torch.Tensor, " B"],
+    ones_weight: Float[torch.Tensor, "B N_atom"],
 ) -> None:
     """Over identical blocks, ``med_loss`` is a decayed mean of the two terms.
 
@@ -1083,7 +1086,7 @@ def test_med_loss_matches_closed_form(
 )
 def test_med_loss_rejects_bad_block_lists(
     batch: FeaturizedBatch,
-    ones_weight: Float[torch.Tensor, " B"],
+    ones_weight: Float[torch.Tensor, "B N_atom"],
     n_structure: int,
     n_sequence: int,
     error: type[ValueError],
@@ -1111,7 +1114,7 @@ def test_med_loss_rejects_bad_block_lists(
 def test_med_loss_gradient_reaches_the_earliest_block(
     batch: FeaturizedBatch,
     perturbed: Coords,
-    ones_weight: Float[torch.Tensor, " B"],
+    ones_weight: Float[torch.Tensor, "B N_atom"],
 ) -> None:
     """Block 0, the most decayed, still gets a finite nonzero gradient.
 
@@ -1500,3 +1503,95 @@ def test_losses_reject_malformed_inputs(
     """
     with pytest.raises(TypeCheckError):
         _ = malformed_scenario.value.call(malformed_inputs)
+
+
+@dataclasses.dataclass(frozen=True)
+class EdmWeightCase:
+    """Inputs and expected output of one ``edm_loss_weight`` call.
+
+    Attributes:
+        t_hat: Noise level of each residue, one row per sample.
+        sigma_data: Standard deviation of the clean data.
+        points_per_residue: Points (atoms) each residue's weight covers.
+        expected: Expected weight of each point, one row per sample.
+    """
+
+    t_hat: tuple[tuple[float, ...], ...]
+    sigma_data: float
+    points_per_residue: int
+    expected: tuple[tuple[float, ...], ...]
+
+
+class EdmWeight(enum.Enum):
+    """Hand-computed EDM weights ``(t^2 + s^2) / (t * s)^2``.
+
+    Members:
+        uniform: sigma 1 everywhere with sigma_data 1 gives 2 per point.
+        mixed: sigma 1 then 2 gives 2 for the first residue's points and
+            (4 + 1) / 4 = 1.25 for the second's.
+        default_scale: sigma 16 with the default sigma_data 16 gives
+            512 / 65536 = 0.0078125.
+    """
+
+    uniform = EdmWeightCase(((1.0, 1.0),), 1.0, 2, ((2.0, 2.0, 2.0, 2.0),))
+    mixed = EdmWeightCase(((1.0, 2.0),), 1.0, 2, ((2.0, 2.0, 1.25, 1.25),))
+    default_scale = EdmWeightCase(((16.0,),), 16.0, 1, ((0.0078125,),))
+
+
+@pytest.fixture
+def edm_weight(edm_weight_scenario: EdmWeight) -> Float[torch.Tensor, "B N"]:
+    """EDM weight computed for the scenario's noise levels.
+
+    Args:
+        edm_weight_scenario: Inputs to ``edm_loss_weight``; the requesting
+            test parametrizes it.
+
+    Returns:
+        The per-point weight returned by ``edm_loss_weight``.
+    """
+    case = edm_weight_scenario.value
+    return edm_loss_weight(
+        torch.tensor(case.t_hat),
+        case.sigma_data,
+        points_per_residue=case.points_per_residue,
+    )
+
+
+@pytest.fixture
+def expected_edm_weight(
+    edm_weight_scenario: EdmWeight,
+) -> Float[torch.Tensor, "B N"]:
+    """Hand-computed per-point weight for the scenario.
+
+    Args:
+        edm_weight_scenario: Case holding the expected weights; the
+            requesting test parametrizes it.
+
+    Returns:
+        The expected weights as a tensor.
+    """
+    return torch.tensor(edm_weight_scenario.value.expected)
+
+
+@pytest.mark.parametrize(
+    "edm_weight_scenario",
+    list(EdmWeight),
+    ids=[case.name for case in EdmWeight],
+)
+def test_edm_loss_weight_repeats_each_residue_weight_over_its_points(
+    edm_weight: Float[torch.Tensor, "B N"],
+    expected_edm_weight: Float[torch.Tensor, "B N"],
+) -> None:
+    """Each point gets the EDM weight of its own residue's noise level.
+
+    Arrange: per-residue noise levels with hand-computed weights.
+    Act: ``edm_loss_weight``.
+    Assert: the weights match point for point, so residues at different
+    noise levels get different weights and each weight covers exactly its
+    residue's points.
+
+    Args:
+        edm_weight: Computed per-point weights.
+        expected_edm_weight: Hand-computed per-point weights.
+    """
+    torch.testing.assert_close(edm_weight, expected_edm_weight)
