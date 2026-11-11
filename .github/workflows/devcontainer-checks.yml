@@ -44,6 +44,11 @@ on:
         required: false
         type: boolean
         default: false
+      hide-gpus-from-pytest:
+        description: "Run pytest with CUDA_VISIBLE_DEVICES empty, so tests never allocate GPU memory"
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   static-checks:
@@ -117,7 +122,15 @@ jobs:
           push: never
           noCache: ${{ inputs.no-cache }}
           # Keep pytest from writing into the bind-mounted checkout as root.
+          # With hide-gpus-from-pytest, no test can open a CUDA context (the
+          # DataLoader's pin-memory thread otherwise opens one on GPU 0), so
+          # the suite cannot run out of memory next to a training job on the
+          # same GPUs. No test needs a GPU; pinning becomes a no-op, as on
+          # the ARM64 runner.
           runCmd: |
             export PYTHONDONTWRITEBYTECODE=1
             export HYPOTHESIS_STORAGE_DIRECTORY=/tmp/hypothesis
+            if [ "${{ inputs.hide-gpus-from-pytest }}" = "true" ]; then
+              export CUDA_VISIBLE_DEVICES=""
+            fi
             pytest -p no:cacheprovider pallatom
