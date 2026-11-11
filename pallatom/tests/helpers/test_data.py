@@ -204,7 +204,7 @@ def featurized_item_raw() -> FeaturizedItem:
         ref_pos=torch.randn(BT_N_ATOM, 3),
         ref_element=torch.zeros(BT_N_ATOM, 4),
         f_residue_idx=torch.arange(BT_N_RES, dtype=torch.long),
-        t_hat=torch.randn([]),
+        t_hat=torch.randn(BT_N_RES),
         t_normalized=torch.randn(BT_N_RES, BT_N_RES),
         ref_space_uid=torch.arange(
             BT_N_RES,
@@ -282,7 +282,7 @@ def test_featurized_item_rejects_1d_r_gt() -> None:
             ref_pos=torch.randn(BT_N_ATOM, 3),
             ref_element=torch.zeros(BT_N_ATOM, 4),
             f_residue_idx=torch.arange(BT_N_RES, dtype=torch.long),
-            t_hat=torch.randn([]),
+            t_hat=torch.randn(BT_N_RES),
             t_normalized=torch.randn(BT_N_RES, BT_N_RES),
             ref_space_uid=torch.zeros(BT_N_ATOM, dtype=torch.long),
             tok_idx=torch.zeros(BT_N_ATOM, dtype=torch.long),
@@ -327,7 +327,7 @@ def test_featurized_item_rejects_wrong_ref_element_dim() -> None:
             ref_pos=torch.randn(BT_N_ATOM, 3),
             ref_element=torch.zeros(BT_N_ATOM, 3),
             f_residue_idx=torch.arange(BT_N_RES, dtype=torch.long),
-            t_hat=torch.randn([]),
+            t_hat=torch.randn(BT_N_RES),
             t_normalized=torch.randn(BT_N_RES, BT_N_RES),
             ref_space_uid=torch.zeros(BT_N_ATOM, dtype=torch.long),
             tok_idx=torch.zeros(BT_N_ATOM, dtype=torch.long),
@@ -383,7 +383,7 @@ def featurized_batch_raw() -> FeaturizedBatch:
         r_gt_noised=torch.randn(BT_B, BT_N_ATOM, 3),
         atom5_mask=torch.ones(BT_B, BT_N_ATOM, dtype=torch.bool),
         aa_indices=torch.zeros(BT_B, BT_N_RES, dtype=torch.long),
-        t_hat=torch.randn(BT_B),
+        t_hat=torch.randn(BT_B, BT_N_RES),
         t_normalized=torch.rand(BT_B, BT_N_RES, BT_N_RES),
         tok_idx=torch.zeros(BT_B, BT_N_ATOM, dtype=torch.long),
         center_uid=torch.zeros(BT_B, BT_N_ATOM, dtype=torch.long),
@@ -471,7 +471,7 @@ def test_featurized_batch_rejects_unbatched_ref_pos() -> None:
             r_gt_noised=torch.randn(BT_B, BT_N_ATOM, 3),
             atom5_mask=torch.ones(BT_B, BT_N_ATOM, dtype=torch.bool),
             aa_indices=torch.zeros(BT_B, BT_N_RES, dtype=torch.long),
-            t_hat=torch.randn(BT_B),
+            t_hat=torch.randn(BT_B, BT_N_RES),
             t_normalized=torch.randn(BT_B, BT_N_RES, BT_N_RES),
             tok_idx=torch.zeros(BT_B, BT_N_ATOM, dtype=torch.long),
             center_uid=torch.zeros(BT_B, BT_N_ATOM, dtype=torch.long),
@@ -519,7 +519,7 @@ def test_featurized_batch_rejects_wrong_coords_dim() -> None:
             r_gt_noised=torch.randn(BT_B, BT_N_ATOM, 3),
             atom5_mask=torch.ones(BT_B, BT_N_ATOM, dtype=torch.bool),
             aa_indices=torch.zeros(BT_B, BT_N_RES, dtype=torch.long),
-            t_hat=torch.randn(BT_B),
+            t_hat=torch.randn(BT_B, BT_N_RES),
             t_normalized=torch.randn(BT_B, BT_N_RES, BT_N_RES),
             tok_idx=torch.zeros(BT_B, BT_N_ATOM, dtype=torch.long),
             center_uid=torch.zeros(BT_B, BT_N_ATOM, dtype=torch.long),
@@ -1083,7 +1083,7 @@ def test_featurize_single_item_output_shapes(
 
     assert all(
         [
-            bool(featurized_item.t_hat > 0.0),
+            bool((featurized_item.t_hat > 0.0).all()),
             bool((featurized_item.t_normalized >= 0.0).all()),
             bool((featurized_item.t_normalized <= 1.0).all()),
         ],
@@ -2261,7 +2261,10 @@ def test_featurized_template_weight_is_normalized_noise_level(
     embedder. It must now equal the sampler's definition at every residue
     pair. No other cases: the item's noise level is the only input.
     """
-    expected = normalized_time_from_sigma(featurized_item.t_hat, tcfg.noise)
+    expected = normalized_time_from_sigma(
+        featurized_item.t_hat[0],
+        tcfg.noise,
+    )
     assert torch.equal(
         featurized_item.t_normalized,
         torch.full_like(featurized_item.t_normalized, expected.item()),

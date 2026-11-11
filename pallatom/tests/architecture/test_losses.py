@@ -7,6 +7,9 @@ all-masked edge case, conditioning-dropout token conventions, and the
 featurize pipeline's handling of unknown amino acid 'X'.
 """
 
+import dataclasses
+import enum
+
 import numpy as np
 import pytest
 import torch
@@ -23,6 +26,7 @@ from architecture.losses import (
     atom_loss,
     distogram_loss_atom,
     distogram_loss_residue,
+    edm_loss_weight,
     med_loss,
     pairwise_dist,
     residue_type_weight,
@@ -326,7 +330,7 @@ def batch(
         r_gt_noised=r_gt.clone(),
         atom5_mask=torch.ones(B, N, dtype=torch.bool),
         aa_indices=aa_gt,
-        t_hat=torch.zeros(B),
+        t_hat=torch.zeros(B, N),
         t_normalized=torch.zeros(B, N, N),
         tok_idx=torch.zeros(B, N, dtype=torch.long),
         center_uid=torch.zeros(B, N, dtype=torch.long),
@@ -452,7 +456,7 @@ def test_atom_loss_perfect_near_zero(
         coords,
         coords,
         aa_indices=uniform_aa_indices,
-        lambda_sigma_weight=torch.ones(B),
+        lambda_sigma_weight=torch.ones(B, N),
     )
     assert loss.shape == (B,)
     assert loss.max().item() < TOLERANCE
@@ -474,7 +478,7 @@ def test_atom_loss_known_translation_near_zero(
         r_translated,
         coords,
         aa_indices=uniform_aa_indices,
-        lambda_sigma_weight=torch.ones(B),
+        lambda_sigma_weight=torch.ones(B, N),
     )
     assert (loss < TIGHT_TOLERANCE).all()
 
@@ -490,7 +494,7 @@ def test_atom_loss_full_mask_matches_no_mask(
     to the unmasked default, confirming mask has no unintended side effects.
     """
     mask_all = torch.ones(B, N, dtype=torch.float)
-    w = torch.ones(B)
+    w = torch.ones(B, N)
     assert torch.allclose(
         atom_loss(
             coords,
@@ -521,7 +525,7 @@ def test_atom_loss_increases_with_noise_level(
     """
     _ = manual_seed(0)
     noise_dir = torch.randn(B, N, 3)
-    w = torch.ones(B)
+    w = torch.ones(B, N)
     loss_low = atom_loss(
         coords + 0.1 * noise_dir,
         coords,
@@ -553,7 +557,7 @@ def test_atom_loss_gradient_flow() -> None:
     """
     aa_indices = torch.zeros(1, N, dtype=torch.long)
     r_pred = torch.randn(1, N, 3, requires_grad=True)
-    w1 = torch.ones(1)
+    w1 = torch.ones(1, N)
     (grad,) = torch.autograd.grad(
         atom_loss(
             r_pred,
@@ -592,7 +596,7 @@ def test_atom_loss_rotation_invariant(
     tolerance.
     """
     r_gt_rot = einsum(r_gt, rotation, "b n d, d e -> b n e")
-    w = torch.ones(B)
+    w = torch.ones(B, N)
     assert torch.allclose(
         atom_loss(
             coords,
@@ -643,7 +647,7 @@ def test_med_loss_scalar_finite_positive(
         list(aa_blocks),
         batch,
         LossParams(lam=LAM, alpha_0=ALPHA, gamma=GAMMA),
-        lambda_sigma_weight=torch.ones(B),
+        lambda_sigma_weight=torch.ones(B, N),
     )
     assert loss.ndim == 0
     assert torch.isfinite(loss)
@@ -665,7 +669,7 @@ def test_med_loss_perfect_struct_near_zero(
         list(aa_blocks),
         batch,
         LossParams(lam=LAM, alpha_0=0.0, gamma=GAMMA),
-        lambda_sigma_weight=torch.ones(B),
+        lambda_sigma_weight=torch.ones(B, N),
     )
     assert loss.item() < TOLERANCE
 
@@ -702,7 +706,7 @@ def test_med_loss_mismatched_blocks_raises(
             list(aa_blocks)[:-1],
             batch,
             LossParams(lam=LAM, alpha_0=ALPHA),
-            lambda_sigma_weight=torch.ones(B),
+            lambda_sigma_weight=torch.ones(B, N),
         )
 
 
@@ -732,7 +736,7 @@ def test_med_loss_gradient_flows_to_first_block() -> None:
         r_gt_noised=torch.randn(1, N, 3),
         atom5_mask=torch.ones(1, N, dtype=torch.bool),
         aa_indices=torch.randint(0, VOCAB, (1, N)),
-        t_hat=torch.zeros(1),
+        t_hat=torch.zeros(1, N),
         t_normalized=torch.zeros(1, N, N),
         tok_idx=torch.zeros(1, N, dtype=torch.long),
         center_uid=torch.zeros(1, N, dtype=torch.long),
@@ -750,7 +754,7 @@ def test_med_loss_gradient_flows_to_first_block() -> None:
             aa_blocks_g,
             batch_1,
             LossParams(lam=LAM, alpha_0=ALPHA, gamma=GAMMA),
-            lambda_sigma_weight=torch.ones(1),
+            lambda_sigma_weight=torch.ones(1, N),
         ),
         r0,
     )
@@ -769,7 +773,7 @@ def test_med_loss_hyperparams_scale_contributions(
     smaller total loss than the nominal configuration.
     """
     r_list, aa_list = list(r_blocks), list(aa_blocks)
-    w = torch.ones(B)
+    w = torch.ones(B, N)
     loss_nominal = med_loss(
         r_list,
         aa_list,
@@ -1105,7 +1109,7 @@ def test_atom_loss_wrong_shape() -> None:
             r_bad,
             r_target,
             aa_indices=aa_indices,
-            lambda_sigma_weight=torch.ones(B),
+            lambda_sigma_weight=torch.ones(B, N),
         )
 
 
@@ -1124,7 +1128,7 @@ def test_atom_loss_residue_count_mismatch_raises() -> None:
             r,
             r,
             aa_indices=aa_indices,
-            lambda_sigma_weight=torch.ones(B),
+            lambda_sigma_weight=torch.ones(B, N),
         )
 
 
@@ -1180,7 +1184,7 @@ def test_atom_loss_weights_deviation_by_residue_polarity(
         pred_coords,
         gt_coords,
         aa_indices=aa_indices,
-        lambda_sigma_weight=torch.ones(1),
+        lambda_sigma_weight=torch.ones(1, n_res),
     )
     assert torch.allclose(loss, expected, atol=1e-4)
 
@@ -1273,7 +1277,7 @@ def test_atom_loss_padded_residue_ignored_regardless_of_polarity() -> None:
         gt_coords,
         mask=mask,
         aa_indices=aa_indices,
-        lambda_sigma_weight=torch.ones(1),
+        lambda_sigma_weight=torch.ones(1, n_res),
     )
     assert loss.item() < TOLERANCE
 
@@ -1562,3 +1566,100 @@ def test_seq_ce_loss_all_ignored_returns_zero() -> None:
     loss: Float[torch.Tensor, ""] = seq_ce_loss(logits, aa_all_x)
 
     assert loss.item() == 0.0
+
+
+# ---------------------------------------------------------------------------
+# edm_loss_weight
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class EdmWeightCase:
+    """Inputs and expected output of one ``edm_loss_weight`` call.
+
+    Attributes:
+        t_hat: Noise level of each residue, one row per sample.
+        sigma_data: Standard deviation of the clean data.
+        points_per_residue: Points (atoms) each residue's weight covers.
+        expected: Expected weight of each point, one row per sample.
+    """
+
+    t_hat: tuple[tuple[float, ...], ...]
+    sigma_data: float
+    points_per_residue: int
+    expected: tuple[tuple[float, ...], ...]
+
+
+class EdmWeight(enum.Enum):
+    """Hand-computed EDM weights ``(t^2 + s^2) / (t * s)^2``.
+
+    Members:
+        uniform: sigma 1 everywhere with sigma_data 1 gives 2 per point.
+        mixed: sigma 1 then 2 gives 2 for the first residue's points and
+            (4 + 1) / 4 = 1.25 for the second's.
+        default_scale: sigma 16 with the default sigma_data 16 gives
+            512 / 65536 = 0.0078125.
+    """
+
+    uniform = EdmWeightCase(((1.0, 1.0),), 1.0, 2, ((2.0, 2.0, 2.0, 2.0),))
+    mixed = EdmWeightCase(((1.0, 2.0),), 1.0, 2, ((2.0, 2.0, 1.25, 1.25),))
+    default_scale = EdmWeightCase(((16.0,),), 16.0, 1, ((0.0078125,),))
+
+
+@pytest.fixture
+def edm_weight(edm_weight_scenario: EdmWeight) -> Float[torch.Tensor, "B N"]:
+    """EDM weight computed for the scenario's noise levels.
+
+    Args:
+        edm_weight_scenario: Inputs to ``edm_loss_weight``; the requesting
+            test parametrizes it.
+
+    Returns:
+        The per-point weight returned by ``edm_loss_weight``.
+    """
+    case = edm_weight_scenario.value
+    return edm_loss_weight(
+        torch.tensor(case.t_hat),
+        case.sigma_data,
+        points_per_residue=case.points_per_residue,
+    )
+
+
+@pytest.fixture
+def expected_edm_weight(
+    edm_weight_scenario: EdmWeight,
+) -> Float[torch.Tensor, "B N"]:
+    """Hand-computed per-point weight for the scenario.
+
+    Args:
+        edm_weight_scenario: Case holding the expected weights; the
+            requesting test parametrizes it.
+
+    Returns:
+        The expected weights as a tensor.
+    """
+    return torch.tensor(edm_weight_scenario.value.expected)
+
+
+@pytest.mark.parametrize(
+    "edm_weight_scenario",
+    list(EdmWeight),
+    ids=[case.name for case in EdmWeight],
+)
+def test_edm_loss_weight_repeats_each_residue_weight_over_its_points(
+    edm_weight: Float[torch.Tensor, "B N"],
+    expected_edm_weight: Float[torch.Tensor, "B N"],
+) -> None:
+    """Each point gets the EDM weight of its own residue's noise level.
+
+    Arrange: per-residue noise levels with hand-computed weights.
+    Act: ``edm_loss_weight``.
+    Assert: the weights match point for point, so residues at different
+    noise levels get different weights and each weight covers exactly its
+    residue's points.
+
+    Args:
+        edm_weight: Computed per-point weights.
+        expected_edm_weight: Hand-computed per-point weights.
+    """
+    torch.testing.assert_close(edm_weight, expected_edm_weight)

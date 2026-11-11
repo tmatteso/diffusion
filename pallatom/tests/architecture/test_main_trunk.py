@@ -326,7 +326,7 @@ def featurized_batch(  # noqa: PLR0913
         r_gt_noised=r_input,
         atom5_mask=torch.ones(B, N_ATOM, dtype=torch.bool),
         aa_indices=torch.zeros(B, N_RES, dtype=torch.long),
-        t_hat=torch.rand(B) + 0.1,
+        t_hat=torch.rand(B, N_RES) + 0.1,
         t_normalized=torch.randn(B, N_RES, N_RES),
         tok_idx=tok_idx,
         center_uid=center_uid,
@@ -747,7 +747,7 @@ def test_integration_gradient_flow_composite_loss(
         featurized_batch.r_gt,
         featurized_batch.atom5_mask.float(),
         aa_indices=featurized_batch.aa_indices,
-        lambda_sigma_weight=torch.ones(B),
+        lambda_sigma_weight=torch.ones(B, N_ATOM),
     ).mean()
     ce_loss = seq_ce_loss(pred.seq_logits, featurized_batch.aa_indices)
     lddt = smooth_lddt_loss(
@@ -786,7 +786,7 @@ def test_integration_gradient_flow_composite_loss(
             featurized_batch.r_gt,
             featurized_batch.atom5_mask.float(),
             aa_indices=featurized_batch.aa_indices,
-            lambda_sigma_weight=torch.ones(B),
+            lambda_sigma_weight=torch.ones(B, N_ATOM),
         ) + seq_ce_loss(inter_logits, featurized_batch.aa_indices)
         intermediate_loss = intermediate_loss + gamma * k_loss
     intermediate_loss = (intermediate_loss / max(K_unit, 1)).mean()
