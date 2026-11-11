@@ -100,7 +100,10 @@ class FeaturizedItem:
             encoded as a float vector of length 4.
         f_residue_idx: Integer residue index for each residue, projected to a
             sinusoidal embedding inside the model.
-        t_hat: Scalar noise level sigma sampled for this item during training.
+        t_hat: Noise level sigma of each residue. Training draws one sigma
+            per item and repeats it over every residue, padding included;
+            the per-residue shape lets later schedules noise residues at
+            different levels.
         t_normalized: Pairwise normalised time/template weights over residue
             pairs, used for time-conditional template weighting.
         ref_space_uid: Chain / space identifier per atom, used to determine
@@ -125,7 +128,7 @@ class FeaturizedItem:
     ref_pos: Float[torch.Tensor, "N_atom 3"]
     ref_element: Float[torch.Tensor, "N_atom 4"]
     f_residue_idx: Int[torch.Tensor, "N_res"]
-    t_hat: Float[torch.Tensor, ""]
+    t_hat: Float[torch.Tensor, "N_res"]
     t_normalized: Float[torch.Tensor, "N_res N_res"]
     ref_space_uid: Int[torch.Tensor, "N_atom"]
     tok_idx: Int[torch.Tensor, "N_atom"]
@@ -170,7 +173,8 @@ class FeaturizedBatch:
             residue after flattening.
         aa_indices: Integer amino-acid class indices per residue (vocabulary
             size 20) with batch dimension prepended.
-        t_hat: Per-item noise level sigma, one scalar per batch element.
+        t_hat: Noise level sigma of each residue, with batch dimension
+            prepended. Uniform within an item in training and sampling.
         t_normalized: Pairwise normalised time/template weights over residue
             pairs with batch dimension prepended.
         tok_idx: Maps each atom to its parent residue index ``[0, N_res)``
@@ -195,7 +199,7 @@ class FeaturizedBatch:
     r_gt_noised: Float[torch.Tensor, "B N_atom 3"]
     atom5_mask: Bool[torch.Tensor, "B N_atom"]
     aa_indices: Int[torch.Tensor, "B N_res"]
-    t_hat: Float[torch.Tensor, "B"]
+    t_hat: Float[torch.Tensor, "B N_res"]
     t_normalized: Float[torch.Tensor, "B N_res N_res"]
     tok_idx: Int[torch.Tensor, "B N_atom"]
     center_uid: Int[torch.Tensor, "B N_atom"]
@@ -633,8 +637,9 @@ def featurize_single_item(
         FeaturizedItem holding flat atom positions (ground-truth and noised),
         atom and residue masks, GT and noised Cβ distogram targets, sparse
         atom-pair distogram targets, ALA reference geometry, sequence indices,
-        the sampled noise level ``t_hat``, and the template weight
-        ``t_normalized``, the normalized noise level of ``t_hat``.
+        the sampled noise level ``t_hat`` repeated over every residue, and
+        the template weight ``t_normalized``, the normalized noise level of
+        the sampled sigma.
     """
     noise_params = tcfg.noise
     window_size = tcfg.model.window_size
@@ -671,15 +676,15 @@ def featurize_single_item(
     # Noise schedule lognormal. ln(sigma) ~ N(Pmean, Pstd**2),
     # Pmean = -1.2, Pstd = 1.5, sigma_data = 16,
     # ~ N(0, I) * Pstd + Pmean == ~ N(Pmean, Pstd**2).
-    # The reparameterization trick. t_hat is the sampled noise level per AF3.
-    t_hat: Float[torch.Tensor, ""] = noise_params.sigma_data * torch.exp(
+    # The reparameterization trick. sigma is the sampled noise level per AF3.
+    sigma: Float[torch.Tensor, ""] = noise_params.sigma_data * torch.exp(
         torch.randn(()) * noise_params.P_std + noise_params.P_mean,
     )
 
-    # t_normalized is the normalized noise level of t_hat, computed the same
+    # t_normalized is the normalized noise level of sigma, computed the same
     # way the sampler computes it, and broadcast to every residue pair.
     t_template: Float[torch.Tensor, "N_res N_res"] = repeat(
-        normalized_time_from_sigma(t_hat, noise_params),
+        normalized_time_from_sigma(sigma, noise_params),
         "-> n m",
         n=N_res,
         m=N_res,
@@ -733,7 +738,7 @@ def featurize_single_item(
     )
     noise = torch.randn_like(flat_pos)  # (N_atom, 3)
     # zero CoM over valid atoms only, so padded atom slots don't bias it
-    r_gt_noised = flat_pos + t_hat * (
+    r_gt_noised = flat_pos + sigma * (
         noise
         - rearrange(
             masked_com(
@@ -841,7 +846,7 @@ def featurize_single_item(
         ref_pos=ref_pos,
         ref_element=ref_elem,
         f_residue_idx=f_residue_idx,
-        t_hat=t_hat,
+        t_hat=repeat(sigma, "-> n", n=N_res),  # every residue shares sigma
         t_normalized=t_template,
         ref_space_uid=ref_space_uid,
         tok_idx=token_idx,

@@ -63,6 +63,10 @@ class EmbeddedInputs:
 
     Holds s_i, t_i, z_ij, atom skip embeddings, and metadata needed by the
     decoder loop. All tensor fields have a leading batch dimension B.
+
+    ``t_hat`` is the noise level of each residue, and ``t_hat_atom`` the same
+    values repeated over each residue's atoms. ``denom`` is the per-atom EDM
+    ``1 / c_in = sqrt(sigma_data^2 + t_hat_atom^2)``.
     """
 
     s_i: Float[torch.Tensor, "B N_res c_res"]
@@ -75,12 +79,13 @@ class EmbeddedInputs:
     r_input: Float[torch.Tensor, "B N_atom 3"]
     tok_idx: Int[torch.Tensor, "B N_atom"]
     center_uid: Int[torch.Tensor, "B N_atom"]
-    t_hat: Float[torch.Tensor, "B"]
+    t_hat: Float[torch.Tensor, "B N_res"]
+    t_hat_atom: Float[torch.Tensor, "B N_atom"]
     B: int
     N_atom: int
     N_res: int
     device: torch.device
-    denom: Float[torch.Tensor, "B"]
+    denom: Float[torch.Tensor, "B N_atom"]
 
 
 @jaxtyped(typechecker=beartype)
@@ -459,7 +464,7 @@ class MainTrunk(nn.Module):
         f_residue_idx: Int[torch.Tensor, "B N_res"] = batch.f_residue_idx
 
         r_input: Float[torch.Tensor, "B N_atom 3"] = batch.r_gt_noised
-        t_hat: Float[torch.Tensor, "B"] = batch.t_hat
+        t_hat: Float[torch.Tensor, "B N_res"] = batch.t_hat
         t: Float[torch.Tensor, "B N_res N_res"] = batch.t_normalized
         tok_idx: Int[torch.Tensor, "B N_atom"] = batch.tok_idx
         center_uid: Int[torch.Tensor, "B N_atom"] = batch.center_uid
@@ -472,12 +477,20 @@ class MainTrunk(nn.Module):
 
         # ------------------------------------------------------------------
         # Step 1: r_scaled = r_input / sqrt(sigma_data² + t̂²)  [B, N_atom, 3]
-        # this is c_in from EDM. t_hat is sigma
+        # this is c_in from EDM. t_hat is sigma, one per residue, so c_in is
+        # applied per atom using the atom's residue sigma.
         # ------------------------------------------------------------------
-        denom: Float[torch.Tensor, "B"] = torch.sqrt(sd**2 + t_hat**2)
+        t_hat_atom: Float[torch.Tensor, "B N_atom"] = repeat(
+            t_hat,
+            "b n -> b (n a)",
+            a=N_atom // N_res,
+        )
+        denom: Float[torch.Tensor, "B N_atom"] = torch.sqrt(
+            sd**2 + t_hat_atom**2,
+        )
         r_scaled: Float[torch.Tensor, "B N_atom 3"] = r_input / rearrange(
             denom,
-            "b -> b 1 1",
+            "b n -> b n 1",
         )
 
         # ------------------------------------------------------------------
@@ -492,14 +505,9 @@ class MainTrunk(nn.Module):
 
         # ------------------------------------------------------------------
         # Step 3: t_i = TimeFourierEmbedding(¼·log(t̂))  [B, N_res, c_res]
-        # this is noise conditioning, c_noise from EDM.
+        # this is noise conditioning, c_noise from EDM, one per residue.
         # ------------------------------------------------------------------
-        log_val: Float[torch.Tensor, "B"] = 0.25 * torch.log(t_hat)
-        log_arg: Float[torch.Tensor, "B N_res"] = repeat(
-            log_val,
-            "b -> b n",
-            n=N_res,
-        )
+        log_arg: Float[torch.Tensor, "B N_res"] = 0.25 * torch.log(t_hat)
         t_i: Float[torch.Tensor, "B N_res c_res"] = self.time_fourier(log_arg)
 
         # ------------------------------------------------------------------
@@ -584,6 +592,7 @@ class MainTrunk(nn.Module):
             tok_idx=tok_idx,
             center_uid=center_uid,
             t_hat=t_hat,
+            t_hat_atom=t_hat_atom,
             B=B,
             N_atom=N_atom,
             N_res=N_res,
@@ -680,12 +689,18 @@ class MainTrunk(nn.Module):
             # Step 13: r_updates += r_update
             r_updates = r_updates + r_update
 
-            # Step 14: EDM adjustment
+            # Step 14: EDM adjustment, per atom from its residue's t̂
             # c_skip = sigma²/(sigma²+t̂²)
             # c_out = sigma·t̂/√(sigma²+t̂²)
             # EDM r_denoised = c_skip * r_input + c_out * r_updates
-            w_gt = rearrange(sd**2 / (sd**2 + emb.t_hat**2), "b -> b 1 1")
-            w_upd = rearrange((sd * emb.t_hat) / emb.denom, "b -> b 1 1")
+            w_gt = rearrange(
+                sd**2 / (sd**2 + emb.t_hat_atom**2),
+                "b n -> b n 1",
+            )
+            w_upd = rearrange(
+                (sd * emb.t_hat_atom) / emb.denom,
+                "b n -> b n 1",
+            )
             r_denoised = w_gt * emb.r_input + w_upd * r_updates
 
             intermediate_denoised_coord_stack.append(r_denoised)
