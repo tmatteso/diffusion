@@ -1,381 +1,473 @@
 """Tests for the template embedder.
 
-Covers TemplateEmbedder forward pass correctness, output shape, gradient flow,
-time/mask/distogram modulation, batched consistency, and shape-contract
-enforcement. Also tests the typed helper utilities (outer_product,
-mean_sq_diff) and the underlying PairformerStack used inside TemplateEmbedder.
+Covers TemplateEmbedder's output shape and dtype, that each of its four
+inputs conditions the output, batch independence, gradient flow to every
+differentiable input, and the jaxtyping shape contract on ``forward``.
+
+Inputs are deterministic patterns rather than random draws, and the model
+is built under a fixed seed inside its fixture, so every test is
+reproducible on its own regardless of run order.
 """
+
+import abc
+import dataclasses
+import enum
+from typing import cast, override
 
 import pytest
 import torch
 import torch.nn.functional as F
-from architecture.pairformer_stack import PairformerStack
 from architecture.template_embedder import TemplateEmbedder
-from beartype import beartype
-from einops import einsum, rearrange, reduce
+from einops import rearrange, reduce
 from helpers.useful_objects import manual_seed
-from jaxtyping import Float, TypeCheckError, jaxtyped
-
-_ = manual_seed(42)
-
-B = 2
-N_RES = 6
-N_BINS = 8
-C_Z = 16  # input pair dim
-C = 8  # internal pair dim  (must divide N_HEADS)
-D = 16  # output dim
-N_HEADS = 4
-N_BLOCKS = 1
+from jaxtyping import Float, TypeCheckError
 
 
-# ---------------------------------------------------------------------------
-# Typed helpers
-# ---------------------------------------------------------------------------
+@dataclasses.dataclass(frozen=True)
+class EmbedderDims:
+    """Batch, sequence and channel sizes shared by every test in the module.
 
-
-@jaxtyped(typechecker=beartype)
-def outer_product(
-    v: Float[torch.Tensor, "B N"],
-) -> Float[torch.Tensor, "B N N"]:
-    """Compute the outer product b_ij = v_i · v_j.
-
-    Mirrors the mask outer product used to build b_mask inside
-    TemplateEmbedder.
+    Attributes:
+        batch: Batch size ``B``.
+        n_res: Residues per protein ``N_res``.
+        n_bins: Distogram bins, the last axis of ``f_distogram``.
+        c_z: Trunk pair embedding width, the last axis of ``z_ij``.
+        c: Internal pair width; must be divisible by ``n_heads``.
+        d: Output pair width.
+        n_blocks: PairformerStack depth.
+        n_heads: Attention heads in the PairformerStack.
     """
-    return einsum(v, v, "b i, b j -> b i j")
+
+    batch: int
+    n_res: int
+    n_bins: int
+    c_z: int
+    c: int
+    d: int
+    n_blocks: int
+    n_heads: int
 
 
-@jaxtyped(typechecker=beartype)
-def mean_sq_diff(
-    a: Float[torch.Tensor, "B N N D"],
-    b: Float[torch.Tensor, "B N N D"],
-) -> Float[torch.Tensor, ""]:
-    """Return mean squared element-wise difference between a and b.
+@dataclasses.dataclass(frozen=True)
+class EmbedderInputs:
+    """The four positional arguments of ``TemplateEmbedder.forward``.
 
-    Reduces over all batch, spatial, and channel dimensions.
+    Deliberately not ``@jaxtyped``: malformed-input scenarios build a copy
+    with one field reshaped, and the embedder, not this container, must be
+    the thing that rejects it.
+
+    Attributes:
+        f_distogram: One-hot distogram ``(B, N_res, N_res, n_bins)``.
+        f_pseudo_beta_mask: Per-residue template mask ``(B, N_res)``.
+        z_ij: Trunk pair embedding ``(B, N_res, N_res, c_z)``.
+        t: Diffusion time broadcast over pairs ``(B, N_res, N_res)``.
     """
-    diff = a - b
-    return reduce(
-        einsum(diff, diff, "b n m d, b n m d -> b n m"),
-        "b n m -> ",
-        "mean",
-    )
+
+    f_distogram: Float[torch.Tensor, "B N_res N_res n_bins"]
+    f_pseudo_beta_mask: Float[torch.Tensor, "B N_res"]
+    z_ij: Float[torch.Tensor, "B N_res N_res c_z"]
+    t: Float[torch.Tensor, "B N_res N_res"]
 
 
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
+@dataclasses.dataclass(frozen=True)
+class InputEdit(abc.ABC):
+    """A change to one embedder input, applied to the base inputs.
+
+    Each subclass names one kind of change and holds its settings as plain
+    fields, so every scenario reads as data.
+
+    Attributes:
+        field: Name of the ``EmbedderInputs`` field to change.
+    """
+
+    field: str
+
+    @abc.abstractmethod
+    def transform(
+        self,
+        tensor: Float[torch.Tensor, "..."],
+    ) -> Float[torch.Tensor, "..."]:
+        """Return the replacement for the field's tensor.
+
+        Args:
+            tensor: The field's current value.
+
+        Returns:
+            The tensor to store in ``field``.
+        """
+
+    def apply(self, inputs: EmbedderInputs) -> EmbedderInputs:
+        """Return a copy of ``inputs`` with ``field`` transformed.
+
+        Args:
+            inputs: Inputs to copy.
+
+        Returns:
+            The copy, every other field shared with ``inputs``.
+        """
+        old = cast(Float[torch.Tensor, "..."], getattr(inputs, self.field))
+        return dataclasses.replace(inputs, **{self.field: self.transform(old)})
+
+
+@dataclasses.dataclass(frozen=True)
+class ScaleEdit(InputEdit):
+    """Multiply the field by a constant.
+
+    Attributes:
+        factor: Multiplier applied to every element.
+    """
+
+    factor: float
+
+    @override
+    def transform(
+        self,
+        tensor: Float[torch.Tensor, "..."],
+    ) -> Float[torch.Tensor, "..."]:
+        """Scale ``tensor`` by ``factor``.
+
+        Args:
+            tensor: The field's current value.
+
+        Returns:
+            ``tensor * factor``.
+        """
+        return tensor * self.factor
+
+
+@dataclasses.dataclass(frozen=True)
+class ShiftBinsEdit(InputEdit):
+    """Move every entry one step up the last axis, wrapping the top bin."""
+
+    @override
+    def transform(
+        self,
+        tensor: Float[torch.Tensor, "..."],
+    ) -> Float[torch.Tensor, "..."]:
+        """Roll ``tensor`` by one along its last axis.
+
+        Args:
+            tensor: The field's current value.
+
+        Returns:
+            The rolled tensor; a one-hot bin ``k`` becomes bin ``k + 1``.
+        """
+        return tensor.roll(1, -1)
+
+
+@dataclasses.dataclass(frozen=True)
+class SelectEdit(InputEdit):
+    """Keep one index of an axis, removing that axis.
+
+    Attributes:
+        dim: Axis to select from.
+        index: Position along ``dim`` to keep.
+    """
+
+    dim: int
+    index: int
+
+    @override
+    def transform(
+        self,
+        tensor: Float[torch.Tensor, "..."],
+    ) -> Float[torch.Tensor, "..."]:
+        """Select ``index`` along ``dim``.
+
+        Args:
+            tensor: The field's current value.
+
+        Returns:
+            ``tensor`` with axis ``dim`` removed.
+        """
+        return tensor.select(self.dim, self.index)
+
+
+@dataclasses.dataclass(frozen=True)
+class DropFirstEdit(InputEdit):
+    """Remove the first entry of an axis, shortening it by one.
+
+    Attributes:
+        dim: Axis to shorten.
+    """
+
+    dim: int
+
+    @override
+    def transform(
+        self,
+        tensor: Float[torch.Tensor, "..."],
+    ) -> Float[torch.Tensor, "..."]:
+        """Drop index 0 along ``dim``.
+
+        Args:
+            tensor: The field's current value.
+
+        Returns:
+            ``tensor`` with ``dim`` one shorter.
+        """
+        return tensor.narrow(self.dim, 1, tensor.shape[self.dim] - 1)
+
+
+class ConditioningScenario(enum.Enum):
+    """Changes to a single input that must change the embedding.
+
+    Members:
+        time: ``t`` moves from 0.5 to 1.0 on every pair.
+        mask: Every residue's pseudo-beta mask drops from 1 to 0.
+        distogram: Every pair's one-hot bin shifts up by one.
+        pair_embedding: ``z_ij`` is negated.
+    """
+
+    time = ScaleEdit("t", factor=2.0)
+    mask = ScaleEdit("f_pseudo_beta_mask", factor=0.0)
+    distogram = ShiftBinsEdit("f_distogram")
+    pair_embedding = ScaleEdit("z_ij", factor=-1.0)
+
+
+class MalformedScenario(enum.Enum):
+    """Inputs whose shape breaks the ``forward`` jaxtyping contract.
+
+    Members:
+        distogram_missing_bins: ``f_distogram`` loses its ``n_bins`` axis.
+        mask_too_short: ``f_pseudo_beta_mask`` has one residue fewer than
+            the pair tensors.
+        time_per_residue: ``t`` is ``(B, N_res)`` instead of per pair.
+    """
+
+    distogram_missing_bins = SelectEdit("f_distogram", dim=-1, index=0)
+    mask_too_short = DropFirstEdit("f_pseudo_beta_mask", dim=1)
+    time_per_residue = SelectEdit("t", dim=1, index=0)
 
 
 @pytest.fixture
-def embedder() -> TemplateEmbedder:
-    """Provide a small TemplateEmbedder in eval mode.
+def dims() -> EmbedderDims:
+    """Return the small sizes every test builds its model and inputs from.
 
-    Constructed with test-sized hyperparameters (N_BINS, C_Z, C, D, N_BLOCKS,
-    N_HEADS).
+    Returns:
+        Sizes with ``c`` divisible by ``n_heads`` as the attention requires.
     """
+    return EmbedderDims(
+        batch=2,
+        n_res=6,
+        n_bins=8,
+        c_z=16,
+        c=8,
+        d=16,
+        n_blocks=1,
+        n_heads=4,
+    )
+
+
+@pytest.fixture
+def embedder(dims: EmbedderDims) -> TemplateEmbedder:
+    """Build a TemplateEmbedder in eval mode under a fixed seed.
+
+    Args:
+        dims: Model sizes.
+
+    Returns:
+        Deterministically initialised embedder.
+    """
+    _ = manual_seed(0)
     return TemplateEmbedder(
-        n_bins=N_BINS,
-        c_z=C_Z,
-        c=C,
-        d=D,
-        n_blocks=N_BLOCKS,
-        n_heads=N_HEADS,
+        n_bins=dims.n_bins,
+        c_z=dims.c_z,
+        c=dims.c,
+        d=dims.d,
+        n_blocks=dims.n_blocks,
+        n_heads=dims.n_heads,
     ).eval()
 
 
 @pytest.fixture
-def f_distogram() -> Float[torch.Tensor, "B N_res N_res N_bins"]:
-    """Provide a random one-hot distogram tensor (B, N_RES, N_RES, N_BINS).
+def base_inputs(dims: EmbedderDims) -> EmbedderInputs:
+    """Build deterministic, hand-readable embedder inputs.
 
-    Each pairwise position is assigned a random bin via one-hot encoding.
+    The distogram puts pair ``(i, j)`` in bin ``(i + j) % n_bins``, every
+    residue is masked in, ``z_ij`` is a sine ramp over its elements so no
+    two channels are equal, and ``t`` is 0.5 everywhere. Each batch item
+    is offset differently so the batch-independence test is meaningful.
+
+    Args:
+        dims: Sizes to build the tensors at.
+
+    Returns:
+        The four forward inputs.
     """
-    return F.one_hot(
-        torch.randint(0, N_BINS, (B, N_RES, N_RES)),
-        N_BINS,
-    ).float()
-
-
-@pytest.fixture
-def f_pseudo_beta_mask() -> Float[torch.Tensor, "B N_res"]:
-    """Provide an all-ones pseudo-beta mask (B, N_RES).
-
-    Indicates every residue has a valid pseudo-beta carbon in the template.
-    """
-    return torch.ones(B, N_RES)
-
-
-@pytest.fixture
-def zero_mask() -> Float[torch.Tensor, "B N_res"]:
-    """Provide an all-zeros pseudo-beta mask (B, N_RES).
-
-    Simulates a template with no valid pseudo-beta carbons for any residue.
-    """
-    return torch.zeros(B, N_RES)
-
-
-@pytest.fixture
-def z_ij() -> Float[torch.Tensor, "B N_res N_res C_z"]:
-    """Provide a random pair-embedding tensor (B, N_RES, N_RES, C_Z).
-
-    Used as the trunk pair embedding input to TemplateEmbedder.
-    """
-    return torch.randn(B, N_RES, N_RES, C_Z)
-
-
-# ---------------------------------------------------------------------------
-# Typed helper self-tests
-# ---------------------------------------------------------------------------
-
-
-def test_outer_product_known_values() -> None:
-    """Verify outer_product produces the correct values for a known input.
-
-    Uses hand-crafted vector where the expected outer product matrix is exact.
-    """
-    v = torch.tensor([[1.0, 0.0, 1.0]])  # B=1, N=3
-    expected = torch.tensor(
-        [[[1.0, 0.0, 1.0], [0.0, 0.0, 0.0], [1.0, 0.0, 1.0]]],
+    b, n = dims.batch, dims.n_res
+    idx = torch.arange(n)
+    bins = (rearrange(idx, "i -> 1 i 1") + rearrange(idx, "j -> 1 1 j")) + (
+        rearrange(torch.arange(b), "b -> b 1 1")
     )
-    assert torch.allclose(outer_product(v), expected)
+    ramp = torch.arange(b * n * n * dims.c_z, dtype=torch.float32)
+    return EmbedderInputs(
+        f_distogram=F.one_hot(bins % dims.n_bins, dims.n_bins).float(),
+        f_pseudo_beta_mask=torch.ones(b, n),
+        z_ij=rearrange(
+            torch.sin(ramp),
+            "(b i j c) -> b i j c",
+            b=b,
+            i=n,
+            j=n,
+        ),
+        t=torch.full((b, n, n), 0.5),
+    )
 
 
-def test_outer_product_diagonal_is_elementwise_square(
-    f_pseudo_beta_mask: Float[torch.Tensor, "B N_res"],
+def embed(
+    model: TemplateEmbedder,
+    inputs: EmbedderInputs,
+) -> Float[torch.Tensor, "B N_res N_res d"]:
+    """Run ``model.forward`` on the four fields of ``inputs`` in order.
+
+    Args:
+        model: Template embedder to run.
+        inputs: Forward inputs.
+
+    Returns:
+        Template pair embedding.
+    """
+    return model(
+        inputs.f_distogram,
+        inputs.f_pseudo_beta_mask,
+        inputs.z_ij,
+        inputs.t,
+    )
+
+
+@pytest.fixture
+def first_item_inputs(base_inputs: EmbedderInputs) -> EmbedderInputs:
+    """Return the first batch item of ``base_inputs`` as a batch of one.
+
+    Args:
+        base_inputs: Batched forward inputs.
+
+    Returns:
+        Every field sliced to ``[:1]``, keeping the batch axis.
+    """
+    return EmbedderInputs(
+        f_distogram=base_inputs.f_distogram[:1],
+        f_pseudo_beta_mask=base_inputs.f_pseudo_beta_mask[:1],
+        z_ij=base_inputs.z_ij[:1],
+        t=base_inputs.t[:1],
+    )
+
+
+def test_template_embedder_output_shape_and_dtype(
+    dims: EmbedderDims,
+    base_inputs: EmbedderInputs,
+    embedder: TemplateEmbedder,
 ) -> None:
-    """Outer_product diagonal equals element-wise square of the input vector.
+    """The embedding is float32 ``(B, N_res, N_res, d)`` and finite.
 
-    Checks identity diag(v ⊗ v) = v² for the all-ones pseudo-beta mask fixture.
+    Not parametrized: the output shape depends only on the sizes in
+    ``dims``, which the shape contract already ties to the inputs.
+
+    Args:
+        dims: Sizes the output must match.
+        base_inputs: Valid forward inputs.
+        embedder: Model under test.
     """
-    op = outer_product(f_pseudo_beta_mask)  # (B, N, N)
-    diag = torch.diagonal(op, dim1=-2, dim2=-1)  # (B, N)
-    assert torch.allclose(diag, f_pseudo_beta_mask**2)
-
-
-# ---------------------------------------------------------------------------
-# PairformerStack
-# ---------------------------------------------------------------------------
-
-
-def test_pairformer_stack_preserves_shape() -> None:
-    """PairformerStack preserves the [B, N_res, N_res, C] pair embedding shape.
-
-    Checks both shape equality and that all output values are finite.
-    """
-    stack = PairformerStack(c=C, n_blocks=N_BLOCKS, n_heads=N_HEADS)
-    v = torch.randn(B, N_RES, N_RES, C)
-    out = stack(s=None, z=v)
-    assert out.shape == (B, N_RES, N_RES, C)
+    with torch.no_grad():
+        out = embed(embedder, base_inputs)
+    assert out.shape == (dims.batch, dims.n_res, dims.n_res, dims.d)
+    assert out.dtype == torch.float32
     assert torch.isfinite(out).all()
 
 
-def test_pairformer_stack_gradient_flows() -> None:
-    """Gradients flow through PairformerStack back to pair embedding input.
-
-    Confirms that the backward pass populates v.grad with finite values.
-    """
-    stack = PairformerStack(c=C, n_blocks=N_BLOCKS, n_heads=N_HEADS)
-    v = torch.randn(B, N_RES, N_RES, C, requires_grad=True)
-    torch.autograd.backward([reduce(stack(s=None, z=v), "b n m c -> ", "sum")])
-    assert v.grad is not None
-    assert torch.isfinite(v.grad).all()
-
-
-# ---------------------------------------------------------------------------
-# TemplateEmbedder — output shape and values
-# ---------------------------------------------------------------------------
-
-
-def test_time_modulates_output(
+@pytest.mark.parametrize(
+    "conditioning_scenario",
+    list(ConditioningScenario),
+    ids=[case.name for case in ConditioningScenario],
+)
+def test_template_embedder_output_depends_on_each_input(
+    base_inputs: EmbedderInputs,
+    conditioning_scenario: ConditioningScenario,
     embedder: TemplateEmbedder,
-    f_distogram: Float[torch.Tensor, "B N_res N_res N_bins"],
-    f_pseudo_beta_mask: Float[torch.Tensor, "B N_res"],
-    z_ij: Float[torch.Tensor, "B N_res N_res C_z"],
 ) -> None:
-    """Verify changing diffusion time t changes the template embedding output.
+    """Changing any one input, all else fixed, changes the embedding.
 
-    Confirms time conditioning is correctly wired by comparing outputs at t=0
-    and t=0.5.
+    A failure means that input is not wired into the forward pass.
+
+    Args:
+        base_inputs: Valid forward inputs.
+        conditioning_scenario: Change applied to one input.
+        embedder: Model under test.
     """
     with torch.no_grad():
-        out_t0 = embedder(
-            f_distogram,
-            f_pseudo_beta_mask,
-            z_ij,
-            t=torch.zeros(B, N_RES, N_RES),
-        )
-        out_t5 = embedder(
-            f_distogram,
-            f_pseudo_beta_mask,
-            z_ij,
-            t=torch.full((B, N_RES, N_RES), 0.5),
-        )
-    assert mean_sq_diff(out_t0, out_t5).item() > 0
+        base = embed(embedder, base_inputs)
+        edited = embed(embedder, conditioning_scenario.value.apply(base_inputs))
+    assert not torch.allclose(base, edited)
 
 
-def test_mask_zeros_modulates_output(
+def test_template_embedder_batch_items_are_independent(
+    base_inputs: EmbedderInputs,
+    first_item_inputs: EmbedderInputs,
     embedder: TemplateEmbedder,
-    f_distogram: Float[torch.Tensor, "B N_res N_res N_bins"],
-    zero_mask: Float[torch.Tensor, "B N_res"],
-    z_ij: Float[torch.Tensor, "B N_res N_res C_z"],
 ) -> None:
-    """All-zero pseudo-beta mask produces different output than all-ones mask.
+    """Running the first item alone matches its slice of the batched run.
 
-    Checks mask (indicating valid template residues) meaningfully influences
-    the embedding, simulating the no-valid-template case.
-    """
-    t = torch.full((B, N_RES, N_RES), 0.5)
-    with torch.no_grad():
-        out_ones = embedder(f_distogram, torch.ones(B, N_RES), z_ij, t=t)
-        out_zeros = embedder(f_distogram, zero_mask, z_ij, t=t)
-    assert mean_sq_diff(out_ones, out_zeros).item() > 0
+    Not parametrized: one sliced item is enough to expose any cross-batch
+    mixing, since every batch item has distinct inputs.
 
-
-def test_distogram_modulates_output(
-    embedder: TemplateEmbedder,
-    f_pseudo_beta_mask: Float[torch.Tensor, "B N_res"],
-    z_ij: Float[torch.Tensor, "B N_res N_res C_z"],
-) -> None:
-    """Verify that different distogram templates produce different embeddings.
-
-    Generates two independent random one-hot distograms and checks their
-    outputs differ.
-    """
-    f_dist_a = F.one_hot(
-        torch.randint(0, N_BINS, (B, N_RES, N_RES)),
-        N_BINS,
-    ).float()
-    f_dist_b = F.one_hot(
-        torch.randint(0, N_BINS, (B, N_RES, N_RES)),
-        N_BINS,
-    ).float()
-    t = torch.full((B, N_RES, N_RES), 0.5)
-    with torch.no_grad():
-        out_a = embedder(f_dist_a, f_pseudo_beta_mask, z_ij, t=t)
-        out_b = embedder(f_dist_b, f_pseudo_beta_mask, z_ij, t=t)
-    assert mean_sq_diff(out_a, out_b).item() > 0
-
-
-def test_z_ij_modulates_output(
-    embedder: TemplateEmbedder,
-    f_distogram: Float[torch.Tensor, "B N_res N_res N_bins"],
-    f_pseudo_beta_mask: Float[torch.Tensor, "B N_res"],
-) -> None:
-    """Different pair embeddings z_ij produce different template embedder out.
-
-    Checks trunk pair embedding is active conditioning signal in forward pass.
-    """
-    z_a = torch.randn(B, N_RES, N_RES, C_Z)
-    z_b = torch.randn(B, N_RES, N_RES, C_Z)
-    t = torch.full((B, N_RES, N_RES), 0.5)
-    with torch.no_grad():
-        out_a = embedder(f_distogram, f_pseudo_beta_mask, z_a, t=t)
-        out_b = embedder(f_distogram, f_pseudo_beta_mask, z_b, t=t)
-    assert mean_sq_diff(out_a, out_b).item() > 0
-
-
-def test_batched_consistency(
-    embedder: TemplateEmbedder,
-    f_distogram: Float[torch.Tensor, "B N_res N_res N_bins"],
-    f_pseudo_beta_mask: Float[torch.Tensor, "B N_res"],
-    z_ij: Float[torch.Tensor, "B N_res N_res C_z"],
-) -> None:
-    """Processing one sample gives same result as slicing from larger batch.
-
-    Confirms embedder has no cross-batch interactions or batch-norm artefacts.
+    Args:
+        base_inputs: Batched forward inputs.
+        first_item_inputs: The first batch item alone.
+        embedder: Model under test.
     """
     with torch.no_grad():
-        out_batch = embedder(
-            f_distogram,
-            f_pseudo_beta_mask,
-            z_ij,
-            t=torch.full((B, N_RES, N_RES), 0.5),
-        )
-        out_single = embedder(
-            f_distogram[:1],
-            f_pseudo_beta_mask[:1],
-            z_ij[:1],
-            t=torch.full((1, N_RES, N_RES), 0.5),
-        )
-    assert torch.allclose(
-        rearrange(out_batch[0], "n m d -> 1 n m d"),
-        out_single,
-        atol=1e-5,
-    )
+        batched = embed(embedder, base_inputs)[:1]
+        single = embed(embedder, first_item_inputs)
+    torch.testing.assert_close(batched, single, atol=1e-5, rtol=0)
 
 
-# ---------------------------------------------------------------------------
-# TemplateEmbedder — gradient flow
-# ---------------------------------------------------------------------------
-
-
-def test_gradient_flows_to_z_ij(
-    embedder: TemplateEmbedder,
-    f_distogram: Float[torch.Tensor, "B N_res N_res N_bins"],
-    f_pseudo_beta_mask: Float[torch.Tensor, "B N_res"],
-) -> None:
-    """Verify template embedder output is differentiable with respect to z_ij.
-
-    Checks that the backward pass populates z_g.grad with finite values.
-    """
-    z_g = torch.randn(B, N_RES, N_RES, C_Z, requires_grad=True)
-    t = torch.full((B, N_RES, N_RES), 0.3)
-    out = embedder(f_distogram, f_pseudo_beta_mask, z_g, t=t)
-    torch.autograd.backward([reduce(out, "b n m d -> ", "sum")])
-    assert z_g.grad is not None
-    assert torch.isfinite(z_g.grad).all()
-
-
-def test_gradient_flows_to_f_distogram(
-    embedder: TemplateEmbedder,
-    f_pseudo_beta_mask: Float[torch.Tensor, "B N_res"],
-    z_ij: Float[torch.Tensor, "B N_res N_res C_z"],
-) -> None:
-    """Template embedder output is differentiable w.r.t distogram features.
-
-    Checks that the backward pass populates f_dist_g.grad with finite values.
-    """
-    f_dist_g = torch.randn(B, N_RES, N_RES, N_BINS, requires_grad=True)
-    t = torch.full((B, N_RES, N_RES), 0.3)
-    out = embedder(f_dist_g, f_pseudo_beta_mask, z_ij, t=t)
-    torch.autograd.backward([reduce(out, "b n m d -> ", "sum")])
-    assert f_dist_g.grad is not None
-    assert torch.isfinite(f_dist_g.grad).all()
-
-
-def test_gradient_flows_to_f_pseudo_beta_mask(
-    embedder: TemplateEmbedder,
-    f_distogram: Float[torch.Tensor, "B N_res N_res N_bins"],
-    z_ij: Float[torch.Tensor, "B N_res N_res C_z"],
-) -> None:
-    """Template embedder output is differentiable w.r.t. pseudo-beta mask.
-
-    Checks that the backward pass populates mask_g.grad with finite values.
-    """
-    mask_g = torch.ones(B, N_RES, requires_grad=True)
-    t = torch.full((B, N_RES, N_RES), 0.3)
-    out = embedder(f_distogram, mask_g, z_ij, t=t)
-    torch.autograd.backward([reduce(out, "b n m d -> ", "sum")])
-    assert mask_g.grad is not None
-    assert torch.isfinite(mask_g.grad).all()
-
-
-# ---------------------------------------------------------------------------
-# Shape-contract enforcement — negative tests
-# ---------------------------------------------------------------------------
-
-
-def test_template_embedder_forward_wrong_shape(
+@pytest.mark.parametrize(
+    "grad_input_name",
+    ["f_distogram", "f_pseudo_beta_mask", "z_ij"],
+)
+def test_template_embedder_gradient_reaches_input(
+    base_inputs: EmbedderInputs,
+    grad_input_name: str,
     embedder: TemplateEmbedder,
 ) -> None:
-    """Verify wrong f_distogram ndim triggers TypeCheckError.
+    """The summed embedding has a finite, nonzero gradient for the input.
 
-    Passes a 3-D tensor (missing the n_bins dimension) to confirm shape
-    contracts fire.
+    ``t`` is left out: in training it is a sampled noise level, never a
+    learned quantity.
+
+    Args:
+        base_inputs: Valid forward inputs.
+        grad_input_name: Field to differentiate with respect to.
+        embedder: Model under test.
     """
-    f_distogram_bad = torch.zeros(B, N_RES, N_RES)  # missing n_bins dim
-    bad_mask = torch.zeros(B, N_RES)
-    bad_z_ij = torch.zeros(B, N_RES, N_RES, C_Z)
-    t = torch.full((B, N_RES, N_RES), 0.5)
+    leaf = cast(torch.Tensor, getattr(base_inputs, grad_input_name))
+    leaf = leaf.clone().requires_grad_()
+    inputs = dataclasses.replace(base_inputs, **{grad_input_name: leaf})
+    out = reduce(embed(embedder, inputs), "b i j d -> ", "sum")
+    torch.autograd.backward([out])
+    assert leaf.grad is not None
+    assert torch.isfinite(leaf.grad).all()
+    assert torch.count_nonzero(leaf.grad) > 0
+
+
+@pytest.mark.parametrize(
+    "malformed_scenario",
+    list(MalformedScenario),
+    ids=[case.name for case in MalformedScenario],
+)
+def test_template_embedder_rejects_malformed_input(
+    base_inputs: EmbedderInputs,
+    malformed_scenario: MalformedScenario,
+    embedder: TemplateEmbedder,
+) -> None:
+    """A wrongly shaped input fails the jaxtyping contract on ``forward``.
+
+    Args:
+        base_inputs: Valid forward inputs.
+        malformed_scenario: Edit that breaks one input's shape.
+        embedder: Model under test.
+    """
+    malformed = malformed_scenario.value.apply(base_inputs)
     with pytest.raises(TypeCheckError):
-        _ = embedder(f_distogram_bad, bad_mask, bad_z_ij, t)
+        _ = embed(embedder, malformed)
