@@ -43,7 +43,7 @@ from helpers.data import (
 from jaxtyping import Bool, Float, Int, Num, jaxtyped
 from sample.sample_config import SampleConfig, SamplerParams
 from structlog.typing import FilteringBoundLogger
-from train.train_config import NoiseScheduleParams
+from train.train_config import NoiseScheduleParams, length_noise_shift
 
 NATOM = 5  # atoms per residue
 
@@ -552,6 +552,9 @@ class EDMSampler:
                        not a noise level (Pallatom: 0.01 and 1.0)
     S_noise   : float  scaling of injected noise
     noise_shift : float  multiplier on every schedule noise level (1 = off)
+    length_shift: float  training's length-dependent sigma multiplier for the
+                       context's residue count (1 unless
+                       noise_params.length_shift_beta > 0)
     """
 
     def __init__(
@@ -578,6 +581,10 @@ class EDMSampler:
         self.eta_step_scale: float = sampler_params.eta_step_scale
         self.seq_temperature: float = sampler_params.seq_temperature
         self.noise_shift: float = sampler_params.noise_shift
+        self.length_shift: float = length_noise_shift(
+            context.aa_indices.shape[1],
+            noise_params,
+        )
         self.device: torch.device = context.r_gt.device
 
     @jaxtyped(typechecker=beartype)
@@ -591,8 +598,8 @@ class EDMSampler:
         Pallatom sampler's convention: sampling starts near t = 1 and steps
         toward t = 0. The formula is:
 
-        t_hat = noise_shift * sigma_data * (sigma_min^(1/rho) + t *
-        (sigma_max^(1/rho) - sigma_min^(1/rho)))^rho
+        t_hat = noise_shift * length_shift * sigma_data * (sigma_min^(1/rho)
+        + t * (sigma_max^(1/rho) - sigma_min^(1/rho)))^rho
 
         ``noise_shift`` (``SamplerParams.noise_shift``, default 1) is the
         EDM form of a rectified-flow timestep shift. Every noise level the
@@ -601,10 +608,15 @@ class EDMSampler:
         still computed from the shifted sigma by
         ``normalized_time_from_sigma``, the same mapping training uses, so
         the model is told the noise level it actually sees.
+
+        ``length_shift`` is the same length-dependent multiplier training
+        applies to its sigma draws, so a model trained with a length shift
+        is sampled on the matching schedule.
         """
         t_hat: Float[torch.Tensor, ""] = cast(
             'Float[torch.Tensor, ""]',
             self.noise_shift
+            * self.length_shift
             * self.sigma_data
             * (
                 self.sigma_min ** (1 / self.rho)

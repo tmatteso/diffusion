@@ -339,3 +339,53 @@ def test_shifted_sampling_runs_end_to_end(
     """
     assert shifted_sample_coords.shape == sampling_context.r_gt.shape
     assert bool(torch.isfinite(shifted_sample_coords).all())
+
+
+@pytest.fixture
+def length_shifted_schedule(
+    small_trunk: MainTrunk,
+    sampling_context: FeaturizedBatch,
+    template_distogram: Distogram,
+    schedule_times: Float[torch.Tensor, "n_t"],
+) -> Float[torch.Tensor, "n_t"]:
+    """Schedule of a sampler whose noise params carry a length shift.
+
+    The context has four residues; ``length_shift_ref`` 16 with
+    ``length_shift_beta`` 0.5 gives a shift of ``sqrt(4 / 16) = 0.5``.
+
+    Args:
+        small_trunk: Model the sampler drives.
+        sampling_context: Four-residue sampling context.
+        template_distogram: Template distogram module.
+        schedule_times: Times at which to evaluate the schedule.
+
+    Returns:
+        ``noise_schedule(t)`` for each time.
+    """
+    sampler = EDMSampler(
+        small_trunk,
+        sampling_context,
+        template_distogram,
+        SamplerParams(S_churn=0.0, ddim_steps=2),
+        NoiseScheduleParams(length_shift_beta=0.5, length_shift_ref=16),
+    )
+    return torch.stack([sampler.noise_schedule(t) for t in schedule_times])
+
+
+def test_length_shift_scales_the_sampling_schedule(
+    length_shifted_schedule: Float[torch.Tensor, "n_t"],
+    unshifted_schedule: Float[torch.Tensor, "n_t"],
+) -> None:
+    """Sampling applies the same length shift that training applies.
+
+    No other cases: the shift is one multiplier set by the protein length,
+    and its formula is tested in ``test_length_shift.py``.
+
+    Args:
+        length_shifted_schedule: Schedule with a length shift of 0.5.
+        unshifted_schedule: Default schedule.
+    """
+    torch.testing.assert_close(
+        length_shifted_schedule,
+        0.5 * unshifted_schedule,
+    )
