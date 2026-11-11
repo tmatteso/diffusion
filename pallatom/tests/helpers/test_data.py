@@ -1332,7 +1332,7 @@ def test_featurize_single_item_shapes_ranges_and_index_maps(
     }
     assert {k: tuple(fields[k].shape) for k in shapes} == shapes
     assert all(torch.isfinite(t.float()).all() for t in fields.values())
-    assert bool(x.t_hat > 0)
+    assert bool((x.t_hat > 0).all())
     assert bool(((x.t_normalized >= 0) & (x.t_normalized <= 1)).all())
     assert torch.equal(x.ref_space_uid, residue)
     assert torch.equal(x.tok_idx, residue)
@@ -1683,6 +1683,9 @@ def expected_t_normalized(
 ) -> Float[torch.Tensor, "N_res N_res"]:
     """Build the template weight the featurizer must give ``featurized_item``.
 
+    ``t_hat`` is per residue, but the featurizer draws one noise level per
+    item, so the first residue's level sets the expected weight.
+
     Args:
         featurized_item: Item whose ``t_hat`` sets the noise level.
         tcfg: Supplies the noise schedule.
@@ -1690,7 +1693,7 @@ def expected_t_normalized(
     Returns:
         ``normalized_time_from_sigma(t_hat)`` at every residue pair.
     """
-    expected = normalized_time_from_sigma(featurized_item.t_hat, tcfg.noise)
+    expected = normalized_time_from_sigma(featurized_item.t_hat[0], tcfg.noise)
     return torch.full_like(featurized_item.t_normalized, expected.item())
 
 
