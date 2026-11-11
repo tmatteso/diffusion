@@ -313,6 +313,34 @@ lines to Loki as they are.
   `addModel(pdb, "pdb")`, cartoon with `color: "spectrum"`, then `zoomTo()`.
 - No CSS framework; a small stylesheet with a responsive grid.
 
+**Layout and naming.** Components use **PascalCase**, both for the function
+and for the file, with one component per file and the file named after its
+component:
+
+```
+web/src/
+  main.tsx  App.tsx
+  components/  SampleForm.tsx  SampleGallery.tsx  SampleCard.tsx
+               StructureViewer.tsx  HealthIndicator.tsx
+  hooks/       useHealth.ts  useModelInfo.ts  useJob.ts
+  api/         client.ts  schema.d.ts   # schema.d.ts generated (§6.3)
+```
+
+| Kind | Case | Example |
+|------|------|---------|
+| Components, and their `.tsx` files | PascalCase | `SampleCard`, `SampleCard.tsx` |
+| Props types | PascalCase, `<Component>Props` | `SampleCardProps` |
+| Types, interfaces, enums | PascalCase | `JobState`, `ApiError` |
+| Hooks, and their files | camelCase with a `use` prefix | `useJob`, `useJob.ts` |
+| Other functions, variables, non-component files | camelCase | `submitJob`, `client.ts` |
+| Module-level constants | UPPER_SNAKE_CASE | `POLL_INTERVAL_MS` |
+
+Hooks are the deliberate exception to PascalCase. React's hook lint rules
+only recognise functions whose names start with `use`, so a hook named
+`UseJob` would silently escape `rules-of-hooks`. The API types generated
+from the Pydantic models (`SampleJobSpec`, `JobStatus`, …) are already
+PascalCase, so names match end to end, from Python to TypeScript.
+
 ### 6.2 UI
 
 ```
@@ -376,6 +404,15 @@ regenerates the file from a CPU-only app instance and fails on a diff.
   any class extending `Component` or `PureComponent`, whether imported bare
   or as `React.Component`. Other classes, such as an `ApiError extends Error`
   in `api/client.ts`, are still allowed.
+- Naming (§6.1) is enforced by lint errors:
+  - `@typescript-eslint/naming-convention`: type-like names must be
+    PascalCase; functions must be camelCase or PascalCase; variables must
+    be camelCase or UPPER_CASE.
+  - `react/jsx-pascal-case` covers component usage in JSX. React itself
+    treats any lowercase JSX tag as a DOM element, so a component that isn't
+    PascalCase would not render anyway.
+  - `eslint-plugin-check-file` requires PascalCase file names under
+    `components/` and `use*` camelCase file names under `hooks/`.
 - Prettier with an 80-column print width, to match Black.
 
 ## 7. Tooling, devcontainer and CI (Phase 1)
