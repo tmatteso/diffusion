@@ -28,10 +28,6 @@ from helpers.useful_objects import manual_seed
 from jaxtyping import Float, Int, TypeCheckError
 from tests.patterns import sine_pattern
 
-type Single = Float[torch.Tensor, "B N_res c_res"]
-type Pair = Float[torch.Tensor, "B N_res N_j c_pair"]
-type DenseModule = AttentionPairBias | NodeUpdate
-
 
 @dataclasses.dataclass(frozen=True)
 class NodeDims:
@@ -77,9 +73,9 @@ class NodeInputs:
         z: Pair embedding.
     """
 
-    s: Single
-    t: Single
-    z: Pair
+    s: Float[torch.Tensor, "B N_res c_res"]
+    t: Float[torch.Tensor, "B N_res c_res"]
+    z: Float[torch.Tensor, "B N_res N_j c_pair"]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -96,9 +92,9 @@ class SparseInputs:
         neighbor_idx: Key index for each query slot ``(B, N_res, K)``.
     """
 
-    a: Single
-    s: Single
-    z: Pair
+    a: Float[torch.Tensor, "B N_res c_res"]
+    s: Float[torch.Tensor, "B N_res c_res"]
+    z: Float[torch.Tensor, "B N_res N_j c_pair"]
     neighbor_idx: Int[torch.Tensor, "B N_res K"]
 
 
@@ -326,7 +322,10 @@ def sparse_inputs(
 
 
 @pytest.fixture
-def module_call(module_name: str, modules: NodeModules) -> DenseModule:
+def module_call(
+    module_name: str,
+    modules: NodeModules,
+) -> AttentionPairBias | NodeUpdate:
     """Return the ``(s, t, z)`` module named by ``module_name``.
 
     Args:
@@ -337,7 +336,7 @@ def module_call(module_name: str, modules: NodeModules) -> DenseModule:
     Returns:
         The chosen module.
     """
-    return cast(DenseModule, getattr(modules, module_name))
+    return cast(AttentionPairBias | NodeUpdate, getattr(modules, module_name))
 
 
 @pytest.fixture
@@ -369,7 +368,7 @@ def sparse_beta(
 def test_dense_output_shape_dtype_and_finite(
     dims: NodeDims,
     inputs: NodeInputs,
-    module_call: DenseModule,
+    module_call: AttentionPairBias | NodeUpdate,
 ) -> None:
     """Each module returns a finite float32 ``(B, N_res, c_res)`` tensor.
 
@@ -506,7 +505,7 @@ def test_sparse_gradient_reaches_node_embedding(
 )
 def test_every_parameter_receives_a_finite_gradient(
     inputs: NodeInputs,
-    module_call: DenseModule,
+    module_call: AttentionPairBias | NodeUpdate,
 ) -> None:
     """No parameter is skipped by the forward pass when ``s`` is provided.
 
