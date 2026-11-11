@@ -869,7 +869,7 @@ def sampler_trajectory(
     _ = manual_seed(0)
     _ = sampler.sample(shape)
     steps = denoiser.calls[::2]
-    step_sigmas = torch.stack([batch.t_hat[0] for batch in steps])
+    step_sigmas = torch.stack([batch.t_hat[0, 0] for batch in steps])
     step_rms = torch.stack([centred_rms(batch.r_gt_noised) for batch in steps])
     times = (torch.arange(case.ddim_steps, 0, -1) - case.jitter) * delta_t
     sigmas = torch.stack([sampler.noise_schedule(t) for t in times])
@@ -1066,7 +1066,7 @@ def test_build_sampling_context_holds_unconditional_placeholders(
         "atoms_present": bool(x.atom5_mask.all()),
         "pseudo_beta_present": bool((x.f_pseudo_beta_mask == 1).all()),
         "pairs_present": bool(x.gt_atom_distogram_mask_sparse.all()),
-        "t_hat_is_1": torch.equal(x.t_hat, torch.ones(1)),
+        "t_hat_is_1": torch.equal(x.t_hat, torch.ones(x.aa_indices.shape)),
         "t_normalized_is_half": torch.equal(
             x.t_normalized,
             torch.full_like(x.t_normalized, 0.5),
