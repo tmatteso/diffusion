@@ -289,6 +289,26 @@ lines to Loki as they are.
 ### 6.1 Stack
 
 - **Vite + React 19 + TypeScript**, strict. No router and no state library.
+  Scaffold with the `react-ts` template, which uses `@vitejs/plugin-react`
+  rather than the SWC variant. At this size SWC's dev-speed edge is
+  negligible, `plugin-react` is the officially supported path for the React
+  Compiler, and type checking comes from `tsc --noEmit` either way (§6.5).
+- **Function components only.** Every component is a plain function
+  declaration with a typed props interface and an explicit return type, for
+  example
+  `function SampleCard({ sample }: SampleCardProps): React.JSX.Element`.
+  Don't use `React.FC`. State and effects use hooks (`useState`,
+  `useReducer`, `useEffect`), and shared logic lives in custom hooks rather
+  than higher-order components or render props:
+  - `useHealth()` polls `/api/health`.
+  - `useModelInfo()` fetches `/api/model` once.
+  - `useJob(jobId)` holds the polling state machine for
+    `/api/jobs/{id}`: queued → running → succeeded or failed.
+
+  The one thing React still has no hook for is an **error boundary**. Use
+  the `react-error-boundary` package's `<ErrorBoundary>` component rather
+  than hand-writing a class, so the codebase itself contains no class
+  components.
 - **3Dmol.js** (npm `3dmol`), the JavaScript library under `py3Dmol`:
   `addModel(pdb, "pdb")`, cartoon with `color: "spectrum"`, then `zoomTo()`.
 - No CSS framework; a small stylesheet with a responsive grid.
@@ -348,7 +368,14 @@ regenerates the file from a CPU-only app instance and fails on a diff.
   `exactOptionalPropertyTypes`, `noImplicitOverride`.
 - ESLint with `typescript-eslint` `strictTypeChecked`;
   `no-explicit-any` and the `no-unsafe-*` rules are errors, mirroring the
-  repo's `Any` ban.
+  repo's `Any` ban. `explicit-module-boundary-types` is also an error,
+  mirroring the repo's rule that every function is annotated.
+- `eslint-plugin-react-hooks`: `rules-of-hooks` and `exhaustive-deps` are
+  errors.
+- Class components are banned by a `no-restricted-syntax` rule that matches
+  any class extending `Component` or `PureComponent`, whether imported bare
+  or as `React.Component`. Other classes, such as an `ApiError extends Error`
+  in `api/client.ts`, are still allowed.
 - Prettier with an 80-column print width, to match Black.
 
 ## 7. Tooling, devcontainer and CI (Phase 1)
