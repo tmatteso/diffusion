@@ -23,6 +23,7 @@ from architecture.losses import (
     POLAR_RESIDUE_WEIGHT,
     POLAR_RESIDUES,
     RESIDUE_TYPE_WEIGHTS,
+    NoiseGroupShares,
     atom_loss,
     distogram_loss_atom,
     distogram_loss_residue,
@@ -1783,7 +1784,11 @@ def test_noise_group_shares_all_or_nothing(
         unit_lambda: EDM weight of 1 everywhere.
         group_share_scenario: Expected share; parametrized.
     """
-    shares = noise_group_shares(denoised_near_gt, group_batch, unit_lambda)
+    shares: NoiseGroupShares = noise_group_shares(
+        denoised_near_gt,
+        group_batch,
+        unit_lambda,
+    )
     expected = torch.tensor(group_share_scenario.value.expected_share)
     torch.testing.assert_close(shares.loss_share, expected)
     torch.testing.assert_close(shares.weight_share, expected)
@@ -1832,6 +1837,10 @@ def test_noise_group_shares_split_batch(
         denoised_near_gt: Predicted coordinates.
         unit_lambda: EDM weight of 1 everywhere.
     """
-    shares = noise_group_shares(denoised_near_gt, half_low_batch, unit_lambda)
+    shares: NoiseGroupShares = noise_group_shares(
+        denoised_near_gt,
+        half_low_batch,
+        unit_lambda,
+    )
     torch.testing.assert_close(shares.weight_share, torch.tensor(0.5))
     assert 0.0 < float(shares.loss_share) < 1.0

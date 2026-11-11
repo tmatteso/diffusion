@@ -50,6 +50,7 @@ from helpers.data import (
     noised_template,
     normalized_time_from_sigma,
     null_template_distogram,
+    per_residue_noised_view,
     ref_pos_for_residue,
     sample_training_sigma,
     self_flow_views,
@@ -2781,3 +2782,63 @@ def test_self_flow_views_without_noise_are_both_the_clean_structure(
     torch.testing.assert_close(student.r_noised, clean_geometry.flat_pos)
     torch.testing.assert_close(teacher.r_noised, clean_geometry.flat_pos)
     assert bool((teacher.t_hat == student.t_hat.amin()).all())
+
+
+@pytest.fixture
+def ramp_noise(clean_geometry: NoisingGeometry) -> Float[torch.Tensor, "N 3"]:
+    """Deterministic, non-zero unit noise for ``clean_geometry``.
+
+    A centred linear ramp, scaled to a few tenths, so centring and scaling
+    both have something to act on without random draws.
+
+    Returns:
+        Noise shaped like the flat positions.
+
+    Args:
+        clean_geometry: Geometry the noise is shaped for.
+    """
+    n_values = clean_geometry.flat_pos.numel()
+    ramp = torch.linspace(-1.0, 1.0, n_values)
+    return rearrange(0.3 * ramp, "(n d) -> n d", d=3)
+
+
+def test_per_residue_view_with_uniform_sigma_matches_the_single_view(
+    clean_geometry: NoisingGeometry,
+    ramp_noise: Float[torch.Tensor, "N 3"],
+    template_distogram_fn: Distogram,
+    tcfg: TrainConfig,
+) -> None:
+    """Per-residue noising at one shared sigma is the default single view.
+
+    No other cases: with every residue at the same sigma the two code paths
+    must agree. They differ only in whether noise is centred before or
+    after scaling, which is the same up to float rounding.
+
+    Args:
+        clean_geometry: Clean geometry.
+        ramp_noise: Deterministic unit noise.
+        template_distogram_fn: Template distogram module.
+        tcfg: Default config supplying the schedule.
+    """
+    sigma = torch.tensor(3.0)
+    single = single_noised_view(
+        clean_geometry,
+        ramp_noise,
+        sigma,
+        template_distogram_fn,
+        tcfg.noise,
+    )
+    per_residue = per_residue_noised_view(
+        clean_geometry,
+        ramp_noise,
+        repeat(sigma, "-> n", n=clean_geometry.residue_mask.shape[0]),
+        template_distogram_fn,
+        tcfg.noise,
+    )
+    torch.testing.assert_close(per_residue.r_noised, single.r_noised)
+    torch.testing.assert_close(per_residue.t_hat, single.t_hat)
+    torch.testing.assert_close(per_residue.t_normalized, single.t_normalized)
+    torch.testing.assert_close(
+        per_residue.noised_res_distogram,
+        single.noised_res_distogram,
+    )
