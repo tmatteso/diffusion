@@ -17,9 +17,11 @@ is seeded in its fixtures.
 import abc
 import dataclasses
 import enum
+import gc
 import json
+import multiprocessing
+import multiprocessing.queues
 import pathlib
-import pickle
 from collections.abc import Mapping
 from concurrent.futures import Executor
 from math import cos, sin
@@ -51,7 +53,7 @@ from helpers.data import (
     sinusoidal_encoding,
 )
 from helpers.useful_objects import manual_seed
-from jaxtyping import Float, Shaped, TypeCheckError
+from jaxtyping import Bool, Float, Int, Shaped, TypeCheckError
 from tests.patterns import sine_pattern
 from train.train_config import (
     LoaderConfig,
@@ -61,10 +63,29 @@ from train.train_config import (
     TrainLoaderConfig,
 )
 
-type Entry = dict[str, object]
+
+def queue_round_trip[T](obj: T) -> T:
+    """Send ``obj`` through a ``multiprocessing.Queue`` and return the copy.
+
+    The queue pickles ``obj`` on ``put`` and unpickles it on ``get``, the
+    same transport a DataLoader uses to hand datasets and collate functions
+    to worker processes, so the copy is what a worker would receive.
+
+    Args:
+        obj: Object to send.
+
+    Returns:
+        The unpickled copy.
+    """
+    channel: multiprocessing.queues.Queue[T] = multiprocessing.Queue()
+    channel.put(obj)
+    copy = channel.get(timeout=60)
+    channel.close()
+    channel.join_thread()
+    return copy
 
 
-def protein_entry(name: str, n: int) -> Entry:
+def protein_entry(name: str, n: int) -> dict[str, object]:
     """Build an all-alanine JSONL protein entry with fixed coordinates.
 
     Residue ``i`` has its CA at ``(3.8 i, 0, 0)`` and N, C and O at fixed
@@ -90,7 +111,10 @@ def protein_entry(name: str, n: int) -> Entry:
     return {"name": name, "seq": "A" * n, "coords": coords}
 
 
-def write_jsonl(path: pathlib.Path, entries: list[Entry]) -> pathlib.Path:
+def write_jsonl(
+    path: pathlib.Path,
+    entries: list[dict[str, object]],
+) -> pathlib.Path:
     """Write one JSON object per line.
 
     Args:
@@ -1007,8 +1031,45 @@ def pickled_dataset(
     """
     if pickle_state.value.read_first:
         _ = train_dataset[0]
-    raw = pickle.dumps(train_dataset)
-    return cast(ProteinDataset, pickle.loads(raw))  # noqa: S301
+    return queue_round_trip(train_dataset)
+
+
+@dataclasses.dataclass(frozen=True)
+class ExpectedItemShapes:
+    """Shapes ``featurize_single_item`` must give the per-atom and pair fields.
+
+    Attributes:
+        ref_pos: ``(N_atom, 3)``.
+        ref_element: ``(N_atom, 4)``.
+        ref_space_uid: ``(N_atom,)``.
+        gt_res_distogram_indices: ``(N_res, N_res)``.
+        noised_res_distogram: ``(N_res, N_res, n_template_bins)``.
+        f_pseudo_beta_mask: ``(N_res,)``.
+        tok_idx: ``(N_atom,)``.
+        center_uid: ``(N_atom,)``.
+    """
+
+    ref_pos: tuple[int, ...]
+    ref_element: tuple[int, ...]
+    ref_space_uid: tuple[int, ...]
+    gt_res_distogram_indices: tuple[int, ...]
+    noised_res_distogram: tuple[int, ...]
+    f_pseudo_beta_mask: tuple[int, ...]
+    tok_idx: tuple[int, ...]
+    center_uid: tuple[int, ...]
+
+
+@dataclasses.dataclass(frozen=True)
+class MetadataMtimes:
+    """Shard metadata modification times around a second dataset build.
+
+    Attributes:
+        before: ``st_mtime_ns`` after the first build.
+        after: ``st_mtime_ns`` after the second build over the same names.
+    """
+
+    before: int
+    after: int
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1114,15 +1175,257 @@ def shard_loader_lifecycle(
     epoch_before_iter = loader.epoch
     batches = len(list(loader))
     epoch_after_iter = loader.epoch
-    loader.__del__()  # pylint: disable=unnecessary-dunder-call
+    process_executor = loader.process_executor
+    queue_watcher = loader.queue_watcher
+    del loader
+    _ = gc.collect()
     return ShardLoaderLifecycle(
         len_after_construction=len_after_construction,
         epoch_before_iter=epoch_before_iter,
         epoch_after_iter=epoch_after_iter,
         batches=batches,
-        process_executor_closed=refuses_new_work(loader.process_executor),
-        queue_watcher_closed=refuses_new_work(loader.queue_watcher),
+        process_executor_closed=refuses_new_work(process_executor),
+        queue_watcher_closed=refuses_new_work(queue_watcher),
     )
+
+
+@pytest.fixture
+def bin_distogram(bin_scenario: BinScenario) -> Distogram:
+    """Build a 16-bin distogram, with an overflow bin if the case asks.
+
+    Args:
+        bin_scenario: Overflow setting; the requesting test parametrizes
+            it.
+
+    Returns:
+        The module in eval mode.
+    """
+    return Distogram(n_bins=16, overflow_bin=bin_scenario.value.overflow).eval()
+
+
+@pytest.fixture
+def pair_at_distance(bin_scenario: BinScenario) -> Float[torch.Tensor, "2 3"]:
+    """Place two atoms the scenario's distance apart along ``x``.
+
+    Args:
+        bin_scenario: Supplies the distance; the requesting test
+            parametrizes it.
+
+    Returns:
+        Coordinates of the two atoms.
+    """
+    return torch.tensor([[0.0, 0, 0], [bin_scenario.value.distance, 0, 0]])
+
+
+@pytest.fixture
+def expected_bin_one_hot(
+    bin_scenario: BinScenario,
+) -> Float[torch.Tensor, " C"]:
+    """One-hot vector over the distogram's classes at the expected bin.
+
+    Args:
+        bin_scenario: Expected bin and overflow setting; the requesting
+            test parametrizes it.
+
+    Returns:
+        A one-hot vector of length ``16 + overflow``.
+    """
+    case = bin_scenario.value
+    expected = torch.zeros(16 + case.overflow)
+    expected[case.expected_bin] = 1
+    return expected
+
+
+@pytest.fixture
+def overflow_distogram(overflow_scenario: OverflowScenario) -> Distogram:
+    """Build a 16-bin distogram with the scenario's overflow setting.
+
+    Args:
+        overflow_scenario: Overflow setting; the requesting test
+            parametrizes it.
+
+    Returns:
+        The module in eval mode.
+    """
+    overflow_bin = overflow_scenario.value.overflow_bin
+    return Distogram(n_bins=16, overflow_bin=overflow_bin).eval()
+
+
+@pytest.fixture
+def no_overflow_distogram() -> Distogram:
+    """Build a 16-bin distogram without an overflow bin.
+
+    Returns:
+        The module in eval mode.
+    """
+    return Distogram(n_bins=16, overflow_bin=False).eval()
+
+
+@pytest.fixture
+def first_atom_invalid() -> Bool[torch.Tensor, "12"]:
+    """Mark atom 0 of 12 invalid and the rest valid.
+
+    Returns:
+        A boolean validity vector.
+    """
+    valid = torch.ones(12, dtype=torch.bool)
+    valid[0] = False
+    return valid
+
+
+@pytest.fixture
+def expected_pair_mask(
+    first_atom_invalid: Bool[torch.Tensor, "12"],
+) -> Bool[torch.Tensor, "12 12"]:
+    """A pair is valid exactly when both of its atoms are.
+
+    Args:
+        first_atom_invalid: Per-atom validity.
+
+    Returns:
+        The outer AND of the validity vector with itself.
+    """
+    valid = first_atom_invalid
+    return rearrange(valid, "i -> i 1") & rearrange(valid, "j -> 1 j")
+
+
+@pytest.fixture
+def sinusoid_position(
+    sinusoid_scenario: SinusoidScenario,
+) -> Float[torch.Tensor, "1 1"]:
+    """Wrap the scenario's position as a ``(1, 1)`` index tensor.
+
+    Args:
+        sinusoid_scenario: Supplies the position; the requesting test
+            parametrizes it.
+
+    Returns:
+        The position.
+    """
+    return torch.tensor([[sinusoid_scenario.value.position]])
+
+
+@pytest.fixture
+def expected_item_shapes(
+    protein: Protein,
+    tcfg: TrainConfig,
+) -> ExpectedItemShapes:
+    """Derive the per-atom and pair field shapes from ``protein``'s length.
+
+    Args:
+        protein: Supplies the residue count.
+        tcfg: Supplies the template bin count.
+
+    Returns:
+        The expected shapes.
+    """
+    n_res = len(protein.aatype)
+    n_atom = n_res * ATOMS_PER_RES
+    return ExpectedItemShapes(
+        ref_pos=(n_atom, 3),
+        ref_element=(n_atom, 4),
+        ref_space_uid=(n_atom,),
+        gt_res_distogram_indices=(n_res, n_res),
+        noised_res_distogram=(n_res, n_res, tcfg.distogram_template.n_bins),
+        f_pseudo_beta_mask=(n_res,),
+        tok_idx=(n_atom,),
+        center_uid=(n_atom,),
+    )
+
+
+@pytest.fixture
+def residue_of_atom(protein: Protein) -> Int[torch.Tensor, " N_atom"]:
+    """Map every atom to the index of its residue.
+
+    Args:
+        protein: Supplies the residue count.
+
+    Returns:
+        ``r`` repeated ``ATOMS_PER_RES`` times for each residue ``r``.
+    """
+    n_res = len(protein.aatype)
+    return repeat(torch.arange(n_res), "r -> (r a)", a=ATOMS_PER_RES)
+
+
+@pytest.fixture
+def featurize_collate(
+    tcfg: TrainConfig,
+    distograms: Distograms,
+) -> FeaturizeCollate:
+    """Build the collate function a DataLoader would hand to its workers.
+
+    Args:
+        tcfg: Configuration.
+        distograms: Template, residue and atom distograms.
+
+    Returns:
+        The collate function.
+    """
+    return FeaturizeCollate(
+        tcfg=tcfg,
+        distogram_template=distograms.template,
+        distogram_residue=distograms.residue,
+        distogram_atom=distograms.atom,
+    )
+
+
+@pytest.fixture
+def listed_dataset(
+    dataset_jsonl: pathlib.Path,
+    names: list[str],
+) -> ProteinDataset:
+    """Build a dataset over ``names`` from the three-entry JSONL.
+
+    Args:
+        dataset_jsonl: JSONL holding three proteins.
+        names: Names to include; the requesting test parametrizes it.
+
+    Returns:
+        The dataset, padding samples to 8 residues.
+    """
+    return ProteinDataset(dataset_jsonl, names, max_seq_length=8)
+
+
+@pytest.fixture
+def long_entry_dataset(long_entry_jsonl: pathlib.Path) -> ProteinDataset:
+    """Build an 8-residue dataset over an entry longer than 8 residues.
+
+    Args:
+        long_entry_jsonl: JSONL holding one long entry.
+
+    Returns:
+        The dataset.
+    """
+    return ProteinDataset(long_entry_jsonl, ["long.A"], max_seq_length=8)
+
+
+@pytest.fixture
+def metadata_mtimes(
+    shard_budget: ShardBudgetParameters,
+    single_entry_jsonl: pathlib.Path,
+) -> MetadataMtimes:
+    """Build the same shard dataset twice and record its metadata mtime.
+
+    Args:
+        shard_budget: Budget and shard directory.
+        single_entry_jsonl: JSONL holding one protein.
+
+    Returns:
+        The metadata file's ``st_mtime_ns`` after each build.
+    """
+    first = ProteinShardDataset(
+        budget_parameters=shard_budget,
+        names=["p1"],
+        dataset_jsonl=single_entry_jsonl,
+    )
+    before = first.shard_metadata_path.stat().st_mtime_ns
+    _ = ProteinShardDataset(
+        budget_parameters=shard_budget,
+        names=["p1"],
+        dataset_jsonl=single_entry_jsonl,
+    )
+    after = first.shard_metadata_path.stat().st_mtime_ns
+    return MetadataMtimes(before=before, after=after)
 
 
 @pytest.mark.parametrize(
@@ -1183,21 +1486,22 @@ def test_featurized_batch_rejects_a_malformed_field(
 )
 def test_distogram_assigns_each_distance_its_bin(
     bin_scenario: BinScenario,
+    bin_distogram: Distogram,
+    pair_at_distance: Float[torch.Tensor, "2 3"],
+    expected_bin_one_hot: Float[torch.Tensor, " C"],
 ) -> None:
     """Two atoms ``distance`` apart get the expected one-hot bin and mask.
 
     Args:
         bin_scenario: Distance, overflow setting and expected outcome.
+        bin_distogram: Distogram under test.
+        pair_at_distance: Two atoms the scenario's distance apart.
+        expected_bin_one_hot: One-hot vector at the expected bin.
     """
-    case = bin_scenario.value
-    disto = Distogram(n_bins=16, overflow_bin=case.overflow).eval()
-    coords = torch.tensor([[0.0, 0, 0], [case.distance, 0, 0]])
     with torch.no_grad():
-        onehot, mask = disto(coords)
-    expected = torch.zeros(16 + case.overflow)
-    expected[case.expected_bin] = 1
-    assert torch.equal(onehot[0, 1], expected)
-    assert bool(mask[0, 1]) == case.valid
+        onehot, mask = bin_distogram(pair_at_distance)
+    assert torch.equal(onehot[0, 1], expected_bin_one_hot)
+    assert bool(mask[0, 1]) == bin_scenario.value.valid
 
 
 @pytest.mark.parametrize(
@@ -1207,6 +1511,7 @@ def test_distogram_assigns_each_distance_its_bin(
 )
 def test_distogram_is_a_symmetric_one_hot_over_its_bins(
     overflow_scenario: OverflowScenario,
+    overflow_distogram: Distogram,
     spread_coords: Float[torch.Tensor, "12 3"],
 ) -> None:
     """Every pair gets exactly one bin, and ``(i, j)`` matches ``(j, i)``.
@@ -1215,13 +1520,12 @@ def test_distogram_is_a_symmetric_one_hot_over_its_bins(
 
     Args:
         overflow_scenario: Overflow setting and the class count it gives.
-        spread_coords: 12 coordinates spread over about 20 angstroms.
+        overflow_distogram: Distogram under test.
+        spread_coords: Twelve atoms at varied distances.
     """
-    case = overflow_scenario.value
-    disto = Distogram(n_bins=16, overflow_bin=case.overflow_bin).eval()
     with torch.no_grad():
-        onehot, mask = disto(spread_coords)
-    assert onehot.shape == (12, 12, case.n_classes)
+        onehot, mask = overflow_distogram(spread_coords)
+    assert onehot.shape == (12, 12, overflow_scenario.value.n_classes)
     assert torch.equal(
         reduce(onehot, "i j b -> i j", "sum"),
         torch.ones(12, 12),
@@ -1231,7 +1535,10 @@ def test_distogram_is_a_symmetric_one_hot_over_its_bins(
 
 
 def test_distogram_masks_every_pair_of_an_invalid_atom(
+    no_overflow_distogram: Distogram,
     near_coords: Float[torch.Tensor, "12 3"],
+    first_atom_invalid: Bool[torch.Tensor, "12"],
+    expected_pair_mask: Bool[torch.Tensor, "12 12"],
 ) -> None:
     """An atom marked invalid drops its whole row and column of pairs.
 
@@ -1240,15 +1547,14 @@ def test_distogram_masks_every_pair_of_an_invalid_atom(
     atom is invalid does not matter.
 
     Args:
-        near_coords: 12 coordinates within 2 angstroms of each other.
+        no_overflow_distogram: Distogram under test.
+        near_coords: Twelve atoms within range.
+        first_atom_invalid: Validity with atom 0 invalid.
+        expected_pair_mask: Valid exactly where both atoms are.
     """
-    disto = Distogram(n_bins=16, overflow_bin=False).eval()
-    valid = torch.ones(12, dtype=torch.bool)
-    valid[0] = False
     with torch.no_grad():
-        _, mask = disto(near_coords, valid)
-    expected = rearrange(valid, "i -> i 1") & rearrange(valid, "j -> 1 j")
-    assert torch.equal(mask, expected)
+        _, mask = no_overflow_distogram(near_coords, first_atom_invalid)
+    assert torch.equal(mask, expected_pair_mask)
 
 
 @pytest.mark.parametrize(
@@ -1258,6 +1564,7 @@ def test_distogram_masks_every_pair_of_an_invalid_atom(
 )
 def test_sinusoidal_encoding_matches_its_closed_form(
     sinusoid_scenario: SinusoidScenario,
+    sinusoid_position: Float[torch.Tensor, "1 1"],
 ) -> None:
     """Position ``p`` maps to ``sin(p f)`` then ``cos(p f)`` per frequency.
 
@@ -1266,9 +1573,10 @@ def test_sinusoidal_encoding_matches_its_closed_form(
 
     Args:
         sinusoid_scenario: Position, width and expected encoding.
+        sinusoid_position: The scenario's position.
     """
     case = sinusoid_scenario.value
-    out = sinusoidal_encoding(torch.tensor([[case.position]]), dim=case.dim)
+    out = sinusoidal_encoding(sinusoid_position, dim=case.dim)
     torch.testing.assert_close(out, torch.tensor([[case.expected]]))
 
 
@@ -1298,8 +1606,8 @@ def test_ref_pos_for_residue_puts_ca_at_the_origin(
 
 def test_featurize_single_item_shapes_ranges_and_index_maps(
     featurized_item: FeaturizedItem,
-    protein: Protein,
-    tcfg: TrainConfig,
+    expected_item_shapes: ExpectedItemShapes,
+    residue_of_atom: Int[torch.Tensor, " N_atom"],
 ) -> None:
     """The item has every field at its shape, finite, with exact index maps.
 
@@ -1308,35 +1616,23 @@ def test_featurize_single_item_shapes_ranges_and_index_maps(
     in ``[0, 1]``. Not parametrized: one protein covers the layout.
 
     Args:
-        featurized_item: The featurized protein.
-        protein: The 12-residue input.
-        tcfg: Supplies the template distogram width.
+        featurized_item: Item from ``featurize_single_item``.
+        expected_item_shapes: Shapes the fields must have.
+        residue_of_atom: Residue index of every atom.
     """
     x = featurized_item
-    n_res = len(protein.aatype)
-    n_atom = n_res * ATOMS_PER_RES
-    residue = torch.arange(n_res).repeat_interleave(ATOMS_PER_RES)
-    shapes = {
-        "ref_pos": (n_atom, 3),
-        "ref_element": (n_atom, 4),
-        "ref_space_uid": (n_atom,),
-        "gt_res_distogram_indices": (n_res, n_res),
-        "noised_res_distogram": (n_res, n_res, tcfg.distogram_template.n_bins),
-        "f_pseudo_beta_mask": (n_res,),
-        "tok_idx": (n_atom,),
-        "center_uid": (n_atom,),
-    }
     fields: Mapping[str, torch.Tensor] = {
         f.name: cast(torch.Tensor, getattr(x, f.name))
         for f in dataclasses.fields(x)
     }
-    assert {k: tuple(fields[k].shape) for k in shapes} == shapes
+    expected = dataclasses.asdict(expected_item_shapes)
+    assert {k: tuple(fields[k].shape) for k in expected} == expected
     assert all(torch.isfinite(t.float()).all() for t in fields.values())
     assert bool((x.t_hat > 0).all())
     assert bool(((x.t_normalized >= 0) & (x.t_normalized <= 1)).all())
-    assert torch.equal(x.ref_space_uid, residue)
-    assert torch.equal(x.tok_idx, residue)
-    assert torch.equal(x.center_uid, ATOMS_PER_RES * residue + 1)
+    assert torch.equal(x.ref_space_uid, residue_of_atom)
+    assert torch.equal(x.tok_idx, residue_of_atom)
+    assert torch.equal(x.center_uid, ATOMS_PER_RES * residue_of_atom + 1)
 
 
 def test_featurize_batch_stacks_items_along_a_batch_axis(
@@ -1365,9 +1661,8 @@ def test_featurize_batch_stacks_items_along_a_batch_axis(
 
 
 def test_featurize_collate_works_after_a_pickle_round_trip(
+    featurize_collate: FeaturizeCollate,
     protein: Protein,
-    tcfg: TrainConfig,
-    distograms: Distograms,
     featurized_batch: FeaturizedBatch,
 ) -> None:
     """A collate restored from pickle, as DataLoader workers get it, works.
@@ -1376,19 +1671,11 @@ def test_featurize_collate_works_after_a_pickle_round_trip(
     Not parametrized: pickling is the one transport DataLoader uses.
 
     Args:
+        featurize_collate: Collate function to send.
         protein: Protein to collate twice.
-        tcfg: Configuration.
-        distograms: Template, residue and atom distograms.
         featurized_batch: Reference batch of the same two proteins.
     """
-    collate = FeaturizeCollate(
-        tcfg=tcfg,
-        distogram_template=distograms.template,
-        distogram_residue=distograms.residue,
-        distogram_atom=distograms.atom,
-    )
-    raw = pickle.dumps(collate)
-    restored = cast(FeaturizeCollate, pickle.loads(raw))  # noqa: S301
+    restored = queue_round_trip(featurize_collate)
     out = restored([protein, protein])
     assert isinstance(out, FeaturizedBatch)
     assert out.r_gt.shape == featurized_batch.r_gt.shape
@@ -1403,20 +1690,17 @@ def test_featurize_collate_works_after_a_pickle_round_trip(
     ],
 )
 def test_protein_dataset_holds_only_listed_names(
-    dataset_jsonl: pathlib.Path,
-    names: list[str],
+    listed_dataset: ProteinDataset,
     expected: int,
 ) -> None:
     """The dataset's length is the number of listed names, and each loads.
 
     Args:
-        dataset_jsonl: Five-entry JSONL.
-        names: Names to load.
-        expected: Expected length.
+        listed_dataset: Dataset over the case's names.
+        expected: Number of samples it must hold.
     """
-    dataset = ProteinDataset(dataset_jsonl, names, max_seq_length=8)
-    assert len(dataset) == expected
-    assert all(isinstance(dataset[i], Protein) for i in range(expected))
+    assert len(listed_dataset) == expected
+    assert all(isinstance(listed_dataset[i], Protein) for i in range(expected))
 
 
 def test_protein_dataset_pads_samples_to_max_length(
@@ -1442,17 +1726,16 @@ def test_protein_dataset_pads_samples_to_max_length(
 
 
 def test_protein_dataset_truncates_long_entries(
-    long_entry_jsonl: pathlib.Path,
+    long_entry_dataset: ProteinDataset,
 ) -> None:
     """A 100-residue entry comes back cut to ``max_seq_length = 8``.
 
     Not parametrized: padding is the test above.
 
     Args:
-        long_entry_jsonl: JSONL holding one 100-residue entry.
+        long_entry_dataset: 8-residue dataset over a longer entry.
     """
-    dataset = ProteinDataset(long_entry_jsonl, ["long.A"], max_seq_length=8)
-    sample = dataset[0]
+    sample = long_entry_dataset[0]
     assert sample.aatype.shape == (8,)
     assert sample.atom_positions.shape == (8, 37, 3)
 
@@ -1524,8 +1807,7 @@ def test_shard_metadata_names_hash_identifies_the_name_set(
 
 
 def test_shard_dataset_reuses_existing_metadata(
-    shard_budget: ShardBudgetParameters,
-    single_entry_jsonl: pathlib.Path,
+    metadata_mtimes: MetadataMtimes,
 ) -> None:
     """A second dataset in the same shard directory leaves the shards alone.
 
@@ -1533,22 +1815,9 @@ def test_shard_dataset_reuses_existing_metadata(
     parametrized: the cache check reads one file.
 
     Args:
-        shard_budget: Shard parameters, shared by both builds.
-        single_entry_jsonl: JSONL holding entry ``p1``.
+        metadata_mtimes: Metadata mtimes around the second build.
     """
-    jsonl = single_entry_jsonl
-    first = ProteinShardDataset(
-        budget_parameters=shard_budget,
-        names=["p1"],
-        dataset_jsonl=jsonl,
-    )
-    before = first.shard_metadata_path.stat().st_mtime_ns
-    _ = ProteinShardDataset(
-        budget_parameters=shard_budget,
-        names=["p1"],
-        dataset_jsonl=jsonl,
-    )
-    assert first.shard_metadata_path.stat().st_mtime_ns == before
+    assert metadata_mtimes.after == metadata_mtimes.before
 
 
 @pytest.mark.parametrize(
