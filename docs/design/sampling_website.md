@@ -311,7 +311,8 @@ lines to Loki as they are.
   components.
 - **3Dmol.js** (npm `3dmol`), the JavaScript library under `py3Dmol`:
   `addModel(pdb, "pdb")`, cartoon with `color: "spectrum"`, then `zoomTo()`.
-- No CSS framework; a small stylesheet with a responsive grid.
+- **StyleX** for all styling (see *Styling* below). There is no CSS
+  framework and no hand-written stylesheets beyond a tiny reset.
 
 **Layout and naming.** Components use **PascalCase**, both for the function
 and for the file, with one component per file and the file named after its
@@ -324,6 +325,7 @@ web/src/
                StructureViewer.tsx  HealthIndicator.tsx
   hooks/       useHealth.ts  useModelInfo.ts  useJob.ts
   api/         client.ts  schema.d.ts   # schema.d.ts generated (§6.3)
+  styles/      tokens.stylex.ts  reset.css
 ```
 
 | Kind | Case | Example |
@@ -333,6 +335,8 @@ web/src/
 | Types, interfaces, enums | PascalCase | `JobState`, `ApiError` |
 | Hooks, and their files | camelCase with a `use` prefix | `useJob`, `useJob.ts` |
 | Other functions, variables, non-component files | camelCase | `submitJob`, `client.ts` |
+| StyleX token files | camelCase with the `.stylex.ts` suffix that StyleX requires | `tokens.stylex.ts` |
+| StyleX style keys | camelCase | `styles.grid`, `styles.failed` |
 | Module-level constants | UPPER_SNAKE_CASE | `POLL_INTERVAL_MS` |
 
 Hooks are the deliberate exception to PascalCase. React's hook lint rules
@@ -340,6 +344,108 @@ only recognise functions whose names start with `use`, so a hook named
 `UseJob` would silently escape `rules-of-hooks`. The API types generated
 from the Pydantic models (`SampleJobSpec`, `JobStatus`, …) are already
 PascalCase, so names match end to end, from Python to TypeScript.
+
+**Styling: StyleX.** Styles are typed TypeScript objects, compiled at build
+time to static atomic CSS. This is Meta's system (facebook.com, Instagram,
+WhatsApp web, Threads), and it is the same build-time approach as
+Microsoft's Griffel. We chose it over Bootstrap, Tailwind, CSS Modules and
+runtime CSS-in-JS because:
+
+- styles are plain TypeScript, with camelCase properties and no second
+  syntax to learn
+- conditional styles are ordinary expressions
+- misspelled properties and missing tokens are compile errors
+- it has no runtime cost
+
+Plain CSS files read poorly next to the rest of a strictly typed codebase;
+StyleX keeps styling inside the type system.
+
+*Design tokens* live in one file, as typed variables. Dark mode is part of
+the token definitions, so components never mention it:
+
+```tsx
+// styles/tokens.stylex.ts
+import * as stylex from "@stylexjs/stylex";
+
+const DARK = "@media (prefers-color-scheme: dark)";
+
+export const colors = stylex.defineVars({
+  bg: { default: "#ffffff", [DARK]: "#121212" },
+  surface: { default: "#f5f6f8", [DARK]: "#1e1f22" },
+  fg: { default: "#1a1a1a", [DARK]: "#e8e8e8" },
+  muted: { default: "#5f6368", [DARK]: "#9aa0a6" },
+  accent: "#2f6fdf",
+  danger: { default: "#c5221f", [DARK]: "#f28b82" },
+});
+
+export const space = stylex.defineVars({ xs: "0.25rem", sm: "0.5rem",
+                                         md: "1rem", lg: "1.5rem" });
+export const radius = stylex.defineVars({ sm: "4px", md: "8px" });
+```
+
+*Component styles* sit at module scope in the component's own file, as one
+`styles` constant per file:
+
+```tsx
+// components/SampleGallery.tsx
+import * as stylex from "@stylexjs/stylex";
+import { space } from "../styles/tokens.stylex";
+
+const styles = stylex.create({
+  grid: {
+    display: "grid",
+    gridTemplateColumns: "repeat(auto-fill, minmax(280px, 1fr))",
+    gap: space.md,
+  },
+});
+
+export function SampleGallery({ samples }: SampleGalleryProps): React.JSX.Element {
+  return <div {...stylex.props(styles.grid)}>{/* SampleCard × n */}</div>;
+}
+```
+
+```tsx
+// components/SampleCard.tsx: a variant is just a boolean expression
+const styles = stylex.create({
+  card: { backgroundColor: colors.surface, borderRadius: radius.md,
+          padding: space.md },
+  failed: { outlineColor: colors.danger, outlineStyle: "solid",
+            outlineWidth: 2 },
+});
+// <article {...stylex.props(styles.card, failed && styles.failed)}>
+```
+
+*Rules:*
+
+- **Every colour, spacing and radius value comes from `tokens.stylex.ts`.**
+  Components contain no raw hex values or pixel spacing. Layout values that
+  aren't tokens, such as the `280px` grid minimum, are fine.
+- **Styles are always applied with `stylex.props(...)`.** No `className`
+  strings and no inline `style={{…}}`. The one exception is dynamic values
+  that 3Dmol needs on its own canvas.
+- **Overrides are typed.** A component that accepts style overrides from its
+  parent types the prop as `StyleXStyles<{…}>`, which limits which
+  properties may be overridden. The MVP needs none.
+- **The only `.css` file is `styles/reset.css`**, a few lines (box-sizing,
+  body margin) imported once in `main.tsx`. StyleX does not do global
+  element styles. The page background and font are set by `App`'s root
+  StyleX style.
+- **The 3Dmol viewer needs a sized container.** 3Dmol sizes its canvas from
+  its container, so `StructureViewer`'s container style must include
+  `position: "relative"`, `width: "100%"` and `aspectRatio: "1"`. Without
+  them the canvas collapses to 0 px.
+
+*Build integration:*
+
+- StyleX ships a Babel plugin (`@stylexjs/babel-plugin`), which runs through
+  `@vitejs/plugin-react`'s `babel.plugins` option. This is one more reason
+  for `plugin-react` over SWC.
+- In dev, styles are injected at runtime for fast reloads. Production builds
+  extract them into a single static `.css` file.
+- Vitest reuses the Vite config, so tests see the same transform.
+- StyleX's Vite integration has been evolving. At PR 3, use whatever package
+  the StyleX docs currently recommend for Vite, and record the choice in
+  `web/README.md`.
 
 ### 6.2 UI
 
@@ -413,6 +519,9 @@ regenerates the file from a CPU-only app instance and fails on a diff.
     PascalCase would not render anyway.
   - `eslint-plugin-check-file` requires PascalCase file names under
     `components/` and `use*` camelCase file names under `hooks/`.
+- `@stylexjs/eslint-plugin`: `valid-styles` (rejects invalid CSS
+  properties and values inside `stylex.create`) and `no-unused` (flags style
+  keys that are never used). Both are errors.
 - Prettier with an 80-column print width, to match Black.
 
 ## 7. Tooling, devcontainer and CI (Phase 1)
