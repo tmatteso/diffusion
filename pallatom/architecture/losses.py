@@ -532,8 +532,8 @@ def distogram_loss_atom(
             einsum(ce, m, "... n m, ... n m -> ...") / NM
         )
     else:
-        N_at = q.shape[-2]
-        loss = ce.sum(dim=(-2, -1)) / (N_at * N_at)
+        n_slots = q.shape[-3] * q.shape[-2]
+        loss = ce.sum(dim=(-2, -1)) / n_slots
 
     if torch.isnan(loss).any():
         raise LossComputationError

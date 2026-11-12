@@ -50,8 +50,6 @@ from train.train_config import (
     TemplateDistogramParams,
 )
 
-type StateDict = dict[str, Float[torch.Tensor, "..."]]
-
 
 @dataclasses.dataclass(frozen=True)
 class TrunkDims:
@@ -616,7 +614,7 @@ def test_ema_init_shadow_is_an_independent_snapshot(model: MainTrunk) -> None:
         model: Trunk to snapshot; perturbed here after the EMA is built.
     """
     ema = EMA(model, decay=0.999)
-    state = cast(StateDict, model.state_dict())
+    state = cast(dict[str, Float[torch.Tensor, "..."]], model.state_dict())
     matches = all(torch.equal(ema.shadow[k], v) for k, v in state.items())
     snapshot = {k: v.clone() for k, v in ema.shadow.items()}
     with torch.no_grad():
@@ -777,12 +775,19 @@ def test_ema_swap_twice_restores_both_sides(model: MainTrunk) -> None:
         for param in model.parameters():
             _ = param.add_(1.0)
     model_before = {
-        k: v.clone() for k, v in cast(StateDict, model.state_dict()).items()
+        k: v.clone()
+        for k, v in cast(
+            dict[str, Float[torch.Tensor, "..."]],
+            model.state_dict(),
+        ).items()
     }
     shadow_before = {k: v.clone() for k, v in ema.shadow.items()}
     ema.swap(model)
     ema.swap(model)
-    model_after = cast(StateDict, model.state_dict())
+    model_after = cast(
+        dict[str, Float[torch.Tensor, "..."]],
+        model.state_dict(),
+    )
     assert all(torch.equal(model_after[k], v) for k, v in model_before.items())
     assert all(torch.equal(ema.shadow[k], v) for k, v in shadow_before.items())
 
