@@ -22,7 +22,7 @@ import multiprocessing
 import pathlib
 from datetime import timedelta
 from multiprocessing.queues import SimpleQueue
-from typing import cast
+from typing import Protocol, cast
 from unittest import mock
 
 import numpy as np
@@ -55,7 +55,7 @@ from helpers.useful_objects import (
     ThroughputStatistics,
     manual_seed,
 )
-from jaxtyping import Float
+from jaxtyping import Bool, Float
 from pydantic import ValidationError
 from structlog.typing import FilteringBoundLogger
 from torch.multiprocessing.spawn import spawn
@@ -91,9 +91,6 @@ from train.train_loop import (
     take_step,
     train,
 )
-
-type StateDict = dict[str, Float[torch.Tensor, "..."]]
-type DataLoader = torch.utils.data.DataLoader[FeaturizedBatch]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -202,8 +199,8 @@ class Loaders:
         test: Evaluation loader.
     """
 
-    train: DataLoader
-    test: DataLoader
+    train: torch.utils.data.DataLoader[FeaturizedBatch]
+    test: torch.utils.data.DataLoader[FeaturizedBatch]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -219,8 +216,8 @@ class SwapSetup:
 
     setup: ModelSetup
     inner: MainTrunk
-    raw: StateDict
-    shadow: StateDict
+    raw: dict[str, Float[torch.Tensor, "..."]]
+    shadow: dict[str, Float[torch.Tensor, "..."]]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -674,18 +671,19 @@ def featurized_batch(model_params: ModelSetup) -> FeaturizedBatch:
         The batch.
     """
     n = 16
-    r = np.arange(n, dtype=np.float64)[:, None]
-    a = np.arange(37, dtype=np.float64)[None, :]
+    n_atoms = ResidueRepresentation.atom37.value
+    r = rearrange(np.arange(n, dtype=np.float64), "r -> r 1")
+    a = rearrange(np.arange(n_atoms, dtype=np.float64), "a -> 1 a")
     protein = Protein(
         atom_positions=np.stack(
-            [3.8 * r + 0.1 * a, np.sin(r + a), np.zeros((n, 37))],
+            [3.8 * r + 0.1 * a, np.sin(r + a), np.zeros((n, n_atoms))],
             axis=-1,
         ),
-        atom_mask=np.ones((n, 37)),
+        atom_mask=np.ones((n, n_atoms)),
         residue_index=np.arange(n, dtype=np.intp),
         aatype=np.arange(n, dtype=np.intp) % RESTYPE_NUM,
         chain_index=np.zeros(n, dtype=np.intp),
-        b_factors=np.zeros((n, 37)),
+        b_factors=np.zeros((n, n_atoms)),
     )
     _ = manual_seed(1)
     return featurize_batch(
@@ -802,19 +800,78 @@ def swap_setup(
     if swap_wrap.value.ddp:
         request.getfixturevalue("single_process_gloo_group")
         setup = dataclasses.replace(diverged_ema, model=DDP(inner))
-    raw = {k: v.clone() for k, v in cast(StateDict, inner.state_dict()).items()}
+    raw = {
+        k: v.clone()
+        for k, v in cast(
+            dict[str, Float[torch.Tensor, "..."]],
+            inner.state_dict(),
+        ).items()
+    }
     shadow = {k: v.clone() for k, v in diverged_ema.ema.state_dict().items()}
     return SwapSetup(setup=setup, inner=inner, raw=raw, shadow=shadow)
 
 
+class SteppingOptimizer(Protocol):
+    """An optimizer whose ``step`` takes no closure.
+
+    torch decorates ``Adam.step`` in a way that leaves it untyped, so
+    calling it directly is an unknown member to the type checker. Casting
+    to this protocol states the one call the tests make.
+    """
+
+    def step(self) -> None:
+        """Apply one update from the parameters' gradients."""
+
+
+@dataclasses.dataclass(frozen=True)
+class CorruptedAfterSave:
+    """A setup saved after one step, then corrupted in place.
+
+    Attributes:
+        setup: The setup, with its weights, EMA shadow and Adam first
+            moments zeroed and its scheduler rewound after saving.
+        saved: The checkpoint as written, before the corruption.
+    """
+
+    setup: ModelSetup
+    saved: dict[str, dict[str, object]]
+
+
+@dataclasses.dataclass(frozen=True)
+class PreflushInputs:
+    """Loaders and setup for a run whose token budget forces preflushes.
+
+    Attributes:
+        loaders: Train and test loaders, one protein per test batch.
+        model_params: Fresh setup trained on them.
+    """
+
+    loaders: Loaders
+    model_params: ModelSetup
+
+
 @pytest.fixture
-def lr_schedule_optimizer() -> Adam:
-    """Return Adam over one dummy parameter at a base learning rate of 2.
+def lr_schedule_base_lr() -> float:
+    """Return the base learning rate the schedule multiplies.
+
+    Returns:
+        2.0, so a schedule factor of ``f`` gives a learning rate of
+        ``2 f``.
+    """
+    return 2.0
+
+
+@pytest.fixture
+def lr_schedule_optimizer(lr_schedule_base_lr: float) -> Adam:
+    """Return Adam over one dummy parameter at ``lr_schedule_base_lr``.
+
+    Args:
+        lr_schedule_base_lr: Base learning rate.
 
     Returns:
         The optimizer.
     """
-    return Adam([nn.Parameter(torch.zeros(1))], lr=2.0)
+    return Adam([nn.Parameter(torch.zeros(1))], lr=lr_schedule_base_lr)
 
 
 @pytest.fixture
@@ -884,6 +941,189 @@ def train_run(
         The scenario's record.
     """
     return recorded_train_runs.get(train_scenario)
+
+
+@pytest.fixture
+def corrupted_after_save(
+    diverged_ema: ModelSetup,
+    log: FilteringBoundLogger,
+) -> CorruptedAfterSave:
+    """Step and save ``diverged_ema``, then corrupt every saved state.
+
+    After one optimizer and scheduler step the setup is saved. Its weights
+    and EMA shadow are then zeroed, Adam's first moments zeroed and the
+    scheduler rewound, so a load that skipped any state would leave it
+    corrupted.
+
+    Args:
+        diverged_ema: Setup whose EMA differs from its weights.
+        log: Logger.
+
+    Returns:
+        The corrupted setup and the checkpoint written before corruption.
+    """
+    setup = diverged_ema
+    for param in setup.model.parameters():
+        param.grad = torch.ones_like(param)
+    cast(SteppingOptimizer, setup.optimizer).step()
+    setup.scheduler.step()
+    save_checkpoint(
+        model_params=setup,
+        rank=0,
+        log=log,
+        best_val_loss=torch.tensor(0.271),
+    )
+    saved = cast(
+        dict[str, dict[str, object]],
+        torch.load(setup.tcfg.checkpoint.checkpoint_path, weights_only=True),
+    )
+    with torch.no_grad():
+        for param in setup.model.parameters():
+            _ = param.zero_()
+        for tensor in setup.ema.shadow.values():
+            _ = tensor.zero_()
+        live_state = cast(
+            dict[nn.Parameter, dict[str, Float[torch.Tensor, "..."]]],
+            setup.optimizer.state,
+        )
+        for state in live_state.values():
+            _ = state["exp_avg"].zero_()
+    setup.scheduler.last_epoch = -1
+    return CorruptedAfterSave(setup=setup, saved=saved)
+
+
+@pytest.fixture
+def ddp_model_params(
+    single_process_gloo_group: None,
+    model_params: ModelSetup,
+) -> ModelSetup:
+    """Return ``model_params`` with its model wrapped in one-rank DDP.
+
+    Args:
+        single_process_gloo_group: Starts the process group DDP needs.
+        model_params: Setup to wrap.
+
+    Returns:
+        The setup, whose model's state-dict keys carry ``module.``.
+    """
+    _ = single_process_gloo_group
+    return dataclasses.replace(model_params, model=DDP(model_params.model))
+
+
+@pytest.fixture
+def gated_wandb_setup(gate: WandbGate, model_params: ModelSetup) -> ModelSetup:
+    """Return ``model_params`` with W&B enabled or not, per the gate.
+
+    Args:
+        gate: Whether W&B is enabled; the requesting test parametrizes it.
+        model_params: Setup to copy.
+
+    Returns:
+        A copy whose config has the gate's ``use_wandb``.
+    """
+    logging = LoggingParams(use_wandb=gate.value.use_wandb)
+    tcfg = model_params.tcfg.model_copy(update={"logging": logging})
+    return dataclasses.replace(model_params, tcfg=tcfg)
+
+
+@pytest.fixture
+def wandb_enabled_setup(model_params: ModelSetup) -> ModelSetup:
+    """Return ``model_params`` with W&B enabled.
+
+    Args:
+        model_params: Setup to copy.
+
+    Returns:
+        A copy whose config has ``use_wandb=True``.
+    """
+    logging = LoggingParams(use_wandb=True)
+    tcfg = model_params.tcfg.model_copy(update={"logging": logging})
+    return dataclasses.replace(model_params, tcfg=tcfg)
+
+
+@pytest.fixture
+def budget_params(budget: int) -> TrainingParams:
+    """Build training parameters with the given token budget.
+
+    Args:
+        budget: Accumulated token budget; the requesting test parametrizes
+            it.
+
+    Returns:
+        The validated parameters.
+    """
+    return TrainingParams(accumulated_token_budget=budget)
+
+
+@pytest.fixture
+def expected_lr(
+    n_steps: int,
+    lr_schedule_base_lr: float,
+    lr_schedule_training: TrainingParams,
+) -> float:
+    """Learning rate ``alphafold_lr_lambda`` prescribes after ``n_steps``.
+
+    Args:
+        n_steps: Scheduler steps taken; the requesting test parametrizes
+            it.
+        lr_schedule_base_lr: Base learning rate.
+        lr_schedule_training: Warmup and decay settings.
+
+    Returns:
+        The base rate times the schedule factor.
+    """
+    factor = alphafold_lr_lambda(
+        n_steps,
+        warmup_steps=lr_schedule_training.lr_warmup_steps,
+        decay_steps=lr_schedule_training.lr_decay_steps,
+        decay_factor=lr_schedule_training.lr_decay_factor,
+    )
+    return lr_schedule_base_lr * factor
+
+
+@pytest.fixture
+def preflush_inputs(
+    tmp_path: pathlib.Path,
+    harness: TrainHarness,
+) -> PreflushInputs:
+    """Build loaders and a setup whose 42-token budget forces preflushes.
+
+    Args:
+        tmp_path: Directory for the run's shards and checkpoint.
+        harness: Builds the configuration, loaders and setup.
+
+    Returns:
+        The loaders and a fresh setup.
+    """
+    tcfg = harness.tcfg(
+        tmp_path,
+        TrainCase(1, 7, 1.0, use_wandb=False),
+        loader_budget=42,
+    )
+    tcfg = tcfg.model_copy(update={"test_loader": LoaderConfig(batch_size=1)})
+    return PreflushInputs(
+        loaders=harness.loaders(tmp_path, tcfg),
+        model_params=harness.setup(harness.trunk(), tcfg),
+    )
+
+
+@pytest.fixture
+def valid_pair_mask(
+    featurized_batch: FeaturizedBatch,
+) -> Bool[torch.Tensor, "B N_res N_res"]:
+    """Mark the residue pairs whose two residues both have a pseudo-Cβ.
+
+    Args:
+        featurized_batch: Supplies the pseudo-Cβ mask.
+
+    Returns:
+        The outer AND of the residue mask with itself.
+    """
+    residue_mask = featurized_batch.f_pseudo_beta_mask.bool()
+    return rearrange(residue_mask, "b i -> b i 1") & rearrange(
+        residue_mask,
+        "b j -> b 1 j",
+    )
 
 
 def test_take_step_eval_reports_finite_metrics_without_gradients(
@@ -1066,7 +1306,10 @@ def test_optimizer_step_moves_weights_and_blends_the_ema(
         model_params,
         global_step=step,
     )
-    after = cast(StateDict, model_params.model.state_dict())[name]
+    after = cast(
+        dict[str, Float[torch.Tensor, "..."]],
+        model_params.model.state_dict(),
+    )[name]
     ramp = (step + 1) / (step + 10)
     decay = min(model_params.tcfg.training.ema_decay, ramp)
     expected = decay * shadow_before + (1 - decay) * after
@@ -1116,9 +1359,12 @@ def test_swapped_in_ema_weights_swaps_in_and_back(
     """
     x = swap_setup
     with swapped_in_ema_weights(x.setup):
-        inside = cast(StateDict, x.inner.state_dict())
+        inside = cast(
+            dict[str, Float[torch.Tensor, "..."]],
+            x.inner.state_dict(),
+        )
         matched = all(torch.equal(inside[k], v) for k, v in x.shadow.items())
-    after = cast(StateDict, x.inner.state_dict())
+    after = cast(dict[str, Float[torch.Tensor, "..."]], x.inner.state_dict())
     assert matched
     assert all(torch.equal(after[k], v) for k, v in x.raw.items())
 
@@ -1149,7 +1395,7 @@ def test_swapped_in_ema_weights_restores_raw_weights_on_error(
         swapped_in_ema_weights(x.setup),
     ):
         raise RuntimeError(message)
-    after = cast(StateDict, x.inner.state_dict())
+    after = cast(dict[str, Float[torch.Tensor, "..."]], x.inner.state_dict())
     assert all(torch.equal(after[k], v) for k, v in x.raw.items())
 
 
@@ -1190,7 +1436,7 @@ def test_save_checkpoint_writes_only_on_rank_zero(
 
 
 def test_load_checkpoint_restores_every_saved_state(
-    diverged_ema: ModelSetup,
+    corrupted_after_save: CorruptedAfterSave,
     log: FilteringBoundLogger,
 ) -> None:
     """Loading undoes corruption of the weights, EMA, Adam and scheduler.
@@ -1201,42 +1447,29 @@ def test_load_checkpoint_restores_every_saved_state(
     validation loss. Not parametrized: every state goes in one file.
 
     Args:
-        diverged_ema: Setup whose EMA differs from its weights.
+        corrupted_after_save: Corrupted setup and its saved checkpoint.
         log: Logger.
     """
-    setup = diverged_ema
-    for param in setup.model.parameters():
-        param.grad = torch.ones_like(param)
-    _ = setup.optimizer.step()  # pyright: ignore[reportUnknownMemberType]
-    setup.scheduler.step()
-    save_checkpoint(
-        model_params=setup,
+    saved = corrupted_after_save.saved
+    restored, best = load_checkpoint(
+        model_params=corrupted_after_save.setup,
         rank=0,
         log=log,
-        best_val_loss=torch.tensor(0.271),
     )
-    saved = cast(
-        dict[str, dict[str, object]],
-        torch.load(setup.tcfg.checkpoint.checkpoint_path, weights_only=True),
+    model_sd = cast(dict[str, Float[torch.Tensor, "..."]], saved["model"])
+    ema_sd = cast(dict[str, Float[torch.Tensor, "..."]], saved["ema"])
+    opt_sd = cast(
+        dict[int, dict[str, Float[torch.Tensor, "..."]]],
+        saved["optimizer"]["state"],
     )
-    with torch.no_grad():
-        for param in setup.model.parameters():
-            _ = param.zero_()
-        for tensor in setup.ema.shadow.values():
-            _ = tensor.zero_()
-        live_state = cast(dict[nn.Parameter, StateDict], setup.optimizer.state)
-        for state in live_state.values():
-            _ = state["exp_avg"].zero_()
-    setup.scheduler.last_epoch = -1
-    restored, best = load_checkpoint(model_params=setup, rank=0, log=log)
-    model_sd = cast(StateDict, saved["model"])
-    ema_sd = cast(StateDict, saved["ema"])
-    opt_sd = cast(dict[int, StateDict], saved["optimizer"]["state"])
     restored_opt = cast(
-        dict[int, StateDict],
+        dict[int, dict[str, Float[torch.Tensor, "..."]]],
         cast(dict[str, object], restored.optimizer.state_dict())["state"],
     )
-    live = cast(StateDict, restored.model.state_dict())
+    live = cast(
+        dict[str, Float[torch.Tensor, "..."]],
+        restored.model.state_dict(),
+    )
     assert all(torch.equal(live[k], v) for k, v in model_sd.items())
     assert all(
         torch.equal(restored.ema.shadow[k], v) for k, v in ema_sd.items()
@@ -1249,9 +1482,9 @@ def test_load_checkpoint_restores_every_saved_state(
     torch.testing.assert_close(best, torch.tensor(0.271))
 
 
-@pytest.mark.usefixtures("single_process_gloo_group")
 def test_save_checkpoint_strips_ddp_wrapper_prefix(
     model_params: ModelSetup,
+    ddp_model_params: ModelSetup,
     log: FilteringBoundLogger,
 ) -> None:
     """A checkpoint saved from a DDP model has the plain model's keys.
@@ -1261,21 +1494,19 @@ def test_save_checkpoint_strips_ddp_wrapper_prefix(
     is the rank-0 test above.
 
     Args:
-        model_params: Setup whose model is wrapped here.
+        model_params: Unwrapped setup, for the expected keys.
+        ddp_model_params: The same setup with its model in DDP.
         log: Logger.
     """
     plain_keys = set(model_params.model.state_dict())
     save_checkpoint(
-        model_params=dataclasses.replace(
-            model_params,
-            model=DDP(model_params.model),
-        ),
+        model_params=ddp_model_params,
         rank=0,
         log=log,
         best_val_loss=torch.tensor(0.3),
     )
     saved = cast(
-        dict[str, StateDict],
+        dict[str, dict[str, Float[torch.Tensor, "..."]]],
         torch.load(
             model_params.tcfg.checkpoint.checkpoint_path,
             weights_only=True,
@@ -1290,7 +1521,7 @@ def test_save_checkpoint_strips_ddp_wrapper_prefix(
     ids=[case.name for case in WandbGate],
 )
 def test_log_epoch_calls_wandb_only_when_asked_and_enabled(
-    model_params: ModelSetup,
+    gated_wandb_setup: ModelSetup,
     epoch_metrics: EpochMetrics,
     log: FilteringBoundLogger,
     wandb_payloads: list[dict[str, object]],
@@ -1299,19 +1530,16 @@ def test_log_epoch_calls_wandb_only_when_asked_and_enabled(
     """``wandb.log`` runs once when ``do_log`` and ``use_wandb`` are both set.
 
     Args:
-        model_params: Setup whose logging flag is replaced here.
+        gated_wandb_setup: Setup with the gate's ``use_wandb``.
         epoch_metrics: Metrics to log.
         log: Logger.
-        wandb_payloads: Captured ``wandb.log`` payloads.
-        gate: Flags and the expected call count.
+        wandb_payloads: Captured ``wandb.log`` calls.
+        gate: ``do_log`` and the expected call count.
     """
     case = gate.value
-    tcfg = model_params.tcfg.model_copy(
-        update={"logging": LoggingParams(use_wandb=case.use_wandb)},
-    )
     log_epoch(
         epoch_metrics=epoch_metrics,
-        model_params=dataclasses.replace(model_params, tcfg=tcfg),
+        model_params=gated_wandb_setup,
         log=log,
         do_log=case.do_log,
     )
@@ -1319,7 +1547,7 @@ def test_log_epoch_calls_wandb_only_when_asked_and_enabled(
 
 
 def test_log_epoch_payload_names_the_epoch_and_both_splits(
-    model_params: ModelSetup,
+    wandb_enabled_setup: ModelSetup,
     epoch_metrics: EpochMetrics,
     log: FilteringBoundLogger,
     wandb_payloads: list[dict[str, object]],
@@ -1329,17 +1557,14 @@ def test_log_epoch_payload_names_the_epoch_and_both_splits(
     Not parametrized: the gating is the test above.
 
     Args:
-        model_params: Setup whose W&B flag is switched on here.
-        epoch_metrics: Metrics for epoch 7.
+        wandb_enabled_setup: Setup with W&B enabled.
+        epoch_metrics: Metrics to log.
         log: Logger.
-        wandb_payloads: Captured ``wandb.log`` payloads.
+        wandb_payloads: Captured ``wandb.log`` calls.
     """
-    tcfg = model_params.tcfg.model_copy(
-        update={"logging": LoggingParams(use_wandb=True)},
-    )
     log_epoch(
         epoch_metrics=epoch_metrics,
-        model_params=dataclasses.replace(model_params, tcfg=tcfg),
+        model_params=wandb_enabled_setup,
         log=log,
         do_log=True,
     )
@@ -1364,15 +1589,16 @@ def test_accumulated_token_budget_rejects_non_positive_values(
 
 @pytest.mark.parametrize("budget", [1, 1_000_000], ids=["one", "large"])
 def test_accumulated_token_budget_accepts_any_positive_value(
+    budget_params: TrainingParams,
     budget: int,
 ) -> None:
     """Any positive token budget is accepted as given.
 
     Args:
-        budget: Valid budget.
+        budget_params: Parameters built with the budget.
+        budget: The budget passed in.
     """
-    params = TrainingParams(accumulated_token_budget=budget)
-    assert params.accumulated_token_budget == budget
+    assert budget_params.accumulated_token_budget == budget
 
 
 @pytest.mark.parametrize(
@@ -1390,9 +1616,9 @@ def test_accumulated_token_budget_accepts_any_positive_value(
 )
 def test_build_lr_scheduler_follows_alphafold_lr_lambda(
     lr_schedule_optimizer: Adam,
-    lr_schedule_training: TrainingParams,
     lr_scheduler: LambdaLR,
     n_steps: int,
+    expected_lr: float,
 ) -> None:
     """The training LR schedule reproduces ``alphafold_lr_lambda`` exactly.
 
@@ -1401,26 +1627,19 @@ def test_build_lr_scheduler_follows_alphafold_lr_lambda(
     ``2 * alphafold_lr_lambda(n_steps)``, through PyTorch's scheduler.
 
     Args:
-        lr_schedule_optimizer: Adam at base rate 2.
-        lr_schedule_training: Warmup and decay settings.
-        lr_scheduler: ``build_lr_scheduler`` over that optimizer.
+        lr_schedule_optimizer: Optimizer the schedule drives.
+        lr_scheduler: The training schedule, at step 0.
         n_steps: Scheduler steps to take.
+        expected_lr: Learning rate the schedule must give.
     """
     for _ in range(n_steps):
         lr_scheduler.step()
     actual = cast(float, lr_schedule_optimizer.param_groups[0]["lr"])
-    expected = alphafold_lr_lambda(
-        n_steps,
-        warmup_steps=lr_schedule_training.lr_warmup_steps,
-        decay_steps=lr_schedule_training.lr_decay_steps,
-        decay_factor=lr_schedule_training.lr_decay_factor,
-    )
-    torch.testing.assert_close(actual, 2.0 * expected)
+    torch.testing.assert_close(actual, expected_lr)
 
 
 def test_train_preflushes_before_an_oversized_batch(
-    tmp_path: pathlib.Path,
-    harness: TrainHarness,
+    preflush_inputs: PreflushInputs,
     log: FilteringBoundLogger,
 ) -> None:
     """Each window is flushed before a batch that would exceed the budget.
@@ -1432,17 +1651,10 @@ def test_train_preflushes_before_an_oversized_batch(
     budget is chosen so every arrival triggers a flush.
 
     Args:
-        tmp_path: Per-test directory.
-        harness: Builds the trunk, configuration, setup and loaders.
+        preflush_inputs: Loaders and a fresh setup with a 42-token budget.
         log: Logger.
     """
-    tcfg = harness.tcfg(
-        tmp_path,
-        TrainCase(1, 7, 1.0, use_wandb=False),
-        loader_budget=42,
-    )
-    tcfg = tcfg.model_copy(update={"test_loader": LoaderConfig(batch_size=1)})
-    built = harness.loaders(tmp_path, tcfg)
+    built = preflush_inputs.loaders
     with mock.patch(
         "train.train_loop.process_accum_window",
         autospec=True,
@@ -1452,7 +1664,7 @@ def test_train_preflushes_before_an_oversized_batch(
             best_val_loss=torch.tensor(float("inf")),
             train_loader=built.train,
             test_loader=built.test,
-            model_params=harness.setup(harness.trunk(), tcfg),
+            model_params=preflush_inputs.model_params,
             log=log,
         )
     windows = [
@@ -1561,7 +1773,7 @@ def test_train_checkpoint_holds_stepped_optimizer_and_scheduler(
         train_run: Recorded one-epoch run.
     """
     opt_state = cast(
-        dict[int, StateDict],
+        dict[int, dict[str, Float[torch.Tensor, "..."]]],
         train_run.checkpoint["optimizer"]["state"],
     )
     first = next(iter(opt_state.values()))
@@ -1912,11 +2124,6 @@ def test_train_ddp_keeps_ranks_in_lockstep(
     assert len({digest for _, digest in reported}) == 1
 
 
-# ---------------------------------------------------------------------------
-# self_conditioned_template — the training-side self-conditioning pass
-# ---------------------------------------------------------------------------
-
-
 @dataclasses.dataclass(frozen=True)
 class TrunkCall:
     """What the trunk saw on one forward call.
@@ -2059,7 +2266,7 @@ def template_pair(
 
 
 def test_self_conditioned_template_is_binned_prediction(
-    featurized_batch: FeaturizedBatch,
+    valid_pair_mask: Bool[torch.Tensor, "B N_res N_res"],
     template_pair: TemplatePair,
 ) -> None:
     """The template is a one-hot per valid pair and follows the noisy input.
@@ -2070,18 +2277,13 @@ def test_self_conditioned_template_is_binned_prediction(
     coordinates are the only input the prediction is built from.
 
     Args:
-        featurized_batch: Supplies the residue mask.
+        valid_pair_mask: Pairs whose residues both have a pseudo-Cβ.
         template_pair: Templates before and after the input moved.
     """
-    residue_mask = featurized_batch.f_pseudo_beta_mask.bool()
-    pair_mask = rearrange(residue_mask, "b i -> b i 1") & rearrange(
-        residue_mask,
-        "b j -> b 1 j",
-    )
     bin_sums = reduce(template_pair.baseline, "b i j k -> b i j", "sum")
     assert torch.equal(
-        bin_sums[pair_mask],
-        torch.ones_like(bin_sums[pair_mask]),
+        bin_sums[valid_pair_mask],
+        torch.ones_like(bin_sums[valid_pair_mask]),
     )
     assert not torch.equal(template_pair.baseline, template_pair.perturbed)
 
