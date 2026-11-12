@@ -64,7 +64,7 @@ and "You Might Not Need an Effect".
 | pylint | `eslint-plugin-unicorn`, `eslint-plugin-sonarjs`, `eslint-plugin-import-x` | Deeper semantic and idiom checks. |
 | black | Prettier | `eslint-config-prettier` turns off ESLint's formatting rules. |
 | xenon / radon | ESLint `complexity`, `max-depth`, `max-params`, `max-lines-per-function`, `sonarjs/cognitive-complexity` | Cognitive complexity tracks readability better than cyclomatic. |
-| pydoclint | `eslint-plugin-jsdoc` (TypeScript mode) or `eslint-plugin-tsdoc` | Docs must not repeat types already in the signature. |
+| pydoclint | `eslint-plugin-jsdoc` (TypeScript preset) | Enforces the Google guide's JSDoc rules; see [Documentation linting](#documentation-linting). |
 | `enforce-einops`, `enforce-jaxtyping` | `no-restricted-syntax`, `no-restricted-imports`, `no-restricted-properties` | Each ban is one rule with an AST selector; no custom script needed. |
 | jaxtyping runtime checks | Zod or Valibot schemas at I/O boundaries | TS types are erased at runtime, so untrusted data must be parsed. |
 | (none) | knip | Unused files, exports and dependencies. |
@@ -164,6 +164,72 @@ Rules that must stay on, and why:
   arrows, not `function` expressions.
 
 ESLint runs with `--max-warnings 0`, so there is no "warning" tier.
+
+## Documentation linting
+
+`eslint-plugin-jsdoc` plays the role of pydoclint. We do not use
+`eslint-plugin-tsdoc`: its only rule, `tsdoc/syntax`, checks that comments
+parse as TSDoc. It does not require docs to exist, check `@param` names
+against the signature, or ban types in docs, and the Google guide does not
+use the TSDoc dialect.
+
+How the Google guide's JSDoc rules map to lint rules:
+
+| Google TS guide rule | pydoclint analogue | Lint rule |
+|---|---|---|
+| `/** */` for docs, `//` for implementation comments | none | `jsdoc/no-bad-blocks`, core `multiline-comment-style: ["error", "separate-lines"]` (skips JSDoc by default) |
+| Document all top-level exports | ruff `D1xx` | `jsdoc/require-jsdoc` |
+| Don't repeat types already in the signature | `arg-type-hints-in-docstring = false` | `jsdoc/no-types`; the TS preset turns off `require-param-type` and `require-returns-type` |
+| Don't use tags TS makes redundant (`@private`, `@override`, `@implements`, `@enum`) | none | `jsdoc/check-tag-names` with `typed: true` |
+| `@param` names match the signature | DOC101–DOC105 | `jsdoc/check-param-names` |
+| Descriptions add information, not restate the name | none | `jsdoc/informative-docs`, `jsdoc/require-description` |
+| Parameter properties are documented with `@param` on the constructor | none | `jsdoc/check-param-names`, `jsdoc/require-param` |
+| Returns and raises sections | DOC201+, DOC501+ | `jsdoc/require-returns`, `jsdoc/require-throws` |
+
+Proposed configuration:
+
+```ts
+import jsdoc from "eslint-plugin-jsdoc";
+
+export default [
+  jsdoc.configs["flat/recommended-typescript-error"],
+  {
+    rules: {
+      "jsdoc/require-jsdoc": ["error", {
+        publicOnly: false, // every function, as on the Python side
+        require: {
+          FunctionDeclaration: true,
+          ClassDeclaration: true,
+          MethodDefinition: true,
+        },
+        contexts: ["TSInterfaceDeclaration", "TSTypeAliasDeclaration",
+                   "TSPropertySignature"],
+      }],
+      "jsdoc/check-tag-names": ["error", { typed: true }],
+      "jsdoc/no-types": "error",
+      "jsdoc/require-param": ["error", { checkDestructured: false }],
+      "jsdoc/check-param-names": ["error", { checkDestructured: false }],
+      "jsdoc/require-returns": "error",
+      "jsdoc/require-throws": "error",
+      "jsdoc/require-description": "error",
+      "jsdoc/informative-docs": "error",
+      "jsdoc/no-blank-blocks": "error",
+    },
+  },
+];
+```
+
+One deliberate departure from the Google guide: Google makes `@param` and
+`@return` optional, to be written only when they add information. We
+require them, matching the full `Args`/`Returns` sections that pydoclint
+enforces on the Python side. Following Google strictly would mean turning
+off `require-param` and `require-returns` while keeping `check-param-names`,
+so tags that are present still cannot drift from the signature.
+
+For React components, `checkDestructured: false` avoids demanding a
+`@param props.foo` tag for every destructured prop. Props are documented
+on the fields of the `XProps` interface instead, which
+`TSPropertySignature` in `require-jsdoc` enforces.
 
 ## React conventions for the style guide
 
