@@ -1,13 +1,21 @@
 """Tests for atom-level transformer layers.
 
-Covers build_sparse_pairs, compute_beta, scatter_mean,
-ConditionedTransitionBlock, DiffusionTransformer, AtomTransformer,
-AtomFeatureEncoder, and AtomAttentionDecoder, including shape contracts,
-numerical stability, gradient flow, and sparse regression checks for the
-K < N attention-bias shape mismatch.
+Covers ``build_sparse_pairs`` against the window definition, ``compute_beta``
+admission rules and fill values, ``scatter_mean`` on hand-computed cases,
+the block isolation of AtomTransformer's sliding windows, and the output,
+gradient and shape contracts of ConditionedTransitionBlock,
+DiffusionTransformer, AtomTransformer, AtomFeatureEncoder and
+AtomAttentionDecoder, including the sparse ``K < N`` layout that once
+crashed with a pair-bias shape mismatch.
+
+Float inputs come from ``tests.patterns.sine_pattern`` and every module
+is built under a fixed seed, so each test is reproducible on its own.
 """
 
+import abc
 import dataclasses
+import enum
+from typing import cast, override
 
 import pytest
 import torch
@@ -22,1654 +30,1367 @@ from architecture.atom_transformers import (
     compute_beta,
     scatter_mean,
 )
-from beartype import beartype
-from einops import einsum, rearrange, reduce, repeat
+from einops import rearrange, reduce, repeat
 from helpers.useful_objects import manual_seed
-from jaxtyping import Bool, Float, Int, TypeCheckError, jaxtyped
+from jaxtyping import Bool, Float, Int, TypeCheckError
+from tests.patterns import sine_pattern
 from train.train_config import ModelParams
-
-_ = manual_seed(42)
-
-N_RES = 8
-ATOMS_PER_RES = 3
-N_ATOM = N_RES * ATOMS_PER_RES  # 24
-E = 4  # element one-hot dim
-C_ATOM = 32
-C_ATOMPAIR = 16
-C_TOKEN = 32
-C_PAIR = 32
-F_REF_DIM = ATOMS_PER_RES * (3 + E)
-B = 1
-N_HEADS = 4
-NON_ZERO_BETA = -1e10
-ATOM_TRANSFORMER_BLOCKS = 3
-ATOM_TRANSFORMER_HEADS = 4
-DIFFUSION_TRANSFORMER_BLOCKS = 3
-
-# K is dynamic — pre-compute once from the canonical tok_idx
-_base_tok = torch.repeat_interleave(torch.arange(N_RES), ATOMS_PER_RES)
-_base_nbrs, _ = build_sparse_pairs(_base_tok)
-K = _base_nbrs.size(1)
-
-# Sparse-mismatch regression constants.
-# With a small window_size, K < N_ATOM, reproducing the production crash where
-# attn (B, n_heads, N, N) and pair_bias (B, n_heads, N, K) had mismatched
-# last dims.
-_SPARSE_WINDOW = 4  # small window so K << N_ATOM
-_SPARSE_RES = 20  # number of residues — gives N_ATOM_SPARSE = 20 * 2 = 40
-_ATOMS_PER_RES_SPARSE = 2
-N_ATOM_SPARSE = _SPARSE_RES * _ATOMS_PER_RES_SPARSE
-_sparse_tok = torch.repeat_interleave(
-    torch.arange(_SPARSE_RES),
-    _ATOMS_PER_RES_SPARSE,
-)
-_sparse_nbrs, _sparse_mask_raw = build_sparse_pairs(
-    _sparse_tok,
-    window_size=_SPARSE_WINDOW,
-)
-K_SPARSE = _sparse_nbrs.size(
-    1,
-)  # guaranteed < N_ATOM_SPARSE for _SPARSE_WINDOW small enough
-
-
-# ---------------------------------------------------------------------------
-# Input bundles — collapse wide fixture lists for encoder/decoder tests
-# ---------------------------------------------------------------------------
 
 
 @dataclasses.dataclass(frozen=True)
-class EncoderInputs:
-    """All AtomFeatureEncoder forward-pass inputs in one bundle."""
+class AtomDims:
+    """Sizes shared by every module and input in this file.
 
+    Attributes:
+        batch: Batch size ``B``.
+        n_res: Residues ``N_res``.
+        atoms_per_res: Atoms per residue.
+        n_elements: Width ``E`` of the element one-hot.
+        c_atom: Atom single embedding width.
+        c_atompair: Atom pair embedding width.
+        c_token: Residue single embedding width.
+        c_pair: Residue pair embedding width.
+        n_heads: Attention heads.
+    """
+
+    batch: int
+    n_res: int
+    atoms_per_res: int
+    n_elements: int
+    c_atom: int
+    c_atompair: int
+    c_token: int
+    c_pair: int
+    n_heads: int
+
+    @property
+    def n_atom(self) -> int:
+        """Total atoms ``N_atom = n_res * atoms_per_res``.
+
+        Returns:
+            Atom count.
+        """
+        return self.n_res * self.atoms_per_res
+
+
+@dataclasses.dataclass(frozen=True)
+class SparsePairs:
+    """Batched output of ``build_sparse_pairs``.
+
+    Attributes:
+        neighbor_idx: Neighbour atom index per slot ``(B, N_atom, K)``.
+        valid_mask: True where the slot is a real neighbour.
+    """
+
+    neighbor_idx: Int[torch.Tensor, "B N_atom K"]
+    valid_mask: Bool[torch.Tensor, "B N_atom K"]
+
+
+@dataclasses.dataclass(frozen=True)
+class AtomInputs:
+    """Every encoder, decoder and atom-transformer input, from one layout.
+
+    Attributes:
+        tok_idx: Residue index per atom ``(B, N_atom)``.
+        pairs: Sparse neighbour layout for ``tok_idx``.
+        q: Atom queries ``(B, N_atom, c_atom)``.
+        c: Atom context ``(B, N_atom, c_atom)``.
+        p: Sparse atom pairs ``(B, N_atom, K, c_atompair)``.
+        ref_pos: Reference positions ``(B, N_atom, 3)``.
+        ref_element: Element one-hot ``(B, N_atom, E)``.
+        ref_space_uid: Chain id per atom ``(B, N_atom)``; all zero.
+        r_scaled: Scaled noisy positions ``(B, N_atom, 3)``.
+        s_input: Trunk single embedding ``(B, N_res, c_token)``.
+        z_input: Trunk pair embedding ``(B, N_res, N_res, c_pair)``.
+    """
+
+    tok_idx: Int[torch.Tensor, "B N_atom"]
+    pairs: SparsePairs
+    q: Float[torch.Tensor, "B N_atom c_atom"]
+    c: Float[torch.Tensor, "B N_atom c_atom"]
+    p: Float[torch.Tensor, "B N_atom K c_atompair"]
     ref_pos: Float[torch.Tensor, "B N_atom 3"]
     ref_element: Float[torch.Tensor, "B N_atom E"]
     ref_space_uid: Int[torch.Tensor, "B N_atom"]
-    s_input: Float[torch.Tensor, "B N_res C_token"]
-    z_input: Float[torch.Tensor, "B N_res N_res C_pair"]
     r_scaled: Float[torch.Tensor, "B N_atom 3"]
-    tok_idx_batched: Int[torch.Tensor, "B N_atom"]
+    s_input: Float[torch.Tensor, "B N_res c_token"]
+    z_input: Float[torch.Tensor, "B N_res N_res c_pair"]
 
 
 @dataclasses.dataclass(frozen=True)
-class DecoderInputs:
-    """All AtomAttentionDecoder forward-pass inputs in one bundle."""
+class NeighbourSets:
+    """Expected neighbours of every atom in a layout.
 
-    q_skip: Float[torch.Tensor, "B N_atom C_atom"]
-    p_skip: Float[torch.Tensor, "B N_atom K C_atompair"]
-    c_skip: Float[torch.Tensor, "B N_atom C_atom"]
-    c_l: Float[torch.Tensor, "B N_atom C_atom"]
-    s_input: Float[torch.Tensor, "B N_res C_token"]
-    z_input: Float[torch.Tensor, "B N_res N_res C_pair"]
-    tok_idx_batched: Int[torch.Tensor, "B N_atom"]
-
-
-# ---------------------------------------------------------------------------
-# Typed helpers
-# ---------------------------------------------------------------------------
-
-
-@jaxtyped(typechecker=beartype)
-def pairwise_sq_dist(
-    x: Float[torch.Tensor, "N D"],
-) -> Float[torch.Tensor, "N N"]:
-    """Compute pairwise squared Euclidean distances between N vectors.
-
-    Used in tests to verify that output embeddings differ across positions.
+    Attributes:
+        per_atom: Neighbour atom indices of atom ``l`` at position ``l``.
     """
-    diff = rearrange(x, "n d -> n 1 d") - rearrange(x, "n d -> 1 n d")
-    return einsum(diff, diff, "n m d, n m d -> n m")
+
+    per_atom: tuple[frozenset[int], ...]
 
 
-# ---------------------------------------------------------------------------
-# Model fixtures
-# ---------------------------------------------------------------------------
+@dataclasses.dataclass(frozen=True)
+class ModuleProbe(abc.ABC):
+    """One module call reduced to a single differentiable input and output.
+
+    Each subclass holds a module and every input it needs except the one
+    under test, and ``run`` calls the module with that one input swapped
+    in. Every fixed input is a named field, so nothing is captured.
+
+    Attributes:
+        first: The input the gradient and malformed-shape tests act on.
+        out_shape: Shape the probed output must have.
+    """
+
+    first: Float[torch.Tensor, "..."]
+    out_shape: tuple[int, ...]
+
+    @abc.abstractmethod
+    def run(
+        self,
+        first: Float[torch.Tensor, "..."],
+    ) -> Float[torch.Tensor, "..."]:
+        """Call the module with ``first`` in place of the probed input.
+
+        Args:
+            first: Value for the probed input.
+
+        Returns:
+            The probed output.
+        """
+
+
+@dataclasses.dataclass(frozen=True)
+class TransitionProbe(ModuleProbe):
+    """ConditionedTransitionBlock probed over its atom embedding ``a``.
+
+    Attributes:
+        block: Module under test.
+        s: Fixed conditioning embedding.
+    """
+
+    block: ConditionedTransitionBlock
+    s: Float[torch.Tensor, "..."]
+
+    @override
+    def run(
+        self,
+        first: Float[torch.Tensor, "..."],
+    ) -> Float[torch.Tensor, "..."]:
+        """Run ``block(first, s)``.
+
+        Args:
+            first: Atom embedding ``a``.
+
+        Returns:
+            The block's output.
+        """
+        return self.block(first, self.s)
+
+
+@dataclasses.dataclass(frozen=True)
+class DiffusionProbe(ModuleProbe):
+    """DiffusionTransformer probed over its atom embedding ``a``.
+
+    Attributes:
+        model: Module under test.
+        s: Fixed conditioning embedding.
+        z: Fixed pair embedding, dense or sparse.
+        beta: Fixed attention bias aligned with ``z``.
+        neighbor_idx: Neighbour index for the sparse layout, or ``None``
+            for dense pairs.
+    """
+
+    model: DiffusionTransformer
+    s: Float[torch.Tensor, "..."]
+    z: Float[torch.Tensor, "..."]
+    beta: Float[torch.Tensor, "..."]
+    neighbor_idx: Int[torch.Tensor, "B N K"] | None
+
+    @override
+    def run(
+        self,
+        first: Float[torch.Tensor, "..."],
+    ) -> Float[torch.Tensor, "..."]:
+        """Run the transformer with ``first`` as ``a``.
+
+        Args:
+            first: Atom embedding ``a``.
+
+        Returns:
+            The transformer's output.
+        """
+        return self.model(
+            first,
+            self.s,
+            self.z,
+            self.beta,
+            neighbor_idx=self.neighbor_idx,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class AtomTransformerProbe(ModuleProbe):
+    """AtomTransformer probed over its queries ``q``.
+
+    Attributes:
+        model: Module under test.
+        inputs: Fixed context, pairs and neighbour layout.
+    """
+
+    model: AtomTransformer
+    inputs: AtomInputs
+
+    @override
+    def run(
+        self,
+        first: Float[torch.Tensor, "..."],
+    ) -> Float[torch.Tensor, "..."]:
+        """Run the transformer with ``first`` as ``q``.
+
+        Args:
+            first: Atom queries ``q``.
+
+        Returns:
+            The transformer's output.
+        """
+        x = self.inputs
+        return self.model(
+            first,
+            x.c,
+            x.p,
+            x.pairs.neighbor_idx,
+            x.pairs.valid_mask,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class EncoderProbe(ModuleProbe):
+    """AtomFeatureEncoder probed from ``r_scaled`` to ``q_skip``.
+
+    Attributes:
+        encoder: Module under test.
+        inputs: Every other encoder input.
+    """
+
+    encoder: AtomFeatureEncoder
+    inputs: AtomInputs
+
+    @override
+    def run(
+        self,
+        first: Float[torch.Tensor, "..."],
+    ) -> Float[torch.Tensor, "..."]:
+        """Run the encoder with ``first`` as ``r_scaled``.
+
+        Args:
+            first: Scaled noisy positions.
+
+        Returns:
+            The encoder's ``q_skip`` output.
+        """
+        x = self.inputs
+        _, q_skip, *_ = self.encoder(
+            x.ref_pos,
+            x.ref_element,
+            x.ref_space_uid,
+            x.s_input,
+            x.z_input,
+            first,
+            x.tok_idx,
+        )
+        return q_skip
+
+
+@dataclasses.dataclass(frozen=True)
+class DecoderProbe(ModuleProbe):
+    """AtomAttentionDecoder probed from ``q_skip`` to its position update.
+
+    Attributes:
+        decoder: Module under test.
+        inputs: Atom-level inputs; ``q``, ``p`` and ``c`` stand in for the
+            encoder's skip outputs.
+    """
+
+    decoder: AtomAttentionDecoder
+    inputs: AtomInputs
+
+    @override
+    def run(
+        self,
+        first: Float[torch.Tensor, "..."],
+    ) -> Float[torch.Tensor, "..."]:
+        """Run the decoder with ``first`` as ``q_skip``.
+
+        Args:
+            first: Atom skip queries.
+
+        Returns:
+            The decoder's ``r_update`` output.
+        """
+        x = self.inputs
+        _, _, r_update, _ = self.decoder(
+            first,
+            x.p,
+            x.c,
+            x.c,
+            x.s_input,
+            x.z_input,
+            x.tok_idx,
+        )
+        return r_update
+
+
+@dataclasses.dataclass(frozen=True)
+class LayoutCase:
+    """A residue layout for ``build_sparse_pairs`` and its neighbour count.
+
+    Attributes:
+        n_res: Residues in the chain.
+        atoms_per_res: Atoms per residue.
+        window_size: Full window span in residues.
+        expected_k: Largest neighbour count of any atom.
+    """
+
+    n_res: int
+    atoms_per_res: int
+    window_size: int
+    expected_k: int
+
+
+class LayoutScenario(enum.Enum):
+    """Layouts with and without atoms outside each other's window.
+
+    Members:
+        one_window: 8 residues fit in a 128 window, so all 24 atoms are
+            neighbours of each other.
+        chain_window_8: 64 one-atom residues, half window 4: up to 7
+            neighbours, fewer at the chain ends.
+        pairs_window_4: 20 two-atom residues, half window 2: 3 residues of
+            2 atoms each, so ``K = 6 < N = 40``.
+    """
+
+    one_window = LayoutCase(8, 3, 128, 24)
+    chain_window_8 = LayoutCase(64, 1, 8, 7)
+    pairs_window_4 = LayoutCase(20, 2, 4, 6)
+
+
+@dataclasses.dataclass(frozen=True)
+class BetaPointCase:
+    """One atom pair on an 8-atom dense layout and whether it is admitted.
+
+    Window centres sit at ``c * n_queries + n_queries / 2 - 0.5``. A pair
+    ``(l, m)`` is admitted when some centre has ``l`` within
+    ``n_queries / 2`` and ``m`` within ``n_keys / 2`` of it, strictly.
+
+    Attributes:
+        n_queries: Query window width.
+        n_keys: Key window width.
+        query: Atom ``l``.
+        key: Atom ``m``.
+        expected_beta: 0.0 when the pair is admitted, else the float32
+            fill value -1e10.
+    """
+
+    n_queries: int
+    n_keys: int
+    query: int
+    key: int
+    expected_beta: float
+
+
+class BetaPointScenario(enum.Enum):
+    """Hand-derived admission decisions for ``compute_beta``.
+
+    Members:
+        shared_centre: q=4, k=8. Centre 1.5 has ``|0-1.5| < 2`` and
+            ``|1-1.5| < 4``.
+        disjoint_windows: q=k=4. Atom 7 is no key of centre 1.5 and atom 0
+            no query of centre 5.5.
+        boundary_is_strict: q=k=4. Atom 3 queries centre 1.5 but
+            ``|4-1.5| = 2.5`` is not below 2.
+        boundary_self: q=k=4. Centre 1.5 admits ``(3, 3)``.
+        other_centre_admits: q=4, k=8. Atom 4 queries centre 5.5, which has
+            ``|3-5.5| = 2.5 < 4``.
+        forward_admitted: q=2, k=8. Atom 0 queries centre 0.5 and
+            ``|4-0.5| = 3.5 < 4``.
+        backward_blocked: q=2, k=8. Atom 4 queries centre 4.5 but
+            ``|0-4.5| = 4.5`` is not below 4: beta is not symmetric.
+    """
+
+    shared_centre = BetaPointCase(4, 8, 0, 1, 0.0)
+    disjoint_windows = BetaPointCase(4, 4, 0, 7, -1e10)
+    boundary_is_strict = BetaPointCase(4, 4, 3, 4, -1e10)
+    boundary_self = BetaPointCase(4, 4, 3, 3, 0.0)
+    other_centre_admits = BetaPointCase(4, 8, 4, 3, 0.0)
+    forward_admitted = BetaPointCase(2, 8, 0, 4, 0.0)
+    backward_blocked = BetaPointCase(2, 8, 4, 0, -1e10)
+
+
+@dataclasses.dataclass(frozen=True)
+class ScatterCase:
+    """A ``scatter_mean`` input and its hand-computed mean, one channel.
+
+    Attributes:
+        src: Values per batch item and source position.
+        index: Flat segment per position, already offset by ``b * N_tgt``.
+        expected: Mean per batch item and target segment.
+    """
+
+    src: tuple[tuple[float, ...], ...]
+    index: tuple[tuple[int, ...], ...]
+    expected: tuple[tuple[float, ...], ...]
+
+
+class ScatterScenario(enum.Enum):
+    """Segment layouts for ``scatter_mean``.
+
+    Members:
+        uniform_pairs: Two atoms per segment: ``mean(0, 2) = 1``,
+            ``mean(4, 6) = 5``.
+        uneven: Three then two atoms: ``mean(1, 3, 5) = 3``,
+            ``mean(7, 9) = 8``.
+        one_per_segment: Each atom its own segment, so values pass through.
+        batch_offset: Batch 1's segment index is offset by ``N_tgt = 1``;
+            each batch item averages only its own atoms.
+    """
+
+    uniform_pairs = ScatterCase(((0, 2, 4, 6),), ((0, 0, 1, 1),), ((1, 5),))
+    uneven = ScatterCase(((1, 3, 5, 7, 9),), ((0, 0, 0, 1, 1),), ((3, 8),))
+    one_per_segment = ScatterCase(((4, -2, 7),), ((0, 1, 2),), ((4, -2, 7),))
+    batch_offset = ScatterCase(((1, 3), (5, 9)), ((0, 0), (1, 1)), ((2,), (7,)))
 
 
 @pytest.fixture
-def conditioned_transition_block() -> ConditionedTransitionBlock:
-    """Provide a ConditionedTransitionBlock with c_a=c_s=C_ATOM in eval mode.
+def dims() -> AtomDims:
+    """Return the small sizes every test builds its modules and inputs from.
 
     Returns:
-        A ConditionedTransitionBlock instance ready for inference.
+        Sizes with every attention width divisible by ``n_heads``.
     """
-    return ConditionedTransitionBlock(
-        c_a=C_ATOM,
-        c_s=C_ATOM,
-        expansion=2,
-    ).eval()
-
-
-@pytest.fixture
-def diffusion_transformer() -> DiffusionTransformer:
-    """Provide a DiffusionTransformer with 2 blocks in eval mode.
-
-    Returns:
-        A DiffusionTransformer instance ready for inference.
-    """
-    return DiffusionTransformer(
-        c_a=C_ATOM,
-        c_s=C_ATOM,
-        c_pair=C_PAIR,
-        N_block=2,
-        N_head=N_HEADS,
-    ).eval()
-
-
-@pytest.fixture
-def transformer() -> AtomTransformer:
-    """Provide an AtomTransformer with 2 blocks in eval mode.
-
-    Returns:
-        An AtomTransformer instance ready for inference.
-    """
-    return AtomTransformer(C_ATOM, C_ATOMPAIR, n_blocks=2, n_heads=4).eval()
-
-
-@pytest.fixture
-def model_params() -> ModelParams:
-    """Provide ModelParams sized to the small test dimensions.
-
-    Returns:
-        A ModelParams instance with test-scaled channel dims and 1 block each.
-    """
-    return ModelParams(
-        f_ref_dim=F_REF_DIM,
-        c_res=C_TOKEN,
-        c_pair=C_PAIR,
-        c_atom=C_ATOM,
-        c_atompair=C_ATOMPAIR,
-        n_blocks_atom_transformer_encoder=1,
-        n_heads_atom_transformer_encoder=4,
-        n_blocks_atom_transformer_decoder=1,
-        n_heads_atom_transformer_decoder=4,
+    return AtomDims(
+        batch=1,
+        n_res=8,
+        atoms_per_res=3,
+        n_elements=4,
+        c_atom=32,
+        c_atompair=16,
+        c_token=32,
+        c_pair=32,
+        n_heads=4,
     )
 
 
 @pytest.fixture
-def encoder(model_params: ModelParams) -> AtomFeatureEncoder:
-    """Provide an AtomFeatureEncoder in eval mode.
+def model_params(dims: AtomDims) -> ModelParams:
+    """Build ModelParams at the test sizes, one block per atom transformer.
 
     Args:
-        model_params: Fixture providing the shared ModelParams configuration.
+        dims: Model sizes.
 
     Returns:
-        An AtomFeatureEncoder instance ready for inference.
+        ModelParams whose ``f_ref_dim`` matches ``atoms_per_res * (3 + E)``.
     """
+    return ModelParams(
+        f_ref_dim=dims.atoms_per_res * (3 + dims.n_elements),
+        c_res=dims.c_token,
+        c_pair=dims.c_pair,
+        c_atom=dims.c_atom,
+        c_atompair=dims.c_atompair,
+        n_blocks_atom_transformer_encoder=1,
+        n_heads_atom_transformer_encoder=dims.n_heads,
+        n_blocks_atom_transformer_decoder=1,
+        n_heads_atom_transformer_decoder=dims.n_heads,
+    )
+
+
+@pytest.fixture
+def atom_inputs(dims: AtomDims) -> AtomInputs:
+    """Build every atom-level input from deterministic patterns.
+
+    Atoms are grouped ``atoms_per_res`` to a residue, atom ``l`` has element
+    ``l % E``, and the sparse layout uses the default window, which covers
+    all 8 residues.
+
+    Args:
+        dims: Input sizes.
+
+    Returns:
+        The bundled inputs.
+    """
+    b, n, r = dims.batch, dims.n_atom, dims.n_res
+    tok = torch.repeat_interleave(torch.arange(r), dims.atoms_per_res)
+    nbrs, mask = build_sparse_pairs(tok)
+    k = nbrs.shape[1]
+    elements = torch.arange(n) % dims.n_elements
+    return AtomInputs(
+        tok_idx=repeat(tok, "n -> b n", b=b),
+        pairs=SparsePairs(
+            neighbor_idx=repeat(nbrs, "n k -> b n k", b=b),
+            valid_mask=repeat(mask, "n k -> b n k", b=b),
+        ),
+        q=sine_pattern((b, n, dims.c_atom), 0.31),
+        c=sine_pattern((b, n, dims.c_atom), 0.43),
+        p=sine_pattern((b, n, k, dims.c_atompair), 0.59),
+        ref_pos=sine_pattern((b, n, 3), 0.67),
+        ref_element=repeat(
+            F.one_hot(elements, dims.n_elements).float(),
+            "n e -> b n e",
+            b=b,
+        ),
+        ref_space_uid=torch.zeros(b, n, dtype=torch.long),
+        r_scaled=sine_pattern((b, n, 3), 0.79),
+        s_input=sine_pattern((b, r, dims.c_token), 0.83),
+        z_input=sine_pattern((b, r, r, dims.c_pair), 0.97),
+    )
+
+
+@pytest.fixture
+def sparse_inputs(dims: AtomDims) -> AtomInputs:
+    """Build atom inputs on 20 two-atom residues with a window of 4.
+
+    Each atom then has ``K = 6`` neighbours out of ``N = 40``, the layout
+    in which dense ``(N, N)`` logits plus a ``(N, K)`` pair bias crashed.
+    Only the atom-level fields are meaningful; the residue-level fields are
+    sized for 20 residues but unused by the sparse probes.
+
+    Args:
+        dims: Channel sizes.
+
+    Returns:
+        The bundled inputs.
+    """
+    b, r, per = dims.batch, 20, 2
+    n = r * per
+    tok = torch.repeat_interleave(torch.arange(r), per)
+    nbrs, mask = build_sparse_pairs(tok, window_size=4)
+    k = nbrs.shape[1]
+    return AtomInputs(
+        tok_idx=repeat(tok, "n -> b n", b=b),
+        pairs=SparsePairs(
+            neighbor_idx=repeat(nbrs, "n k -> b n k", b=b),
+            valid_mask=repeat(mask, "n k -> b n k", b=b),
+        ),
+        q=sine_pattern((b, n, dims.c_atom), 0.31),
+        c=sine_pattern((b, n, dims.c_atom), 0.43),
+        p=sine_pattern((b, n, k, dims.c_atompair), 0.59),
+        ref_pos=sine_pattern((b, n, 3), 0.67),
+        ref_element=torch.zeros(b, n, dims.n_elements),
+        ref_space_uid=torch.zeros(b, n, dtype=torch.long),
+        r_scaled=sine_pattern((b, n, 3), 0.79),
+        s_input=sine_pattern((b, r, dims.c_token), 0.83),
+        z_input=sine_pattern((b, r, r, dims.c_pair), 0.97),
+    )
+
+
+@pytest.fixture
+def transition_probe(dims: AtomDims) -> TransitionProbe:
+    """Probe ConditionedTransitionBlock on residue-level inputs.
+
+    Args:
+        dims: Module and input sizes.
+
+    Returns:
+        Probe over the atom embedding ``a``.
+    """
+    _ = manual_seed(0)
+    shape = (dims.batch, dims.n_res, dims.c_atom)
+    return TransitionProbe(
+        first=sine_pattern(shape, 0.37),
+        out_shape=shape,
+        block=ConditionedTransitionBlock(dims.c_atom, dims.c_atom).eval(),
+        s=sine_pattern(shape, 0.53),
+    )
+
+
+@pytest.fixture
+def diffusion_dense_probe(dims: AtomDims) -> DiffusionProbe:
+    """Probe a two-block DiffusionTransformer on dense residue pairs.
+
+    Args:
+        dims: Module and input sizes.
+
+    Returns:
+        Probe over the atom embedding ``a``.
+    """
+    _ = manual_seed(0)
+    b, n = dims.batch, dims.n_res
+    shape = (b, n, dims.c_atom)
+    return DiffusionProbe(
+        first=sine_pattern(shape, 0.37),
+        out_shape=shape,
+        model=DiffusionTransformer(
+            dims.c_atom,
+            dims.c_atom,
+            dims.c_pair,
+            N_block=2,
+            N_head=dims.n_heads,
+        ).eval(),
+        s=sine_pattern(shape, 0.53),
+        z=sine_pattern((b, n, n, dims.c_pair), 0.71),
+        beta=torch.zeros(b, n, n),
+        neighbor_idx=None,
+    )
+
+
+@pytest.fixture
+def diffusion_sparse_probe(
+    dims: AtomDims,
+    sparse_inputs: AtomInputs,
+) -> DiffusionProbe:
+    """Probe DiffusionTransformer on the ``K < N`` sparse layout.
+
+    Args:
+        dims: Module sizes.
+        sparse_inputs: Inputs with 6 of 40 neighbours per atom.
+
+    Returns:
+        Probe over the atom embedding ``a``.
+    """
+    _ = manual_seed(0)
+    x = sparse_inputs
+    return DiffusionProbe(
+        first=x.q,
+        out_shape=tuple(x.q.shape),
+        model=DiffusionTransformer(
+            dims.c_atom,
+            dims.c_atom,
+            dims.c_atompair,
+            N_block=1,
+            N_head=dims.n_heads,
+        ).eval(),
+        s=x.c,
+        z=x.p,
+        beta=torch.zeros(x.pairs.neighbor_idx.shape),
+        neighbor_idx=x.pairs.neighbor_idx,
+    )
+
+
+@pytest.fixture
+def atom_transformer_probe(
+    dims: AtomDims,
+    atom_inputs: AtomInputs,
+) -> AtomTransformerProbe:
+    """Probe a two-block AtomTransformer on the 24-atom layout.
+
+    Args:
+        dims: Module sizes.
+        atom_inputs: Atom-level inputs.
+
+    Returns:
+        Probe over the queries ``q``.
+    """
+    _ = manual_seed(0)
+    model = AtomTransformer(dims.c_atom, dims.c_atompair, 2, dims.n_heads)
+    return AtomTransformerProbe(
+        first=atom_inputs.q,
+        out_shape=tuple(atom_inputs.q.shape),
+        model=model.eval(),
+        inputs=atom_inputs,
+    )
+
+
+@pytest.fixture
+def atom_transformer_sparse_probe(
+    dims: AtomDims,
+    sparse_inputs: AtomInputs,
+) -> AtomTransformerProbe:
+    """Probe AtomTransformer on the ``K < N`` sparse layout.
+
+    Args:
+        dims: Module sizes.
+        sparse_inputs: Inputs with 6 of 40 neighbours per atom.
+
+    Returns:
+        Probe over the queries ``q``.
+    """
+    _ = manual_seed(0)
+    model = AtomTransformer(dims.c_atom, dims.c_atompair, 1, dims.n_heads)
+    return AtomTransformerProbe(
+        first=sparse_inputs.q,
+        out_shape=tuple(sparse_inputs.q.shape),
+        model=model.eval(),
+        inputs=sparse_inputs,
+    )
+
+
+@pytest.fixture
+def encoder(dims: AtomDims, model_params: ModelParams) -> AtomFeatureEncoder:
+    """Build an AtomFeatureEncoder at the test sizes under a fixed seed.
+
+    Args:
+        dims: Module sizes.
+        model_params: Shared model configuration.
+
+    Returns:
+        The encoder in eval mode.
+    """
+    _ = manual_seed(0)
     return AtomFeatureEncoder(
-        c=C_TOKEN,
-        d=C_ATOMPAIR,
-        m=C_ATOM,
+        c=dims.c_token,
+        d=dims.c_atompair,
+        m=dims.c_atom,
         model_params=model_params,
     ).eval()
 
 
 @pytest.fixture
 def decoder(model_params: ModelParams) -> AtomAttentionDecoder:
-    """Provide an AtomAttentionDecoder in eval mode.
+    """Build an AtomAttentionDecoder at the test sizes under a fixed seed.
 
     Args:
-        model_params: Fixture providing the shared ModelParams configuration.
+        model_params: Shared model configuration.
 
     Returns:
-        An AtomAttentionDecoder instance ready for inference.
+        The decoder in eval mode.
     """
+    _ = manual_seed(0)
     return AtomAttentionDecoder(model_params=model_params).eval()
 
 
-# ---------------------------------------------------------------------------
-# Input tensor fixtures
-# ---------------------------------------------------------------------------
-
-
 @pytest.fixture
-def tok_idx() -> Int[torch.Tensor, "N_atom"]:
-    """Unbatched token index for build_sparse_pairs and the batched version.
-
-    Returns:
-        Int tensor of shape [N_atom] mapping each atom to its parent residue.
-    """
-    return torch.repeat_interleave(torch.arange(N_RES), ATOMS_PER_RES)
-
-
-@pytest.fixture
-def tok_idx_batched(
-    tok_idx: Int[torch.Tensor, "N_atom"],
-) -> Int[torch.Tensor, "B N_atom"]:
-    """Batched token index [B, N_atom] — passed to encoder/decoder.
+def encoder_probe(
+    encoder: AtomFeatureEncoder,
+    atom_inputs: AtomInputs,
+) -> EncoderProbe:
+    """Probe the encoder from ``r_scaled`` to its ``q_skip`` output.
 
     Args:
-        tok_idx: Fixture providing the unbatched [N_atom] token index.
+        encoder: Encoder under test.
+        atom_inputs: Atom-level inputs.
 
     Returns:
-        Int tensor of shape [B, N_atom] repeating tok_idx along batch.
+        Probe over the scaled noisy positions.
     """
-    return repeat(tok_idx, "n -> b n", b=B).contiguous()
+    return EncoderProbe(
+        first=atom_inputs.r_scaled,
+        out_shape=tuple(atom_inputs.q.shape),
+        encoder=encoder,
+        inputs=atom_inputs,
+    )
 
 
 @pytest.fixture
-def neighbor_idx(
-    tok_idx: Int[torch.Tensor, "N_atom"],
-) -> Int[torch.Tensor, "B N_atom K"]:
-    """Sparse neighbor index [B=1, N_atom, K] from the canonical tok_idx.
+def decoder_probe(
+    decoder: AtomAttentionDecoder,
+    atom_inputs: AtomInputs,
+) -> DecoderProbe:
+    """Probe the decoder from ``q_skip`` to its position update.
 
     Args:
-        tok_idx: Fixture providing the unbatched [N_atom] token index.
+        decoder: Decoder under test.
+        atom_inputs: Atom-level inputs; ``q``, ``p``, ``c`` stand in for
+            the encoder's skip outputs.
 
     Returns:
-        Int tensor of shape [B, N_atom, K] with neighbour indices per atom.
+        Probe over the skip queries.
     """
-    nbrs, _ = build_sparse_pairs(tok_idx)
-    return rearrange(nbrs, "n k -> 1 n k")
+    return DecoderProbe(
+        first=atom_inputs.q,
+        out_shape=tuple(atom_inputs.r_scaled.shape),
+        decoder=decoder,
+        inputs=atom_inputs,
+    )
 
 
 @pytest.fixture
-def valid_mask(
-    tok_idx: Int[torch.Tensor, "N_atom"],
-) -> Bool[torch.Tensor, "B N_atom K"]:
-    """Bool mask [B=1, N_atom, K] — True for real atoms, False for padding.
+def module_probe(
+    request: pytest.FixtureRequest,
+    module_probe_name: str,
+) -> ModuleProbe:
+    """Return the probe fixture named by ``module_probe_name``.
 
     Args:
-        tok_idx: Fixture providing the unbatched [N_atom] token index.
+        request: Pytest request used to look up the named fixture.
+        module_probe_name: A ``*_probe`` fixture name; the requesting test
+            parametrizes it.
 
     Returns:
-        Bool tensor of shape [B, N_atom, K] for valid sparse neighbour slots.
+        The named probe.
     """
-    _, mask = build_sparse_pairs(tok_idx)
-    return rearrange(mask, "n k -> 1 n k")  # [B=1, N_atom, K]
+    return cast(ModuleProbe, request.getfixturevalue(module_probe_name))
 
 
 @pytest.fixture
-def ref_pos() -> Float[torch.Tensor, "B N_atom 3"]:
-    """Random reference atom positions [B, N_atom, 3] for the encoder.
+def layout_tok_idx(layout_scenario: LayoutScenario) -> Int[torch.Tensor, "N"]:
+    """Build the scenario's residue index per atom.
+
+    Args:
+        layout_scenario: Layout to build; the requesting test
+            parametrizes it.
 
     Returns:
-        Float tensor of shape [B, N_atom, 3] with i.i.d. normal entries.
+        ``(N,)`` residue index, ``atoms_per_res`` atoms to a residue.
     """
-    return torch.randn(B, N_ATOM, 3)
+    case = layout_scenario.value
+    return torch.repeat_interleave(torch.arange(case.n_res), case.atoms_per_res)
 
 
 @pytest.fixture
-def ref_element() -> Float[torch.Tensor, "B N_atom E"]:
-    """Random one-hot element features [B, N_atom, E] (C/N/O/UNK per atom).
+def window_neighbours(
+    layout_scenario: LayoutScenario,
+    layout_tok_idx: Int[torch.Tensor, "N"],
+) -> NeighbourSets:
+    """List each atom's neighbours straight from the window definition.
+
+    An independent, loop-based reference: atom ``m`` neighbours ``l`` iff
+    ``|tok[l] - tok[m]| < window_size // 2``.
+
+    Args:
+        layout_scenario: Supplies the window size; the requesting test
+            parametrizes it.
+        layout_tok_idx: Residue index per atom.
 
     Returns:
-        Float tensor of shape [B, N_atom, E] with one-hot rows.
+        One frozenset of neighbour indices per atom.
     """
-    return F.one_hot(torch.randint(0, E, (B, N_ATOM)), num_classes=E).float()
-
-
-@pytest.fixture
-def ref_space_uid() -> Int[torch.Tensor, "B N_atom"]:
-    """All-zero space UIDs [B, N_atom] — every atom in one chain/space.
-
-    Returns:
-        Int tensor of shape [B, N_atom] filled with zeros.
-    """
-    return torch.zeros(B, N_ATOM, dtype=torch.long)
-
-
-@pytest.fixture
-def s_input() -> Float[torch.Tensor, "B N_res C_token"]:
-    """Random residue single embedding [B, N_res, C_token] for encoder.
-
-    Returns:
-        Float tensor of shape [B, N_res, C_token] with i.i.d. normal entries.
-    """
-    return torch.randn(B, N_RES, C_TOKEN)
-
-
-@pytest.fixture
-def z_input() -> Float[torch.Tensor, "B N_res N_res C_pair"]:
-    """Trunk pair embedding [B, N_res, N_res, C_pair] for encoder/decoder.
-
-    Returns:
-        Float tensor [B, N_res, N_res, C_pair] with i.i.d. normal entries.
-    """
-    return torch.randn(B, N_RES, N_RES, C_PAIR)
-
-
-@pytest.fixture
-def a_res() -> Float[torch.Tensor, "B N_res C_atom"]:
-    """Atom embeddings [B, N_res, C_atom] for transition/transformer tests.
-
-    Returns:
-        Float tensor of shape [B, N_res, C_atom] with i.i.d. normal entries.
-    """
-    return torch.randn(B, N_RES, C_ATOM)
-
-
-@pytest.fixture
-def beta_dense() -> Float[torch.Tensor, "B N_res N_res"]:
-    """Dense window-bias mask [B, N_res, N_res]; 0 in-window, -1e10 outside.
-
-    Returns:
-        Float tensor of shape [B, N_res, N_res] filled with zeros.
-    """
-    return torch.zeros(B, N_RES, N_RES)
-
-
-@pytest.fixture
-def r_scaled() -> Float[torch.Tensor, "B N_atom 3"]:
-    """Random atom positions [B, N_atom, 3] as encoder conditioning signal.
-
-    Returns:
-        Float tensor of shape [B, N_atom, 3] with i.i.d. normal entries.
-    """
-    return torch.randn(B, N_ATOM, 3)
-
-
-@pytest.fixture
-def q_batched() -> Float[torch.Tensor, "B N_atom C_atom"]:
-    """Random atom query embedding [B, N_atom, C_atom] for transformer tests.
-
-    Returns:
-        Float tensor of shape [B, N_atom, C_atom] with i.i.d. normal entries.
-    """
-    return torch.randn(B, N_ATOM, C_ATOM)
-
-
-@pytest.fixture
-def c_batched() -> Float[torch.Tensor, "B N_atom C_atom"]:
-    """Random atom context embedding [B, N_atom, C_atom] for key/value.
-
-    Returns:
-        Float tensor of shape [B, N_atom, C_atom] with i.i.d. normal entries.
-    """
-    return torch.randn(B, N_ATOM, C_ATOM)
-
-
-@pytest.fixture
-def p_batched() -> Float[torch.Tensor, "B N_atom K C_atompair"]:
-    """Sparse atom-pair embedding [B, N_atom, K, C_atompair] for tests.
-
-    Returns:
-        Float tensor [B, N_atom, K, C_atompair] with i.i.d. normal entries.
-    """
-    return torch.randn(B, N_ATOM, K, C_ATOMPAIR)
-
-
-@pytest.fixture
-def q_skip() -> Float[torch.Tensor, "B N_atom C_atom"]:
-    """Random atom skip-connection query [B, N_atom, C_atom] per decoder unit.
-
-    Returns:
-        Float tensor of shape [B, N_atom, C_atom] with i.i.d. normal entries.
-    """
-    return torch.randn(B, N_ATOM, C_ATOM)
-
-
-@pytest.fixture
-def c_skip() -> Float[torch.Tensor, "B N_atom C_atom"]:
-    """Random atom skip-connection context [B, N_atom, C_atom] per decoder unit.
-
-    Returns:
-        Float tensor of shape [B, N_atom, C_atom] with i.i.d. normal entries.
-    """
-    return torch.randn(B, N_ATOM, C_ATOM)
-
-
-@pytest.fixture
-def p_skip() -> Float[torch.Tensor, "B N_atom K C_atompair"]:
-    """Random sparse pair skip embed [B, N_atom, K, C_atompair] per decoder.
-
-    Returns:
-        Float tensor [B, N_atom, K, C_atompair] with i.i.d. normal entries.
-    """
-    return torch.randn(B, N_ATOM, K, C_ATOMPAIR)
-
-
-@pytest.fixture
-def c_l() -> Float[torch.Tensor, "B N_atom C_atom"]:
-    """Atom-level latent embedding [B, N_atom, C_atom] refined by the decoder.
-
-    Returns:
-        Float tensor of shape [B, N_atom, C_atom] with i.i.d. normal entries.
-    """
-    return torch.randn(B, N_ATOM, C_ATOM)
-
-
-@pytest.fixture
-def a_res_bad() -> Float[torch.Tensor, "B N_res"]:
-    """Wrong-shape residue embedding [B, N_res] missing the channel dim.
-
-    Returns:
-        Float tensor of shape [B, N_res], 2-D instead of the expected 3-D.
-    """
-    return torch.zeros(B, N_RES)
-
-
-@pytest.fixture
-def q_batched_bad() -> Float[torch.Tensor, "B N_atom"]:
-    """Wrong-shape atom query embedding [B, N_atom] missing the channel dim.
-
-    Returns:
-        Float tensor of shape [B, N_atom], 2-D instead of the expected 3-D.
-    """
-    return torch.zeros(B, N_ATOM)
-
-
-@pytest.fixture
-def ref_pos_bad() -> Float[torch.Tensor, "B N_atom"]:
-    """Wrong-shape reference positions [B, N_atom] missing the coordinate dim.
-
-    Returns:
-        Float tensor of shape [B, N_atom], 2-D instead of the expected 3-D.
-    """
-    return torch.zeros(B, N_ATOM)
-
-
-@pytest.fixture
-def q_skip_bad() -> Float[torch.Tensor, "B N_atom"]:
-    """Wrong-shape skip query embedding [B, N_atom] missing the channel dim.
-
-    Returns:
-        Float tensor of shape [B, N_atom], 2-D instead of the expected 3-D.
-    """
-    return torch.zeros(B, N_ATOM)
-
-
-@pytest.fixture
-def encoder_inputs() -> EncoderInputs:
-    """All AtomFeatureEncoder inputs bundled; builds tensors directly.
-
-    Returns:
-        EncoderInputs with random ref_pos, ref_element, ref_space_uid,
-        s_input, z_input, r_scaled, and tok_idx_batched.
-    """
-    return EncoderInputs(
-        ref_pos=torch.randn(B, N_ATOM, 3),
-        ref_element=F.one_hot(
-            torch.randint(0, E, (B, N_ATOM)),
-            num_classes=E,
-        ).float(),
-        ref_space_uid=torch.zeros(B, N_ATOM, dtype=torch.long),
-        s_input=torch.randn(B, N_RES, C_TOKEN),
-        z_input=torch.randn(B, N_RES, N_RES, C_PAIR),
-        r_scaled=torch.randn(B, N_ATOM, 3),
-        tok_idx_batched=repeat(_base_tok, "n -> b n", b=B).contiguous(),
+    half = layout_scenario.value.window_size // 2
+    tok = [int(t) for t in layout_tok_idx]
+    return NeighbourSets(
+        per_atom=tuple(
+            frozenset(m for m, t_m in enumerate(tok) if abs(t_l - t_m) < half)
+            for t_l in tok
+        ),
     )
 
 
 @pytest.fixture
-def decoder_inputs() -> DecoderInputs:
-    """All AtomAttentionDecoder inputs bundled; builds tensors directly.
+def dense_pairs() -> SparsePairs:
+    """Build a two-item batch of 8 atoms where every slot is every atom.
+
+    Slot ``k`` of atom ``l`` holds atom ``k``, so ``beta[b, l, k]`` reads
+    as the bias for the pair ``(l, k)``.
 
     Returns:
-        DecoderInputs with random q_skip, p_skip, c_skip, c_l, s_input,
-        z_input, and tok_idx_batched.
+        Identity neighbour layout, all slots valid.
     """
-    return DecoderInputs(
-        q_skip=torch.randn(B, N_ATOM, C_ATOM),
-        p_skip=torch.randn(B, N_ATOM, K, C_ATOMPAIR),
-        c_skip=torch.randn(B, N_ATOM, C_ATOM),
-        c_l=torch.randn(B, N_ATOM, C_ATOM),
-        s_input=torch.randn(B, N_RES, C_TOKEN),
-        z_input=torch.randn(B, N_RES, N_RES, C_PAIR),
-        tok_idx_batched=repeat(_base_tok, "n -> b n", b=B).contiguous(),
+    n = 8
+    return SparsePairs(
+        neighbor_idx=repeat(torch.arange(n), "k -> b n k", b=2, n=n),
+        valid_mask=torch.ones(2, n, n, dtype=torch.bool),
     )
 
 
-# ---------------------------------------------------------------------------
-# build_sparse_pairs
-# ---------------------------------------------------------------------------
+@pytest.fixture
+def windowed_transformer(dims: AtomDims) -> AtomTransformer:
+    """Build a one-block, one-head AtomTransformer with windows of 4 atoms.
+
+    On 8 atoms the two windows, centred at 1.5 and 5.5, share no pair.
+
+    Args:
+        dims: Channel sizes.
+
+    Returns:
+        The transformer in eval mode.
+    """
+    _ = manual_seed(0)
+    return AtomTransformer(
+        dims.c_atom,
+        dims.c_atompair,
+        n_blocks=1,
+        n_heads=1,
+        n_queries=4,
+        n_keys=4,
+    ).eval()
 
 
-def test_build_sparse_pairs_output_shapes(
-    tok_idx: Int[torch.Tensor, "N_atom"],
+@pytest.fixture
+def windowed_inputs(
+    dims: AtomDims,
+    dense_pairs: SparsePairs,
+) -> AtomInputs:
+    """Build one-item inputs on the 8-atom dense layout.
+
+    Args:
+        dims: Channel sizes.
+        dense_pairs: Identity layout; only batch item 0 is used.
+
+    Returns:
+        Inputs whose atom-level fields drive ``windowed_transformer``.
+    """
+    n = 8
+    pairs = SparsePairs(
+        neighbor_idx=dense_pairs.neighbor_idx[:1],
+        valid_mask=dense_pairs.valid_mask[:1],
+    )
+    return AtomInputs(
+        tok_idx=rearrange(torch.arange(n), "n -> 1 n"),
+        pairs=pairs,
+        q=sine_pattern((1, n, dims.c_atom), 0.31),
+        c=sine_pattern((1, n, dims.c_atom), 0.43),
+        p=sine_pattern((1, n, n, dims.c_atompair), 0.59),
+        ref_pos=torch.zeros(1, n, 3),
+        ref_element=torch.zeros(1, n, dims.n_elements),
+        ref_space_uid=torch.zeros(1, n, dtype=torch.long),
+        r_scaled=torch.zeros(1, n, 3),
+        s_input=torch.zeros(1, n, dims.c_token),
+        z_input=torch.zeros(1, n, n, dims.c_pair),
+    )
+
+
+@pytest.mark.parametrize(
+    "layout_scenario",
+    list(LayoutScenario),
+    ids=[case.name for case in LayoutScenario],
+)
+def test_build_sparse_pairs_matches_window_definition(
+    layout_scenario: LayoutScenario,
+    layout_tok_idx: Int[torch.Tensor, "N"],
+    window_neighbours: NeighbourSets,
 ) -> None:
-    """Nbrs has shape [N_atom, K]; mask has same shape with bool dtype."""
-    nbrs, mask = build_sparse_pairs(tok_idx)
-    assert nbrs.shape == (N_ATOM, K)
-    assert mask.shape == (N_ATOM, K)
-    assert mask.dtype == torch.bool
+    """Each atom's valid slots hold exactly its in-window atoms.
+
+    Also checks ``K`` is the largest neighbour count, the dtypes, and that
+    padding slots hold an in-range index, so a gather never reads out of
+    bounds.
+
+    Args:
+        layout_scenario: Layout and expected ``K``.
+        layout_tok_idx: Residue index per atom.
+        window_neighbours: Reference neighbour set per atom.
+    """
+    case = layout_scenario.value
+    nbrs, mask = build_sparse_pairs(layout_tok_idx, case.window_size)
+    n = layout_tok_idx.shape[0]
+    found = tuple(
+        frozenset(int(m) for m in row[valid])
+        for row, valid in zip(nbrs, mask, strict=True)
+    )
+    assert nbrs.shape == mask.shape == (n, case.expected_k)
+    assert (nbrs.dtype, mask.dtype) == (torch.long, torch.bool)
+    assert found == window_neighbours.per_atom
+    assert bool(((nbrs >= 0) & (nbrs < n)).all())
 
 
-def test_build_sparse_pairs_all_valid_within_window(
-    tok_idx: Int[torch.Tensor, "N_atom"],
+@pytest.mark.parametrize(
+    "beta_point_scenario",
+    list(BetaPointScenario),
+    ids=[case.name for case in BetaPointScenario],
+)
+def test_compute_beta_admits_pairs_sharing_a_window_centre(
+    beta_point_scenario: BetaPointScenario,
+    dense_pairs: SparsePairs,
 ) -> None:
-    """When N_res < half-window, every atom is neighbour to every other atom.
+    """``beta[l, m]`` is 0 when some centre admits both atoms, else -1e10.
 
-    Verifies that the validity mask is all-True when the structure fits entirely
-    within a single attention window.
+    Args:
+        beta_point_scenario: Window widths, pair, and decision.
+        dense_pairs: 8-atom identity layout with every slot valid.
     """
-    # N_RES=8 < WINDOW_SIZE//2=16, so every atom neighbours every other atom
-    _, mask = build_sparse_pairs(tok_idx)
-    assert mask.all()
+    case = beta_point_scenario.value
+    ref = torch.zeros(2, 8, 1)
+    beta = compute_beta(
+        dense_pairs.neighbor_idx,
+        dense_pairs.valid_mask,
+        case.n_queries,
+        case.n_keys,
+        ref,
+    )
+    assert beta[0, case.query, case.key].item() == case.expected_beta
 
 
-def test_build_sparse_pairs_self_is_neighbour(
-    tok_idx: Int[torch.Tensor, "N_atom"],
+@pytest.mark.parametrize(
+    ("dtype", "fill"),
+    [
+        pytest.param(torch.float32, -1e10, id="float32"),
+        pytest.param(torch.float16, -32752.0, id="float16"),
+    ],
+)
+def test_compute_beta_values_are_zero_or_dtype_safe_fill(
+    dense_pairs: SparsePairs,
+    dtype: torch.dtype,
+    fill: float,
 ) -> None:
-    """Every atom index appears in its own neighbour row (self-attention).
+    """Beta holds only 0 and the fill value, in ``ref``'s dtype, never inf.
 
-    Each atom's own index is present in the neighbour list returned
-    by build_sparse_pairs.
+    The fill is -1e10 where the dtype can hold it and half the dtype's
+    minimum otherwise, since -1e10 overflows float16 to -inf: float16's
+    minimum is -65504, so its fill is -32752.
+
+    Args:
+        dense_pairs: 8-atom identity layout with every slot valid.
+        dtype: Dtype of ``ref``.
+        fill: Value blocked pairs must hold.
     """
-    nbrs, _ = build_sparse_pairs(tok_idx)
-    for i in range(N_ATOM):
-        assert (nbrs[i] == i).any()
+    ref = torch.zeros(2, 8, 1, dtype=dtype)
+    beta = compute_beta(
+        dense_pairs.neighbor_idx,
+        dense_pairs.valid_mask,
+        4,
+        4,
+        ref,
+    )
+    assert beta.shape == dense_pairs.neighbor_idx.shape
+    assert beta.dtype == dtype
+    assert bool(((beta == 0) | (beta == fill)).all())
+    assert bool((beta == 0).any())
+    assert bool((beta == fill).any())
 
 
-def test_build_sparse_pairs_padding_indices_in_range(
-    tok_idx: Int[torch.Tensor, "N_atom"],
+def test_compute_beta_invalid_slots_get_fill_per_batch_item(
+    dense_pairs: SparsePairs,
 ) -> None:
-    """Padding slots re-use valid indices, not out-of-bounds sentinels.
+    """Masked slots are blocked; unmasked ones keep the geometric decision.
 
-    Verifies that every entry in the neighbor index tensor is a valid atom index
-    in [0, N_ATOM), preventing out-of-bounds access during gather operations.
+    Batch item 1 masks the in-window pair ``(0, 1)`` and all of atom 2's
+    slots; batch item 0 masks nothing. Item 1 must equal item 0 where valid
+    and the fill elsewhere, and item 0 must be unaffected by item 1's mask.
+    Not parametrized: one mask with a single slot and a full row covers
+    both shapes of masking.
+
+    Args:
+        dense_pairs: 8-atom identity layout with every slot valid.
     """
-    nbrs, _ = build_sparse_pairs(tok_idx)
-    assert (nbrs >= 0).all()
-    assert (nbrs < N_ATOM).all()
+    mask = dense_pairs.valid_mask.clone()
+    mask[1, 0, 1] = False
+    mask[1, 2, :] = False
+    ref = torch.zeros(2, 8, 1)
+    idx = dense_pairs.neighbor_idx
+    open_beta = compute_beta(idx[:1], mask[:1], 4, 8, ref[:1])
+    beta = compute_beta(idx, mask, 4, 8, ref)
+    expected_item_1 = torch.where(mask[1], open_beta[0], -1e10)
+    assert torch.equal(beta[0], open_beta[0])
+    assert torch.equal(beta[1], expected_item_1)
 
 
-def test_build_sparse_pairs_window_excludes_far_atoms() -> None:
-    """Atoms beyond the half-window are excluded from sparse pairs."""
-    # 64 residues, 1 atom each, window_size=8 → half=4
-    n_res = 64
-    tok = torch.arange(n_res, dtype=torch.long)
-    nbrs, mask = build_sparse_pairs(tok, window_size=8)
-    half = 4
-    first_valid = nbrs[0][mask[0]]
-    last_valid = nbrs[-1][mask[-1]]
-    assert (first_valid < half).all()
-    assert (last_valid >= n_res - half).all()
-
-
-# ---------------------------------------------------------------------------
-# compute_beta
-# ---------------------------------------------------------------------------
-
-
-def test_compute_beta_output_shape(
-    neighbor_idx: Int[torch.Tensor, "B N_atom K"],
-    valid_mask: Bool[torch.Tensor, "B N_atom K"],
+def test_compute_beta_admits_everything_when_one_window_covers_all(
+    atom_inputs: AtomInputs,
 ) -> None:
-    """compute_beta returns float [B, N_atom, K] matching the ref dtype."""
-    ref = torch.randn(B, N_ATOM, C_ATOM)
+    """With ``N <= n_queries`` every valid pair is admitted.
+
+    24 atoms fit in one 32-atom query window whose 128-atom key window
+    covers them too, the production widths on a short chain. Not
+    parametrized: any wider window admits the same set.
+
+    Args:
+        atom_inputs: 24-atom layout with every slot valid.
+    """
+    pairs = atom_inputs.pairs
     beta = compute_beta(
-        neighbor_idx,
-        valid_mask,
-        n_queries=32,
-        n_keys=128,
-        ref=ref,
+        pairs.neighbor_idx,
+        pairs.valid_mask,
+        32,
+        128,
+        atom_inputs.q,
     )
-    assert beta.shape == (B, N_ATOM, K)
-    assert beta.dtype == ref.dtype
+    assert bool((beta[pairs.valid_mask] == 0).all())
 
 
-def test_compute_beta_values_are_binary(
-    neighbor_idx: Int[torch.Tensor, "B N_atom K"],
-    valid_mask: Bool[torch.Tensor, "B N_atom K"],
+def test_compute_beta_rejects_unbatched_neighbor_index(
+    atom_inputs: AtomInputs,
 ) -> None:
-    """Every element of beta is exactly 0.0 or -1e10; no intermediate values."""
-    ref = torch.randn(B, N_ATOM, C_ATOM)
-    beta = compute_beta(
-        neighbor_idx,
-        valid_mask,
-        n_queries=32,
-        n_keys=128,
-        ref=ref,
-    )
-    assert ((beta == 0.0) | (beta == NON_ZERO_BETA)).all()
+    """A ``neighbor_idx`` with only the atom axis fails the shape contract.
 
+    Not parametrized: the other inputs share ``neighbor_idx``'s named axes,
+    so breaking one of them is enough.
 
-def test_compute_beta_zero_for_near_atoms() -> None:
-    """An atom pair sharing a window centre receives beta=0.0.
-
-    n_queries=4, n_keys=8: centre 0 at 1.5 (half_q=2.0, half_k=4.0).
-    l=0: |0-1.5|=1.5 < 2.0 → query; m=1: |1-1.5|=0.5 < 4.0 → key → beta=0.0.
+    Args:
+        atom_inputs: Supplies a valid mask and ``ref``.
     """
-    N_t, n_q, n_k, B_t = 8, 4, 8, 1
-    neighbor_idx_t = repeat(torch.arange(N_t), "k -> b n k", b=B_t, n=N_t)
-    valid_mask_t = torch.ones(B_t, N_t, N_t, dtype=torch.bool)
-    ref = torch.zeros(B_t, N_t, C_ATOM)
-    beta = compute_beta(
-        neighbor_idx_t,
-        valid_mask_t,
-        n_queries=n_q,
-        n_keys=n_k,
-        ref=ref,
-    )
-    assert beta[0, 0, 1].item() == 0.0
-
-
-def test_compute_beta_large_neg_for_far_atoms() -> None:
-    """An atom pair from disjoint windows receives beta=-1e10.
-
-    n_queries=n_keys=4: centres at 1.5 and 5.5 (half_q=half_k=2.0).
-    l=0 is a query for centre 0 (|0-1.5|=1.5<2.0).
-    m=7: |7-1.5|=5.5 > 2.0 → not a key for centre 0.
-    l=0: |0-5.5|=5.5 > 2.0 → not a query for centre 1.
-    No centre admits this pair → beta=-1e10.
-    """
-    N_t, n_q, n_k, B_t = 8, 4, 4, 1
-    neighbor_idx_t = repeat(torch.arange(N_t), "k -> b n k", b=B_t, n=N_t)
-    valid_mask_t = torch.ones(B_t, N_t, N_t, dtype=torch.bool)
-    ref = torch.zeros(B_t, N_t, C_ATOM)
-    beta = compute_beta(
-        neighbor_idx_t,
-        valid_mask_t,
-        n_queries=n_q,
-        n_keys=n_k,
-        ref=ref,
-    )
-    assert beta[0, 0, 7].item() == NON_ZERO_BETA
-
-
-def test_compute_beta_valid_mask_forces_neg() -> None:
-    """valid_mask=False forces -1e10 even for geometrically in-window pairs."""
-    N_t, n_q, n_k, B_t = 8, 4, 8, 1
-    neighbor_idx_t = repeat(torch.arange(N_t), "k -> b n k", b=B_t, n=N_t)
-    valid_mask_t = torch.ones(B_t, N_t, N_t, dtype=torch.bool)
-    valid_mask_t[0, 0, 1] = False  # pair (l=0, m=1) is in-window but masked
-    ref = torch.zeros(B_t, N_t, C_ATOM)
-    beta = compute_beta(
-        neighbor_idx_t,
-        valid_mask_t,
-        n_queries=n_q,
-        n_keys=n_k,
-        ref=ref,
-    )
-    assert beta[0, 0, 1].item() == NON_ZERO_BETA  # mask wins over geometry
-    assert beta[0, 0, 0].item() == 0.0  # unmasked in-window pair is unaffected
-
-
-def test_compute_beta_boundary_exclusive() -> None:
-    """The window boundary is strict (<): the atom just outside is excluded.
-
-    With n_queries=n_keys=4, centres are at 1.5 and 5.5 (half_q=half_k=2.0).
-    Atom 3 is the last query for centre 0; atom 4 is the first query for centre
-    1.
-    Pair (l=3, m=4):
-      centre 0: l=3 is query (|3-1.5|=1.5<2), m=4 is NOT key (|4-1.5|=2.5>2)
-      centre 1: l=3 is NOT query (|3-5.5|=2.5>2)
-    → beta=-1e10.
-    Pair (l=3, m=3): centre 0 admits both → beta=0.0.
-    """
-    N_t, n_q, n_k, B_t = 8, 4, 4, 1
-    neighbor_idx_t = repeat(torch.arange(N_t), "k -> b n k", b=B_t, n=N_t)
-    valid_mask_t = torch.ones(B_t, N_t, N_t, dtype=torch.bool)
-    ref = torch.zeros(B_t, N_t, C_ATOM)
-    beta = compute_beta(
-        neighbor_idx_t,
-        valid_mask_t,
-        n_queries=n_q,
-        n_keys=n_k,
-        ref=ref,
-    )
-    assert beta[0, 3, 4].item() == NON_ZERO_BETA
-    assert beta[0, 3, 3].item() == 0.0
-
-
-def test_compute_beta_cross_window_centre_admits_pair() -> None:
-    """A pair admitted by any centre (not just its own) gets 0.0.
-
-    n_queries=4, n_keys=8 (half_q=2.0, half_k=4.0). Centres at 1.5 and 5.5.
-    Pair (l=4, m=3):
-      centre 0: l=4 is NOT a query (|4-1.5|=2.5>2.0)
-      centre 1: l=4 IS a query (|4-5.5|=1.5<2.0), m=3 IS a key
-      (|3-5.5|=2.5<4.0)
-    → beta=0.0 because centre 1 admits both. Tests multi-centre reduce logic.
-    """
-    N_t, n_q, n_k, B_t = 8, 4, 8, 1
-    neighbor_idx_t = repeat(torch.arange(N_t), "k -> b n k", b=B_t, n=N_t)
-    valid_mask_t = torch.ones(B_t, N_t, N_t, dtype=torch.bool)
-    ref = torch.zeros(B_t, N_t, C_ATOM)
-    beta = compute_beta(
-        neighbor_idx_t,
-        valid_mask_t,
-        n_queries=n_q,
-        n_keys=n_k,
-        ref=ref,
-    )
-    assert beta[0, 4, 3].item() == 0.0
-
-
-def test_compute_beta_all_zero_when_n_leq_n_queries(
-    neighbor_idx: Int[torch.Tensor, "B N_atom K"],
-    valid_mask: Bool[torch.Tensor, "B N_atom K"],
-) -> None:
-    """When N <= n_queries, every valid pair is in-window — no -1e10 entries.
-
-    N_ATOM=24 < n_queries=32: single centre at 15.5 (half_q=16.0) covers all
-    atoms. n_keys=128, half_k=64.0: all atoms are keys too. Every valid pair
-    gets beta=0.0.
-    """
-    ref = torch.randn(B, N_ATOM, C_ATOM)
-    beta = compute_beta(
-        neighbor_idx,
-        valid_mask,
-        n_queries=32,
-        n_keys=128,
-        ref=ref,
-    )
-    assert (beta[valid_mask] == 0.0).all()
-
-
-def test_compute_beta_wrong_shape_raises() -> None:
-    """A 1-D neighbor_idx (missing K dimension) triggers TypeCheckError."""
-    neighbor_idx_bad = torch.zeros(N_ATOM, dtype=torch.long)  # 1-D, not [N, K]
-    valid_mask_t = torch.ones(B, N_ATOM, K, dtype=torch.bool)
-    ref = torch.zeros(B, N_ATOM, C_ATOM)
+    pairs = atom_inputs.pairs
+    flat = pairs.neighbor_idx[0, :, 0]
     with pytest.raises(TypeCheckError):
-        _ = compute_beta(neighbor_idx_bad, valid_mask_t, 32, 128, ref)
+        _ = compute_beta(flat, pairs.valid_mask, 32, 128, atom_inputs.q)
 
 
-def test_compute_beta_no_inf_in_output(
-    neighbor_idx: Int[torch.Tensor, "B N_atom K"],
-    valid_mask: Bool[torch.Tensor, "B N_atom K"],
+@pytest.mark.parametrize(
+    "scatter_scenario",
+    list(ScatterScenario),
+    ids=[case.name for case in ScatterScenario],
+)
+def test_scatter_mean_averages_each_segment(
+    scatter_scenario: ScatterScenario,
 ) -> None:
-    """compute_beta output contains no -inf values when ref dtype is float16.
+    """Each output segment is the mean of the source values mapped to it.
 
-    Regression guard for the float16 fill-value fix in compute_beta: the
-    original -1e10 constant raises RuntimeError when cast to float16
-    (overflow). After the fix, a dtype-safe value is used and the output
-    contains no -inf.
+    Args:
+        scatter_scenario: Source, flat index, and expected means.
     """
-    ref = torch.zeros(B, N_ATOM, C_ATOM, dtype=torch.float16)
-    beta = compute_beta(
-        neighbor_idx,
-        valid_mask,
-        n_queries=32,
-        n_keys=128,
-        ref=ref,
-    )
-    assert not beta.isinf().any()
+    case = scatter_scenario.value
+    src = rearrange(torch.tensor(case.src, dtype=torch.float32), "b n -> b n 1")
+    index = torch.tensor(case.index)
+    expected = torch.tensor(case.expected, dtype=torch.float32)
+    b, n_tgt = expected.shape
+    out = scatter_mean(src, index, b * n_tgt, b)
+    torch.testing.assert_close(out, rearrange(expected, "b n -> b n 1"))
 
 
-def test_compute_beta_asymmetric() -> None:
-    """Beta is directional: (l=0, m=4) admitted while (l=4, m=0) is blocked.
+@pytest.fixture
+def channel_source() -> Float[torch.Tensor, "1 12 5"]:
+    """Return a 12-atom, 5-channel source whose channels all differ.
 
-    n_queries=2, n_keys=8, N=8: half_q=1.0, half_k=4.0.
-    Centres at 0.5, 2.5, 4.5, 6.5. l=0 queries centre 0 (|0-0.5|=0.5 < 1.0);
-    m=4 is a key (|4-0.5|=3.5 < 4.0) -> 0.0. l=4 queries centre 2
-    (|4-4.5|=0.5 < 1.0); m=0 NOT a key (|0-4.5|=4.5 > 4.0) -> -1e10.
+    Returns:
+        A sine pattern of shape ``(1, 12, 5)``.
     """
-    N_t, n_q, n_k, B_t = 8, 2, 8, 1
-    neighbor_idx_t: Int[torch.Tensor, "B_t N_t K_t"] = repeat(
-        torch.arange(N_t),
-        "k -> b n k",
-        b=B_t,
-        n=N_t,
-    )
-    valid_mask_t: Bool[torch.Tensor, "B_t N_t N_t"] = torch.ones(
-        B_t,
-        N_t,
-        N_t,
-        dtype=torch.bool,
-    )
-    ref = torch.zeros(B_t, N_t, C_ATOM)
-    beta = compute_beta(
-        neighbor_idx_t,
-        valid_mask_t,
-        n_queries=n_q,
-        n_keys=n_k,
-        ref=ref,
-    )
-    assert (
-        beta[0, 0, 4].item() == 0.0
-    ), "pair (0,4) should be admitted by centre 0"
-    assert (
-        beta[0, 4, 0].item() == NON_ZERO_BETA
-    ), "pair (4,0) blocked: m=0 outside key window of centre 2"
+    return sine_pattern((1, 12, 5), 0.41)
 
 
-def test_compute_beta_all_neighbors_masked_row(
-    neighbor_idx: Int[torch.Tensor, "B N_atom K"],
+def test_scatter_mean_averages_every_channel_independently(
+    channel_source: Float[torch.Tensor, "1 12 5"],
 ) -> None:
-    """A fully-masked query row gets all -1e10; adjacent rows are unaffected."""
-    mask = torch.ones(B, N_ATOM, K, dtype=torch.bool)
-    mask[0, 0, :] = False
-    ref = torch.randn(B, N_ATOM, C_ATOM)
-    beta = compute_beta(
-        neighbor_idx,
-        mask,
-        n_queries=32,
-        n_keys=128,
-        ref=ref,
-    )
-    assert (beta[0, 0, :] == NON_ZERO_BETA).all()
-    assert (beta[0, 1, :][mask[0, 1, :]] == 0.0).all()
+    """With 5 channels, each channel's segment mean matches a grouped mean.
+
+    Three segments of four atoms each; the reference groups the atoms with
+    ``rearrange`` and averages with ``reduce``. Not parametrized: the
+    one-channel scenarios already vary the segment layout.
+
+    Args:
+        channel_source: Source with five distinct channels.
+    """
+    src = channel_source
+    index = rearrange(torch.repeat_interleave(torch.arange(3), 4), "n -> 1 n")
+    grouped = rearrange(src, "b (n a) c -> b n a c", a=4)
+    expected = reduce(grouped, "b n a c -> b n c", "mean")
+    out = scatter_mean(src, index, 3, 1)
+    torch.testing.assert_close(out, expected, atol=1e-6, rtol=0)
 
 
-def test_compute_beta_batch_independence(
-    neighbor_idx: Int[torch.Tensor, "B N_atom K"],
+def test_scatter_mean_rejects_source_without_channel_axis(
+    atom_inputs: AtomInputs,
 ) -> None:
-    """Different valid_masks per batch element produce independent betas."""
-    valid_mask_two: Bool[torch.Tensor, "2 N_atom K"] = torch.zeros(
-        2,
-        N_ATOM,
-        K,
-        dtype=torch.bool,
-    )
-    valid_mask_two[0] = True  # batch 0: all valid; batch 1: all masked
-    ref = torch.randn(2, N_ATOM, C_ATOM)
-    neighbor_idx_two: Int[torch.Tensor, "2 N_atom K"] = repeat(
-        neighbor_idx,
-        "1 n k -> b n k",
-        b=2,
-    )
-    # n_queries=32 > N_ATOM=24: single window covers all; all valid pairs 0.0
-    beta = compute_beta(
-        neighbor_idx_two,
-        valid_mask_two,
-        n_queries=32,
-        n_keys=128,
-        ref=ref,
-    )
-    assert (beta[1] == NON_ZERO_BETA).all()
-    assert (beta[0][valid_mask_two[0]] == 0.0).all()
+    """A 2-D ``src`` fails the ``(B, N_src, C)`` shape contract.
+
+    Not parametrized: ``index`` has no channel axis to break.
+
+    Args:
+        atom_inputs: Supplies a valid index and a source to flatten.
+    """
+    flat = atom_inputs.q[..., 0]
+    with pytest.raises(TypeCheckError):
+        _ = scatter_mean(flat, atom_inputs.tok_idx, 8, 1)
 
 
-# ---------------------------------------------------------------------------
-# ConditionedTransitionBlock
-# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "module_probe_name",
+    [
+        "transition_probe",
+        "diffusion_dense_probe",
+        "diffusion_sparse_probe",
+        "atom_transformer_probe",
+        "atom_transformer_sparse_probe",
+        "encoder_probe",
+        "decoder_probe",
+    ],
+)
+def test_probed_output_shape_and_finite(module_probe: ModuleProbe) -> None:
+    """Each module's probed output has its expected shape and is finite.
 
+    The sparse probes run the ``K < N`` layout that used to raise a shape
+    mismatch between dense logits and the sparse pair bias.
 
-def test_conditioned_transition_block_output(
-    conditioned_transition_block: ConditionedTransitionBlock,
-    a_res: Float[torch.Tensor, "B N_res C_atom"],
-    s_input: Float[torch.Tensor, "B N_res C_token"],
-) -> None:
-    """The block returns [B, N_res, C_atom] with no NaN or Inf."""
+    Args:
+        module_probe: Module call under test.
+    """
     with torch.no_grad():
-        out = conditioned_transition_block(a_res, s_input)
-    assert out.shape == (B, N_RES, C_ATOM)
+        out = module_probe.run(module_probe.first)
+    assert tuple(out.shape) == module_probe.out_shape
     assert torch.isfinite(out).all()
 
 
-def test_conditioned_transition_block_gradient_flows(
-    conditioned_transition_block: ConditionedTransitionBlock,
-    a_res: Float[torch.Tensor, "B N_res C_atom"],
-    s_input: Float[torch.Tensor, "B N_res C_token"],
-) -> None:
-    """Gradients flow through AdaLN and SwiGLU gate to the atom embedding."""
-    a_g = a_res.clone().requires_grad_(True)  # noqa:FBT003
-    out = conditioned_transition_block(a_g, s_input)
-    torch.autograd.backward([reduce(out, "b n c -> ", "sum")])
-    assert a_g.grad is not None
-    assert torch.isfinite(a_g.grad).all()
+@pytest.mark.parametrize(
+    "module_probe_name",
+    [
+        "transition_probe",
+        "diffusion_dense_probe",
+        "diffusion_sparse_probe",
+        "atom_transformer_probe",
+        "atom_transformer_sparse_probe",
+        "encoder_probe",
+        "decoder_probe",
+    ],
+)
+def test_probed_gradient_reaches_first_input(module_probe: ModuleProbe) -> None:
+    """The summed probed output has a finite, nonzero input gradient.
 
-
-# ---------------------------------------------------------------------------
-# DiffusionTransformer
-# ---------------------------------------------------------------------------
-
-
-def test_diffusion_transformer_output(
-    diffusion_transformer: DiffusionTransformer,
-    a_res: Float[torch.Tensor, "B N_res C_atom"],
-    s_input: Float[torch.Tensor, "B N_res C_token"],
-    z_input: Float[torch.Tensor, "B N_res N_res C_pair"],
-    beta_dense: Float[torch.Tensor, "B N_res N_res"],
-) -> None:
-    """N_block rounds leave [B, N_res, C_atom] unchanged with no NaN or Inf."""
-    with torch.no_grad():
-        out = diffusion_transformer(a_res, s_input, z_input, beta_dense)
-    assert out.shape == (B, N_RES, C_ATOM)
-    assert torch.isfinite(out).all()
-
-
-def test_diffusion_transformer_n_block_stored() -> None:
-    """N_block constructor arg is stored and determines iteration depth."""
-    dt = DiffusionTransformer(
-        c_a=C_ATOM,
-        c_s=C_ATOM,
-        c_pair=C_PAIR,
-        N_block=DIFFUSION_TRANSFORMER_BLOCKS,
-        N_head=N_HEADS,
-    )
-    assert dt.N_block == DIFFUSION_TRANSFORMER_BLOCKS
-
-
-def test_diffusion_transformer_gradient_flows(
-    diffusion_transformer: DiffusionTransformer,
-    a_res: Float[torch.Tensor, "B N_res C_atom"],
-    s_input: Float[torch.Tensor, "B N_res C_token"],
-    z_input: Float[torch.Tensor, "B N_res N_res C_pair"],
-    beta_dense: Float[torch.Tensor, "B N_res N_res"],
-) -> None:
-    """Gradients propagate through all blocks to the atom embedding input."""
-    a_g = a_res.clone().requires_grad_(True)  # noqa:FBT003
-    out = diffusion_transformer(a_g, s_input, z_input, beta_dense)
-    torch.autograd.backward([reduce(out, "b n c -> ", "sum")])
-    assert a_g.grad is not None
-    assert torch.isfinite(a_g.grad).all()
-
-
-# ---------------------------------------------------------------------------
-# AtomTransformer
-# ---------------------------------------------------------------------------
-
-
-def test_atom_transformer_output(
-    transformer: AtomTransformer,
-    q_batched: Float[torch.Tensor, "B N_atom C_atom"],
-    c_batched: Float[torch.Tensor, "B N_atom C_atom"],
-    p_batched: Float[torch.Tensor, "B N_atom K C_atompair"],
-    neighbor_idx: Int[torch.Tensor, "B N_atom K"],
-    valid_mask: Bool[torch.Tensor, "B N_atom K"],
-) -> None:
-    """Multiple stacked blocks leave [B, N_atom, C_atom] with no NaN or Inf."""
-    with torch.no_grad():
-        out = transformer(
-            q_batched,
-            c_batched,
-            p_batched,
-            neighbor_idx,
-            valid_mask,
-        )
-    assert out.shape == (B, N_ATOM, C_ATOM)
-    assert torch.isfinite(out).all()
-
-
-def test_atom_transformer_block_count() -> None:
-    """n_blocks is stored and forwarded to DiffusionTransformer.N_block."""
-    t = AtomTransformer(
-        C_ATOM,
-        C_ATOMPAIR,
-        n_blocks=ATOM_TRANSFORMER_BLOCKS,
-        n_heads=ATOM_TRANSFORMER_HEADS,
-    )
-    assert t.blocks.N_block == ATOM_TRANSFORMER_BLOCKS
-
-
-def test_atom_transformer_gradient_flows(
-    transformer: AtomTransformer,
-    q_batched: Float[torch.Tensor, "B N_atom C_atom"],
-    c_batched: Float[torch.Tensor, "B N_atom C_atom"],
-    p_batched: Float[torch.Tensor, "B N_atom K C_atompair"],
-    neighbor_idx: Int[torch.Tensor, "B N_atom K"],
-    valid_mask: Bool[torch.Tensor, "B N_atom K"],
-) -> None:
-    """Gradients propagate through all stacked blocks to the query input."""
-    q_g = q_batched.clone().requires_grad_(True)  # noqa:FBT003
-    out = transformer(q_g, c_batched, p_batched, neighbor_idx, valid_mask)
-    torch.autograd.backward([reduce(out, "b n c -> ", "sum")])
-    assert q_g.grad is not None
-    assert torch.isfinite(q_g.grad).all()
-
-
-def test_atom_transformer_block_isolation() -> None:
-    """Block-0 output is unchanged when block-1 inputs are scrambled.
-
-    With n_queries=n_keys=4 and N=8, blocks [0..3] and [4..7] map to disjoint
-    window centres (1.5 and 5.5). Since exp(-1e10)=0.0 in float32, cross-block
-    attention weights are exactly zero, so block-1 inputs cannot affect block-0
-    outputs.
+    Args:
+        module_probe: Module call under test.
     """
-    n_q, N_t, B_t = 4, 8, 1
-    model = AtomTransformer(
-        C_ATOM,
-        C_ATOMPAIR,
-        n_blocks=1,
-        n_heads=1,
-        n_queries=n_q,
-        n_keys=n_q,
-    ).eval()
-    neighbor_idx_t = repeat(torch.arange(N_t), "k -> b n k", b=B_t, n=N_t)
-    valid_mask_t = torch.ones(B_t, N_t, N_t, dtype=torch.bool)
-
-    _ = manual_seed(0)
-    q = torch.randn(B_t, N_t, C_ATOM)
-    c = torch.randn(B_t, N_t, C_ATOM)
-    p = torch.randn(B_t, N_t, N_t, C_ATOMPAIR)
-
-    with torch.no_grad():
-        out1 = model(q, c, p, neighbor_idx_t, valid_mask_t)
-
-    _ = manual_seed(1)
-    q_alt = q.clone()
-    c_alt = c.clone()
-    q_alt[:, n_q:, :] = torch.randn(B_t, n_q, C_ATOM)
-    c_alt[:, n_q:, :] = torch.randn(B_t, n_q, C_ATOM)
-
-    with torch.no_grad():
-        out2 = model(q_alt, c_alt, p, neighbor_idx_t, valid_mask_t)
-
-    assert torch.equal(out1[:, :n_q, :], out2[:, :n_q, :])
+    leaf = module_probe.first.clone().requires_grad_()
+    out = reduce(module_probe.run(leaf), "... -> ", "sum")
+    (grad,) = torch.autograd.grad(out, leaf)
+    assert torch.isfinite(grad).all()
+    assert torch.count_nonzero(grad) > 0
 
 
-def test_atom_transformer_gradient_isolation() -> None:
-    """Backprop from block-0 outputs gives zero gradient for block-1 inputs.
+@pytest.mark.parametrize(
+    "module_probe_name",
+    [
+        "transition_probe",
+        "diffusion_dense_probe",
+        "diffusion_sparse_probe",
+        "atom_transformer_probe",
+        "atom_transformer_sparse_probe",
+        "encoder_probe",
+        "decoder_probe",
+    ],
+)
+def test_probed_input_missing_last_axis_is_rejected(
+    module_probe: ModuleProbe,
+) -> None:
+    """Dropping the probed input's last axis fails the module's contract.
 
-    With n_queries=n_keys=4 and N=8, the two blocks are disjoint. Softmax
-    weights for cross-block pairs are exactly 0.0 in float32, so the softmax
-    gradient (s_lm * (delta - s_lm) = 0 when s_lm=0) propagates zero back to
-    block-1 inputs. ConditionedTransitionBlock is pointwise, so it contributes
-    no cross-block gradient.
+    Args:
+        module_probe: Module call under test.
     """
-    n_q, N_t, B_t = 4, 8, 1
-    model = AtomTransformer(
-        C_ATOM,
-        C_ATOMPAIR,
-        n_blocks=1,
-        n_heads=1,
-        n_queries=n_q,
-        n_keys=n_q,
-    ).eval()
-    neighbor_idx_t = repeat(torch.arange(N_t), "k -> b n k", b=B_t, n=N_t)
-    valid_mask_t = torch.ones(B_t, N_t, N_t, dtype=torch.bool)
-
-    _ = manual_seed(0)
-    q = torch.randn(B_t, N_t, C_ATOM, requires_grad=True)
-    c = torch.randn(B_t, N_t, C_ATOM, requires_grad=True)
-    p = torch.randn(B_t, N_t, N_t, C_ATOMPAIR)
-
-    out = model(q, c, p, neighbor_idx_t, valid_mask_t)
-    torch.autograd.backward([reduce(out[:, :n_q, :], "b n c -> ", "sum")])
-
-    assert q.grad is not None
-    assert c.grad is not None
-    assert q.grad[:, n_q:, :].abs().max().item() == 0.0
-    assert c.grad[:, n_q:, :].abs().max().item() == 0.0
+    malformed = module_probe.first[..., 0]
+    with pytest.raises(TypeCheckError):
+        _ = module_probe.run(malformed)
 
 
-# ---------------------------------------------------------------------------
-# AtomFeatureEncoder
-# ---------------------------------------------------------------------------
-
-
-def test_atom_feature_encoder_outputs(
+def test_atom_feature_encoder_output_shapes_and_finite(
+    dims: AtomDims,
     encoder: AtomFeatureEncoder,
-    encoder_inputs: EncoderInputs,
+    atom_inputs: AtomInputs,
 ) -> None:
-    """Encoder returns five tensors with correct shapes and no NaN or Inf."""
-    inp = encoder_inputs
+    """All five encoder outputs have their shapes and are finite.
+
+    ``p_skip`` has one slot per sparse neighbour, so its ``K`` must match
+    ``build_sparse_pairs`` on the same residue index. Not parametrized: the
+    probe tests cover the encoder's other contracts.
+
+    Args:
+        dims: Expected sizes.
+        encoder: Encoder under test.
+        atom_inputs: Atom-level inputs.
+    """
+    x = atom_inputs
+    b, n, k = x.pairs.neighbor_idx.shape
     with torch.no_grad():
-        s_i, enc_q_skip, enc_c_skip, enc_p_skip, enc_c_l = encoder(
-            inp.ref_pos,
-            inp.ref_element,
-            inp.ref_space_uid,
-            inp.s_input,
-            inp.z_input,
-            inp.r_scaled,
-            inp.tok_idx_batched,
+        outputs = encoder(
+            x.ref_pos,
+            x.ref_element,
+            x.ref_space_uid,
+            x.s_input,
+            x.z_input,
+            x.r_scaled,
+            x.tok_idx,
         )
-    assert s_i.shape == (B, N_RES, C_TOKEN)
-    assert enc_q_skip.shape == (B, N_ATOM, C_ATOM)
-    assert enc_c_skip.shape == (B, N_ATOM, C_ATOM)
-    assert enc_p_skip.shape == (B, N_ATOM, K, C_ATOMPAIR)
-    assert enc_c_l.shape == (B, N_ATOM, C_ATOM)
-    for t in (s_i, enc_q_skip, enc_c_skip, enc_p_skip, enc_c_l):
-        assert torch.isfinite(t).all()
+    assert [tuple(t.shape) for t in outputs] == [
+        (b, dims.n_res, dims.c_token),
+        (b, n, dims.c_atom),
+        (b, n, dims.c_atom),
+        (b, n, k, dims.c_atompair),
+        (b, n, dims.c_atom),
+    ]
+    assert all(torch.isfinite(t).all() for t in outputs)
 
 
-def test_atom_feature_encoder_s_i_varies_across_residues(
+def test_atom_feature_encoder_keeps_residues_distinct(
     encoder: AtomFeatureEncoder,
-    encoder_inputs: EncoderInputs,
+    atom_inputs: AtomInputs,
 ) -> None:
-    """Residue embeddings are distinct — encoder does not collapse them."""
-    inp = encoder_inputs
+    """No two residues get the same pooled embedding ``s_i``.
+
+    Guards against the atom-to-residue pooling collapsing residues. Not
+    parametrized: distinct inputs per residue are enough to expose it.
+
+    Args:
+        encoder: Encoder under test.
+        atom_inputs: Atom-level inputs that differ per residue.
+    """
+    x = atom_inputs
     with torch.no_grad():
         s_i, *_ = encoder(
-            inp.ref_pos,
-            inp.ref_element,
-            inp.ref_space_uid,
-            inp.s_input,
-            inp.z_input,
-            inp.r_scaled,
-            inp.tok_idx_batched,
+            x.ref_pos,
+            x.ref_element,
+            x.ref_space_uid,
+            x.s_input,
+            x.z_input,
+            x.r_scaled,
+            x.tok_idx,
         )
-    off_diag = pairwise_sq_dist(s_i[0]) + torch.eye(N_RES) * 1e10
-    assert off_diag.min().item() > 0
+    assert torch.pdist(s_i[0]).min() > 0
 
 
-def test_atom_feature_encoder_p_skip_k_matches_sparse_index(
-    encoder: AtomFeatureEncoder,
-    encoder_inputs: EncoderInputs,
-    tok_idx: Int[torch.Tensor, "N_atom"],
-) -> None:
-    """p_skip K dim matches sparse neighbour count from build_sparse_pairs."""
-    inp = encoder_inputs
-    with torch.no_grad():
-        _, _, _, enc_p_skip, _ = encoder(
-            inp.ref_pos,
-            inp.ref_element,
-            inp.ref_space_uid,
-            inp.s_input,
-            inp.z_input,
-            inp.r_scaled,
-            inp.tok_idx_batched,
-        )
-    nbrs, _ = build_sparse_pairs(tok_idx)
-    assert enc_p_skip.shape[2] == nbrs.size(
-        1,
-    )  # K dim is index 2 in (B, N_atom, K, c_atompair)
-
-
-def test_atom_feature_encoder_gradient_flows_to_r_scaled(
-    encoder: AtomFeatureEncoder,
-    encoder_inputs: EncoderInputs,
-) -> None:
-    """The encoder is differentiable with respect to r_scaled."""
-    inp = encoder_inputs
-    r_scaled_g = torch.randn(B, N_ATOM, 3, requires_grad=True)
-    _, enc_q_skip, *_ = encoder(
-        inp.ref_pos,
-        inp.ref_element,
-        inp.ref_space_uid,
-        inp.s_input,
-        inp.z_input,
-        r_scaled_g,
-        inp.tok_idx_batched,
-    )
-    torch.autograd.backward([reduce(enc_q_skip, "b n c -> ", "sum")])
-    assert r_scaled_g.grad is not None
-    assert torch.isfinite(r_scaled_g.grad).all()
-
-
-# ---------------------------------------------------------------------------
-# AtomAttentionDecoder
-# ---------------------------------------------------------------------------
-
-
-def test_atom_attention_decoder_outputs(
+def test_atom_attention_decoder_output_shapes_and_finite(
+    dims: AtomDims,
     decoder: AtomAttentionDecoder,
-    decoder_inputs: DecoderInputs,
+    atom_inputs: AtomInputs,
 ) -> None:
-    """Decoder returns [B, N_atom, 3] and [B, N_atom, C_atom], no NaN/Inf."""
-    inp = decoder_inputs
+    """The decoder returns a finite ``(B, N, 3)`` update and atom context.
+
+    Not parametrized: the probe tests cover the decoder's other contracts.
+
+    Args:
+        dims: Expected sizes.
+        decoder: Decoder under test.
+        atom_inputs: Atom-level inputs.
+    """
+    x = atom_inputs
     with torch.no_grad():
         _, _, r_update, c_out = decoder(
-            inp.q_skip,
-            inp.p_skip,
-            inp.c_skip,
-            inp.c_l,
-            inp.s_input,
-            inp.z_input,
-            inp.tok_idx_batched,
+            x.q,
+            x.p,
+            x.c,
+            x.c,
+            x.s_input,
+            x.z_input,
+            x.tok_idx,
         )
-    assert r_update.shape == (B, N_ATOM, 3)
+    assert r_update.shape == (dims.batch, dims.n_atom, 3)
+    assert c_out.shape == (dims.batch, dims.n_atom, dims.c_atom)
     assert torch.isfinite(r_update).all()
-    assert c_out.shape == (B, N_ATOM, C_ATOM)
     assert torch.isfinite(c_out).all()
 
 
-def test_atom_attention_decoder_gradient_flows_to_q_skip(
-    decoder: AtomAttentionDecoder,
-    decoder_inputs: DecoderInputs,
+def test_atom_transformer_window_ignores_atoms_outside_it(
+    windowed_transformer: AtomTransformer,
+    windowed_inputs: AtomInputs,
 ) -> None:
-    """Position update is differentiable with respect to q_skip."""
-    inp = decoder_inputs
-    q_skip_g = torch.randn(B, N_ATOM, C_ATOM, requires_grad=True)
-    _, _, r_update, _ = decoder(
-        q_skip_g,
-        inp.p_skip,
-        inp.c_skip,
-        inp.c_l,
-        inp.s_input,
-        inp.z_input,
-        inp.tok_idx_batched,
-    )
-    torch.autograd.backward([reduce(r_update, "b n d -> ", "sum")])
-    assert q_skip_g.grad is not None
-    assert torch.isfinite(q_skip_g.grad).all()
+    """Replacing atoms 4-7 leaves the output for atoms 0-3 bit-identical.
 
-
-# ---------------------------------------------------------------------------
-# Sparse-mismatch regression: K_SPARSE < N_ATOM_SPARSE
-#
-# Before the fix, DiffusionTransformer (and thus AtomTransformer) computed dense
-# attention logits of shape (B, n_heads, N, N) then tried to add a sparse pair
-# bias of shape (B, n_heads, N, K) with K != N, producing:
-#   RuntimeError: The size of tensor a (N) must match the size of tensor b (K)
-# These tests exercise the exact shape regime that triggered that crash.
-# ---------------------------------------------------------------------------
-
-
-@pytest.fixture
-def sparse_neighbor_idx() -> Int[torch.Tensor, "B N_atom_sparse K_sparse"]:
-    """Sparse neighbour index [B=1, N_ATOM_SPARSE, K_SPARSE] with K < N."""
-    return repeat(_sparse_nbrs, "n k -> 1 n k")
-
-
-@pytest.fixture
-def sparse_valid_mask() -> Bool[torch.Tensor, "B N_atom_sparse K_sparse"]:
-    """Validity mask [B, N_ATOM_SPARSE, K_SPARSE] for the sparse scenario."""
-    return repeat(_sparse_mask_raw, "n k -> b n k", b=B)
-
-
-@pytest.fixture
-def q_sparse() -> Float[torch.Tensor, "B N_atom_sparse C_atom"]:
-    """Query atom embeddings [B, N_ATOM_SPARSE, C_ATOM] for sparse tests."""
-    return torch.randn(B, N_ATOM_SPARSE, C_ATOM)
-
-
-@pytest.fixture
-def p_sparse() -> Float[torch.Tensor, "B N_atom_sparse K_sparse C_atompair"]:
-    """Sparse pair embeddings [B, N_ATOM_SPARSE, K_SPARSE, C_ATOMPAIR]."""
-    return torch.randn(B, N_ATOM_SPARSE, K_SPARSE, C_ATOMPAIR)
-
-
-@pytest.fixture
-def z_sparse_dt() -> Float[torch.Tensor, "B N_atom_sparse K_sparse C_atom"]:
-    """Sparse pair embeddings for DiffusionTransformer [B, N, K, C_ATOM]."""
-    return torch.randn(B, N_ATOM_SPARSE, K_SPARSE, C_ATOM)
-
-
-@pytest.fixture
-def beta_sparse_dt() -> Float[torch.Tensor, "B N_atom_sparse K_sparse"]:
-    """Sparse attention bias [B, N, K] aligned with z_sparse_dt."""
-    return torch.zeros(B, N_ATOM_SPARSE, K_SPARSE)
-
-
-def test_diffusion_transformer_sparse_no_shape_mismatch(
-    z_sparse_dt: Float[torch.Tensor, "B N_atom_sparse K_sparse C_atom"],
-    beta_sparse_dt: Float[torch.Tensor, "B N_atom_sparse K_sparse"],
-    sparse_neighbor_idx: Int[torch.Tensor, "B N_atom_sparse K_sparse"],
-) -> None:
-    """DiffusionTransformer with sparse z (K<N) and neighbor_idx works."""
-    model = DiffusionTransformer(
-        c_a=C_ATOM,
-        c_s=C_ATOM,
-        c_pair=C_ATOM,
-        N_block=1,
-        N_head=N_HEADS,
-    ).eval()
-    a = torch.randn(B, N_ATOM_SPARSE, C_ATOM)
-    s = torch.randn(B, N_ATOM_SPARSE, C_ATOM)
-    with torch.no_grad():
-        out = model(
-            a,
-            s,
-            z_sparse_dt,
-            beta_sparse_dt,
-            neighbor_idx=sparse_neighbor_idx,
-        )
-    assert out.shape == (B, N_ATOM_SPARSE, C_ATOM)
-    assert torch.isfinite(out).all()
-
-
-def test_atom_transformer_sparse_k_lt_n_no_shape_mismatch(
-    q_sparse: Float[torch.Tensor, "B N_atom_sparse C_atom"],
-    p_sparse: Float[torch.Tensor, "B N_atom_sparse K_sparse C_atompair"],
-    sparse_neighbor_idx: Int[torch.Tensor, "B N_atom_sparse K_sparse"],
-    sparse_valid_mask: Bool[torch.Tensor, "B N_atom_sparse K_sparse"],
-) -> None:
-    """AtomTransformer with K_SPARSE < N_ATOM_SPARSE raises no RuntimeError.
-
-    This is the exact shape regime that caused the production crash:
-        attn (B, n_heads, N, N) + pair_bias (B, n_heads, N, K) with N != K.
-    """
-    model = AtomTransformer(
-        C_ATOM,
-        C_ATOMPAIR,
-        n_blocks=1,
-        n_heads=N_HEADS,
-    ).eval()
-    c = torch.randn(B, N_ATOM_SPARSE, C_ATOM)
-    with torch.no_grad():
-        out = model(
-            q_sparse,
-            c,
-            p_sparse,
-            sparse_neighbor_idx,
-            sparse_valid_mask,
-        )
-    assert out.shape == (B, N_ATOM_SPARSE, C_ATOM)
-    assert torch.isfinite(out).all()
-
-
-def test_atom_transformer_sparse_gradient_flows(
-    p_sparse: Float[torch.Tensor, "B N_atom_sparse K_sparse C_atompair"],
-    sparse_neighbor_idx: Int[torch.Tensor, "B N_atom_sparse K_sparse"],
-    sparse_valid_mask: Bool[torch.Tensor, "B N_atom_sparse K_sparse"],
-) -> None:
-    """Gradients flow through the sparse attention path when K < N."""
-    model = AtomTransformer(
-        C_ATOM,
-        C_ATOMPAIR,
-        n_blocks=1,
-        n_heads=N_HEADS,
-    ).eval()
-    q_g = torch.randn(B, N_ATOM_SPARSE, C_ATOM, requires_grad=True)
-    c = torch.randn(B, N_ATOM_SPARSE, C_ATOM)
-    out = model(q_g, c, p_sparse, sparse_neighbor_idx, sparse_valid_mask)
-    torch.autograd.backward([reduce(out, "b n c -> ", "sum")])
-    assert q_g.grad is not None
-    assert torch.isfinite(q_g.grad).all()
-
-
-# ---------------------------------------------------------------------------
-# scatter_mean fixtures
-# ---------------------------------------------------------------------------
-
-
-@pytest.fixture
-def sm_src_uniform() -> Float[torch.Tensor, "1 4 1"]:
-    """Source tensor (1, 4, 1) with values 0, 2, 4, 6 — two atoms per residue.
-
-    Returns:
-        Float tensor of shape [1, 4, 1] for uniform-group testing.
-    """
-    return torch.tensor([[[0.0], [2.0], [4.0], [6.0]]])
-
-
-@pytest.fixture
-def sm_index_uniform() -> Int[torch.Tensor, "1 4"]:
-    """Segment index (1, 4): atoms 0-1 in seg 0; atoms 2-3 in seg 1.
-
-    Returns:
-        Int tensor [[0, 0, 1, 1]].
-    """
-    return torch.tensor([[0, 0, 1, 1]])
-
-
-@pytest.fixture
-def sm_src_nonuniform() -> Float[torch.Tensor, "1 5 1"]:
-    """Source (1, 5, 1) values [1, 3, 5, 7, 9]: 3 then 2 atoms per residue.
-
-    Returns:
-        Float tensor of shape [1, 5, 1] for non-uniform group testing.
-    """
-    return torch.tensor([[[1.0], [3.0], [5.0], [7.0], [9.0]]])
-
-
-@pytest.fixture
-def sm_index_nonuniform() -> Int[torch.Tensor, "1 5"]:
-    """Segment index (1, 5): atoms 0-2 in seg 0; atoms 3-4 in seg 1.
-
-    Returns:
-        Int tensor [[0, 0, 0, 1, 1]].
-    """
-    return torch.tensor([[0, 0, 0, 1, 1]])
-
-
-@pytest.fixture
-def sm_src_one_per_res() -> Float[torch.Tensor, "2 4 6"]:
-    """Random source features (2, 4, 6) — one atom per residue, two batch items.
-
-    Returns:
-        Float tensor of shape [2, 4, 6] with i.i.d. standard normal entries.
-    """
-    return torch.randn(2, 4, 6)
-
-
-@pytest.fixture
-def sm_index_one_per_res() -> Int[torch.Tensor, "2 4"]:
-    """Batch-offset identity index (2, 4) — each atom maps to its own segment.
-
-    Returns:
-        Int tensor [[0, 1, 2, 3], [4, 5, 6, 7]].
-    """
-    base = repeat(torch.arange(4), "n -> b n", b=2)
-    offset = repeat(torch.arange(2) * 4, "b -> b n", n=4)
-    return base + offset
-
-
-@pytest.fixture
-def sm_src_constant() -> Float[torch.Tensor, "2 6 4"]:
-    """Constant source features (2, 6, 4) filled with 3.14, 3 atoms/residue.
-
-    Returns:
-        Float tensor of shape [2, 6, 4] with every entry equal to 3.14.
-    """
-    return torch.full((2, 6, 4), 3.14)
-
-
-@pytest.fixture
-def sm_index_constant() -> Int[torch.Tensor, "2 6"]:
-    """Batch-offset index (2, 6): 3 atoms per residue, 2 residues per batch.
-
-    Returns:
-        Int tensor [[0, 0, 0, 1, 1, 1], [2, 2, 2, 3, 3, 3]].
-    """
-    tok = torch.repeat_interleave(torch.arange(2), 3)
-    tok = repeat(tok, "n -> b n", b=2)
-    offset = repeat(torch.arange(2) * 2, "b -> b n", n=6)
-    return tok + offset
-
-
-@pytest.fixture
-def sm_src_batch_indep() -> Float[torch.Tensor, "2 8 6"]:
-    """Random source features (2, 8, 6): 2 atoms/res, 4 residues, 2 batches.
-
-    Returns:
-        Float tensor of shape [2, 8, 6] with i.i.d. normal entries.
-    """
-    return torch.randn(2, 8, 6)
-
-
-@pytest.fixture
-def sm_src_batch_indep_zeroed(
-    sm_src_batch_indep: Float[torch.Tensor, "2 8 6"],
-) -> Float[torch.Tensor, "2 8 6"]:
-    """Clone of sm_src_batch_indep with batch item 1 zeroed out.
+    The windows centred at 1.5 and 5.5 share no pair, and ``exp(-1e10)`` is
+    exactly 0 in float32, so the second window has no path into the first.
+    Not parametrized: the two-window split is the smallest layout with a
+    window boundary.
 
     Args:
-        sm_src_batch_indep: Fixture providing the [2, 8, 6] source tensor.
-
-    Returns:
-        Float [2, 8, 6]; batch 0 identical to sm_src_batch_indep,
-        batch 1 all zeros.
+        windowed_transformer: Transformer with 4-atom windows.
+        windowed_inputs: 8-atom inputs.
     """
-    src0 = sm_src_batch_indep.clone()
-    src0[1] = 0.0
-    return src0
-
-
-@pytest.fixture
-def sm_index_batch_indep() -> Int[torch.Tensor, "2 8"]:
-    """Batch-offset index (2, 8): 2 atoms per residue, 4 residues per batch.
-
-    Returns:
-        Int tensor mapping atoms [0,0,1,1,2,2,3,3] with batch stride 4.
-    """
-    tok_base = torch.repeat_interleave(torch.arange(4), 2)
-    tok = repeat(tok_base, "n -> b n", b=2)
-    offset = repeat(torch.arange(2) * 4, "b -> b n", n=8)
-    return tok + offset
-
-
-@pytest.fixture
-def sm_src_multichannel() -> Float[torch.Tensor, "1 12 5"]:
-    """Random source features (1, 12, 5): 4 atoms/residue, 3 residues, 1 batch.
-
-    Returns:
-        Float tensor of shape [1, 12, 5] with i.i.d. standard normal entries.
-    """
-    return torch.randn(1, 12, 5)
-
-
-@pytest.fixture
-def sm_index_multichannel() -> Int[torch.Tensor, "1 12"]:
-    """Index (1, 12) mapping 4 atoms per residue across 3 residues, 1 batch.
-
-    Returns:
-        Int tensor [[0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2]].
-    """
-    tok = torch.repeat_interleave(torch.arange(3), 4)
-    return repeat(tok, "n -> b n", b=1)
-
-
-@pytest.fixture
-def sm_src_bad() -> Float[torch.Tensor, "B N_atom"]:
-    """Wrong-shape source (B, N_atom) missing the channel dim for scatter_mean.
-
-    Returns:
-        Float tensor of shape [B, N_atom], 2-D instead of the expected 3-D.
-    """
-    return torch.zeros(B, N_ATOM)
-
-
-@pytest.fixture
-def sm_index_bad() -> Int[torch.Tensor, "B N_atom"]:
-    """All-zero int index (B, N_atom) paired with sm_src_bad for shape testing.
-
-    Returns:
-        Int tensor of shape [B, N_atom] filled with zeros.
-    """
-    return torch.zeros(B, N_ATOM, dtype=torch.long)
-
-
-# ---------------------------------------------------------------------------
-# scatter_mean
-# ---------------------------------------------------------------------------
-
-
-def test_scatter_mean_known_values_uniform(
-    sm_src_uniform: Float[torch.Tensor, "1 4 1"],
-    sm_index_uniform: Int[torch.Tensor, "1 4"],
-) -> None:
-    """With two atoms per residue, scatter_mean produces mean of each pair."""
-    out = scatter_mean(sm_src_uniform, sm_index_uniform, 2, 1)
-    expected = torch.tensor([[[1.0], [5.0]]])  # mean(0,2)=1, mean(4,6)=5
-    assert torch.allclose(out, expected)
-
-
-def test_scatter_mean_known_values_nonuniform(
-    sm_src_nonuniform: Float[torch.Tensor, "1 5 1"],
-    sm_index_nonuniform: Int[torch.Tensor, "1 5"],
-) -> None:
-    """scatter_mean handles variable group sizes (3 and 2 atoms per residue)."""
-    out = scatter_mean(sm_src_nonuniform, sm_index_nonuniform, 2, 1)
-    expected = torch.tensor([[[3.0], [8.0]]])  # mean(1,3,5)=3, mean(7,9)=8
-    assert torch.allclose(out, expected)
-
-
-def test_scatter_mean_one_atom_per_residue(
-    sm_src_one_per_res: Float[torch.Tensor, "2 4 6"],
-    sm_index_one_per_res: Int[torch.Tensor, "2 4"],
-) -> None:
-    """With one atom per residue, scatter_mean is identity over atoms."""
-    out = scatter_mean(sm_src_one_per_res, sm_index_one_per_res, 2 * 4, 2)
-    assert torch.allclose(out, sm_src_one_per_res)
-
-
-def test_scatter_mean_constant_src_returns_that_constant(
-    sm_src_constant: Float[torch.Tensor, "2 6 4"],
-    sm_index_constant: Int[torch.Tensor, "2 6"],
-) -> None:
-    """Constant values average to themselves regardless of group size."""
-    out = scatter_mean(sm_src_constant, sm_index_constant, 2 * 2, 2)
-    assert torch.allclose(out, torch.full((2, 2, 4), 3.14))
-
-
-def test_scatter_mean_batch_items_independent(
-    sm_src_batch_indep: Float[torch.Tensor, "2 8 6"],
-    sm_src_batch_indep_zeroed: Float[torch.Tensor, "2 8 6"],
-    sm_index_batch_indep: Int[torch.Tensor, "2 8"],
-) -> None:
-    """Zeroing one batch item must not affect scatter_mean for other items."""
-    out_full = scatter_mean(sm_src_batch_indep, sm_index_batch_indep, 2 * 4, 2)
-    out_zero = scatter_mean(
-        sm_src_batch_indep_zeroed,
-        sm_index_batch_indep,
-        2 * 4,
-        2,
-    )
-    assert torch.allclose(out_full[0], out_zero[0])
-
-
-def test_scatter_mean_multichannel_mean_matches_per_channel(
-    sm_src_multichannel: Float[torch.Tensor, "1 12 5"],
-    sm_index_multichannel: Int[torch.Tensor, "1 12"],
-) -> None:
-    """scatter_mean agrees with reshape+reduce mean across all C channels."""
-    out = scatter_mean(sm_src_multichannel, sm_index_multichannel, 1 * 3, 1)
-    src_grouped: Float[torch.Tensor, "Bsm Ntgt atoms_per Csm"] = rearrange(
-        sm_src_multichannel,
-        "b (n a) c -> b n a c",
-        n=3,
-        a=4,
-    )
-    expected: Float[torch.Tensor, "Bsm Ntgt Csm"] = reduce(
-        src_grouped,
-        "b n a c -> b n c",
-        "mean",
-    )
-    assert torch.allclose(out, expected, atol=1e-6)
-
-
-def test_scatter_mean_wrong_shape(
-    sm_src_bad: Float[torch.Tensor, "B N_atom"],
-    sm_index_bad: Int[torch.Tensor, "B N_atom"],
-) -> None:
-    """Wrong src ndim (2-D instead of 3-D) triggers TypeCheckError."""
-    with pytest.raises(TypeCheckError):
-        _ = scatter_mean(sm_src_bad, sm_index_bad, N_RES, B)
-
-
-# ---------------------------------------------------------------------------
-# Shape-contract enforcement — negative tests
-# ---------------------------------------------------------------------------
-
-
-def test_conditioned_transition_block_forward_wrong_shape(
-    conditioned_transition_block: ConditionedTransitionBlock,
-    a_res_bad: Float[torch.Tensor, "B N_res"],
-    s_input: Float[torch.Tensor, "B N_res C_token"],
-) -> None:
-    """Wrong a ndim (2-D instead of 3-D) triggers TypeCheckError."""
-    with pytest.raises(TypeCheckError):
-        _ = conditioned_transition_block(a_res_bad, s_input)
-
-
-def test_diffusion_transformer_forward_wrong_shape(
-    diffusion_transformer: DiffusionTransformer,
-    a_res_bad: Float[torch.Tensor, "B N_res"],
-    s_input: Float[torch.Tensor, "B N_res C_token"],
-    z_input: Float[torch.Tensor, "B N_res N_res C_pair"],
-) -> None:
-    """Wrong a ndim (2-D instead of 3-D) triggers TypeCheckError."""
-    with pytest.raises(TypeCheckError):
-        _ = diffusion_transformer(a_res_bad, s_input, z_input)
-
-
-def test_atom_transformer_forward_wrong_shape(
-    transformer: AtomTransformer,
-    q_batched_bad: Float[torch.Tensor, "B N_atom"],
-    c_batched: Float[torch.Tensor, "B N_atom C_atom"],
-    p_batched: Float[torch.Tensor, "B N_atom K C_atompair"],
-    neighbor_idx: Int[torch.Tensor, "B N_atom K"],
-    valid_mask: Bool[torch.Tensor, "B N_atom K"],
-) -> None:
-    """Wrong q ndim (2-D instead of 3-D) triggers TypeCheckError."""
-    with pytest.raises(TypeCheckError):
-        _ = transformer(
-            q_batched_bad,
-            c_batched,
-            p_batched,
-            neighbor_idx,
-            valid_mask,
+    x = windowed_inputs
+    pairs = x.pairs
+    q_alt, c_alt = x.q.clone(), x.c.clone()
+    q_alt[:, 4:] = -q_alt[:, 4:] + 1
+    c_alt[:, 4:] = -c_alt[:, 4:] + 1
+    with torch.no_grad():
+        out = windowed_transformer(
+            x.q,
+            x.c,
+            x.p,
+            pairs.neighbor_idx,
+            pairs.valid_mask,
         )
-
-
-def test_atom_feature_encoder_forward_wrong_shape(
-    encoder: AtomFeatureEncoder,
-    encoder_inputs: EncoderInputs,
-    ref_pos_bad: Float[torch.Tensor, "B N_atom"],
-) -> None:
-    """Wrong ref_pos ndim (2-D instead of 3-D) triggers TypeCheckError."""
-    inp = encoder_inputs
-    with pytest.raises(TypeCheckError):
-        _ = encoder(
-            ref_pos_bad,
-            inp.ref_element,
-            inp.ref_space_uid,
-            inp.s_input,
-            inp.z_input,
-            inp.r_scaled,
-            inp.tok_idx_batched,
+        out_alt = windowed_transformer(
+            q_alt,
+            c_alt,
+            x.p,
+            pairs.neighbor_idx,
+            pairs.valid_mask,
         )
+    assert torch.equal(out[:, :4], out_alt[:, :4])
 
 
-def test_atom_attention_decoder_forward_wrong_shape(
-    decoder: AtomAttentionDecoder,
-    decoder_inputs: DecoderInputs,
-    q_skip_bad: Float[torch.Tensor, "B N_atom"],
+def test_atom_transformer_window_blocks_gradient_from_outside_it(
+    windowed_transformer: AtomTransformer,
+    windowed_inputs: AtomInputs,
 ) -> None:
-    """Wrong q_skip ndim (2-D instead of 3-D) triggers TypeCheckError."""
-    inp = decoder_inputs
-    with pytest.raises(TypeCheckError):
-        _ = decoder(
-            q_skip_bad,
-            inp.p_skip,
-            inp.c_skip,
-            inp.c_l,
-            inp.s_input,
-            inp.z_input,
-            inp.tok_idx_batched,
-        )
+    """Gradients of atoms 0-3's outputs are exactly zero for atoms 4-7.
+
+    Cross-window softmax weights are exactly 0, so their gradient
+    ``s * (delta - s)`` is too, and the transition block is per-atom. Not
+    parametrized: the companion forward test uses the same layout.
+
+    Args:
+        windowed_transformer: Transformer with 4-atom windows.
+        windowed_inputs: 8-atom inputs.
+    """
+    x = windowed_inputs
+    q = x.q.clone().requires_grad_()
+    c = x.c.clone().requires_grad_()
+    pairs = x.pairs
+    out = windowed_transformer(q, c, x.p, pairs.neighbor_idx, pairs.valid_mask)
+    total = reduce(out[:, :4], "b n c -> ", "sum")
+    grad_q, grad_c = torch.autograd.grad(total, [q, c])
+    assert torch.count_nonzero(grad_q[:, 4:]) == 0
+    assert torch.count_nonzero(grad_c[:, 4:]) == 0
+    assert torch.count_nonzero(grad_q[:, :4]) > 0
