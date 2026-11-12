@@ -89,33 +89,36 @@ def feature_example(
         ``atom_positions``, ``atom_mask`` and ``residue_index``.
     """
     value = np.arange(1, n + 1, dtype=np.float64)
+    n_atoms = ResidueRepresentation.atom37.value
     return {
-        "atom_positions": einops.repeat(value, "n -> n 37 3"),
-        "atom_mask": einops.repeat(value, "n -> n 37"),
+        "atom_positions": einops.repeat(value, "n -> n a 3", a=n_atoms),
+        "atom_mask": einops.repeat(value, "n -> n a", a=n_atoms),
         "residue_index": np.arange(1, n + 1),
     }
 
 
 def alanine_protein(
-    present: tuple[int, ...],
+    present_atoms: tuple[str, ...],
     chains: tuple[int, ...],
 ) -> Protein:
-    """Build one alanine per chain entry with chosen atom37 slots present.
+    """Build one alanine per chain entry with the named atoms present.
 
     Args:
-        present: Atom37 slots present in every residue.
+        present_atoms: Names of the atoms present in every residue, looked
+            up in the library's ``atom_types`` table.
         chains: Chain index per residue.
 
     Returns:
         The protein, at deterministic positions.
     """
     n = len(chains)
-    mask = np.zeros((n, 37))
-    mask[:, list(present)] = 1.0
+    n_atoms = ResidueRepresentation.atom37.value
+    mask = np.zeros((n, n_atoms))
+    mask[:, [atom_types.index(name) for name in present_atoms]] = 1.0
     positions = einops.rearrange(
-        np.arange(n * 37 * 3, dtype=np.float64) / 10,
+        np.arange(n * n_atoms * 3, dtype=np.float64) / 10,
         "(r a d) -> r a d",
-        a=37,
+        a=n_atoms,
         d=3,
     )
     return Protein(
@@ -124,7 +127,7 @@ def alanine_protein(
         atom_mask=mask,
         residue_index=np.arange(n, dtype=np.intp),
         chain_index=np.array(chains, dtype=np.intp),
-        b_factors=np.zeros((n, 37)),
+        b_factors=np.zeros((n, n_atoms)),
     )
 
 
@@ -549,12 +552,12 @@ class CenterCase:
 
     Attributes:
         n_res: Residues to build.
-        present_atoms: Atom37 slots marked present.
+        present_atoms: Names of the atoms marked present.
         ca_center: Masked mean of the CA positions before centring.
     """
 
     n_res: int
-    present_atoms: tuple[int, ...]
+    present_atoms: tuple[str, ...]
     ca_center: tuple[float, float, float]
 
 
@@ -568,21 +571,49 @@ class CenterPositionsScenario(enum.Enum):
             must end at zero; CA centre is ``111 * 2 + (3, 4, 5)``.
     """
 
-    full_mask = CenterCase(8, tuple(range(37)), (391.5, 392.5, 393.5))
-    ca_only = CenterCase(5, (ATOM37_CA,), (225.0, 226.0, 227.0))
+    full_mask = CenterCase(8, tuple(atom_types), (391.5, 392.5, 393.5))
+    ca_only = CenterCase(5, ("CA",), (225.0, 226.0, 227.0))
 
 
 @dataclasses.dataclass(frozen=True)
 class WrongShape(abc.ABC):
     """An atom conversion and positions of a deliberately wrong shape.
 
+    Each subclass names, as ``atoms``, the layout its conversion expects;
+    the fields say how the positions depart from it.
+
     Attributes:
-        positions_shape: Invalid shape for the positions.
-        mask_shape: Valid shape for the mask.
+        atoms: Atom layout the conversion expects.
+        batch: Batch size.
+        n_res: Residues per item.
+        missing_atoms: Atoms the positions have fewer than ``atoms``.
+        coord_width: Components per point; the valid width is 3.
     """
 
-    positions_shape: tuple[int, ...]
-    mask_shape: tuple[int, ...]
+    atoms: ClassVar[ResidueRepresentation]
+    batch: int
+    n_res: int
+    missing_atoms: int
+    coord_width: int
+
+    @property
+    def positions_shape(self) -> tuple[int, ...]:
+        """Shape of the invalid positions.
+
+        Returns:
+            ``(batch, n_res, atoms - missing_atoms, coord_width)``.
+        """
+        n_atoms = self.atoms.value - self.missing_atoms
+        return (self.batch, self.n_res, n_atoms, self.coord_width)
+
+    @property
+    def mask_shape(self) -> tuple[int, ...]:
+        """Shape of the valid mask.
+
+        Returns:
+            ``(batch, n_res, atoms)``.
+        """
+        return (self.batch, self.n_res, self.atoms.value)
 
     @abc.abstractmethod
     def convert(
@@ -604,6 +635,8 @@ class WrongShape(abc.ABC):
 @dataclasses.dataclass(frozen=True)
 class Atom37ToAtom5Shape(WrongShape):
     """Calls ``atom37_to_atom5(positions, mask)``."""
+
+    atoms: ClassVar[ResidueRepresentation] = ResidueRepresentation.atom37
 
     @override
     def convert(
@@ -627,6 +660,8 @@ class Atom37ToAtom5Shape(WrongShape):
 class Atom5ToAtom37Shape(WrongShape):
     """Calls ``atom5_to_atom37(positions, mask)``."""
 
+    atoms: ClassVar[ResidueRepresentation] = ResidueRepresentation.atom5
+
     @override
     def convert(
         self,
@@ -648,6 +683,8 @@ class Atom5ToAtom37Shape(WrongShape):
 @dataclasses.dataclass(frozen=True)
 class Atom37ToCbShape(WrongShape):
     """Calls ``atom37_to_cb(positions, mask)``."""
+
+    atoms: ClassVar[ResidueRepresentation] = ResidueRepresentation.atom37
 
     @override
     def convert(
@@ -679,9 +716,9 @@ class WrongAtomShape(enum.Enum):
         cb_width: ``atom37_to_cb`` given 4-component points.
     """
 
-    atom37_width = Atom37ToAtom5Shape((2, 10, 37, 4), (2, 10, 37))
-    atom5_count = Atom5ToAtom37Shape((2, 10, 4, 3), (2, 10, 5))
-    cb_width = Atom37ToCbShape((2, 10, 37, 4), (2, 10, 37))
+    atom37_width = Atom37ToAtom5Shape(2, 10, missing_atoms=0, coord_width=4)
+    atom5_count = Atom5ToAtom37Shape(2, 10, missing_atoms=1, coord_width=3)
+    cb_width = Atom37ToCbShape(2, 10, missing_atoms=0, coord_width=4)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -725,13 +762,13 @@ class PdbProteinCase:
     """A protein layout ``to_pdb`` writes and the records it must contain.
 
     Attributes:
-        present_atoms: Atom37 slots present in every residue.
+        present_atoms: Names of the atoms present in every residue.
         chains: Chain index per residue.
         atom_lines: Expected number of ATOM records.
         ter_lines: Expected number of TER records, one per chain.
     """
 
-    present_atoms: tuple[int, ...]
+    present_atoms: tuple[str, ...]
     chains: tuple[int, ...]
     atom_lines: int
     ter_lines: int
@@ -746,9 +783,9 @@ class ToPdbScenario(enum.Enum):
         two_chains: Four residues over chains 0 and 1: a TER per chain.
     """
 
-    backbone = PdbProteinCase((0, 1, 2, 4), (0, 0, 0, 0, 0), 20, 1)
-    ca_only = PdbProteinCase((1,), (0, 0, 0), 3, 1)
-    two_chains = PdbProteinCase((0, 1, 2, 4), (0, 0, 1, 1), 16, 2)
+    backbone = PdbProteinCase(("N", "CA", "C", "O"), (0, 0, 0, 0, 0), 20, 1)
+    ca_only = PdbProteinCase(("CA",), (0, 0, 0), 3, 1)
+    two_chains = PdbProteinCase(("N", "CA", "C", "O"), (0, 0, 1, 1), 16, 2)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -955,12 +992,13 @@ def np_example_to_center(
         Deterministic ``atom_positions`` and ``atom_mask``.
     """
     case = center_scenario.value
-    mask = np.zeros((case.n_res, 37))
-    mask[:, list(case.present_atoms)] = 1.0
+    n_atoms = ResidueRepresentation.atom37.value
+    mask = np.zeros((case.n_res, n_atoms))
+    mask[:, [atom_types.index(name) for name in case.present_atoms]] = 1.0
     positions = einops.rearrange(
-        np.arange(case.n_res * 37 * 3, dtype=np.float64),
+        np.arange(case.n_res * n_atoms * 3, dtype=np.float64),
         "(r a d) -> r a d",
-        a=37,
+        a=n_atoms,
         d=3,
     )
     return {"atom_positions": positions, "atom_mask": mask}
@@ -1005,10 +1043,16 @@ def roundtrip_protein() -> Protein:
         The protein.
     """
     aatype = np.array([restype_order[c] for c in "ARSVG"], dtype=np.intp)
-    present = np.zeros((5, 37))
+    n_atoms = ResidueRepresentation.atom37.value
+    present = np.zeros((5, n_atoms))
     present[:, [ATOM37_N, ATOM37_CA, ATOM37_C, ATOM37_CB, ATOM37_O]] = 1.0
     present[4, ATOM37_CB] = 0.0
-    grid = einops.rearrange(np.arange(555.0), "(r a d) -> r a d", a=37, d=3)
+    grid = einops.rearrange(
+        np.arange(5 * n_atoms * 3, dtype=np.float64),
+        "(r a d) -> r a d",
+        a=n_atoms,
+        d=3,
+    )
     mask = einops.rearrange(present, "r a -> r a 1")
     return Protein(
         atom_positions=np.round(grid * 0.123, 3) * mask,
@@ -1016,7 +1060,7 @@ def roundtrip_protein() -> Protein:
         atom_mask=present,
         residue_index=np.arange(5, dtype=np.intp),
         chain_index=np.zeros(5, dtype=np.intp),
-        b_factors=np.zeros((5, 37)),
+        b_factors=np.zeros((5, n_atoms)),
     )
 
 
@@ -1085,7 +1129,7 @@ def unwritable_protein(unwritable_scenario: UnwritableScenario) -> Protein:
     """
     case = unwritable_scenario.value
     return dataclasses.replace(
-        alanine_protein((1,), case.chains),
+        alanine_protein(("CA",), case.chains),
         aatype=np.full(len(case.chains), case.aatype, dtype=np.intp),
     )
 
@@ -1368,8 +1412,8 @@ def test_atom5_to_atom37_scatters_into_backbone_slots_only(
     atom_spec = atom_scenario.value
     x = atom_tensors
     positions, mask = atom5_to_atom37(x.positions, atom5_mask_argument)
-    other = sorted(set(range(37)) - set(ATOM5_TO_ATOM37))
     n_atoms = ResidueRepresentation.atom37.value
+    other = sorted(set(range(n_atoms)) - set(ATOM5_TO_ATOM37))
     shape = (atom_spec.batch, atom_spec.n_res, n_atoms)
     assert (positions.shape, mask.shape) == ((*shape, 3), shape)
     assert (positions.dtype, mask.dtype) == (x.positions.dtype, x.mask.dtype)
@@ -1503,7 +1547,7 @@ def test_make_np_example_packs_backbone_into_atom37(
         k: torch.tensor(v) for k, v in make_np_example(coords_dict).items()
     }
     backbone = [atom_types.index(name) for name in ("N", "CA", "C", "O")]
-    other = sorted(set(range(37)) - set(backbone))
+    other = sorted(set(range(ResidueRepresentation.atom37)) - set(backbone))
     positions = example["atom_positions"]
     assert torch.equal(positions[:, backbone], expected_backbone_positions)
     assert torch.count_nonzero(positions[:, other]) == 0
@@ -1738,7 +1782,8 @@ def test_protein_from_pdb_classifies_molecules_and_chains(
     protein = protein_from_pdb(scenario_pdb)
     b_factors = torch.tensor(protein.b_factors[:, 0])
     aatype = torch.tensor(protein.aatype)
-    assert protein.atom_positions.shape == (len(case.mol_types), 37, 3)
+    n_atoms = ResidueRepresentation.atom37.value
+    assert protein.atom_positions.shape == (len(case.mol_types), n_atoms, 3)
     assert torch.equal(b_factors, expected_mol_types)
     assert torch.equal(
         torch.tensor(protein.chain_index),
