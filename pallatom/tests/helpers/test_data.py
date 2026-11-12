@@ -64,27 +64,6 @@ from train.train_config import (
 )
 
 
-def queue_round_trip[T](obj: T) -> T:
-    """Send ``obj`` through a ``multiprocessing.Queue`` and return the copy.
-
-    The queue pickles ``obj`` on ``put`` and unpickles it on ``get``, the
-    same transport a DataLoader uses to hand datasets and collate functions
-    to worker processes, so the copy is what a worker would receive.
-
-    Args:
-        obj: Object to send.
-
-    Returns:
-        The unpickled copy.
-    """
-    channel: multiprocessing.queues.Queue[T] = multiprocessing.Queue()
-    channel.put(obj)
-    copy = channel.get(timeout=60)
-    channel.close()
-    channel.join_thread()
-    return copy
-
-
 def protein_entry(name: str, n: int) -> dict[str, object]:
     """Build an all-alanine JSONL protein entry with fixed coordinates.
 
@@ -1019,19 +998,31 @@ def pickled_dataset(
     pickle_state: PickleState,
     train_dataset: ProteinDataset,
 ) -> ProteinDataset:
-    """Pickle round-trip ``train_dataset``, optionally after reading from it.
+    """Send ``train_dataset`` through a queue, optionally after reading it.
+
+    A ``multiprocessing.Queue`` pickles the dataset on ``put`` and
+    unpickles it on ``get``, the transport a DataLoader uses to hand the
+    dataset to its worker processes. Closing the queue and joining its
+    feeder thread leaves no thread behind after the test.
 
     Args:
         pickle_state: Whether to read a sample first, which opens the
             dataset's file handle; the requesting test parametrizes it.
-        train_dataset: Dataset to pickle.
+        train_dataset: Dataset to send.
 
     Returns:
-        The restored copy.
+        The copy a worker would receive.
     """
     if pickle_state.value.read_first:
         _ = train_dataset[0]
-    return queue_round_trip(train_dataset)
+    channel: multiprocessing.queues.Queue[ProteinDataset] = (
+        multiprocessing.Queue()
+    )
+    channel.put(train_dataset)
+    restored = channel.get(timeout=60)
+    channel.close()
+    channel.join_thread()
+    return restored
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1370,6 +1361,30 @@ def featurize_collate(
 
 
 @pytest.fixture
+def restored_collate(featurize_collate: FeaturizeCollate) -> FeaturizeCollate:
+    """Send ``featurize_collate`` through a queue, as a worker receives it.
+
+    A ``multiprocessing.Queue`` pickles the collate function on ``put`` and
+    unpickles it on ``get``. Closing the queue and joining its feeder
+    thread leaves no thread behind after the test.
+
+    Args:
+        featurize_collate: Collate function to send.
+
+    Returns:
+        The copy a worker would receive.
+    """
+    channel: multiprocessing.queues.Queue[FeaturizeCollate] = (
+        multiprocessing.Queue()
+    )
+    channel.put(featurize_collate)
+    restored = channel.get(timeout=60)
+    channel.close()
+    channel.join_thread()
+    return restored
+
+
+@pytest.fixture
 def listed_dataset(
     dataset_jsonl: pathlib.Path,
     names: list[str],
@@ -1661,7 +1676,7 @@ def test_featurize_batch_stacks_items_along_a_batch_axis(
 
 
 def test_featurize_collate_works_after_a_pickle_round_trip(
-    featurize_collate: FeaturizeCollate,
+    restored_collate: FeaturizeCollate,
     protein: Protein,
     featurized_batch: FeaturizedBatch,
 ) -> None:
@@ -1671,12 +1686,11 @@ def test_featurize_collate_works_after_a_pickle_round_trip(
     Not parametrized: pickling is the one transport DataLoader uses.
 
     Args:
-        featurize_collate: Collate function to send.
+        restored_collate: Collate function after the pickle round trip.
         protein: Protein to collate twice.
         featurized_batch: Reference batch of the same two proteins.
     """
-    restored = queue_round_trip(featurize_collate)
-    out = restored([protein, protein])
+    out = restored_collate([protein, protein])
     assert isinstance(out, FeaturizedBatch)
     assert out.r_gt.shape == featurized_batch.r_gt.shape
 
