@@ -8,6 +8,7 @@ length/indexing; and make_bucketed_data_loaders behaviour.
 """
 
 import dataclasses
+import enum
 import functools
 import json
 import math
@@ -40,6 +41,8 @@ from helpers.data import (
     featurize_batch,
     featurize_single_item,
     make_bucketed_data_loaders,
+    normalized_time_from_sigma,
+    null_template_distogram,
     ref_pos_for_residue,
     sinusoidal_encoding,
 )
@@ -51,6 +54,7 @@ from train.train_config import (
     LoaderConfig as EvalLoaderConfig,
 )
 from train.train_config import (
+    NoiseScheduleParams,
     TrainArgs,
     TrainConfig,
     TrainLoaderConfig,
@@ -200,7 +204,7 @@ def featurized_item_raw() -> FeaturizedItem:
         ref_pos=torch.randn(BT_N_ATOM, 3),
         ref_element=torch.zeros(BT_N_ATOM, 4),
         f_residue_idx=torch.arange(BT_N_RES, dtype=torch.long),
-        t_hat=torch.randn([]),
+        t_hat=torch.randn(BT_N_RES),
         t_normalized=torch.randn(BT_N_RES, BT_N_RES),
         ref_space_uid=torch.arange(
             BT_N_RES,
@@ -278,7 +282,7 @@ def test_featurized_item_rejects_1d_r_gt() -> None:
             ref_pos=torch.randn(BT_N_ATOM, 3),
             ref_element=torch.zeros(BT_N_ATOM, 4),
             f_residue_idx=torch.arange(BT_N_RES, dtype=torch.long),
-            t_hat=torch.randn([]),
+            t_hat=torch.randn(BT_N_RES),
             t_normalized=torch.randn(BT_N_RES, BT_N_RES),
             ref_space_uid=torch.zeros(BT_N_ATOM, dtype=torch.long),
             tok_idx=torch.zeros(BT_N_ATOM, dtype=torch.long),
@@ -323,7 +327,7 @@ def test_featurized_item_rejects_wrong_ref_element_dim() -> None:
             ref_pos=torch.randn(BT_N_ATOM, 3),
             ref_element=torch.zeros(BT_N_ATOM, 3),
             f_residue_idx=torch.arange(BT_N_RES, dtype=torch.long),
-            t_hat=torch.randn([]),
+            t_hat=torch.randn(BT_N_RES),
             t_normalized=torch.randn(BT_N_RES, BT_N_RES),
             ref_space_uid=torch.zeros(BT_N_ATOM, dtype=torch.long),
             tok_idx=torch.zeros(BT_N_ATOM, dtype=torch.long),
@@ -379,7 +383,7 @@ def featurized_batch_raw() -> FeaturizedBatch:
         r_gt_noised=torch.randn(BT_B, BT_N_ATOM, 3),
         atom5_mask=torch.ones(BT_B, BT_N_ATOM, dtype=torch.bool),
         aa_indices=torch.zeros(BT_B, BT_N_RES, dtype=torch.long),
-        t_hat=torch.randn(BT_B),
+        t_hat=torch.randn(BT_B, BT_N_RES),
         t_normalized=torch.rand(BT_B, BT_N_RES, BT_N_RES),
         tok_idx=torch.zeros(BT_B, BT_N_ATOM, dtype=torch.long),
         center_uid=torch.zeros(BT_B, BT_N_ATOM, dtype=torch.long),
@@ -467,7 +471,7 @@ def test_featurized_batch_rejects_unbatched_ref_pos() -> None:
             r_gt_noised=torch.randn(BT_B, BT_N_ATOM, 3),
             atom5_mask=torch.ones(BT_B, BT_N_ATOM, dtype=torch.bool),
             aa_indices=torch.zeros(BT_B, BT_N_RES, dtype=torch.long),
-            t_hat=torch.randn(BT_B),
+            t_hat=torch.randn(BT_B, BT_N_RES),
             t_normalized=torch.randn(BT_B, BT_N_RES, BT_N_RES),
             tok_idx=torch.zeros(BT_B, BT_N_ATOM, dtype=torch.long),
             center_uid=torch.zeros(BT_B, BT_N_ATOM, dtype=torch.long),
@@ -515,7 +519,7 @@ def test_featurized_batch_rejects_wrong_coords_dim() -> None:
             r_gt_noised=torch.randn(BT_B, BT_N_ATOM, 3),
             atom5_mask=torch.ones(BT_B, BT_N_ATOM, dtype=torch.bool),
             aa_indices=torch.zeros(BT_B, BT_N_RES, dtype=torch.long),
-            t_hat=torch.randn(BT_B),
+            t_hat=torch.randn(BT_B, BT_N_RES),
             t_normalized=torch.randn(BT_B, BT_N_RES, BT_N_RES),
             tok_idx=torch.zeros(BT_B, BT_N_ATOM, dtype=torch.long),
             center_uid=torch.zeros(BT_B, BT_N_ATOM, dtype=torch.long),
@@ -1079,7 +1083,7 @@ def test_featurize_single_item_output_shapes(
 
     assert all(
         [
-            bool(featurized_item.t_hat > 0.0),
+            bool((featurized_item.t_hat > 0.0).all()),
             bool((featurized_item.t_normalized >= 0.0).all()),
             bool((featurized_item.t_normalized <= 1.0).all()),
         ],
@@ -2239,3 +2243,125 @@ def test_featurize_single_item_is_importable_from_data() -> None:
 def test_featurize_batch_is_importable_from_data() -> None:
     """featurize_batch is callable and importable from helpers.data."""
     assert callable(featurize_batch)
+
+
+# ---------------------------------------------------------------------------
+# Template weight and null template
+# ---------------------------------------------------------------------------
+
+
+def test_featurized_template_weight_is_normalized_noise_level(
+    featurized_item: FeaturizedItem,
+    tcfg: TrainConfig,
+) -> None:
+    """``t_normalized`` is the normalized noise level of ``t_hat`` everywhere.
+
+    The featurizer used to draw the template weight from ``U(0, 1)``
+    independently of ``t_hat``, which made it pure noise to the template
+    embedder. It must now equal the sampler's definition at every residue
+    pair. No other cases: the item's noise level is the only input.
+    """
+    expected = normalized_time_from_sigma(
+        featurized_item.t_hat[0],
+        tcfg.noise,
+    )
+    assert torch.equal(
+        featurized_item.t_normalized,
+        torch.full_like(featurized_item.t_normalized, expected.item()),
+    )
+
+
+@pytest.fixture
+def noise_schedule() -> NoiseScheduleParams:
+    """Provide the production noise schedule parameters."""
+    return NoiseScheduleParams()
+
+
+@pytest.mark.parametrize(
+    ("sigma_over_data", "expected"),
+    [
+        pytest.param(1e3, 1.0, id="above_sigma_max_clamps_to_1"),
+        pytest.param(1e-6, 0.0, id="below_sigma_min_clamps_to_0"),
+        pytest.param(160.0, 1.0, id="at_sigma_max"),
+        pytest.param(4e-4, 0.0, id="at_sigma_min"),
+    ],
+)
+def test_normalized_time_from_sigma_bounds(
+    noise_schedule: NoiseScheduleParams,
+    sigma_over_data: float,
+    expected: float,
+) -> None:
+    """Sigmas at or past the schedule's bounds map to exactly 0 or 1.
+
+    The lognormal training distribution draws sigmas outside
+    ``[sigma_min, sigma_max]``, so the inverse clamps rather than returning
+    times outside [0, 1].
+    """
+    t = normalized_time_from_sigma(
+        torch.tensor(sigma_over_data * noise_schedule.sigma_data),
+        noise_schedule,
+    )
+    torch.testing.assert_close(t, torch.tensor(expected), atol=1e-6, rtol=0)
+
+
+@dataclasses.dataclass(frozen=True)
+class NullTemplateCase:
+    """Shape requested from ``null_template_distogram`` in one scenario.
+
+    Attributes:
+        shape: Requested (B, N_res, N_res, n_templ_bins) shape, which the
+            returned tensor must match exactly.
+    """
+
+    shape: torch.Size
+
+
+class NullTemplateScenario(enum.Enum):
+    """Null template shapes, varying batch, residue and bin counts.
+
+    Members:
+        single_sample: One 4-residue sample with the production 39 bins.
+        batched_19_bins: Three 7-residue samples with 19 bins.
+    """
+
+    single_sample = NullTemplateCase(torch.Size((1, 4, 4, 39)))
+    batched_19_bins = NullTemplateCase(torch.Size((3, 7, 7, 19)))
+
+
+@pytest.fixture
+def null_template(
+    null_template_scenario: NullTemplateScenario,
+) -> Float[torch.Tensor, "B N_res N_res n_templ_bins"]:
+    """Build the scenario's null template distogram on the CPU.
+
+    Args:
+        null_template_scenario: Scenario holding the shape to request,
+            parametrized directly by the requesting test.
+
+    Returns:
+        The output of ``null_template_distogram`` for that shape.
+    """
+    return null_template_distogram(null_template_scenario.value.shape, "cpu")
+
+
+@pytest.mark.parametrize(
+    "null_template_scenario",
+    list(NullTemplateScenario),
+    ids=[case.name for case in NullTemplateScenario],
+)
+def test_null_template_distogram_is_all_zero(
+    null_template: Float[torch.Tensor, "B N_res N_res n_templ_bins"],
+    null_template_scenario: NullTemplateScenario,
+) -> None:
+    """The null template has the requested shape, float dtype, and no mass.
+
+    A real template is one-hot on the bin axis; the null must sum to zero
+    there so the trunk can tell "no template" apart from any structure.
+
+    Args:
+        null_template: The null template built for the scenario.
+        null_template_scenario: Scenario holding the requested shape.
+    """
+    assert null_template.shape == null_template_scenario.value.shape
+    assert null_template.dtype == torch.float32
+    assert not null_template.any()

@@ -188,12 +188,17 @@ devcontainer from scratch and reruns the full check suite inside it.
 | Workflow | Trigger | What it does |
 |----------|---------|---------------|
 | `.github/workflows/arm64.yml` (**ARM64 CI**) | every `push` to `main` and every `pull_request` | Calls the reusable workflow below on `ubuntu-24.04-arm`, a native aarch64 hosted runner, with `pre-commit run --all-files` as its static checks, so every hook runs here once |
-| `.github/workflows/cuda.yml` (**CUDA CI**) | every `push` to `main` and every `pull_request` | Calls the same reusable workflow on the self-hosted GPU runner, asserts `torch.cuda.is_available()`, and runs only `basedpyright` as its static check, because torch resolves differently in this environment |
+| `.github/workflows/cuda.yml` (**CUDA CI**) | every `push` to `main` and every `pull_request` | Calls the same reusable workflow on the self-hosted GPU runner, asserts `torch.cuda.is_available()`, and runs only `basedpyright` as its static check, because torch resolves differently in this environment. Its `pytest` runs with `CUDA_VISIBLE_DEVICES` empty (`hide-gpus-from-pytest`), so the suite never allocates GPU memory next to a training job on the same GPUs, and with `OMP_NUM_THREADS=8` (`pytest-cpu-threads`), so torch does not oversubscribe CPU cores that training is using |
 | `.github/workflows/devcontainer-checks.yml` (reusable, called by both above) | — | Inside the devcontainer: a `static-checks` job runs the caller's command, then a `test` job that depends on it runs `pytest pallatom` |
 
 In short: every pre-commit hook runs a second time in CI against a clean container
 image, once per push and PR. The GPU runner reruns only `basedpyright`, and the full
 test suite runs on both runners after their static checks pass.
+
+Both workflows set a `concurrency` group per pull request with
+`cancel-in-progress`, so pushing to a PR cancels that PR's older ARM64 and CUDA
+runs. This matters most for CUDA CI, which shares one self-hosted GPU runner
+across every branch. Pushes to `main` and manual runs are never cancelled.
 
 ---
 

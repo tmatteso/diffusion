@@ -22,8 +22,6 @@ class SamplerParams(BaseModel):
 
     Attributes:
         model_config: Pydantic config — frozen to prevent mutation after init.
-        rho: Exponent controlling the non-linear time-step spacing; higher
-            values concentrate steps near low noise levels.
         S_churn: Amount of stochasticity injected at each step; 0 recovers
             deterministic DDIM.
         S_tmin: Lower bound of the schedule-time window in which churn is
@@ -39,11 +37,18 @@ class SamplerParams(BaseModel):
             the eta (coordinate-update) calculation.
         seq_temperature: Softmax temperature for sampling amino-acid sequence
             tokens from the sequence logits.
+        noise_shift: Multiplier ``alpha`` applied to every noise level of
+            the sampling schedule, ``sigma -> alpha * sigma``. This is the
+            EDM form of the rectified-flow timestep shift
+            ``t' = alpha*t / (1 + (alpha - 1)*t)`` (Esser et al. 2024),
+            since ``sigma = t / (1 - t)``. 1.0 leaves the schedule unchanged;
+            values above 1 spend more of the trajectory at high noise.
+            It shifts sampling only, and is meant to be swept on a trained
+            checkpoint without retraining.
     """
 
     model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True)
 
-    rho: float = Field(default=7.0, gt=0)
     S_churn: float = Field(default=0.2, ge=0)
     S_tmin: float = Field(default=0.01, ge=0)
     S_tmax: float = Field(default=1.0, gt=0)
@@ -51,6 +56,7 @@ class SamplerParams(BaseModel):
     ddim_steps: int = Field(default=200, gt=1)
     eta_step_scale: float = Field(default=2.25, gt=1)
     seq_temperature: float = Field(default=0.1, gt=0)
+    noise_shift: float = Field(default=1.0, gt=0)
 
 
 class GenerationParams(BaseModel):

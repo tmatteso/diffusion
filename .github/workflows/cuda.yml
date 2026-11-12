@@ -6,6 +6,13 @@ on:
   pull_request:
   workflow_dispatch:
 
+# A new push to a pull request cancels that PR's older run in this workflow,
+# which is stale once the branch has moved. Pushes to main and manual runs
+# get a group of their own (the run id), so every one of them completes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   checks-cuda:
     uses: ./.github/workflows/devcontainer-checks.yml
@@ -15,6 +22,12 @@ jobs:
       image-name: devcontainer-cuda
       static-checks-cmd: uv run --no-sync basedpyright pallatom
       cleanup-stale-container: true
+      # The GPUs are shared with training jobs; pytest needs none of them.
+      # Static checks and the CUDA assertion below still see the GPUs.
+      hide-gpus-from-pytest: true
+      # The host's 34 cores are shared with training too; torch's default of
+      # one thread per core oversubscribes them and slows tests ~10x.
+      pytest-cpu-threads: "8"
       build-run-cmd: |
         show-platform
         python3 -c "import torch; assert torch.cuda.is_available(), 'CUDA not available'"

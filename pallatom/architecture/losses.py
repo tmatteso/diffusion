@@ -42,6 +42,33 @@ RESIDUE_TYPE_WEIGHTS: list[float] = [
 
 
 @jaxtyped(typechecker=beartype)
+def edm_loss_weight(
+    t_hat: Float[torch.Tensor, "B N_res"],
+    sigma_data: float,
+    points_per_residue: int,
+) -> Float[torch.Tensor, "B N_point"]:
+    """EDM loss weight of every point, from its residue's noise level.
+
+    ``lambda = (t̂² + sigma_data²) / (t̂ · sigma_data)²`` (Karras et al.
+    2022), which equals ``1 / c_out²``. It is computed per residue and
+    repeated over the residue's points (atoms), matching the per-atom
+    preconditioning in ``MainTrunk``.
+
+    Args:
+        t_hat: Noise level sigma of each residue.
+        sigma_data: Standard deviation of the clean data.
+        points_per_residue: Number of points (atoms) per residue.
+
+    Returns:
+        The weight of each point, in residue-major order.
+    """
+    per_residue: Float[torch.Tensor, "B N_res"] = (
+        t_hat**2 + sigma_data**2
+    ) / (t_hat * sigma_data) ** 2
+    return repeat(per_residue, "b n -> b (n p)", p=points_per_residue)
+
+
+@jaxtyped(typechecker=beartype)
 def residue_type_weight(
     aa_indices: Int[torch.Tensor, "B N_aa"],
 ) -> Float[torch.Tensor, "B N_aa"]:
@@ -78,7 +105,7 @@ def atom_loss(
     mask: Float[torch.Tensor, "B N_res"] | None = None,
     *,
     aa_indices: Int[torch.Tensor, "B N_aa"],
-    lambda_sigma_weight: Float[torch.Tensor, "B"],
+    lambda_sigma_weight: Float[torch.Tensor, "B N_res"],
 ) -> Float[torch.Tensor, "B"]:
     """Kabsch-aligned atom-coordinate MSE loss with EDM noise weighting.
 
@@ -87,14 +114,21 @@ def atom_loss(
     match it), then computes the residue-type-weighted mean squared
     deviation per coordinate:
 
-        L_atom = lambda_sigma · Σ w_l · ||r_denoised_l - r_aligned_l||² /
+        L_atom = Σ w_l · lambda_l · ||r_denoised_l - r_aligned_l||² /
         (3 · Σ w_l)
 
     where w_l is ``POLAR_RESIDUE_WEIGHT`` (2.0) for polar residues and
     ``NONPOLAR_RESIDUE_WEIGHT`` (1.0) otherwise (zeroed at padded positions
     by `mask`), the factor 3 accounts for the x, y, z dimensions, and
-    ``lambda_sigma = (t̂² + sigma_data²) / (t̂ · sigma_data)²`` is the
-    per-sample EDM noise weighting.
+    ``lambda_l = (t̂_l² + sigma_data²) / (t̂_l · sigma_data)²`` is the EDM
+    noise weighting of point l (see ``edm_loss_weight``).
+
+    lambda multiplies each point's squared error before the weighted mean.
+    Because EDM's ``lambda = 1 / c_out²``, this weights every point equally
+    in terms of the network's raw output, even when points sit at different
+    noise levels. When lambda is constant within a sample it factors out of
+    the sum, giving the per-sample form ``lambda · Σ w_l · ||…||² /
+    (3 · Σ w_l)``.
 
     Args:
         r_denoised: (B, N_res, 3) — model output / denoised coordinates.
@@ -107,8 +141,9 @@ def atom_loss(
             to build the polar/nonpolar weight tensor. N_aa must evenly
             divide N_res (each residue's weight is repeated across the
             points — e.g. atoms — that belong to it).
-        lambda_sigma_weight: Per-batch EDM loss weight
-            ``(t̂² + sigma_data²) / (t̂ · sigma_data)²``, shape ``(B,)``.
+        lambda_sigma_weight: Per-point EDM loss weight
+            ``(t̂² + sigma_data²) / (t̂ · sigma_data)²``, shape
+            ``(B, N_res)``, from ``edm_loss_weight``.
 
     Returns:
         (B,) EDM-weighted loss per batch element.
@@ -164,10 +199,9 @@ def atom_loss(
     loss: Float[torch.Tensor, "B"] = einsum(
         sq,
         weights,
-        "b l, b l -> b",
+        lambda_sigma_weight,
+        "b l, b l, b l -> b",
     ) / (3.0 * L_eff)
-
-    loss = loss * lambda_sigma_weight
 
     if torch.isnan(loss).any():
         raise LossComputationError
@@ -180,7 +214,7 @@ def med_loss(
     logits_aa_blocks: list[Float[torch.Tensor, "K N_res n_amino"]],
     batch: FeaturizedBatch,
     loss_params: LossParams,
-    lambda_sigma_weight: Float[torch.Tensor, "B"],
+    lambda_sigma_weight: Float[torch.Tensor, "B N_atom"],
 ) -> Float[torch.Tensor, ""]:
     """Intermediate loss over K decoder blocks.
 
@@ -202,8 +236,9 @@ def med_loss(
         batch: Ground-truth coordinates, atom masks, and amino-acid indices.
         loss_params: Scalar hyperparameters lam (lambda), alpha_0, and gamma
             controlling loss weighting.
-        lambda_sigma_weight: Per-batch EDM loss weight
-            ``(t̂² + sigma_data²) / (t̂ · sigma_data)²``, shape ``(B,)``.
+        lambda_sigma_weight: Per-atom EDM loss weight
+            ``(t̂² + sigma_data²) / (t̂ · sigma_data)²``, shape
+            ``(B, N_atom)``, from ``edm_loss_weight``.
 
     Returns:
         Scalar mean intermediate loss L_med.
