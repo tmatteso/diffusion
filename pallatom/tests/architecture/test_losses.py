@@ -153,16 +153,13 @@ class TargetForm(enum.Enum):
 
 @dataclasses.dataclass(frozen=True)
 class MaskCase:
-    """Whether a distogram loss is given a mask, and whether that is buggy.
+    """Whether a distogram loss is given a mask.
 
     Attributes:
         masked: Pass a mask when true, ``None`` when false.
-        divisor_bug: The case hits the known ``distogram_loss_atom``
-            normalisation bug, so its fixture marks it strict ``xfail``.
     """
 
     masked: bool
-    divisor_bug: bool
 
 
 class ResidueMask(enum.Enum):
@@ -173,8 +170,8 @@ class ResidueMask(enum.Enum):
         masked: The last residue is masked out.
     """
 
-    unmasked = MaskCase(masked=False, divisor_bug=False)
-    masked = MaskCase(masked=True, divisor_bug=False)
+    unmasked = MaskCase(masked=False)
+    masked = MaskCase(masked=True)
 
 
 class AtomMask(enum.Enum):
@@ -182,12 +179,12 @@ class AtomMask(enum.Enum):
 
     Members:
         masked: An all-valid slot mask.
-        unmasked: No mask. Fails today: without a mask the loss divides
-            by ``q.shape[-2] ** 2 = K**2`` instead of ``N_atom * K``.
+        unmasked: No mask, so the loss averages over all ``N_atom * K``
+            slots.
     """
 
-    masked = MaskCase(masked=True, divisor_bug=False)
-    unmasked = MaskCase(masked=False, divisor_bug=True)
+    masked = MaskCase(masked=True)
+    unmasked = MaskCase(masked=False)
 
 
 class RigidScenario(enum.Enum):
@@ -518,32 +515,19 @@ def residue_mask(
 
 @pytest.fixture
 def atom_mask(
-    request: pytest.FixtureRequest,
     atom_mask_case: AtomMask,
     atom_bins: Int[torch.Tensor, "B N_atom K"],
 ) -> Bool[torch.Tensor, "B N_atom K"] | None:
     """Return the slot mask that ``atom_mask_case`` asks for.
 
-    A case flagged ``divisor_bug`` gets a strict ``xfail`` marker, so it
-    must fail today and the marker must come off once the loss is fixed.
-    Marks cannot ride on enum members, so the fixture applies it.
-
     Args:
-        request: Pytest request that receives the ``xfail`` marker.
-        atom_mask_case: Whether to mask, and whether the case hits the
-            known divisor bug; the requesting test parametrizes it.
+        atom_mask_case: Whether to mask; the requesting test parametrizes
+            it.
         atom_bins: Supplies the slot layout.
 
     Returns:
         An all-valid slot mask, or ``None``.
     """
-    if atom_mask_case.value.divisor_bug:
-        request.applymarker(
-            pytest.mark.xfail(
-                strict=True,
-                reason="unmasked distogram_loss_atom divides by K**2",
-            ),
-        )
     if not atom_mask_case.value.masked:
         return None
     return torch.ones(atom_bins.shape, dtype=torch.bool)
@@ -2007,10 +1991,10 @@ def test_distogram_loss_atom_uniform_logits_give_log_bins(
 ) -> None:
     """Uniform logits give ``log(n_bins)`` per item for any target and mask.
 
-    The documented loss is ``-1/(N_atom K) sum``, so with ``K = 5`` slots for
-    12 atoms the unmasked case fails today: it divides by ``K²`` and
-    returns ``(12/5) log(n_bins)``. ``atom_mask`` marks that case strict
-    ``xfail``.
+    The documented loss is ``-1/(N_atom K) sum``. With ``K = 5`` slots for
+    12 atoms, the unmasked case is the regression test for a divisor of
+    ``K**2``, which returned ``(12/5) log(n_bins)``; a square layout,
+    where ``K = N_atom``, could not tell the two apart.
 
     Args:
         uniform_atom_logits: All-zero logits.
@@ -2075,9 +2059,8 @@ def test_distogram_loss_atom_one_hot_and_index_targets_agree(
     """``distogram_loss_atom`` agrees for one-hot and index targets.
 
     Uses non-uniform logits, where the two code paths, an einsum and a
-    gather, could disagree. The mask is all True, so the masked path runs
-    and the known unmasked divisor bug cannot affect the comparison. Not
-    parametrized: both encodings are compared here.
+    gather, could disagree. The mask is all True, so the masked path runs.
+    Not parametrized: both encodings are compared here.
 
     Args:
         sine_atom_logits: Non-uniform atom logits.
