@@ -9,6 +9,7 @@ featurize pipeline's handling of unknown amino acid 'X'.
 
 import dataclasses
 import enum
+import math
 
 import numpy as np
 import pytest
@@ -1663,3 +1664,119 @@ def test_edm_loss_weight_repeats_each_residue_weight_over_its_points(
         expected_edm_weight: Hand-computed per-point weights.
     """
     torch.testing.assert_close(edm_weight, expected_edm_weight)
+
+
+@dataclasses.dataclass(frozen=True)
+class SparseAtomCase:
+    """A sparse atom distogram layout with fewer neighbours than atoms.
+
+    Attributes:
+        n_atom: Atoms per structure.
+        k: Neighbour slots per atom, fewer than ``n_atom`` so that a
+            divisor of ``K**2`` and the correct ``N_atom * K`` differ.
+        n_bins: Distance bins.
+        one_hot: Pass one-hot targets instead of bin indices.
+    """
+
+    n_atom: int
+    k: int
+    n_bins: int
+    one_hot: bool
+
+
+class SparseAtomLayout(enum.Enum):
+    """Unmasked ``distogram_loss_atom`` calls on a non-square layout.
+
+    Members:
+        index_targets: 12 atoms, 5 slots, 38 bins, integer targets.
+        one_hot_targets: The same layout with one-hot targets.
+    """
+
+    index_targets = SparseAtomCase(12, 5, 38, one_hot=False)
+    one_hot_targets = SparseAtomCase(12, 5, 38, one_hot=True)
+
+
+@pytest.fixture
+def sparse_uniform_logits(
+    sparse_atom_layout: SparseAtomLayout,
+) -> Float[torch.Tensor, "1 N_atom K n_bins"]:
+    """All-zero logits, a uniform distribution over the bins in every slot.
+
+    Args:
+        sparse_atom_layout: Layout to build; the requesting test
+            parametrizes it.
+
+    Returns:
+        Zeros of shape ``(1, n_atom, k, n_bins)``.
+    """
+    case = sparse_atom_layout.value
+    return torch.zeros(1, case.n_atom, case.k, case.n_bins)
+
+
+@pytest.fixture
+def sparse_targets(
+    sparse_atom_layout: SparseAtomLayout,
+) -> Int[torch.Tensor, "1 N_atom K"] | Float[torch.Tensor, "1 N_atom K n_bins"]:
+    """Target bins ``(n + k) % n_bins`` for slot ``k`` of atom ``n``.
+
+    Args:
+        sparse_atom_layout: Layout and target encoding; the requesting test
+            parametrizes it.
+
+    Returns:
+        Integer bin indices, or their one-hot encoding.
+    """
+    case = sparse_atom_layout.value
+    atoms = rearrange(torch.arange(case.n_atom), "n -> 1 n 1")
+    slots = rearrange(torch.arange(case.k), "k -> 1 1 k")
+    bins = (atoms + slots) % case.n_bins
+    if not case.one_hot:
+        return bins
+    return F.one_hot(bins, case.n_bins).float()
+
+
+@pytest.fixture
+def sparse_log_bins(
+    sparse_atom_layout: SparseAtomLayout,
+) -> Float[torch.Tensor, "1"]:
+    """Cross-entropy of a uniform distribution, ``log(n_bins)``.
+
+    Args:
+        sparse_atom_layout: Supplies the bin count; the requesting test
+            parametrizes it.
+
+    Returns:
+        ``log(n_bins)`` for the single batch item.
+    """
+    return torch.tensor([math.log(sparse_atom_layout.value.n_bins)])
+
+
+@pytest.mark.parametrize(
+    "sparse_atom_layout",
+    list(SparseAtomLayout),
+    ids=[case.name for case in SparseAtomLayout],
+)
+def test_distogram_loss_atom_unmasked_averages_over_every_slot(
+    sparse_uniform_logits: Float[torch.Tensor, "1 N_atom K n_bins"],
+    sparse_targets: (
+        Int[torch.Tensor, "1 N_atom K"]
+        | Float[torch.Tensor, "1 N_atom K n_bins"]
+    ),
+    sparse_log_bins: Float[torch.Tensor, "1"],
+) -> None:
+    """Without a mask, the loss is the mean cross-entropy over all slots.
+
+    Every slot has cross-entropy ``log(n_bins)`` under uniform logits, so
+    the mean over the ``N_atom * K`` slots is exactly ``log(n_bins)``.
+    Regression test for a divisor of ``K**2``, which gave
+    ``N_atom / K = 2.4`` times that here. The square ``(N, N)`` layouts
+    used elsewhere in this file have ``K = N_atom`` and cannot tell the two
+    apart.
+
+    Args:
+        sparse_uniform_logits: All-zero logits.
+        sparse_targets: Target bins, as indices or one-hot.
+        sparse_log_bins: The expected loss.
+    """
+    loss = distogram_loss_atom(sparse_uniform_logits, sparse_targets)
+    torch.testing.assert_close(loss, sparse_log_bins)
