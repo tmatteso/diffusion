@@ -32,12 +32,6 @@ from helpers.useful_objects import manual_seed
 from jaxtyping import Float, TypeCheckError
 from tests.patterns import sine_pattern
 
-type AnyFloat = Float[torch.Tensor, "..."]
-type Pair = Float[torch.Tensor, "B N_res N_res c"]
-type TriangleAttention = (
-    TriangleAttentionStartingNodeWithBias | TriangleAttentionEndingNodeWithBias
-)
-
 
 @dataclasses.dataclass(frozen=True)
 class PairDims:
@@ -66,7 +60,10 @@ class PairProbe(abc.ABC):
     """
 
     @abc.abstractmethod
-    def run(self, pair: AnyFloat) -> AnyFloat:
+    def run(
+        self,
+        pair: Float[torch.Tensor, "..."],
+    ) -> Float[torch.Tensor, "..."]:
         """Call the module on ``pair`` with every other input fixed.
 
         Args:
@@ -86,11 +83,17 @@ class TriangleProbe(PairProbe):
         bias: Fixed attention bias.
     """
 
-    module: TriangleAttention
-    bias: Pair
+    module: (
+        TriangleAttentionStartingNodeWithBias
+        | TriangleAttentionEndingNodeWithBias
+    )
+    bias: Float[torch.Tensor, "B N_res N_res c"]
 
     @override
-    def run(self, pair: AnyFloat) -> AnyFloat:
+    def run(
+        self,
+        pair: Float[torch.Tensor, "..."],
+    ) -> Float[torch.Tensor, "..."]:
         """Run ``module(pair, bias)``.
 
         Args:
@@ -113,7 +116,10 @@ class TransitionProbe(PairProbe):
     module: Transition
 
     @override
-    def run(self, pair: AnyFloat) -> AnyFloat:
+    def run(
+        self,
+        pair: Float[torch.Tensor, "..."],
+    ) -> Float[torch.Tensor, "..."]:
         """Run ``module(pair)``.
 
         Args:
@@ -138,7 +144,10 @@ class PairUpdateProbe(PairProbe):
     r_center: Float[torch.Tensor, "B N_res 3"]
 
     @override
-    def run(self, pair: AnyFloat) -> AnyFloat:
+    def run(
+        self,
+        pair: Float[torch.Tensor, "..."],
+    ) -> Float[torch.Tensor, "..."]:
         """Run ``module(pair, r_center)``.
 
         Args:
@@ -190,19 +199,86 @@ class RbfScenario(enum.Enum):
 
 
 @dataclasses.dataclass(frozen=True)
-class TriangleCase:
+class TriangleCase(abc.ABC):
     """A triangle attention direction and the axis it attends within.
 
     Attributes:
-        module_cls: The attention class.
         axis: Axis of ``z`` whose index is held fixed while attending: 1
             (rows) for the starting node, 2 (columns) for the ending node.
             Output slices along this axis depend only on the matching
             input slice.
     """
 
-    module_cls: type[TriangleAttention]
     axis: int
+
+    @abc.abstractmethod
+    def build(
+        self,
+        c: int,
+        n_heads: int,
+    ) -> (
+        TriangleAttentionStartingNodeWithBias
+        | TriangleAttentionEndingNodeWithBias
+    ):
+        """Build this direction's triangle attention.
+
+        Args:
+            c: Pair embedding width.
+            n_heads: Attention heads.
+
+        Returns:
+            The module, in training mode.
+        """
+
+
+@dataclasses.dataclass(frozen=True)
+class StartingCase(TriangleCase):
+    """``TriangleAttentionStartingNodeWithBias``.
+
+    Row ``i`` attends over its columns.
+    """
+
+    @override
+    def build(
+        self,
+        c: int,
+        n_heads: int,
+    ) -> TriangleAttentionStartingNodeWithBias:
+        """Build a ``TriangleAttentionStartingNodeWithBias``.
+
+        Args:
+            c: Pair embedding width.
+            n_heads: Attention heads.
+
+        Returns:
+            The module, in training mode.
+        """
+        return TriangleAttentionStartingNodeWithBias(c, n_heads=n_heads)
+
+
+@dataclasses.dataclass(frozen=True)
+class EndingCase(TriangleCase):
+    """``TriangleAttentionEndingNodeWithBias``.
+
+    Column ``j`` attends over its rows.
+    """
+
+    @override
+    def build(
+        self,
+        c: int,
+        n_heads: int,
+    ) -> TriangleAttentionEndingNodeWithBias:
+        """Build a ``TriangleAttentionEndingNodeWithBias``.
+
+        Args:
+            c: Pair embedding width.
+            n_heads: Attention heads.
+
+        Returns:
+            The module, in training mode.
+        """
+        return TriangleAttentionEndingNodeWithBias(c, n_heads=n_heads)
 
 
 class TriangleScenario(enum.Enum):
@@ -215,22 +291,65 @@ class TriangleScenario(enum.Enum):
             attends over its rows.
     """
 
-    starting = TriangleCase(TriangleAttentionStartingNodeWithBias, 1)
-    ending = TriangleCase(TriangleAttentionEndingNodeWithBias, 2)
+    starting = StartingCase(1)
+    ending = EndingCase(2)
 
 
 @dataclasses.dataclass(frozen=True)
-class DropoutCase:
+class DropoutCase(abc.ABC):
     """A structured dropout and the axis whose slices it drops whole.
 
     Attributes:
-        module_cls: The dropout class.
         axis: Each ``(batch, index along axis)`` slice is kept or dropped
             as a unit.
     """
 
-    module_cls: type[DropoutRowwise | DropoutColumnwise]
     axis: int
+
+    @abc.abstractmethod
+    def build(self, p: float) -> DropoutRowwise | DropoutColumnwise:
+        """Build this dropout.
+
+        Args:
+            p: Drop probability.
+
+        Returns:
+            The module, in training mode.
+        """
+
+
+@dataclasses.dataclass(frozen=True)
+class RowwiseCase(DropoutCase):
+    """``DropoutRowwise``, which drops whole rows."""
+
+    @override
+    def build(self, p: float) -> DropoutRowwise:
+        """Build a ``DropoutRowwise``.
+
+        Args:
+            p: Drop probability.
+
+        Returns:
+            The module, in training mode.
+        """
+        return DropoutRowwise(p=p)
+
+
+@dataclasses.dataclass(frozen=True)
+class ColumnwiseCase(DropoutCase):
+    """``DropoutColumnwise``, which drops whole columns."""
+
+    @override
+    def build(self, p: float) -> DropoutColumnwise:
+        """Build a ``DropoutColumnwise``.
+
+        Args:
+            p: Drop probability.
+
+        Returns:
+            The module, in training mode.
+        """
+        return DropoutColumnwise(p=p)
 
 
 class DropoutScenario(enum.Enum):
@@ -241,8 +360,8 @@ class DropoutScenario(enum.Enum):
         columnwise: ``DropoutColumnwise`` drops whole columns (axis 2).
     """
 
-    rowwise = DropoutCase(DropoutRowwise, 1)
-    columnwise = DropoutCase(DropoutColumnwise, 2)
+    rowwise = RowwiseCase(1)
+    columnwise = ColumnwiseCase(2)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -286,7 +405,7 @@ def dims() -> PairDims:
 
 
 @pytest.fixture
-def z(dims: PairDims) -> Pair:
+def z(dims: PairDims) -> Float[torch.Tensor, "B N_res N_res c"]:
     """Return a deterministic pair embedding.
 
     Args:
@@ -299,7 +418,7 @@ def z(dims: PairDims) -> Pair:
 
 
 @pytest.fixture
-def bias(dims: PairDims) -> Pair:
+def bias(dims: PairDims) -> Float[torch.Tensor, "B N_res N_res c"]:
     """Return a deterministic triangle attention bias, unrelated to ``z``.
 
     Args:
@@ -347,7 +466,9 @@ def pair_update(dims: PairDims) -> PairUpdate:
 def triangle(
     triangle_scenario: TriangleScenario,
     dims: PairDims,
-) -> TriangleAttention:
+) -> (
+    TriangleAttentionStartingNodeWithBias | TriangleAttentionEndingNodeWithBias
+):
     """Build the scenario's triangle attention under a fixed seed.
 
     Args:
@@ -359,12 +480,14 @@ def triangle(
         The module in eval mode.
     """
     _ = manual_seed(0)
-    module_cls = triangle_scenario.value.module_cls
-    return module_cls(dims.c, n_heads=dims.n_heads).eval()
+    return triangle_scenario.value.build(dims.c, dims.n_heads).eval()
 
 
 @pytest.fixture
-def starting_probe(dims: PairDims, bias: Pair) -> TriangleProbe:
+def starting_probe(
+    dims: PairDims,
+    bias: Float[torch.Tensor, "B N_res N_res c"],
+) -> TriangleProbe:
     """Probe the starting-node triangle attention with a fixed bias.
 
     Args:
@@ -380,7 +503,10 @@ def starting_probe(dims: PairDims, bias: Pair) -> TriangleProbe:
 
 
 @pytest.fixture
-def ending_probe(dims: PairDims, bias: Pair) -> TriangleProbe:
+def ending_probe(
+    dims: PairDims,
+    bias: Float[torch.Tensor, "B N_res N_res c"],
+) -> TriangleProbe:
     """Probe the ending-node triangle attention with a fixed bias.
 
     Args:
@@ -537,7 +663,10 @@ def test_transform_rbf_rejects_distances_missing_an_axis(
     "pair_probe_name",
     ["starting_probe", "ending_probe", "transition_probe", "pair_update_probe"],
 )
-def test_output_shape_and_finite(z: Pair, pair_probe: PairProbe) -> None:
+def test_output_shape_and_finite(
+    z: Float[torch.Tensor, "B N_res N_res c"],
+    pair_probe: PairProbe,
+) -> None:
     """Each module maps the pair embedding to a finite tensor of its shape.
 
     Args:
@@ -555,7 +684,7 @@ def test_output_shape_and_finite(z: Pair, pair_probe: PairProbe) -> None:
     ["starting_probe", "ending_probe", "transition_probe", "pair_update_probe"],
 )
 def test_gradient_reaches_pair_embedding(
-    z: Pair,
+    z: Float[torch.Tensor, "B N_res N_res c"],
     pair_probe: PairProbe,
 ) -> None:
     """The summed output has a finite, nonzero gradient with respect to ``z``.
@@ -576,7 +705,7 @@ def test_gradient_reaches_pair_embedding(
     ["starting_probe", "ending_probe", "pair_update_probe"],
 )
 def test_forward_rejects_pair_missing_channel_axis(
-    z: Pair,
+    z: Float[torch.Tensor, "B N_res N_res c"],
     pair_probe: PairProbe,
 ) -> None:
     """Each module's contract rejects a ``(B, N, N)`` pair tensor.
@@ -619,9 +748,12 @@ def test_transition_accepts_any_leading_shape(
 )
 def test_triangle_attention_keeps_its_axis_independent(
     triangle_scenario: TriangleScenario,
-    triangle: TriangleAttention,
-    z: Pair,
-    bias: Pair,
+    triangle: (
+        TriangleAttentionStartingNodeWithBias
+        | TriangleAttentionEndingNodeWithBias
+    ),
+    z: Float[torch.Tensor, "B N_res N_res c"],
+    bias: Float[torch.Tensor, "B N_res N_res c"],
 ) -> None:
     """Changing slice 0 of ``z`` along the fixed axis leaves the rest alone.
 
@@ -650,9 +782,12 @@ def test_triangle_attention_keeps_its_axis_independent(
     ids=[case.name for case in TriangleScenario],
 )
 def test_triangle_attention_reads_its_bias(
-    triangle: TriangleAttention,
-    z: Pair,
-    bias: Pair,
+    triangle: (
+        TriangleAttentionStartingNodeWithBias
+        | TriangleAttentionEndingNodeWithBias
+    ),
+    z: Float[torch.Tensor, "B N_res N_res c"],
+    bias: Float[torch.Tensor, "B N_res N_res c"],
 ) -> None:
     """Negating the bias, ``z`` fixed, changes the attention output.
 
@@ -674,7 +809,7 @@ def test_triangle_attention_reads_its_bias(
 )
 def test_dropout_is_identity_in_eval(
     dropout_scenario: DropoutScenario,
-    z: Pair,
+    z: Float[torch.Tensor, "B N_res N_res c"],
 ) -> None:
     """In eval mode the dropout returns its input unchanged.
 
@@ -682,7 +817,7 @@ def test_dropout_is_identity_in_eval(
         dropout_scenario: Dropout under test.
         z: Valid pair embedding.
     """
-    drop = dropout_scenario.value.module_cls(p=0.5).eval()
+    drop = dropout_scenario.value.build(p=0.5).eval()
     assert torch.equal(drop(z), z)
 
 
@@ -709,7 +844,7 @@ def test_dropout_drops_whole_slices_and_rescales(
     ones = torch.ones(dims.batch, dims.n_res, dims.n_res, dims.c)
     _ = manual_seed(0)
     p = 0.5
-    out = case.module_cls(p=p).train()(ones)
+    out = case.build(p=p).train()(ones)
     slices = rearrange(out.movedim(case.axis, 1), "b n ... -> b n (...)")
     lowest = reduce(slices, "b n k -> b n", "min")
     highest = reduce(slices, "b n k -> b n", "max")
@@ -722,7 +857,7 @@ def test_dropout_drops_whole_slices_and_rescales(
 
 def test_pair_update_is_not_identity(
     pair_update_probe: PairUpdateProbe,
-    z: Pair,
+    z: Float[torch.Tensor, "B N_res N_res c"],
 ) -> None:
     """PairUpdate's residual updates are nonzero at initialisation.
 
@@ -740,7 +875,7 @@ def test_pair_update_is_not_identity(
 
 def test_pair_update_coordinate_gradient_is_finite(
     pair_update: PairUpdate,
-    z: Pair,
+    z: Float[torch.Tensor, "B N_res N_res c"],
     r_center: Float[torch.Tensor, "B N_res 3"],
 ) -> None:
     """The output's gradient with respect to ``r_center`` is finite.
@@ -768,7 +903,7 @@ def test_pair_update_coordinate_gradient_is_finite(
 def test_pair_update_is_invariant_to_rigid_motion(
     rigid_scenario: RigidScenario,
     pair_update: PairUpdate,
-    z: Pair,
+    z: Float[torch.Tensor, "B N_res N_res c"],
     r_center: Float[torch.Tensor, "B N_res 3"],
 ) -> None:
     """Moving every centre atom rigidly leaves PairUpdate's output unchanged.
