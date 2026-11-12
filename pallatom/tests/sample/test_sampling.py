@@ -37,6 +37,7 @@ from helpers.atom_utils import (
 from helpers.data import (
     Distogram,
     FeaturizedBatch,
+    build_distogram_module,
     normalized_time_from_sigma,
 )
 from helpers.useful_objects import manual_seed
@@ -53,7 +54,7 @@ from sample.sampling import (
     build_template_context,
     sampled_structure_to_pdb,
 )
-from train.train_config import NoiseScheduleParams
+from train.train_config import NoiseScheduleParams, TemplateDistogramParams
 
 
 @dataclasses.dataclass
@@ -194,19 +195,20 @@ def aa_protein(sequence: str) -> Protein:
         The protein.
     """
     n = len(sequence)
+    n_atoms = ResidueRepresentation.atom37.value
     r = rearrange(np.arange(n, dtype=np.float64), "r -> r 1")
-    a = rearrange(np.arange(37, dtype=np.float64), "a -> 1 a")
+    a = rearrange(np.arange(n_atoms, dtype=np.float64), "a -> 1 a")
     positions = np.stack(
-        [r + 0.1 * a, np.sin(r + a), np.zeros((n, 37))],
+        [r + 0.1 * a, np.sin(r + a), np.zeros((n, n_atoms))],
         axis=-1,
     )
     return Protein(
         atom_positions=positions,
         aatype=np.array([restype_order[c] for c in sequence], dtype=np.intp),
-        atom_mask=np.ones((n, 37)),
+        atom_mask=np.ones((n, n_atoms)),
         residue_index=np.arange(n, dtype=np.intp),
         chain_index=np.zeros(n, dtype=np.intp),
-        b_factors=np.zeros((n, 37)),
+        b_factors=np.zeros((n, n_atoms)),
     )
 
 
@@ -281,14 +283,15 @@ class ContextScenario(enum.Enum):
     """Unconditional context sizes.
 
     Members:
-        base: 4 residues, the 39-bin template distogram used in training.
+        base: 4 residues, the template distogram used in training (the
+            ``TemplateDistogramParams`` defaults).
         doubled: 8 residues; every atom and token axis doubles.
         template_20_bins: A 19-bin template plus overflow; the stored
             distogram must take its width from the module passed in.
     """
 
-    base = ContextCase(4, 39)
-    doubled = ContextCase(8, 39)
+    base = ContextCase(4, TemplateDistogramParams().n_bins)
+    doubled = ContextCase(8, TemplateDistogramParams().n_bins)
     template_20_bins = ContextCase(4, 20)
 
 
@@ -554,17 +557,13 @@ def atom_disto() -> Distogram:
 
 @pytest.fixture
 def templ_disto() -> Distogram:
-    """Return the training template distogram: 38 bins plus overflow.
+    """Return the training template distogram, from the library defaults.
 
     Returns:
-        The module, spanning 3.25 to 50.75 angstroms.
+        The module ``build_distogram_module`` makes from
+        ``TemplateDistogramParams()``, as training builds it.
     """
-    return Distogram(
-        n_bins=38,
-        min_dist=3.25,
-        max_dist=50.75,
-        overflow_bin=True,
-    )
+    return build_distogram_module(TemplateDistogramParams())
 
 
 @pytest.fixture
@@ -605,12 +604,8 @@ def scenario_context(
         The context.
     """
     case = context_scenario.value
-    templ = Distogram(
-        n_bins=case.template_bins - 1,
-        min_dist=3.25,
-        max_dist=50.75,
-        overflow_bin=True,
-    )
+    params = TemplateDistogramParams(n_bins=case.template_bins)
+    templ = build_distogram_module(params)
     with torch.no_grad():
         return build_sampling_context(
             pdb_file_path=None,
@@ -890,11 +885,86 @@ def sampler_trajectory(
     )
 
 
+@dataclasses.dataclass(frozen=True)
+class ContextShapes:
+    """Shapes ``build_sampling_context`` must give six of its fields.
+
+    Attributes:
+        ref_pos: ``(1, N_atom, 3)``.
+        ref_element: ``(1, N_atom, 4)``.
+        tok_idx: ``(1, N_atom)``.
+        center_uid: ``(1, N_atom)``.
+        noised_res_distogram: ``(1, N_res, N_res, template_bins)``.
+        f_pseudo_beta_mask: ``(1, N_res)``.
+    """
+
+    ref_pos: tuple[int, ...]
+    ref_element: tuple[int, ...]
+    tok_idx: tuple[int, ...]
+    center_uid: tuple[int, ...]
+    noised_res_distogram: tuple[int, ...]
+    f_pseudo_beta_mask: tuple[int, ...]
+
+
+@dataclasses.dataclass(frozen=True)
+class AaContextShapes:
+    """Shapes ``build_aa_context`` must give every ``AllAtomContext`` field.
+
+    Attributes:
+        r_gt: ``(B, N_atom, 3)``.
+        atom5_mask: ``(B, N_atom)``.
+        residue_mask: ``(B, N_res)``.
+        gt_atom_distogram_sparse: ``(B, N_atom, K)``.
+        gt_atom_distogram_mask_sparse: ``(B, N_atom, K)``.
+        aa_indices: ``(B, N_res)``.
+        f_residue_idx: ``(B, N_res)``.
+    """
+
+    r_gt: tuple[int, ...]
+    atom5_mask: tuple[int, ...]
+    residue_mask: tuple[int, ...]
+    gt_atom_distogram_sparse: tuple[int, ...]
+    gt_atom_distogram_mask_sparse: tuple[int, ...]
+    aa_indices: tuple[int, ...]
+    f_residue_idx: tuple[int, ...]
+
+
 @pytest.fixture
-def aa_ctx(atom_disto: Distogram) -> AllAtomContext:
+def aa_sequence() -> str:
+    """Return the six-residue sequence the all-atom context tests use.
+
+    Returns:
+        ``"ACDEFG"``, six distinct canonical residues.
+    """
+    return "ACDEFG"
+
+
+@pytest.fixture
+def unknown_sequence() -> str:
+    """Return a sequence with unknown residues in positions 1 and 3.
+
+    Returns:
+        ``"AXCX"``.
+    """
+    return "AXCX"
+
+
+@pytest.fixture
+def template_sequence() -> str:
+    """Return the four-residue sequence the template context tests use.
+
+    Returns:
+        ``"ACDE"``.
+    """
+    return "ACDE"
+
+
+@pytest.fixture
+def aa_ctx(aa_sequence: str, atom_disto: Distogram) -> AllAtomContext:
     """Build a batch-of-two all-atom context for the sequence ``ACDEFG``.
 
     Args:
+        aa_sequence: One-letter sequence of the protein.
         atom_disto: Atom distogram.
 
     Returns:
@@ -902,7 +972,7 @@ def aa_ctx(atom_disto: Distogram) -> AllAtomContext:
     """
     with torch.no_grad():
         return build_aa_context(
-            aa_protein("ACDEFG"),
+            aa_protein(aa_sequence),
             atom_disto,
             batch_size=2,
             device="cpu",
@@ -910,17 +980,21 @@ def aa_ctx(atom_disto: Distogram) -> AllAtomContext:
 
 
 @pytest.fixture
-def template_ctx(templ_disto: Distogram) -> TemplateContext:
+def template_ctx(
+    template_sequence: str,
+    templ_disto: Distogram,
+) -> TemplateContext:
     """Build a template context from a 4-residue protein.
 
     Args:
+        template_sequence: One-letter sequence of the protein.
         templ_disto: Template distogram.
 
     Returns:
         The context.
     """
     return build_template_context(
-        aa_protein("ACDE"),
+        aa_protein(template_sequence),
         batch_size=1,
         distogram_fn=templ_disto,
         device="cpu",
@@ -928,10 +1002,15 @@ def template_ctx(templ_disto: Distogram) -> TemplateContext:
 
 
 @pytest.fixture
-def batched_aa_ctx(aa_batch_size: int, atom_disto: Distogram) -> AllAtomContext:
+def batched_aa_ctx(
+    aa_sequence: str,
+    aa_batch_size: int,
+    atom_disto: Distogram,
+) -> AllAtomContext:
     """Build an all-atom context for ``ACDEFG`` at the routed-in batch size.
 
     Args:
+        aa_sequence: One-letter sequence of the protein.
         aa_batch_size: Copies of the protein in the batch; the
             requesting test parametrizes it.
         atom_disto: Atom distogram.
@@ -941,7 +1020,7 @@ def batched_aa_ctx(aa_batch_size: int, atom_disto: Distogram) -> AllAtomContext:
     """
     with torch.no_grad():
         return build_aa_context(
-            aa_protein("ACDEFG"),
+            aa_protein(aa_sequence),
             atom_disto,
             batch_size=aa_batch_size,
             device="cpu",
@@ -949,10 +1028,14 @@ def batched_aa_ctx(aa_batch_size: int, atom_disto: Distogram) -> AllAtomContext:
 
 
 @pytest.fixture
-def unknown_aa_ctx(atom_disto: Distogram) -> AllAtomContext:
+def unknown_aa_ctx(
+    unknown_sequence: str,
+    atom_disto: Distogram,
+) -> AllAtomContext:
     """Build an all-atom context for ``AXCX``, two of whose residues are X.
 
     Args:
+        unknown_sequence: One-letter sequence of the protein.
         atom_disto: Atom distogram.
 
     Returns:
@@ -960,7 +1043,7 @@ def unknown_aa_ctx(atom_disto: Distogram) -> AllAtomContext:
     """
     with torch.no_grad():
         return build_aa_context(
-            aa_protein("AXCX"),
+            aa_protein(unknown_sequence),
             atom_disto,
             batch_size=1,
             device="cpu",
@@ -968,16 +1051,20 @@ def unknown_aa_ctx(atom_disto: Distogram) -> AllAtomContext:
 
 
 @pytest.fixture
-def spread_template_ctx(templ_disto: Distogram) -> TemplateContext:
+def spread_template_ctx(
+    template_sequence: str,
+    templ_disto: Distogram,
+) -> TemplateContext:
     """Build a template context from ``ACDE`` spread out 20 times.
 
     Args:
+        template_sequence: One-letter sequence of the protein.
         templ_disto: Template distogram.
 
     Returns:
         The context.
     """
-    protein = aa_protein("ACDE")
+    protein = aa_protein(template_sequence)
     spread = dataclasses.replace(
         protein,
         atom_positions=20 * protein.atom_positions,
@@ -990,14 +1077,143 @@ def spread_template_ctx(templ_disto: Distogram) -> TemplateContext:
     )
 
 
+@pytest.fixture
+def expected_context_shapes(context_scenario: ContextScenario) -> ContextShapes:
+    """Derive the context's field shapes from the scenario's sizes.
+
+    Args:
+        context_scenario: Residue count and template width; the requesting
+            test parametrizes it.
+
+    Returns:
+        The expected shapes.
+    """
+    case = context_scenario.value
+    n_atom = case.n_res * NATOM
+    return ContextShapes(
+        ref_pos=(1, n_atom, 3),
+        ref_element=(1, n_atom, 4),
+        tok_idx=(1, n_atom),
+        center_uid=(1, n_atom),
+        noised_res_distogram=(1, case.n_res, case.n_res, case.template_bins),
+        f_pseudo_beta_mask=(1, case.n_res),
+    )
+
+
+@pytest.fixture
+def context_residue_of_atom(
+    context_scenario: ContextScenario,
+) -> Int[torch.Tensor, " N_atom"]:
+    """Map every atom of the sampled chain to the index of its residue.
+
+    Args:
+        context_scenario: Residue count; the requesting test parametrizes
+            it.
+
+    Returns:
+        ``r`` repeated ``NATOM`` times for each residue ``r``.
+    """
+    n_res = context_scenario.value.n_res
+    return repeat(torch.arange(n_res), "r -> (r a)", a=NATOM)
+
+
+@pytest.fixture
+def expected_aa_shapes(
+    aa_batch_size: int,
+    aa_sequence: str,
+    batched_aa_ctx: AllAtomContext,
+) -> AaContextShapes:
+    """Derive every ``AllAtomContext`` field's shape from the inputs.
+
+    ``K`` is read from the context itself: it comes from the atom window,
+    which this test does not vary.
+
+    Args:
+        aa_batch_size: Copies of the protein; the requesting test
+            parametrizes it.
+        aa_sequence: Supplies the residue count.
+        batched_aa_ctx: Supplies ``K``.
+
+    Returns:
+        The expected shapes.
+    """
+    b, n_res = aa_batch_size, len(aa_sequence)
+    n_atom = n_res * NATOM
+    k = batched_aa_ctx.gt_atom_distogram_sparse.shape[2]
+    return AaContextShapes(
+        r_gt=(b, n_atom, 3),
+        atom5_mask=(b, n_atom),
+        residue_mask=(b, n_res),
+        gt_atom_distogram_sparse=(b, n_atom, k),
+        gt_atom_distogram_mask_sparse=(b, n_atom, k),
+        aa_indices=(b, n_res),
+        f_residue_idx=(b, n_res),
+    )
+
+
+@pytest.fixture
+def aa_sequence_indices(aa_sequence: str) -> Int[torch.Tensor, " N_res"]:
+    """Convert ``aa_sequence`` to residue indices.
+
+    Args:
+        aa_sequence: One-letter sequence.
+
+    Returns:
+        The index of each residue.
+    """
+    return torch.tensor([restype_order[c] for c in aa_sequence])
+
+
+@pytest.fixture
+def expected_unknown_indices() -> Int[torch.Tensor, " N_res"]:
+    """Indices ``build_aa_context`` must give ``unknown_sequence``.
+
+    Returns:
+        ``A``, then ``RESTYPE_NUM_NO_X``, then ``C``, then
+        ``RESTYPE_NUM_NO_X``.
+    """
+    a, c, x = restype_order["A"], restype_order["C"], RESTYPE_NUM_NO_X
+    return torch.tensor([a, x, c, x])
+
+
+@pytest.fixture
+def expected_template_shape(template_sequence: str) -> torch.Size:
+    """Shape of the template distogram for ``template_sequence``.
+
+    Args:
+        template_sequence: Supplies the residue count.
+
+    Returns:
+        ``(1, N_res, N_res, n_bins)`` with the library's template bins.
+    """
+    n_res = len(template_sequence)
+    return torch.Size((1, n_res, n_res, TemplateDistogramParams().n_bins))
+
+
+@pytest.fixture
+def binless_template(
+    template_ctx: TemplateContext,
+) -> Float[torch.Tensor, "1 N_res N_res"]:
+    """Return the template distogram with its bin axis cut away.
+
+    Args:
+        template_ctx: Valid template context.
+
+    Returns:
+        Bin 0 of every pair.
+    """
+    return template_ctx.f_template_distogram[..., 0]
+
+
 @pytest.mark.parametrize(
     "context_scenario",
     list(ContextScenario),
     ids=[case.name for case in ContextScenario],
 )
 def test_build_sampling_context_shapes_and_index_maps(
-    context_scenario: ContextScenario,
     scenario_context: FeaturizedBatch,
+    expected_context_shapes: ContextShapes,
+    context_residue_of_atom: Int[torch.Tensor, " N_atom"],
 ) -> None:
     """Every field has its shape; atoms map to residues and CA centres.
 
@@ -1005,29 +1221,20 @@ def test_build_sampling_context_shapes_and_index_maps(
     the template distogram takes the template module's full width.
 
     Args:
-        context_scenario: Residue count and template width.
-        scenario_context: The context.
+        scenario_context: Context built for the scenario.
+        expected_context_shapes: Shapes six fields must have.
+        context_residue_of_atom: Residue index of every atom.
     """
-    case = context_scenario.value
     x = scenario_context
-    n_atom = case.n_res * NATOM
-    residue = torch.arange(case.n_res).repeat_interleave(NATOM)
-    shapes = {
-        "ref_pos": (1, n_atom, 3),
-        "ref_element": (1, n_atom, 4),
-        "tok_idx": (1, n_atom),
-        "center_uid": (1, n_atom),
-        "noised_res_distogram": (1, case.n_res, case.n_res, case.template_bins),
-        "f_pseudo_beta_mask": (1, case.n_res),
-    }
+    expected = dataclasses.asdict(expected_context_shapes)
     found = {
         name: tuple(cast(torch.Tensor, getattr(x, name)).shape)
-        for name in shapes
+        for name in expected
     }
-    assert found == shapes
-    assert torch.equal(x.tok_idx[0], residue)
-    assert torch.equal(x.ref_space_uid[0], residue)
-    assert torch.equal(x.center_uid[0], NATOM * residue + 1)
+    assert found == expected
+    assert torch.equal(x.tok_idx[0], context_residue_of_atom)
+    assert torch.equal(x.ref_space_uid[0], context_residue_of_atom)
+    assert torch.equal(x.center_uid[0], NATOM * context_residue_of_atom + 1)
 
 
 @pytest.mark.parametrize(
@@ -1336,8 +1543,8 @@ def test_edm_sampler_step_count_changes_a_nontrivial_trajectory(
 
 @pytest.mark.parametrize("aa_batch_size", [1, 2])
 def test_build_aa_context_shapes_follow_batch_and_protein(
-    aa_batch_size: int,
     batched_aa_ctx: AllAtomContext,
+    expected_aa_shapes: AaContextShapes,
 ) -> None:
     """Every field leads with ``batch_size``, then the atom or residue axis.
 
@@ -1345,29 +1552,19 @@ def test_build_aa_context_shapes_follow_batch_and_protein(
     itself and must match between the distogram and its mask.
 
     Args:
-        aa_batch_size: Copies of the protein in the batch.
-        batched_aa_ctx: Context for ``ACDEFG`` at that batch size.
+        batched_aa_ctx: Context for the batch.
+        expected_aa_shapes: Shapes every field must have.
     """
-    ctx = batched_aa_ctx
-    b, n_res, n_atom = aa_batch_size, 6, 6 * NATOM
-    k = ctx.gt_atom_distogram_sparse.shape[2]
     shapes = {
-        f.name: tuple(cast(torch.Tensor, getattr(ctx, f.name)).shape)
-        for f in dataclasses.fields(ctx)
+        f.name: tuple(cast(torch.Tensor, getattr(batched_aa_ctx, f.name)).shape)
+        for f in dataclasses.fields(batched_aa_ctx)
     }
-    assert shapes == {
-        "r_gt": (b, n_atom, 3),
-        "atom5_mask": (b, n_atom),
-        "residue_mask": (b, n_res),
-        "gt_atom_distogram_sparse": (b, n_atom, k),
-        "gt_atom_distogram_mask_sparse": (b, n_atom, k),
-        "aa_indices": (b, n_res),
-        "f_residue_idx": (b, n_res),
-    }
+    assert shapes == dataclasses.asdict(expected_aa_shapes)
 
 
 def test_build_aa_context_tiles_the_protein_into_every_batch_item(
     aa_ctx: AllAtomContext,
+    aa_sequence_indices: Int[torch.Tensor, " N_res"],
 ) -> None:
     """Both batch items hold the same atoms and the input sequence.
 
@@ -1375,11 +1572,14 @@ def test_build_aa_context_tiles_the_protein_into_every_batch_item(
     parametrized: the batch size is covered by the shape test.
 
     Args:
-        aa_ctx: Context for ``ACDEFG`` tiled twice.
+        aa_ctx: Batch-of-two context.
+        aa_sequence_indices: Residue indices of the protein.
     """
-    sequence = torch.tensor([restype_order[c] for c in "ACDEFG"])
     assert torch.equal(aa_ctx.r_gt[0], aa_ctx.r_gt[1])
-    assert torch.equal(aa_ctx.aa_indices, repeat(sequence, "n -> 2 n"))
+    assert torch.equal(
+        aa_ctx.aa_indices,
+        repeat(aa_sequence_indices, "n -> 2 n"),
+    )
     assert bool(aa_ctx.atom5_mask.all())
     assert bool(aa_ctx.residue_mask.all())
     assert torch.isfinite(aa_ctx.r_gt).all()
@@ -1387,6 +1587,7 @@ def test_build_aa_context_tiles_the_protein_into_every_batch_item(
 
 def test_build_aa_context_keeps_unknown_residues_as_x(
     unknown_aa_ctx: AllAtomContext,
+    expected_unknown_indices: Int[torch.Tensor, " N_res"],
 ) -> None:
     """An ``X`` residue reaches ``aa_indices`` as ``RESTYPE_NUM_NO_X``.
 
@@ -1396,14 +1597,14 @@ def test_build_aa_context_keeps_unknown_residues_as_x(
 
     Args:
         unknown_aa_ctx: Context for ``AXCX``.
+        expected_unknown_indices: Indices it must hold.
     """
-    ctx = unknown_aa_ctx
-    a, c, x = restype_order["A"], restype_order["C"], RESTYPE_NUM_NO_X
-    assert torch.equal(ctx.aa_indices[0], torch.tensor([a, x, c, x]))
+    assert torch.equal(unknown_aa_ctx.aa_indices[0], expected_unknown_indices)
 
 
 def test_build_template_context_is_a_symmetric_one_hot_distogram(
     template_ctx: TemplateContext,
+    expected_template_shape: torch.Size,
 ) -> None:
     """The template distogram is float, one-hot per pair, and symmetric.
 
@@ -1411,14 +1612,15 @@ def test_build_template_context_is_a_symmetric_one_hot_distogram(
     the properties hold for any protein.
 
     Args:
-        template_ctx: Context for a 4-residue protein.
+        template_ctx: Context for ``ACDE``.
+        expected_template_shape: Shape of its distogram.
     """
     disto = template_ctx.f_template_distogram
-    assert disto.shape == (1, 4, 4, 39)
+    assert disto.shape == expected_template_shape
     assert disto.dtype == torch.float32
     assert torch.equal(
         reduce(disto, "b i j k -> b i j", "sum"),
-        torch.ones(1, 4, 4),
+        torch.ones(disto.shape[:-1]),
     )
     assert torch.equal(disto, rearrange(disto, "b i j k -> b j i k"))
     assert template_ctx.f_pseudo_beta_mask.dtype == torch.long
@@ -1470,17 +1672,21 @@ def test_all_atom_context_rejects_a_malformed_field(
 
 def test_template_context_rejects_a_distogram_without_bins(
     template_ctx: TemplateContext,
+    binless_template: Float[torch.Tensor, "1 N_res N_res"],
 ) -> None:
     """A template distogram with no bin axis fails the contract.
 
     Not parametrized: the mask has no axis left to drop independently.
 
     Args:
-        template_ctx: Valid context.
+        template_ctx: Valid template context.
+        binless_template: Its distogram without the bin axis.
     """
-    flat = template_ctx.f_template_distogram[..., 0]
     with pytest.raises(TypeCheckError):
-        _ = dataclasses.replace(template_ctx, f_template_distogram=flat)
+        _ = dataclasses.replace(
+            template_ctx,
+            f_template_distogram=binless_template,
+        )
 
 
 @dataclasses.dataclass(frozen=True)

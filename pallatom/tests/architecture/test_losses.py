@@ -53,6 +53,7 @@ from helpers.atom_utils import (
     restype_order,
 )
 from helpers.data import (
+    Distogram,
     FeaturizedBatch,
     build_distogram_module,
     featurize_single_item,
@@ -66,8 +67,6 @@ from train.train_config import (
     TemplateDistogramParams,
     TrainConfig,
 )
-
-type Coords = Float[torch.Tensor, "B N 3"]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -111,7 +110,10 @@ class RigidCase:
     rotation: tuple[tuple[int, int, int], ...]
     translation: tuple[float, float, float]
 
-    def apply(self, x: Coords) -> Coords:
+    def apply(
+        self,
+        x: Float[torch.Tensor, "B N 3"],
+    ) -> Float[torch.Tensor, "B N 3"]:
         """Rotate then translate every structure in ``x``.
 
         Args:
@@ -151,16 +153,13 @@ class TargetForm(enum.Enum):
 
 @dataclasses.dataclass(frozen=True)
 class MaskCase:
-    """Whether a distogram loss is given a mask, and whether that is buggy.
+    """Whether a distogram loss is given a mask.
 
     Attributes:
         masked: Pass a mask when true, ``None`` when false.
-        divisor_bug: The case hits the known ``distogram_loss_atom``
-            normalisation bug, so its fixture marks it strict ``xfail``.
     """
 
     masked: bool
-    divisor_bug: bool
 
 
 class ResidueMask(enum.Enum):
@@ -171,8 +170,8 @@ class ResidueMask(enum.Enum):
         masked: The last residue is masked out.
     """
 
-    unmasked = MaskCase(masked=False, divisor_bug=False)
-    masked = MaskCase(masked=True, divisor_bug=False)
+    unmasked = MaskCase(masked=False)
+    masked = MaskCase(masked=True)
 
 
 class AtomMask(enum.Enum):
@@ -180,12 +179,12 @@ class AtomMask(enum.Enum):
 
     Members:
         masked: An all-valid slot mask.
-        unmasked: No mask. Fails today: without a mask the loss divides
-            by ``q.shape[-2] ** 2 = K**2`` instead of ``N_atom * K``.
+        unmasked: No mask, so the loss averages over all ``N_atom * K``
+            slots.
     """
 
-    masked = MaskCase(masked=True, divisor_bug=False)
-    unmasked = MaskCase(masked=False, divisor_bug=True)
+    masked = MaskCase(masked=True)
+    unmasked = MaskCase(masked=False)
 
 
 class RigidScenario(enum.Enum):
@@ -253,7 +252,7 @@ class MalformedInputs:
     """
 
     coords4: Float[torch.Tensor, "B N 4"]
-    coords3: Coords
+    coords3: Float[torch.Tensor, "B N 3"]
     flat: Float[torch.Tensor, "N N"]
     idx: Int[torch.Tensor, "N N"]
     seq: Float[torch.Tensor, "B N n_amino"]
@@ -389,7 +388,7 @@ def dims() -> LossDims:
 
 
 @pytest.fixture
-def gt(dims: LossDims) -> Coords:
+def gt(dims: LossDims) -> Float[torch.Tensor, "B N 3"]:
     """Return non-planar ground-truth structures spanning about 10 angstroms.
 
     Args:
@@ -402,7 +401,7 @@ def gt(dims: LossDims) -> Coords:
 
 
 @pytest.fixture
-def perturbed(gt: Coords) -> Coords:
+def perturbed(gt: Float[torch.Tensor, "B N 3"]) -> Float[torch.Tensor, "B N 3"]:
     """Return ``gt`` plus a fixed non-rigid perturbation of about 1 angstrom.
 
     The perturbation is a chiral cloud offset by one structure in the
@@ -516,32 +515,19 @@ def residue_mask(
 
 @pytest.fixture
 def atom_mask(
-    request: pytest.FixtureRequest,
     atom_mask_case: AtomMask,
     atom_bins: Int[torch.Tensor, "B N_atom K"],
 ) -> Bool[torch.Tensor, "B N_atom K"] | None:
     """Return the slot mask that ``atom_mask_case`` asks for.
 
-    A case flagged ``divisor_bug`` gets a strict ``xfail`` marker, so it
-    must fail today and the marker must come off once the loss is fixed.
-    Marks cannot ride on enum members, so the fixture applies it.
-
     Args:
-        request: Pytest request that receives the ``xfail`` marker.
-        atom_mask_case: Whether to mask, and whether the case hits the
-            known divisor bug; the requesting test parametrizes it.
+        atom_mask_case: Whether to mask; the requesting test parametrizes
+            it.
         atom_bins: Supplies the slot layout.
 
     Returns:
         An all-valid slot mask, or ``None``.
     """
-    if atom_mask_case.value.divisor_bug:
-        request.applymarker(
-            pytest.mark.xfail(
-                strict=True,
-                reason="unmasked distogram_loss_atom divides by K**2",
-            ),
-        )
     if not atom_mask_case.value.masked:
         return None
     return torch.ones(atom_bins.shape, dtype=torch.bool)
@@ -550,7 +536,7 @@ def atom_mask(
 @pytest.fixture
 def batch(
     dims: LossDims,
-    gt: Coords,
+    gt: Float[torch.Tensor, "B N 3"],
     aa_indices: Int[torch.Tensor, "B N_res"],
 ) -> FeaturizedBatch:
     """Build a FeaturizedBatch carrying ``gt`` and ``aa_indices``.
@@ -626,7 +612,10 @@ def atom_bins(dims: LossDims) -> Int[torch.Tensor, "B N_atom K"]:
 
 
 @pytest.fixture
-def malformed_inputs(dims: LossDims, gt: Coords) -> MalformedInputs:
+def malformed_inputs(
+    dims: LossDims,
+    gt: Float[torch.Tensor, "B N 3"],
+) -> MalformedInputs:
     """Build the inputs the malformed-shape scenarios cut from.
 
     Args:
@@ -681,28 +670,724 @@ def lddt_floor() -> Float[torch.Tensor, ""]:
     return 1 - torch.sigmoid(thresholds).mean()
 
 
+@pytest.fixture
+def rigid_gt(
+    rigid_scenario: RigidScenario,
+    gt: Float[torch.Tensor, "B N 3"],
+) -> Float[torch.Tensor, "B N 3"]:
+    """Apply the scenario's rigid motion to ``gt``.
+
+    Args:
+        rigid_scenario: Motion to apply; the requesting test parametrizes
+            it.
+        gt: Ground truth.
+
+    Returns:
+        The moved copy.
+    """
+    return rigid_scenario.value.apply(gt)
+
+
+@pytest.fixture
+def deviation_ladder(
+    gt: Float[torch.Tensor, "B N 3"],
+    perturbed: Float[torch.Tensor, "B N 3"],
+) -> Float[torch.Tensor, "S B N 3"]:
+    """Scale the ``perturbed - gt`` deviation by 0.1, 1 and 5.
+
+    Args:
+        gt: Ground truth.
+        perturbed: Prediction defining the deviation.
+
+    Returns:
+        ``gt + s * (perturbed - gt)`` for each scale ``s``, smallest first.
+    """
+    deviation = perturbed - gt
+    return torch.stack([gt + scale * deviation for scale in (0.1, 1.0, 5.0)])
+
+
+@pytest.fixture
+def per_item_weight() -> Float[torch.Tensor, " B"]:
+    """Return EDM weights 2 and 0.5 for the two batch items.
+
+    Returns:
+        ``(2.0, 0.5)``.
+    """
+    return torch.tensor([2.0, 0.5])
+
+
+@pytest.fixture
+def item_weight(
+    per_item_weight: Float[torch.Tensor, " B"],
+    ones_weight: Float[torch.Tensor, "B N_atom"],
+) -> Float[torch.Tensor, "B N_atom"]:
+    """Spread each item's weight over all of its atoms.
+
+    Args:
+        per_item_weight: One weight per batch item.
+        ones_weight: Supplies the atom count.
+
+    Returns:
+        ``(B, N_atom)`` weights, constant within each item.
+    """
+    return repeat(per_item_weight, "b -> b n", n=ones_weight.shape[1])
+
+
+@pytest.fixture
+def pred_leaf(
+    perturbed: Float[torch.Tensor, "B N 3"],
+) -> Float[torch.Tensor, "B N 3"]:
+    """Return a copy of ``perturbed`` that records gradients.
+
+    Args:
+        perturbed: Prediction.
+
+    Returns:
+        A leaf tensor equal to ``perturbed``.
+    """
+    return perturbed.clone().requires_grad_()
+
+
+@pytest.fixture
+def target_leaf(
+    gt: Float[torch.Tensor, "B N 3"],
+) -> Float[torch.Tensor, "B N 3"]:
+    """Return a copy of ``gt`` that records gradients.
+
+    Args:
+        gt: Ground truth.
+
+    Returns:
+        A leaf tensor equal to ``gt``.
+    """
+    return gt.clone().requires_grad_()
+
+
+@pytest.fixture
+def polarity_aa(letter: str, dims: LossDims) -> Int[torch.Tensor, "B N_res"]:
+    """All alanine except residue 0, which is ``letter``.
+
+    Args:
+        letter: One-letter code of residue 0; the requesting test
+            parametrizes it.
+        dims: Supplies the batch and residue counts.
+
+    Returns:
+        Residue types for every batch item.
+    """
+    aa = torch.full((dims.batch, dims.n_res), restype_order["A"])
+    aa[:, 0] = restype_order[letter]
+    return aa
+
+
+@pytest.fixture
+def expected_polarity_loss(
+    weight: float,
+    gt: Float[torch.Tensor, "B N 3"],
+    perturbed: Float[torch.Tensor, "B N 3"],
+    dims: LossDims,
+) -> Float[torch.Tensor, " B"]:
+    """Compute the polarity-weighted loss from an independent reference.
+
+    Aligns ``gt`` onto ``perturbed`` with ``kabsch_align``, then weights
+    the first residue's atoms by ``weight`` and every other atom by 1.
+
+    Args:
+        weight: Weight of residue 0's atoms; the requesting test
+            parametrizes it.
+        gt: Ground truth.
+        perturbed: Prediction.
+        dims: Supplies the atoms per residue and atom count.
+
+    Returns:
+        The expected loss per batch item.
+    """
+    with torch.no_grad():
+        (aligned,) = tuple(kabsch_align(gt, perturbed, return_transform=False))
+    diff = perturbed - aligned
+    sq = einsum(diff, diff, "b n d, b n d -> b n")
+    per_atom = torch.ones(dims.n_atom)
+    per_atom[: dims.atoms_per_res] = weight
+    return einsum(sq, per_atom, "b n, n -> b") / (3 * per_atom.sum())
+
+
+@pytest.fixture
+def first_atoms_masked(
+    gt: Float[torch.Tensor, "B N 3"],
+) -> Float[torch.Tensor, "B N"]:
+    """Mask out the first 3 atoms of every item.
+
+    Args:
+        gt: Supplies the batch and atom counts.
+
+    Returns:
+        A float mask, 0 on the first 3 atoms and 1 elsewhere.
+    """
+    mask = torch.ones(gt.shape[:2])
+    mask[:, :3] = 0
+    return mask
+
+
+@pytest.fixture
+def far_on_first_atoms(
+    gt: Float[torch.Tensor, "B N 3"],
+) -> Float[torch.Tensor, "B N 3"]:
+    """Push the first 3 atoms of ``gt`` 100 angstroms off.
+
+    Args:
+        gt: Ground truth.
+
+    Returns:
+        ``gt`` with its first 3 atoms moved by 100 on every axis.
+    """
+    pred = gt.clone()
+    pred[:, :3] += 100
+    return pred
+
+
+@pytest.fixture
+def all_atoms_valid(
+    gt: Float[torch.Tensor, "B N 3"],
+) -> Float[torch.Tensor, "B N"]:
+    """Return a float mask marking every atom valid.
+
+    Args:
+        gt: Supplies the batch and atom counts.
+
+    Returns:
+        Ones of shape ``(B, N)``.
+    """
+    return torch.ones(gt.shape[:2])
+
+
+@pytest.fixture
+def five_residue_aa(
+    gt: Float[torch.Tensor, "B N 3"],
+) -> Int[torch.Tensor, "B 5"]:
+    """Residue types for 5 residues, which do not divide the atom count.
+
+    Args:
+        gt: Supplies the batch size.
+
+    Returns:
+        Alanine indices of shape ``(B, 5)``.
+    """
+    return torch.zeros(gt.shape[0], 5, dtype=torch.long)
+
+
+@pytest.fixture
+def letter_indices(letters: str) -> Int[torch.Tensor, "1 N"]:
+    """Convert one-letter residue codes to a batch of one index row.
+
+    Args:
+        letters: Residue codes; the requesting test parametrizes it.
+
+    Returns:
+        ``(1, len(letters))`` residue indices.
+    """
+    return torch.tensor([[restype_order[c] for c in letters]])
+
+
+@pytest.fixture
+def weights_from_polar_names() -> Float[torch.Tensor, "1 n_amino"]:
+    """Derive every canonical residue's weight from ``POLAR_RESIDUES``.
+
+    An independent reference for ``RESIDUE_TYPE_WEIGHTS``: polar residues
+    get ``POLAR_RESIDUE_WEIGHT`` and the rest ``NONPOLAR_RESIDUE_WEIGHT``.
+
+    Returns:
+        The expected weights, in ``RESTYPES_NO_X`` order.
+    """
+    return torch.tensor(
+        [
+            [
+                (
+                    POLAR_RESIDUE_WEIGHT
+                    if r in POLAR_RESIDUES
+                    else NONPOLAR_RESIDUE_WEIGHT
+                )
+                for r in RESTYPES_NO_X
+            ],
+        ],
+    )
+
+
+@pytest.fixture
+def uniform_aa_logits(
+    aa_indices: Int[torch.Tensor, "B N_res"],
+) -> Float[torch.Tensor, "B N_res n_amino"]:
+    """Return all-zero sequence logits, a uniform distribution.
+
+    Args:
+        aa_indices: Supplies the batch and residue counts.
+
+    Returns:
+        Zeros over the 20 canonical residue types.
+    """
+    return torch.zeros(*aa_indices.shape, RESTYPE_NUM_NO_X)
+
+
+@pytest.fixture
+def expected_med_loss(
+    med_scenario: MedScenario,
+    batch: FeaturizedBatch,
+    perturbed: Float[torch.Tensor, "B N 3"],
+    ones_weight: Float[torch.Tensor, "B N_atom"],
+) -> Float[torch.Tensor, ""]:
+    """Compute ``med_loss`` in closed form over identical blocks.
+
+    Every block holds ``perturbed`` and uniform logits, so the result is
+    ``(sum(gamma**k) / K) * (lam * mean(atom_loss) + alpha_0 * log 20)``.
+
+    Args:
+        med_scenario: Block count and hyperparameters; the requesting test
+            parametrizes it.
+        batch: Ground truth.
+        perturbed: Every block's prediction.
+        ones_weight: EDM weight of 1.
+
+    Returns:
+        The expected scalar loss.
+    """
+    case = med_scenario.value
+    structure = atom_loss(
+        perturbed,
+        batch.r_gt,
+        batch.atom5_mask.float(),
+        aa_indices=batch.aa_indices,
+        lambda_sigma_weight=ones_weight,
+    ).mean()
+    decay = sum(case.gamma**k for k in range(case.n_blocks)) / case.n_blocks
+    return decay * (
+        case.lam * structure + case.alpha_0 * math.log(RESTYPE_NUM_NO_X)
+    )
+
+
+@pytest.fixture
+def first_block_leaf(
+    perturbed: Float[torch.Tensor, "B N 3"],
+) -> Float[torch.Tensor, "B N 3"]:
+    """Return the earliest block's prediction as a gradient-recording copy.
+
+    Args:
+        perturbed: Prediction.
+
+    Returns:
+        A leaf tensor equal to ``perturbed``.
+    """
+    return perturbed.clone().requires_grad_()
+
+
+@pytest.fixture
+def lddt_kept_atoms(
+    gt: Float[torch.Tensor, "B N 3"],
+) -> Bool[torch.Tensor, "B N"]:
+    """Mark every atom but the first 3 as counted by smooth lDDT.
+
+    Args:
+        gt: Supplies the batch and atom counts.
+
+    Returns:
+        A boolean mask, False on the first 3 atoms.
+    """
+    mask = torch.ones(gt.shape[:2], dtype=torch.bool)
+    mask[:, :3] = False
+    return mask
+
+
+@pytest.fixture
+def first_atoms_scaled(
+    gt: Float[torch.Tensor, "B N 3"],
+) -> Float[torch.Tensor, "B N 3"]:
+    """Scale the first 3 atoms of ``gt`` by 7, distorting their distances.
+
+    Args:
+        gt: Ground truth.
+
+    Returns:
+        ``gt`` with its first 3 atoms multiplied by 7.
+    """
+    pred = gt.clone()
+    pred[:, :3] *= 7
+    return pred
+
+
+@pytest.fixture
+def lddt_ladder(
+    gt: Float[torch.Tensor, "B N 3"],
+    perturbed: Float[torch.Tensor, "B N 3"],
+) -> Float[torch.Tensor, "S B N 3"]:
+    """Scale the ``perturbed - gt`` deviation by 0, 1 and 10.
+
+    Args:
+        gt: Ground truth.
+        perturbed: Prediction defining the deviation.
+
+    Returns:
+        ``gt + s * (perturbed - gt)`` for each scale ``s``, smallest first.
+    """
+    deviation = perturbed - gt
+    return torch.stack([gt + scale * deviation for scale in (0.0, 1.0, 10.0)])
+
+
+@pytest.fixture
+def triangle_distances() -> Float[torch.Tensor, "3 3"]:
+    """Return the pairwise distances of the 3-4-5 triangle.
+
+    Returns:
+        The symmetric distance matrix, zero on the diagonal.
+    """
+    return torch.tensor([[0.0, 3, 4], [3, 0, 5], [4, 5, 0]])
+
+
+@pytest.fixture
+def log_bins_per_item(dims: LossDims) -> Float[torch.Tensor, " B"]:
+    """Cross-entropy of a uniform distribution over the bins, per item.
+
+    Args:
+        dims: Supplies the batch size and bin count.
+
+    Returns:
+        ``log(n_bins)`` for every batch item.
+    """
+    return torch.full((dims.batch,), math.log(dims.n_bins))
+
+
+@pytest.fixture
+def uniform_residue_logits(
+    dims: LossDims,
+    residue_bins: Int[torch.Tensor, "B N_res N_res"],
+) -> Float[torch.Tensor, "B N_res N_res n_bins"]:
+    """Return all-zero residue distogram logits.
+
+    Args:
+        dims: Supplies the bin count.
+        residue_bins: Supplies the pair layout.
+
+    Returns:
+        Zeros, a uniform distribution over the bins.
+    """
+    return torch.zeros(*residue_bins.shape, dims.n_bins)
+
+
+@pytest.fixture
+def wrong_last_residue_logits(
+    dims: LossDims,
+    residue_bins: Int[torch.Tensor, "B N_res N_res"],
+) -> Float[torch.Tensor, "B N_res N_res n_bins"]:
+    """Confident logits, correct except on the last residue's pairs.
+
+    Args:
+        dims: Supplies the bin count.
+        residue_bins: Correct bins.
+
+    Returns:
+        Logits of 50 on the correct bin, or on the next bin for every pair
+        that involves the last residue.
+    """
+    wrong = residue_bins.clone()
+    wrong[:, -1, :] += 1
+    wrong[:, :, -1] += 1
+    return 50 * F.one_hot(wrong % dims.n_bins, dims.n_bins).float()
+
+
+@pytest.fixture
+def last_residue_hidden(dims: LossDims) -> Float[torch.Tensor, "B N_res"]:
+    """Mask out the last residue of every item.
+
+    Args:
+        dims: Supplies the batch and residue counts.
+
+    Returns:
+        A float mask, 0 on the last residue.
+    """
+    mask = torch.ones(dims.batch, dims.n_res)
+    mask[:, -1] = 0
+    return mask
+
+
+@pytest.fixture
+def uniform_atom_logits(
+    dims: LossDims,
+    atom_bins: Int[torch.Tensor, "B N_atom K"],
+) -> Float[torch.Tensor, "B N_atom K n_bins"]:
+    """Return all-zero atom distogram logits.
+
+    Args:
+        dims: Supplies the bin count.
+        atom_bins: Supplies the slot layout.
+
+    Returns:
+        Zeros, a uniform distribution over the bins.
+    """
+    return torch.zeros(*atom_bins.shape, dims.n_bins)
+
+
+@pytest.fixture
+def wrong_last_slot_logits(
+    dims: LossDims,
+    atom_bins: Int[torch.Tensor, "B N_atom K"],
+) -> Float[torch.Tensor, "B N_atom K n_bins"]:
+    """Confident logits, correct except in every atom's last slot.
+
+    Args:
+        dims: Supplies the bin count.
+        atom_bins: Correct bins.
+
+    Returns:
+        Logits of 50 on the correct bin, or on the next bin in the last
+        slot.
+    """
+    wrong = atom_bins.clone()
+    wrong[..., -1] += 1
+    return 50 * F.one_hot(wrong % dims.n_bins, dims.n_bins).float()
+
+
+@pytest.fixture
+def last_slot_hidden(
+    atom_bins: Int[torch.Tensor, "B N_atom K"],
+) -> Bool[torch.Tensor, "B N_atom K"]:
+    """Mask out every atom's last neighbour slot.
+
+    Args:
+        atom_bins: Supplies the slot layout.
+
+    Returns:
+        A boolean mask, False in the last slot.
+    """
+    mask = torch.ones(atom_bins.shape, dtype=torch.bool)
+    mask[..., -1] = False
+    return mask
+
+
+@pytest.fixture
+def all_slots_valid(
+    atom_bins: Int[torch.Tensor, "B N_atom K"],
+) -> Bool[torch.Tensor, "B N_atom K"]:
+    """Mark every neighbour slot valid.
+
+    Args:
+        atom_bins: Supplies the slot layout.
+
+    Returns:
+        An all-True mask.
+    """
+    return torch.ones(atom_bins.shape, dtype=torch.bool)
+
+
+@pytest.fixture
+def sine_residue_logits(
+    dims: LossDims,
+    residue_bins: Int[torch.Tensor, "B N_res N_res"],
+) -> Float[torch.Tensor, "B N_res N_res n_bins"]:
+    """Return varied, non-uniform residue distogram logits.
+
+    Args:
+        dims: Supplies the bin count.
+        residue_bins: Supplies the pair layout.
+
+    Returns:
+        A scaled sine pattern.
+    """
+    return 3 * sine_pattern((*residue_bins.shape, dims.n_bins), 0.37)
+
+
+@pytest.fixture
+def sine_atom_logits(
+    dims: LossDims,
+    atom_bins: Int[torch.Tensor, "B N_atom K"],
+) -> Float[torch.Tensor, "B N_atom K n_bins"]:
+    """Return varied, non-uniform atom distogram logits.
+
+    Args:
+        dims: Supplies the bin count.
+        atom_bins: Supplies the slot layout.
+
+    Returns:
+        A scaled sine pattern.
+    """
+    return 3 * sine_pattern((*atom_bins.shape, dims.n_bins), 0.53)
+
+
+@pytest.fixture
+def residue_one_hot(
+    dims: LossDims,
+    residue_bins: Int[torch.Tensor, "B N_res N_res"],
+) -> Float[torch.Tensor, "B N_res N_res n_bins"]:
+    """Encode ``residue_bins`` as one-hot targets.
+
+    Args:
+        dims: Supplies the bin count.
+        residue_bins: Target bins.
+
+    Returns:
+        The one-hot encoding.
+    """
+    return F.one_hot(residue_bins, dims.n_bins).float()
+
+
+@pytest.fixture
+def atom_one_hot(
+    dims: LossDims,
+    atom_bins: Int[torch.Tensor, "B N_atom K"],
+) -> Float[torch.Tensor, "B N_atom K n_bins"]:
+    """Encode ``atom_bins`` as one-hot targets.
+
+    Args:
+        dims: Supplies the bin count.
+        atom_bins: Target bins.
+
+    Returns:
+        The one-hot encoding.
+    """
+    return F.one_hot(atom_bins, dims.n_bins).float()
+
+
+@pytest.fixture
+def confident_aa_logits(
+    aa_indices: Int[torch.Tensor, "B N_res"],
+) -> Float[torch.Tensor, "B N_res n_amino"]:
+    """Confident correct logits, uniform on the last residue.
+
+    A uniform last residue would add ``log 20`` to the loss if counted.
+
+    Args:
+        aa_indices: Correct residue types.
+
+    Returns:
+        Logits of 50 on the correct type, and zeros on the last residue.
+    """
+    logits = 50 * F.one_hot(aa_indices, RESTYPE_NUM_NO_X).float()
+    logits[:, -1] = 0
+    return logits
+
+
+@pytest.fixture
+def last_target_ignored(
+    ignored: int,
+    aa_indices: Int[torch.Tensor, "B N_res"],
+) -> Int[torch.Tensor, "B N_res"]:
+    """Replace the last residue's target with an ignored index.
+
+    Args:
+        ignored: Index ``seq_ce_loss`` must skip; the requesting test
+            parametrizes it.
+        aa_indices: Correct residue types.
+
+    Returns:
+        The targets, with the last residue set to ``ignored``.
+    """
+    targets = aa_indices.clone()
+    targets[:, -1] = ignored
+    return targets
+
+
+@pytest.fixture
+def all_unknown_targets(
+    aa_indices: Int[torch.Tensor, "B N_res"],
+) -> Int[torch.Tensor, "B N_res"]:
+    """Set every target to the unknown type ``X``, which is ignored.
+
+    Args:
+        aa_indices: Supplies the batch and residue counts.
+
+    Returns:
+        ``RESTYPE_NUM_NO_X`` everywhere.
+    """
+    return torch.full_like(aa_indices, RESTYPE_NUM_NO_X)
+
+
+@pytest.fixture
+def protein_with_unknown() -> Protein:
+    """Build a 5-residue protein ``ACXDE`` whose third residue is ``X``.
+
+    Returns:
+        The protein, all atoms present at the origin.
+    """
+    n_res = 5
+    return Protein(
+        atom_positions=np.zeros((n_res, 37, 3)),
+        aatype=np.array([restype_order[c] for c in "ACXDE"], dtype=np.intp),
+        atom_mask=np.ones((n_res, 37)),
+        residue_index=np.arange(n_res, dtype=np.intp),
+        chain_index=np.zeros(n_res, dtype=np.intp),
+        b_factors=np.zeros((n_res, 37)),
+    )
+
+
+@pytest.fixture
+def template_distogram(dims: LossDims) -> Distogram:
+    """Build the template distogram module at the test bin count.
+
+    Args:
+        dims: Supplies the bin count.
+
+    Returns:
+        The module in eval mode.
+    """
+    params = TemplateDistogramParams(n_bins=dims.n_bins)
+    return build_distogram_module(params).eval()
+
+
+@pytest.fixture
+def residue_distogram(dims: LossDims) -> Distogram:
+    """Build the residue distogram module at the test bin count.
+
+    Args:
+        dims: Supplies the bin count.
+
+    Returns:
+        The module in eval mode.
+    """
+    params = ResidueDistogramParams(n_bins=dims.n_bins)
+    return build_distogram_module(params).eval()
+
+
+@pytest.fixture
+def atom_distogram(dims: LossDims) -> Distogram:
+    """Build the atom distogram module at the test bin count.
+
+    Args:
+        dims: Supplies the bin count.
+
+    Returns:
+        The module in eval mode.
+    """
+    params = AtomDistogramParams(n_bins=dims.n_bins)
+    return build_distogram_module(params).eval()
+
+
+@pytest.fixture
+def train_config() -> TrainConfig:
+    """Return the default training configuration.
+
+    Returns:
+        ``TrainConfig()``.
+    """
+    return TrainConfig()
+
+
 @pytest.mark.parametrize(
     "rigid_scenario",
     list(RigidScenario),
     ids=[case.name for case in RigidScenario],
 )
 def test_atom_loss_is_zero_for_a_rigid_copy(
-    rigid_scenario: RigidScenario,
-    gt: Coords,
+    rigid_gt: Float[torch.Tensor, "B N 3"],
+    gt: Float[torch.Tensor, "B N 3"],
     aa_indices: Int[torch.Tensor, "B N_res"],
     ones_weight: Float[torch.Tensor, "B N_atom"],
 ) -> None:
     """Predicting a rigidly moved ground truth costs nothing after alignment.
 
     Args:
-        rigid_scenario: Motion applied to the prediction.
+        rigid_gt: ``gt`` moved by the scenario's rigid motion.
         gt: Ground truth.
         aa_indices: Residue types.
         ones_weight: EDM weight of 1.
     """
-    pred = rigid_scenario.value.apply(gt)
     loss = atom_loss(
-        pred,
+        rigid_gt,
         gt,
         aa_indices=aa_indices,
         lambda_sigma_weight=ones_weight,
@@ -716,9 +1401,9 @@ def test_atom_loss_is_zero_for_a_rigid_copy(
     ids=[case.name for case in RigidScenario],
 )
 def test_atom_loss_ignores_rigid_motion_of_the_target(
-    rigid_scenario: RigidScenario,
-    gt: Coords,
-    perturbed: Coords,
+    rigid_gt: Float[torch.Tensor, "B N 3"],
+    gt: Float[torch.Tensor, "B N 3"],
+    perturbed: Float[torch.Tensor, "B N 3"],
     aa_indices: Int[torch.Tensor, "B N_res"],
     ones_weight: Float[torch.Tensor, "B N_atom"],
 ) -> None:
@@ -728,22 +1413,22 @@ def test_atom_loss_ignores_rigid_motion_of_the_target(
     are taken, so its frame must not matter.
 
     Args:
-        rigid_scenario: Motion applied to the ground truth.
+        rigid_gt: ``gt`` moved by the scenario's rigid motion.
         gt: Ground truth.
-        perturbed: Non-rigidly perturbed prediction.
+        perturbed: Prediction.
         aa_indices: Residue types.
         ones_weight: EDM weight of 1.
     """
     kwargs = {"aa_indices": aa_indices, "lambda_sigma_weight": ones_weight}
     base = atom_loss(perturbed, gt, **kwargs)
-    moved = atom_loss(perturbed, rigid_scenario.value.apply(gt), **kwargs)
+    moved = atom_loss(perturbed, rigid_gt, **kwargs)
     assert bool((base > 0).all())
     torch.testing.assert_close(moved, base, atol=1e-4, rtol=1e-4)
 
 
 def test_atom_loss_grows_with_deviation(
-    gt: Coords,
-    perturbed: Coords,
+    deviation_ladder: Float[torch.Tensor, "S B N 3"],
+    gt: Float[torch.Tensor, "B N 3"],
     aa_indices: Int[torch.Tensor, "B N_res"],
     ones_weight: Float[torch.Tensor, "B N_atom"],
 ) -> None:
@@ -752,30 +1437,31 @@ def test_atom_loss_grows_with_deviation(
     Not parametrized: the property is an ordering across the three scales.
 
     Args:
+        deviation_ladder: Predictions at deviation scales 0.1, 1 and 5.
         gt: Ground truth.
-        perturbed: ``gt`` plus a non-rigid deviation.
         aa_indices: Residue types.
         ones_weight: EDM weight of 1.
     """
-    deviation = perturbed - gt
     losses = [
         atom_loss(
-            gt + scale * deviation,
+            pred,
             gt,
             aa_indices=aa_indices,
             lambda_sigma_weight=ones_weight,
         )
-        for scale in (0.1, 1.0, 5.0)
+        for pred in deviation_ladder
     ]
     assert bool((losses[0] < losses[1]).all())
     assert bool((losses[1] < losses[2]).all())
 
 
 def test_atom_loss_scales_linearly_with_the_noise_weight(
-    gt: Coords,
-    perturbed: Coords,
+    gt: Float[torch.Tensor, "B N 3"],
+    perturbed: Float[torch.Tensor, "B N 3"],
     aa_indices: Int[torch.Tensor, "B N_res"],
     ones_weight: Float[torch.Tensor, "B N_atom"],
+    per_item_weight: Float[torch.Tensor, " B"],
+    item_weight: Float[torch.Tensor, "B N_atom"],
 ) -> None:
     """Each item's loss is multiplied by a weight constant over its atoms.
 
@@ -788,9 +1474,9 @@ def test_atom_loss_scales_linearly_with_the_noise_weight(
         perturbed: Prediction.
         aa_indices: Residue types.
         ones_weight: EDM weight of 1, the baseline.
+        per_item_weight: The weight each item is scaled by.
+        item_weight: ``per_item_weight`` spread over each item's atoms.
     """
-    per_item = torch.tensor([2.0, 0.5])
-    weight = repeat(per_item, "b -> b n", n=ones_weight.shape[1])
     unit = atom_loss(
         perturbed,
         gt,
@@ -801,14 +1487,14 @@ def test_atom_loss_scales_linearly_with_the_noise_weight(
         perturbed,
         gt,
         aa_indices=aa_indices,
-        lambda_sigma_weight=weight,
+        lambda_sigma_weight=item_weight,
     )
-    torch.testing.assert_close(weighted, per_item * unit)
+    torch.testing.assert_close(weighted, per_item_weight * unit)
 
 
 def test_atom_loss_gradient_reaches_prediction_only(
-    gt: Coords,
-    perturbed: Coords,
+    pred_leaf: Float[torch.Tensor, "B N 3"],
+    target_leaf: Float[torch.Tensor, "B N 3"],
     aa_indices: Int[torch.Tensor, "B N_res"],
     ones_weight: Float[torch.Tensor, "B N_atom"],
 ) -> None:
@@ -818,24 +1504,22 @@ def test_atom_loss_gradient_reaches_prediction_only(
     differentiated. Not parametrized: one backward pass shows both sides.
 
     Args:
-        gt: Ground truth.
-        perturbed: Prediction.
+        pred_leaf: Prediction that records gradients.
+        target_leaf: Ground truth that records gradients.
         aa_indices: Residue types.
         ones_weight: EDM weight of 1.
     """
-    pred = perturbed.clone().requires_grad_()
-    target = gt.clone().requires_grad_()
     loss = atom_loss(
-        pred,
-        target,
+        pred_leaf,
+        target_leaf,
         aa_indices=aa_indices,
         lambda_sigma_weight=ones_weight,
     )
     torch.autograd.backward([loss.sum()])
-    assert pred.grad is not None
-    assert torch.isfinite(pred.grad).all()
-    assert torch.count_nonzero(pred.grad) > 0
-    assert target.grad is None
+    assert pred_leaf.grad is not None
+    assert torch.isfinite(pred_leaf.grad).all()
+    assert torch.count_nonzero(pred_leaf.grad) > 0
+    assert target_leaf.grad is None
 
 
 @pytest.mark.parametrize(
@@ -849,11 +1533,11 @@ def test_atom_loss_gradient_reaches_prediction_only(
     ],
 )
 def test_atom_loss_weights_each_residue_by_polarity(
-    gt: Coords,
-    perturbed: Coords,
-    dims: LossDims,
-    letter: str,
-    weight: float,
+    gt: Float[torch.Tensor, "B N 3"],
+    perturbed: Float[torch.Tensor, "B N 3"],
+    polarity_aa: Int[torch.Tensor, "B N_res"],
+    ones_weight: Float[torch.Tensor, "B N_atom"],
+    expected_polarity_loss: Float[torch.Tensor, " B"],
 ) -> None:
     """One residue of type ``letter`` among alanines carries its table weight.
 
@@ -864,34 +1548,28 @@ def test_atom_loss_weights_each_residue_by_polarity(
     Args:
         gt: Ground truth.
         perturbed: Prediction.
-        dims: Supplies the residue and atom counts.
-        letter: One-letter code of residue 0.
-        weight: Weight residue 0 must get.
+        polarity_aa: All alanine except residue 0.
+        ones_weight: EDM weight of 1.
+        expected_polarity_loss: Loss from the independent reference.
     """
-    aa = torch.full((dims.batch, dims.n_res), restype_order["A"])
-    aa[:, 0] = restype_order[letter]
-    with torch.no_grad():
-        (aligned,) = kabsch_align(  # pylint: disable=unpacking-non-sequence
-            gt,
-            perturbed,
-            return_transform=False,
-        )
-    diff = perturbed - aligned
-    sq = einsum(diff, diff, "b n d, b n d -> b n")
-    per_atom = torch.ones(dims.n_atom)
-    per_atom[: dims.atoms_per_res] = weight
-    expected = einsum(sq, per_atom, "b n, n -> b") / (3 * per_atom.sum())
     loss = atom_loss(
         perturbed,
         gt,
-        aa_indices=aa,
-        lambda_sigma_weight=torch.ones(dims.batch, dims.n_atom),
+        aa_indices=polarity_aa,
+        lambda_sigma_weight=ones_weight,
     )
-    torch.testing.assert_close(loss, expected, atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(
+        loss,
+        expected_polarity_loss,
+        atol=1e-4,
+        rtol=1e-4,
+    )
 
 
 def test_atom_loss_masked_atoms_count_for_nothing(
-    gt: Coords,
+    far_on_first_atoms: Float[torch.Tensor, "B N 3"],
+    gt: Float[torch.Tensor, "B N 3"],
+    first_atoms_masked: Float[torch.Tensor, "B N"],
     aa_indices: Int[torch.Tensor, "B N_res"],
     ones_weight: Float[torch.Tensor, "B N_atom"],
 ) -> None:
@@ -903,18 +1581,16 @@ def test_atom_loss_masked_atoms_count_for_nothing(
     is the next test.
 
     Args:
+        far_on_first_atoms: ``gt`` with its first 3 atoms 100 angstroms off.
         gt: Ground truth.
+        first_atoms_masked: Mask that drops those 3 atoms.
         aa_indices: Residue types.
         ones_weight: EDM weight of 1.
     """
-    mask = torch.ones(gt.shape[:2])
-    mask[:, :3] = 0
-    pred = gt.clone()
-    pred[:, :3] += 100
     loss = atom_loss(
-        pred,
+        far_on_first_atoms,
         gt,
-        mask=mask,
+        mask=first_atoms_masked,
         aa_indices=aa_indices,
         lambda_sigma_weight=ones_weight,
     )
@@ -922,8 +1598,9 @@ def test_atom_loss_masked_atoms_count_for_nothing(
 
 
 def test_atom_loss_all_ones_mask_matches_no_mask(
-    gt: Coords,
-    perturbed: Coords,
+    gt: Float[torch.Tensor, "B N 3"],
+    perturbed: Float[torch.Tensor, "B N 3"],
+    all_atoms_valid: Float[torch.Tensor, "B N"],
     aa_indices: Int[torch.Tensor, "B N_res"],
     ones_weight: Float[torch.Tensor, "B N_atom"],
 ) -> None:
@@ -934,17 +1611,19 @@ def test_atom_loss_all_ones_mask_matches_no_mask(
     Args:
         gt: Ground truth.
         perturbed: Prediction.
+        all_atoms_valid: Mask marking every atom valid.
         aa_indices: Residue types.
         ones_weight: EDM weight of 1.
     """
     kwargs = {"aa_indices": aa_indices, "lambda_sigma_weight": ones_weight}
     unmasked = atom_loss(perturbed, gt, **kwargs)
-    masked = atom_loss(perturbed, gt, torch.ones(gt.shape[:2]), **kwargs)
+    masked = atom_loss(perturbed, gt, all_atoms_valid, **kwargs)
     torch.testing.assert_close(masked, unmasked)
 
 
 def test_atom_loss_rejects_atoms_not_divisible_by_residues(
-    gt: Coords,
+    gt: Float[torch.Tensor, "B N 3"],
+    five_residue_aa: Int[torch.Tensor, "B 5"],
     ones_weight: Float[torch.Tensor, "B N_atom"],
 ) -> None:
     """12 atoms with 5 residue types cannot be split evenly and raise.
@@ -952,12 +1631,17 @@ def test_atom_loss_rejects_atoms_not_divisible_by_residues(
     Not parametrized: any indivisible count takes the same branch.
 
     Args:
-        gt: 12-atom ground truth.
+        gt: Coordinates for 12 atoms.
+        five_residue_aa: Residue types for 5 residues.
         ones_weight: EDM weight of 1.
     """
-    aa = torch.zeros(gt.shape[0], 5, dtype=torch.long)
     with pytest.raises(AtomResidueCountMismatchError, match="multiple"):
-        _ = atom_loss(gt, gt, aa_indices=aa, lambda_sigma_weight=ones_weight)
+        _ = atom_loss(
+            gt,
+            gt,
+            aa_indices=five_residue_aa,
+            lambda_sigma_weight=ones_weight,
+        )
 
 
 def test_atom_loss_rejects_four_coordinate_atoms(
@@ -993,7 +1677,7 @@ def test_atom_loss_rejects_four_coordinate_atoms(
     ],
 )
 def test_residue_type_weight_looks_up_polarity(
-    letters: str,
+    letter_indices: Int[torch.Tensor, "1 N"],
     expected: tuple[float, ...],
 ) -> None:
     """Each residue maps to its polarity weight; ``X`` is clamped into range.
@@ -1001,16 +1685,16 @@ def test_residue_type_weight_looks_up_polarity(
     ``X`` (index 20) sits one past the table, so it must not raise.
 
     Args:
-        letters: One-letter codes.
-        expected: Weights in order.
+        letter_indices: Residue indices for the case's letters.
+        expected: Weight of each residue.
     """
-    aa = torch.tensor([[restype_order[c] for c in letters]])
-    weight = residue_type_weight(aa)
+    weight = residue_type_weight(letter_indices)
     torch.testing.assert_close(weight, torch.tensor([expected]))
 
 
 def test_residue_type_weight_classifies_every_canonical_residue(
     canonical_residues: Int[torch.Tensor, "1 n_amino"],
+    weights_from_polar_names: Float[torch.Tensor, "1 n_amino"],
 ) -> None:
     """Every canonical residue gets 2 if listed as polar and 1 otherwise.
 
@@ -1018,15 +1702,13 @@ def test_residue_type_weight_classifies_every_canonical_residue(
     parametrized: all twenty residues are checked at once.
 
     Args:
-        canonical_residues: Indices 0 to 19 in one row.
+        canonical_residues: Every canonical residue once.
+        weights_from_polar_names: Weights derived from ``POLAR_RESIDUES``.
     """
-    expected = [
-        POLAR_RESIDUE_WEIGHT if r in POLAR_RESIDUES else NONPOLAR_RESIDUE_WEIGHT
-        for r in RESTYPES_NO_X
-    ]
-    assert expected == RESIDUE_TYPE_WEIGHTS
+    table = torch.tensor([RESIDUE_TYPE_WEIGHTS])
+    torch.testing.assert_close(table, weights_from_polar_names)
     weights = residue_type_weight(canonical_residues)
-    torch.testing.assert_close(weights, torch.tensor([expected]))
+    torch.testing.assert_close(weights, weights_from_polar_names)
 
 
 @pytest.mark.parametrize(
@@ -1037,8 +1719,10 @@ def test_residue_type_weight_classifies_every_canonical_residue(
 def test_med_loss_matches_closed_form(
     med_scenario: MedScenario,
     batch: FeaturizedBatch,
-    perturbed: Coords,
+    perturbed: Float[torch.Tensor, "B N 3"],
+    uniform_aa_logits: Float[torch.Tensor, "B N_res n_amino"],
     ones_weight: Float[torch.Tensor, "B N_atom"],
+    expected_med_loss: Float[torch.Tensor, ""],
 ) -> None:
     """Over identical blocks, ``med_loss`` is a decayed mean of the two terms.
 
@@ -1049,32 +1733,22 @@ def test_med_loss_matches_closed_form(
     make ``C = log 20`` exactly.
 
     Args:
-        med_scenario: Hyperparameters.
+        med_scenario: Block count and hyperparameters.
         batch: Ground truth.
-        perturbed: Prediction used by every block.
+        perturbed: Every block's prediction.
+        uniform_aa_logits: Every block's sequence logits.
         ones_weight: EDM weight of 1.
+        expected_med_loss: The closed-form value.
     """
     case = med_scenario.value
-    logits = torch.zeros(*batch.aa_indices.shape, RESTYPE_NUM_NO_X)
-    structure = atom_loss(
-        perturbed,
-        batch.r_gt,
-        batch.atom5_mask.float(),
-        aa_indices=batch.aa_indices,
-        lambda_sigma_weight=ones_weight,
-    ).mean()
-    decay = sum(case.gamma**k for k in range(case.n_blocks)) / case.n_blocks
-    expected = decay * (
-        case.lam * structure + case.alpha_0 * math.log(RESTYPE_NUM_NO_X)
-    )
     loss = med_loss(
         [perturbed] * case.n_blocks,
-        [logits] * case.n_blocks,
+        [uniform_aa_logits] * case.n_blocks,
         batch,
         LossParams(lam=case.lam, alpha_0=case.alpha_0, gamma=case.gamma),
         lambda_sigma_weight=ones_weight,
     )
-    torch.testing.assert_close(loss, expected, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(loss, expected_med_loss, atol=1e-5, rtol=1e-5)
 
 
 @pytest.mark.parametrize(
@@ -1086,6 +1760,7 @@ def test_med_loss_matches_closed_form(
 )
 def test_med_loss_rejects_bad_block_lists(
     batch: FeaturizedBatch,
+    uniform_aa_logits: Float[torch.Tensor, "B N_res n_amino"],
     ones_weight: Float[torch.Tensor, "B N_atom"],
     n_structure: int,
     n_sequence: int,
@@ -1095,16 +1770,16 @@ def test_med_loss_rejects_bad_block_lists(
 
     Args:
         batch: Ground truth.
+        uniform_aa_logits: Sequence logits for each block.
         ones_weight: EDM weight of 1.
         n_structure: Structure blocks passed.
         n_sequence: Sequence blocks passed.
         error: Exception expected.
     """
-    logits = torch.zeros(*batch.aa_indices.shape, RESTYPE_NUM_NO_X)
     with pytest.raises(error):
         _ = med_loss(
             [batch.r_gt] * n_structure,
-            [logits] * n_sequence,
+            [uniform_aa_logits] * n_sequence,
             batch,
             LossParams(),
             lambda_sigma_weight=ones_weight,
@@ -1113,7 +1788,9 @@ def test_med_loss_rejects_bad_block_lists(
 
 def test_med_loss_gradient_reaches_the_earliest_block(
     batch: FeaturizedBatch,
-    perturbed: Coords,
+    first_block_leaf: Float[torch.Tensor, "B N 3"],
+    perturbed: Float[torch.Tensor, "B N 3"],
+    uniform_aa_logits: Float[torch.Tensor, "B N_res n_amino"],
     ones_weight: Float[torch.Tensor, "B N_atom"],
 ) -> None:
     """Block 0, the most decayed, still gets a finite nonzero gradient.
@@ -1123,25 +1800,25 @@ def test_med_loss_gradient_reaches_the_earliest_block(
 
     Args:
         batch: Ground truth.
-        perturbed: Prediction for every block.
+        first_block_leaf: The earliest block's prediction, recording gradients.
+        perturbed: The later blocks' prediction.
+        uniform_aa_logits: Sequence logits for each block.
         ones_weight: EDM weight of 1.
     """
-    first = perturbed.clone().requires_grad_()
-    logits = torch.zeros(*batch.aa_indices.shape, RESTYPE_NUM_NO_X)
     loss = med_loss(
-        [first, perturbed, perturbed],
-        [logits] * 3,
+        [first_block_leaf, perturbed, perturbed],
+        [uniform_aa_logits] * 3,
         batch,
         LossParams(gamma=0.5),
         lambda_sigma_weight=ones_weight,
     )
-    (grad,) = torch.autograd.grad(loss, first)
+    (grad,) = torch.autograd.grad(loss, first_block_leaf)
     assert torch.isfinite(grad).all()
     assert torch.count_nonzero(grad) > 0
 
 
 def test_smooth_lddt_identical_structures_give_the_closed_form(
-    gt: Coords,
+    gt: Float[torch.Tensor, "B N 3"],
     lddt_floor: Float[torch.Tensor, ""],
 ) -> None:
     """With zero distance error the loss is its floor.
@@ -1156,7 +1833,9 @@ def test_smooth_lddt_identical_structures_give_the_closed_form(
 
 
 def test_smooth_lddt_masked_atoms_count_for_nothing(
-    gt: Coords,
+    first_atoms_scaled: Float[torch.Tensor, "B N 3"],
+    gt: Float[torch.Tensor, "B N 3"],
+    lddt_kept_atoms: Bool[torch.Tensor, "B N"],
     lddt_floor: Float[torch.Tensor, ""],
 ) -> None:
     """Corrupting masked atoms leaves the loss at its zero-error floor.
@@ -1165,57 +1844,51 @@ def test_smooth_lddt_masked_atoms_count_for_nothing(
     one masked residue is enough.
 
     Args:
+        first_atoms_scaled: ``gt`` with its first 3 atoms scaled by 7.
         gt: Ground truth.
-        lddt_floor: Loss at zero distance error.
+        lddt_kept_atoms: Mask that drops those 3 atoms.
+        lddt_floor: Loss of an exact structure.
     """
-    mask = torch.ones(gt.shape[:2], dtype=torch.bool)
-    mask[:, :3] = False
-    pred = gt.clone()
-    pred[:, :3] *= 7
-    loss = smooth_lddt_loss(pred, gt, mask=mask)
+    loss = smooth_lddt_loss(first_atoms_scaled, gt, mask=lddt_kept_atoms)
     torch.testing.assert_close(loss, lddt_floor)
 
 
 def test_smooth_lddt_rises_toward_one_with_distance_error(
-    gt: Coords,
-    perturbed: Coords,
+    lddt_ladder: Float[torch.Tensor, "S B N 3"],
+    gt: Float[torch.Tensor, "B N 3"],
 ) -> None:
     """Scaling a deviation up raises the loss, which stays at most 1.
 
     Not parametrized: the property is an ordering across the scales.
 
     Args:
+        lddt_ladder: Predictions at deviation scales 0, 1 and 10.
         gt: Ground truth.
-        perturbed: ``gt`` plus a non-rigid deviation.
     """
-    deviation = perturbed - gt
-    losses = [
-        smooth_lddt_loss(gt + scale * deviation, gt).item()
-        for scale in (0.0, 1.0, 10.0)
-    ]
+    losses = [smooth_lddt_loss(pred, gt).item() for pred in lddt_ladder]
     assert losses[0] < losses[1] < losses[2] <= 1
 
 
 def test_smooth_lddt_gradient_reaches_prediction(
-    gt: Coords,
-    perturbed: Coords,
+    pred_leaf: Float[torch.Tensor, "B N 3"],
+    gt: Float[torch.Tensor, "B N 3"],
 ) -> None:
     """The loss has a finite, nonzero gradient with respect to the prediction.
 
     Not parametrized: one backward pass covers the differentiable path.
 
     Args:
+        pred_leaf: Prediction that records gradients.
         gt: Ground truth.
-        perturbed: Prediction.
     """
-    pred = perturbed.clone().requires_grad_()
-    (grad,) = torch.autograd.grad(smooth_lddt_loss(pred, gt), pred)
+    (grad,) = torch.autograd.grad(smooth_lddt_loss(pred_leaf, gt), pred_leaf)
     assert torch.isfinite(grad).all()
     assert torch.count_nonzero(grad) > 0
 
 
 def test_pairwise_dist_on_a_3_4_5_triangle(
     triangle: Float[torch.Tensor, "3 3"],
+    triangle_distances: Float[torch.Tensor, "3 3"],
 ) -> None:
     """Distances between the triangle's corners are 3, 4 and 5.
 
@@ -1223,12 +1896,12 @@ def test_pairwise_dist_on_a_3_4_5_triangle(
     parametrized: the triangle checks every off-diagonal entry.
 
     Args:
-        triangle: Corners ``(0,0,0)``, ``(3,0,0)`` and ``(0,4,0)``.
+        triangle: Vertices of a 3-4-5 right triangle.
+        triangle_distances: Their pairwise distances.
     """
-    expected = torch.tensor([[0.0, 3, 4], [3, 0, 5], [4, 5, 0]])
     torch.testing.assert_close(
         pairwise_dist(triangle),
-        expected,
+        triangle_distances,
         atol=1e-4,
         rtol=0,
     )
@@ -1245,31 +1918,34 @@ def test_pairwise_dist_on_a_3_4_5_triangle(
     ids=[case.name for case in ResidueMask],
 )
 def test_distogram_loss_residue_uniform_logits_give_log_bins(
-    dims: LossDims,
-    residue_bins: Int[torch.Tensor, "B N_res N_res"],
+    uniform_residue_logits: Float[torch.Tensor, "B N_res N_res n_bins"],
     residue_target: (
         Int[torch.Tensor, "B N_res N_res"]
         | Float[torch.Tensor, "B N_res N_res n"]
     ),
     residue_mask: Float[torch.Tensor, "B N_res"] | None,
+    log_bins_per_item: Float[torch.Tensor, " B"],
 ) -> None:
     """Uniform logits give ``log(n_bins)`` per item for any target and mask.
 
     Args:
-        dims: Supplies ``n_bins``.
-        residue_bins: Supplies the pair layout for the logits.
-        residue_target: Target bins as indices or one-hot.
-        residue_mask: Mask hiding the last residue, or ``None``.
+        uniform_residue_logits: All-zero logits.
+        residue_target: Target bins, as indices or one-hot.
+        residue_mask: Residue mask, or None.
+        log_bins_per_item: ``log(n_bins)`` per item.
     """
-    logits = torch.zeros(*residue_bins.shape, dims.n_bins)
-    loss = distogram_loss_residue(logits, residue_target, residue_mask)
-    expected = torch.full((dims.batch,), math.log(dims.n_bins))
-    torch.testing.assert_close(loss, expected)
+    loss = distogram_loss_residue(
+        uniform_residue_logits,
+        residue_target,
+        residue_mask,
+    )
+    torch.testing.assert_close(loss, log_bins_per_item)
 
 
 def test_distogram_loss_residue_mask_hides_wrong_pairs(
-    dims: LossDims,
+    wrong_last_residue_logits: Float[torch.Tensor, "B N_res N_res n_bins"],
     residue_bins: Int[torch.Tensor, "B N_res N_res"],
+    last_residue_hidden: Float[torch.Tensor, "B N_res"],
 ) -> None:
     """Confidently wrong logits on masked residues leave the loss near 0.
 
@@ -1279,16 +1955,12 @@ def test_distogram_loss_residue_mask_hides_wrong_pairs(
     one masked residue shows the mask is applied to both pair axes.
 
     Args:
-        dims: Supplies the sizes.
-        residue_bins: Target bins.
+        wrong_last_residue_logits: Confident logits, wrong on the last residue.
+        residue_bins: Correct bins.
+        last_residue_hidden: Mask that drops the last residue.
     """
-    wrong = residue_bins.clone()
-    wrong[:, -1, :] += 1
-    wrong[:, :, -1] += 1
-    logits = 50 * F.one_hot(wrong % dims.n_bins, dims.n_bins).float()
-    mask = torch.ones(dims.batch, dims.n_res)
-    mask[:, -1] = 0
-    masked = distogram_loss_residue(logits, residue_bins, mask)
+    logits = wrong_last_residue_logits
+    masked = distogram_loss_residue(logits, residue_bins, last_residue_hidden)
     unmasked = distogram_loss_residue(logits, residue_bins)
     torch.testing.assert_close(
         masked,
@@ -1310,89 +1982,100 @@ def test_distogram_loss_residue_mask_hides_wrong_pairs(
     ids=[case.name for case in AtomMask],
 )
 def test_distogram_loss_atom_uniform_logits_give_log_bins(
-    dims: LossDims,
-    atom_bins: Int[torch.Tensor, "B N_atom K"],
+    uniform_atom_logits: Float[torch.Tensor, "B N_atom K n_bins"],
     atom_target: (
         Int[torch.Tensor, "B N_atom K"] | Float[torch.Tensor, "B N_atom K n"]
     ),
     atom_mask: Bool[torch.Tensor, "B N_atom K"] | None,
+    log_bins_per_item: Float[torch.Tensor, " B"],
 ) -> None:
     """Uniform logits give ``log(n_bins)`` per item for any target and mask.
 
-    The documented loss is ``-1/(N_atom K) sum``, so with ``K = 5`` slots for
-    12 atoms the unmasked case fails today: it divides by ``K²`` and
-    returns ``(12/5) log(n_bins)``. ``atom_mask`` marks that case strict
-    ``xfail``.
+    The documented loss is ``-1/(N_atom K) sum``. With ``K = 5`` slots for
+    12 atoms, the unmasked case is the regression test for a divisor of
+    ``K**2``, which returned ``(12/5) log(n_bins)``; a square layout,
+    where ``K = N_atom``, could not tell the two apart.
 
     Args:
-        dims: Supplies ``n_bins``.
-        atom_bins: Supplies the slot layout for the logits.
-        atom_target: Target bins as indices or one-hot.
-        atom_mask: All-valid slot mask, or ``None``.
+        uniform_atom_logits: All-zero logits.
+        atom_target: Target bins, as indices or one-hot.
+        atom_mask: Slot mask, or None.
+        log_bins_per_item: ``log(n_bins)`` per item.
     """
-    logits = torch.zeros(*atom_bins.shape, dims.n_bins)
-    loss = distogram_loss_atom(logits, atom_target, atom_mask)
-    expected = torch.full((dims.batch,), math.log(dims.n_bins))
-    torch.testing.assert_close(loss, expected)
+    loss = distogram_loss_atom(uniform_atom_logits, atom_target, atom_mask)
+    torch.testing.assert_close(loss, log_bins_per_item)
 
 
 def test_distogram_loss_atom_mask_hides_wrong_slots(
-    dims: LossDims,
+    wrong_last_slot_logits: Float[torch.Tensor, "B N_atom K n_bins"],
     atom_bins: Int[torch.Tensor, "B N_atom K"],
+    last_slot_hidden: Bool[torch.Tensor, "B N_atom K"],
 ) -> None:
     """Confidently wrong logits on masked slots leave the loss near 0.
 
     Not parametrized: one masked slot per atom shows the mask is applied.
 
     Args:
-        dims: Supplies the sizes.
-        atom_bins: Target bins.
+        wrong_last_slot_logits: Confident logits, wrong in the last slot.
+        atom_bins: Correct bins.
+        last_slot_hidden: Mask that drops the last slot.
     """
-    wrong = atom_bins.clone()
-    wrong[..., -1] += 1
-    logits = 50 * F.one_hot(wrong % dims.n_bins, dims.n_bins).float()
-    mask = torch.ones(atom_bins.shape, dtype=torch.bool)
-    mask[..., -1] = False
-    loss = distogram_loss_atom(logits, atom_bins, mask)
+    loss = distogram_loss_atom(
+        wrong_last_slot_logits,
+        atom_bins,
+        last_slot_hidden,
+    )
     torch.testing.assert_close(loss, torch.zeros_like(loss), atol=1e-6, rtol=0)
 
 
-def test_distogram_loss_one_hot_and_index_targets_agree(
-    dims: LossDims,
+def test_distogram_loss_residue_one_hot_and_index_targets_agree(
+    sine_residue_logits: Float[torch.Tensor, "B N_res N_res n_bins"],
     residue_bins: Int[torch.Tensor, "B N_res N_res"],
-    atom_bins: Int[torch.Tensor, "B N_atom K"],
+    residue_one_hot: Float[torch.Tensor, "B N_res N_res n_bins"],
 ) -> None:
-    """Both losses give the same value for one-hot and index targets.
+    """``distogram_loss_residue`` agrees for one-hot and index targets.
 
     Uses non-uniform logits, where the two code paths, an einsum and a
-    gather, could disagree. Not parametrized: both losses are checked.
+    gather, could disagree. Not parametrized: the target encoding is the
+    only input that varies, and both encodings are compared here.
 
     Args:
-        dims: Supplies ``n_bins``.
-        residue_bins: Residue targets.
-        atom_bins: Atom targets.
+        sine_residue_logits: Non-uniform residue logits.
+        residue_bins: Target bins.
+        residue_one_hot: The same targets, one-hot.
     """
-    res_logits = 3 * sine_pattern((*residue_bins.shape, dims.n_bins), 0.37)
-    atom_logits = 3 * sine_pattern((*atom_bins.shape, dims.n_bins), 0.53)
-    mask = torch.ones(atom_bins.shape, dtype=torch.bool)
     torch.testing.assert_close(
-        distogram_loss_residue(res_logits, residue_bins),
-        distogram_loss_residue(
-            res_logits,
-            F.one_hot(residue_bins, dims.n_bins).float(),
-        ),
+        distogram_loss_residue(sine_residue_logits, residue_bins),
+        distogram_loss_residue(sine_residue_logits, residue_one_hot),
     )
+
+
+def test_distogram_loss_atom_one_hot_and_index_targets_agree(
+    sine_atom_logits: Float[torch.Tensor, "B N_atom K n_bins"],
+    atom_bins: Int[torch.Tensor, "B N_atom K"],
+    atom_one_hot: Float[torch.Tensor, "B N_atom K n_bins"],
+    all_slots_valid: Bool[torch.Tensor, "B N_atom K"],
+) -> None:
+    """``distogram_loss_atom`` agrees for one-hot and index targets.
+
+    Uses non-uniform logits, where the two code paths, an einsum and a
+    gather, could disagree. The mask is all True, so the masked path runs.
+    Not parametrized: both encodings are compared here.
+
+    Args:
+        sine_atom_logits: Non-uniform atom logits.
+        atom_bins: Target bins.
+        atom_one_hot: The same targets, one-hot.
+        all_slots_valid: All-True slot mask.
+    """
     torch.testing.assert_close(
-        distogram_loss_atom(atom_logits, atom_bins, mask),
-        distogram_loss_atom(
-            atom_logits,
-            F.one_hot(atom_bins, dims.n_bins).float(),
-            mask,
-        ),
+        distogram_loss_atom(sine_atom_logits, atom_bins, all_slots_valid),
+        distogram_loss_atom(sine_atom_logits, atom_one_hot, all_slots_valid),
     )
 
 
 def test_seq_ce_loss_uniform_logits_give_log_vocabulary(
+    uniform_aa_logits: Float[torch.Tensor, "B N_res n_amino"],
     aa_indices: Int[torch.Tensor, "B N_res"],
 ) -> None:
     """Uniform logits give a scalar loss of exactly ``log 20``.
@@ -1400,10 +2083,10 @@ def test_seq_ce_loss_uniform_logits_give_log_vocabulary(
     Not parametrized: the value is the same for any valid targets.
 
     Args:
-        aa_indices: Valid residue types.
+        uniform_aa_logits: All-zero logits.
+        aa_indices: Residue types.
     """
-    logits = torch.zeros(*aa_indices.shape, RESTYPE_NUM_NO_X)
-    loss = seq_ce_loss(logits, aa_indices)
+    loss = seq_ce_loss(uniform_aa_logits, aa_indices)
     assert loss.shape == ()
     torch.testing.assert_close(loss, torch.tensor(math.log(RESTYPE_NUM_NO_X)))
 
@@ -1414,8 +2097,8 @@ def test_seq_ce_loss_uniform_logits_give_log_vocabulary(
     ids=["padding", "unknown_x"],
 )
 def test_seq_ce_loss_skips_ignored_positions(
-    aa_indices: Int[torch.Tensor, "B N_res"],
-    ignored: int,
+    confident_aa_logits: Float[torch.Tensor, "B N_res n_amino"],
+    last_target_ignored: Int[torch.Tensor, "B N_res"],
 ) -> None:
     """Positions with ``ignored`` as their target add nothing to the loss.
 
@@ -1424,19 +2107,17 @@ def test_seq_ce_loss_skips_ignored_positions(
     it counted.
 
     Args:
-        aa_indices: Residue types; the last residue is replaced here.
-        ignored: Padding or the unknown ``X`` index.
+        confident_aa_logits: Confident correct logits, uniform on the last
+            residue.
+        last_target_ignored: Targets whose last residue is ignored.
     """
-    logits = 50 * F.one_hot(aa_indices, RESTYPE_NUM_NO_X).float()
-    logits[:, -1] = 0
-    targets = aa_indices.clone()
-    targets[:, -1] = ignored
-    loss = seq_ce_loss(logits, targets)
+    loss = seq_ce_loss(confident_aa_logits, last_target_ignored)
     torch.testing.assert_close(loss, torch.zeros(()), atol=1e-6, rtol=0)
 
 
 def test_seq_ce_loss_with_no_valid_target_is_zero(
-    aa_indices: Int[torch.Tensor, "B N_res"],
+    uniform_aa_logits: Float[torch.Tensor, "B N_res n_amino"],
+    all_unknown_targets: Int[torch.Tensor, "B N_res"],
 ) -> None:
     """If every target is ignored the loss is exactly 0, not NaN.
 
@@ -1444,15 +2125,18 @@ def test_seq_ce_loss_with_no_valid_target_is_zero(
     the test above.
 
     Args:
-        aa_indices: Supplies the shape.
+        uniform_aa_logits: All-zero logits.
+        all_unknown_targets: Every target set to the ignored ``X``.
     """
-    logits = torch.zeros(*aa_indices.shape, RESTYPE_NUM_NO_X)
-    targets = torch.full_like(aa_indices, RESTYPE_NUM_NO_X)
-    assert seq_ce_loss(logits, targets).item() == 0
+    assert seq_ce_loss(uniform_aa_logits, all_unknown_targets).item() == 0
 
 
 def test_featurize_keeps_pdb_x_at_the_ignored_index(
-    dims: LossDims,
+    protein_with_unknown: Protein,
+    template_distogram: Distogram,
+    residue_distogram: Distogram,
+    atom_distogram: Distogram,
+    train_config: TrainConfig,
 ) -> None:
     """A PDB ``X`` residue reaches the loss as index 20, which CE ignores.
 
@@ -1462,26 +2146,19 @@ def test_featurize_keeps_pdb_x_at_the_ignored_index(
     the mapping.
 
     Args:
-        dims: Supplies ``n_bins`` for the distogram modules.
+        protein_with_unknown: Protein ``ACXDE``.
+        template_distogram: Template distogram module.
+        residue_distogram: Residue distogram module.
+        atom_distogram: Atom distogram module.
+        train_config: Default training configuration.
     """
-    n_res = 5
-    aatype = np.array([restype_order[c] for c in "ACXDE"], dtype=np.intp)
-    protein = Protein(
-        atom_positions=np.zeros((n_res, 37, 3)),
-        aatype=aatype,
-        atom_mask=np.ones((n_res, 37)),
-        residue_index=np.arange(n_res, dtype=np.intp),
-        chain_index=np.zeros(n_res, dtype=np.intp),
-        b_factors=np.zeros((n_res, 37)),
-    )
-    n = dims.n_bins
     item = featurize_single_item(
-        protein,
-        build_distogram_module(TemplateDistogramParams(n_bins=n)).eval(),
-        build_distogram_module(ResidueDistogramParams(n_bins=n)).eval(),
-        build_distogram_module(AtomDistogramParams(n_bins=n)).eval(),
-        TrainConfig(),
-        max_seq_len_in_batch=n_res,
+        protein_with_unknown,
+        template_distogram,
+        residue_distogram,
+        atom_distogram,
+        train_config,
+        max_seq_len_in_batch=len(protein_with_unknown.aatype),
     )
     assert item.aa_indices[2].item() == RESTYPE_NUM_NO_X
 
