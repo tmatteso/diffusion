@@ -36,8 +36,6 @@ from jaxtyping import Bool, Float, Int, TypeCheckError
 from tests.patterns import sine_pattern
 from train.train_config import ModelParams
 
-type AnyFloat = Float[torch.Tensor, "..."]
-
 
 @dataclasses.dataclass(frozen=True)
 class AtomDims:
@@ -143,11 +141,14 @@ class ModuleProbe(abc.ABC):
         out_shape: Shape the probed output must have.
     """
 
-    first: AnyFloat
+    first: Float[torch.Tensor, "..."]
     out_shape: tuple[int, ...]
 
     @abc.abstractmethod
-    def run(self, first: AnyFloat) -> AnyFloat:
+    def run(
+        self,
+        first: Float[torch.Tensor, "..."],
+    ) -> Float[torch.Tensor, "..."]:
         """Call the module with ``first`` in place of the probed input.
 
         Args:
@@ -168,10 +169,13 @@ class TransitionProbe(ModuleProbe):
     """
 
     block: ConditionedTransitionBlock
-    s: AnyFloat
+    s: Float[torch.Tensor, "..."]
 
     @override
-    def run(self, first: AnyFloat) -> AnyFloat:
+    def run(
+        self,
+        first: Float[torch.Tensor, "..."],
+    ) -> Float[torch.Tensor, "..."]:
         """Run ``block(first, s)``.
 
         Args:
@@ -197,13 +201,16 @@ class DiffusionProbe(ModuleProbe):
     """
 
     model: DiffusionTransformer
-    s: AnyFloat
-    z: AnyFloat
-    beta: AnyFloat
+    s: Float[torch.Tensor, "..."]
+    z: Float[torch.Tensor, "..."]
+    beta: Float[torch.Tensor, "..."]
     neighbor_idx: Int[torch.Tensor, "B N K"] | None
 
     @override
-    def run(self, first: AnyFloat) -> AnyFloat:
+    def run(
+        self,
+        first: Float[torch.Tensor, "..."],
+    ) -> Float[torch.Tensor, "..."]:
         """Run the transformer with ``first`` as ``a``.
 
         Args:
@@ -234,7 +241,10 @@ class AtomTransformerProbe(ModuleProbe):
     inputs: AtomInputs
 
     @override
-    def run(self, first: AnyFloat) -> AnyFloat:
+    def run(
+        self,
+        first: Float[torch.Tensor, "..."],
+    ) -> Float[torch.Tensor, "..."]:
         """Run the transformer with ``first`` as ``q``.
 
         Args:
@@ -266,7 +276,10 @@ class EncoderProbe(ModuleProbe):
     inputs: AtomInputs
 
     @override
-    def run(self, first: AnyFloat) -> AnyFloat:
+    def run(
+        self,
+        first: Float[torch.Tensor, "..."],
+    ) -> Float[torch.Tensor, "..."]:
         """Run the encoder with ``first`` as ``r_scaled``.
 
         Args:
@@ -302,7 +315,10 @@ class DecoderProbe(ModuleProbe):
     inputs: AtomInputs
 
     @override
-    def run(self, first: AnyFloat) -> AnyFloat:
+    def run(
+        self,
+        first: Float[torch.Tensor, "..."],
+    ) -> Float[torch.Tensor, "..."]:
         """Run the decoder with ``first`` as ``q_skip``.
 
         Args:
