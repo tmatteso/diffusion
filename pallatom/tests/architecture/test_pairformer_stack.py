@@ -1,1175 +1,905 @@
 """Tests for the pairformer stack.
 
-Covers PairformerBlock, PairformerStack, TriangleMultiplicationOutgoing,
-and TriangleMultiplicationIncoming: output shape/dtype/finiteness, gradient
-flow, batch independence, gating behaviour, hidden-dimension configuration,
-contraction-direction correctness, access-pattern sensitivity, and type
-enforcement via beartype/jaxtyping.
+Covers TriangleMultiplicationOutgoing and TriangleMultiplicationIncoming
+(the exact output positions a single pair entry reaches, the gates, the
+LayerNorm scale invariance of the projections, ``c_hidden``, and how the two
+contraction directions relate), PairformerBlock with and without the single
+track, PairformerStack as a composition of its blocks, and the output,
+gradient, batch-independence and shape contracts shared by all of them.
+
+Inputs come from ``tests.patterns.sine_pattern`` and every module is
+built under a fixed seed, so each test is reproducible on its own.
 """
+
+import abc
+import dataclasses
+import enum
+from typing import cast, override
 
 import pytest
 import torch
+from architecture.errors import InvalidPairHeadDimensionError
 from architecture.pairformer_stack import (
     PairformerBlock,
     PairformerStack,
     TriangleMultiplicationIncoming,
     TriangleMultiplicationOutgoing,
 )
-from beartype import beartype
 from einops import rearrange, reduce
 from helpers.useful_objects import manual_seed
-from jaxtyping import Float, TypeCheckError, jaxtyped
-
-_ = manual_seed(42)
-
-B = 1
-N_RES = 8
-C = 32
-N_HEADS = 4
-N_BLOCKS = 3
-TOLERANCE = 1e-6
-TIGHT_TOLERANCE = 1e-3
-PAIRFORMER_BLOCK_NUM = 5
-# Constants used exclusively by the TriangleMultiplicationOutgoing tests
-_N = 6
-_C = 16
-_C_HIDDEN = 8
+from jaxtyping import Bool, Float, TypeCheckError
+from tests.patterns import sine_pattern
 
 
-# ---------------------------------------------------------------------------
-# Typed helpers
-# ---------------------------------------------------------------------------
+@dataclasses.dataclass(frozen=True)
+class PairDims:
+    """Sizes shared by every module and input in this file.
 
-
-@jaxtyped(typechecker=beartype)
-def mean_abs_asymmetry(
-    x: Float[torch.Tensor, "B N N C"],
-) -> Float[torch.Tensor, ""]:
-    """Return mean absolute difference between x[b,i,j,c] and x[b,j,i,c].
-
-    Computes the asymmetry of a pair tensor by comparing each (i, j) entry
-    with its transposed counterpart (j, i) and averaging the absolute
-    differences over all elements.
+    Attributes:
+        batch: Batch size ``B``.
+        n_res: Residues ``N_res``.
+        c: Pair embedding width; divisible by ``n_heads``.
+        c_hidden: Hidden width of the triangle multiplications.
+        c_res: Single embedding width for the single-track block.
+        n_heads: Attention heads; triangle attention uses ``n_heads // 4``.
+        n_blocks: Blocks in the stack.
     """
-    diff = x - rearrange(x, "b i j c -> b j i c")
-    return reduce(diff.abs(), "b i j c -> ", "mean")
+
+    batch: int
+    n_res: int
+    c: int
+    c_hidden: int
+    c_res: int
+    n_heads: int
+    n_blocks: int
 
 
-# ---------------------------------------------------------------------------
-# Fixtures — models
-# ---------------------------------------------------------------------------
+@dataclasses.dataclass(frozen=True)
+class TriangleCase(abc.ABC):
+    """A triangle multiplication direction and where ``z[0, 1]`` reaches.
+
+    Perturbing the single entry ``z[:, 0, 1, :]`` changes exactly the
+    output entries in ``rows``, ``cols`` and ``points``. Outgoing computes
+    ``m[i, j] = Σ_k a[i, k] b[k, j]``, so entry ``(0, 1)`` feeds ``a`` in
+    row 0 and ``b`` in column 1. Incoming computes
+    ``m[i, j] = Σ_k a[k, i] b[j, k]``, so it feeds row 1 and column 0, plus
+    the outer gate at ``(0, 1)`` itself.
+
+    Attributes:
+        rows: Output rows that change in full.
+        cols: Output columns that change in full.
+        points: Further single output entries ``(i, j)`` that change.
+    """
+
+    rows: tuple[int, ...]
+    cols: tuple[int, ...]
+    points: tuple[tuple[int, int], ...]
+
+    @abc.abstractmethod
+    def build(
+        self,
+        c: int,
+        c_hidden: int | None,
+    ) -> TriangleMultiplicationOutgoing | TriangleMultiplicationIncoming:
+        """Build this direction's triangle multiplication.
+
+        Args:
+            c: Pair embedding width.
+            c_hidden: Hidden width, or ``None`` for the module's default.
+
+        Returns:
+            The module, in training mode.
+        """
+
+
+@dataclasses.dataclass(frozen=True)
+class OutgoingCase(TriangleCase):
+    """``TriangleMultiplicationOutgoing`` and where ``z[0, 1]`` reaches."""
+
+    @override
+    def build(
+        self,
+        c: int,
+        c_hidden: int | None,
+    ) -> TriangleMultiplicationOutgoing:
+        """Build a ``TriangleMultiplicationOutgoing``.
+
+        Args:
+            c: Pair embedding width.
+            c_hidden: Hidden width, or ``None`` for the module's default.
+
+        Returns:
+            The module, in training mode.
+        """
+        return TriangleMultiplicationOutgoing(c=c, c_hidden=c_hidden)
+
+
+@dataclasses.dataclass(frozen=True)
+class IncomingCase(TriangleCase):
+    """``TriangleMultiplicationIncoming`` and where ``z[0, 1]`` reaches."""
+
+    @override
+    def build(
+        self,
+        c: int,
+        c_hidden: int | None,
+    ) -> TriangleMultiplicationIncoming:
+        """Build a ``TriangleMultiplicationIncoming``.
+
+        Args:
+            c: Pair embedding width.
+            c_hidden: Hidden width, or ``None`` for the module's default.
+
+        Returns:
+            The module, in training mode.
+        """
+        return TriangleMultiplicationIncoming(c=c, c_hidden=c_hidden)
+
+
+class TriangleScenario(enum.Enum):
+    """The two triangle multiplication contraction directions.
+
+    Members:
+        outgoing: ``TriangleMultiplicationOutgoing`` (Algorithm 17 step 2).
+        incoming: ``TriangleMultiplicationIncoming`` (Algorithm 17 step 3).
+    """
+
+    outgoing = OutgoingCase((0,), (1,), ())
+    incoming = IncomingCase((1,), (0,), ((0, 1),))
+
+
+@dataclasses.dataclass(frozen=True)
+class SymmetryCase:
+    """Whether the pair input is symmetric and what that implies.
+
+    Attributes:
+        symmetric_input: Average ``z`` with its transpose before the call.
+        directions_agree: Whether outgoing and incoming must then match.
+    """
+
+    symmetric_input: bool
+    directions_agree: bool
+
+
+class SymmetryScenario(enum.Enum):
+    """Pair inputs for comparing the two triangle directions.
+
+    Members:
+        asymmetric: ``z`` as built, so the two directions differ.
+        symmetric: ``z`` symmetrised, so the two directions agree.
+    """
+
+    asymmetric = SymmetryCase(symmetric_input=False, directions_agree=False)
+    symmetric = SymmetryCase(symmetric_input=True, directions_agree=True)
+
+
+@dataclasses.dataclass(frozen=True)
+class MalformedPair(abc.ABC):
+    """A reshaping of a valid pair tensor that breaks the shape contract."""
+
+    @abc.abstractmethod
+    def malform(
+        self,
+        pair: Float[torch.Tensor, "B N_res N_res c"],
+    ) -> Float[torch.Tensor, "..."]:
+        """Map a valid ``(B, N, N, c)`` tensor to a malformed one.
+
+        Args:
+            pair: Valid pair embedding.
+
+        Returns:
+            The malformed tensor.
+        """
+
+
+@dataclasses.dataclass(frozen=True)
+class SelectIndex(MalformedPair):
+    """Keep one index of an axis, removing that axis.
+
+    Attributes:
+        dim: Axis to select from.
+        index: Position along ``dim`` to keep.
+    """
+
+    dim: int
+    index: int
+
+    @override
+    def malform(
+        self,
+        pair: Float[torch.Tensor, "B N_res N_res c"],
+    ) -> Float[torch.Tensor, "..."]:
+        """Select ``index`` along ``dim``.
+
+        Args:
+            pair: Valid pair embedding.
+
+        Returns:
+            ``pair`` with axis ``dim`` removed.
+        """
+        return pair.select(self.dim, self.index)
+
+
+@dataclasses.dataclass(frozen=True)
+class DropFirst(MalformedPair):
+    """Remove the first entry of an axis, shortening it by one.
+
+    Attributes:
+        dim: Axis to shorten.
+    """
+
+    dim: int
+
+    @override
+    def malform(
+        self,
+        pair: Float[torch.Tensor, "B N_res N_res c"],
+    ) -> Float[torch.Tensor, "..."]:
+        """Drop index 0 along ``dim``.
+
+        Args:
+            pair: Valid pair embedding.
+
+        Returns:
+            ``pair`` with ``dim`` one shorter.
+        """
+        return pair.narrow(self.dim, 1, pair.shape[self.dim] - 1)
+
+
+class MalformedScenario(enum.Enum):
+    """Pair tensors every module in this file must reject.
+
+    Members:
+        missing_batch: ``(N, N, c)`` with no batch axis.
+        missing_channel: ``(B, N, N)`` with no channel axis.
+        non_square: ``(B, N, N - 1, c)``; the two residue axes differ.
+    """
+
+    missing_batch = SelectIndex(dim=0, index=0)
+    missing_channel = SelectIndex(dim=-1, index=0)
+    non_square = DropFirst(dim=2)
 
 
 @pytest.fixture
-def block() -> PairformerBlock:
-    """Provide a single PairformerBlock in eval mode.
+def dims() -> PairDims:
+    """Return the small sizes every test builds its modules and inputs from.
 
-    Instantiated with the module-level C and N_HEADS constants.
+    Returns:
+        Sizes with ``c`` divisible by ``n_heads`` and ``n_heads >= 4``.
     """
-    return PairformerBlock(c_pair=C, c_res=None, n_heads=N_HEADS).eval()
+    return PairDims(
+        batch=2,
+        n_res=6,
+        c=16,
+        c_hidden=8,
+        c_res=8,
+        n_heads=4,
+        n_blocks=3,
+    )
 
 
 @pytest.fixture
-def stack() -> PairformerStack:
-    """Provide a PairformerStack with N_BLOCKS blocks in eval mode.
+def z(dims: PairDims) -> Float[torch.Tensor, "B N_res N_res c"]:
+    """Return a deterministic, asymmetric pair embedding.
 
-    Instantiated with module-level C, N_BLOCKS, and N_HEADS constants.
+    Args:
+        dims: Tensor sizes.
+
+    Returns:
+        ``(B, N_res, N_res, c)`` tensor with distinct batch items.
     """
-    return PairformerStack(
-        c=C,
-        c_res=None,
-        n_blocks=N_BLOCKS,
-        n_heads=N_HEADS,
-    ).eval()
+    return sine_pattern((dims.batch, dims.n_res, dims.n_res, dims.c), 0.37)
 
 
 @pytest.fixture
-def stack_single_block() -> PairformerStack:
-    """Provide a PairformerStack with exactly one block in eval mode.
+def s(
+    dims: PairDims,
+) -> Float[torch.Tensor, "B N_res c_res"]:
+    """Return a deterministic single embedding for the single-track block.
 
-    Instantiated with module-level C and N_HEADS constants and n_blocks=1.
-    Used to verify numerical equivalence with a standalone PairformerBlock.
+    Args:
+        dims: Tensor sizes.
+
+    Returns:
+        ``(B, N_res, c_res)`` tensor.
     """
-    return PairformerStack(
-        c=C,
-        c_res=None,
-        n_blocks=1,
-        n_heads=N_HEADS,
-    ).eval()
-
-
-# ---------------------------------------------------------------------------
-# Fixtures — tensors
-# ---------------------------------------------------------------------------
+    return sine_pattern((dims.batch, dims.n_res, dims.c_res), 0.53)
 
 
 @pytest.fixture
-def v() -> Float[torch.Tensor, "B N_RES N_RES C"]:
-    """Provide a random pair-embedding tensor (B, N_RES, N_RES, C).
+def triangle(
+    triangle_scenario: TriangleScenario,
+    dims: PairDims,
+) -> TriangleMultiplicationOutgoing | TriangleMultiplicationIncoming:
+    """Build the scenario's triangle multiplication under a fixed seed.
 
-    Sampled from a standard normal distribution using module-level B,
-    N_RES, and C constants.
-    """
-    return torch.randn(B, N_RES, N_RES, C)
+    Args:
+        triangle_scenario: Direction to build; the requesting test
+            parametrizes it.
+        dims: Module sizes.
 
-
-@pytest.fixture
-def z_3d() -> Float[torch.Tensor, "B N_RES N_RES"]:
-    """Provide a 3-D tensor (B, N_RES, N_RES) missing the c_pair channel dim.
-
-    Used by wrong-shape type-enforcement tests for PairformerBlock and
-    PairformerStack to verify that beartype/jaxtyping rejects inputs with
-    an incorrect number of dimensions.
-    """
-    return torch.zeros(B, N_RES, N_RES)
-
-
-# ---------------------------------------------------------------------------
-# PairformerBlock
-# ---------------------------------------------------------------------------
-
-
-def test_pairformer_block_output_shape(
-    block: PairformerBlock,
-    v: Float[torch.Tensor, "B N_RES N_RES C"],
-) -> None:
-    """PairformerBlock output shape matches the input (B, N_RES, N_RES, C).
-
-    Verifies that the block does not change the spatial or channel dimensions
-    of the pair embedding tensor.
-    """
-    with torch.no_grad():
-        _, out = block(s=None, z=v)
-    assert out.shape == (B, N_RES, N_RES, C)
-
-
-def test_pairformer_block_output_finite(
-    block: PairformerBlock,
-    v: Float[torch.Tensor, "B N_RES N_RES C"],
-) -> None:
-    """PairformerBlock output contains only finite values.
-
-    Verifies that no NaN or Inf values are produced for a standard random
-    pair-embedding input.
-    """
-    with torch.no_grad():
-        _, out = block(s=None, z=v)
-    assert torch.isfinite(out).all()
-
-
-def test_pairformer_block_output_dtype(
-    block: PairformerBlock,
-    v: Float[torch.Tensor, "B N_RES N_RES C"],
-) -> None:
-    """PairformerBlock output dtype matches the input dtype.
-
-    Verifies that the block does not inadvertently upcast or downcast the
-    pair-embedding tensor during the forward pass.
-    """
-    with torch.no_grad():
-        _, out = block(s=None, z=v)
-    assert out.dtype == v.dtype
-
-
-def test_pairformer_block_changes_input(
-    block: PairformerBlock,
-    v: Float[torch.Tensor, "B N_RES N_RES C"],
-) -> None:
-    """PairformerBlock output differs from its input (non-identity transform).
-
-    Verifies that the block applies a meaningful transformation rather than
-    passing the pair embedding through unchanged.
-    """
-    with torch.no_grad():
-        _, out = block(s=None, z=v)
-    assert not torch.allclose(out, v)
-
-
-def test_pairformer_block_gradient_flows(
-    block: PairformerBlock,
-    v: Float[torch.Tensor, "B N_RES N_RES C"],
-) -> None:
-    """Gradient propagates from PairformerBlock output back to v.
-
-    Verifies that the backward pass produces a non-None, fully finite
-    gradient on the input pair-embedding tensor.
-    """
-    v_g = v.clone().requires_grad_(True)  # noqa: FBT003
-    _, out = block(s=None, z=v_g)
-    torch.autograd.backward([reduce(out, "b n m c -> ", "sum")])
-    assert v_g.grad is not None
-    assert torch.isfinite(v_g.grad).all()
-
-
-def test_pairformer_block_row_attn_preserves_col_symmetry(
-    block: PairformerBlock,
-    v: Float[torch.Tensor, "B N_RES N_RES C"],
-) -> None:
-    """Symmetric input remains finite after one PairformerBlock.
-
-    Verifies numerical stability when the input pair embedding is spatially
-    symmetric (z[b,i,j,c] == z[b,j,i,c]); both row and column attention axes
-    are exercised so neither dimension is favoured (row+col attention both
-    applied).
-    """
-    # Symmetric input should remain approximately symmetric after one block
-    # (row + col attention are both applied, so neither axis is favoured)
-    v_sym = (v + rearrange(v, "b i j c -> b j i c")) * 0.5
-    with torch.no_grad():
-        _, out = block(s=None, z=v_sym)
-    # Not exactly symmetric (weights differ for row vs col), but check finite
-    assert torch.isfinite(out).all()
-
-
-def test_pairformer_block_different_batch_items_independent(
-    block: PairformerBlock,
-) -> None:
-    """Two samples in batch equivalent to processing them separately.
-
-    Verifies that each element in the batch is processed independently by
-    checking that concatenating two samples produces the same results as
-    running them through the block one at a time.
-    """
-    # Each batch element should be processed independently
-    v1 = torch.randn(1, N_RES, N_RES, C)
-    v2 = torch.randn(1, N_RES, N_RES, C)
-    v_cat = torch.cat([v1, v2], dim=0)
-    with torch.no_grad():
-        _, out1 = block(s=None, z=v1)
-        _, out2 = block(s=None, z=v2)
-        _, out_cat = block(s=None, z=v_cat)
-    assert torch.allclose(out1, out_cat[:1], atol=1e-5)
-    assert torch.allclose(out2, out_cat[1:], atol=1e-5)
-
-
-# ---------------------------------------------------------------------------
-# PairformerStack
-# ---------------------------------------------------------------------------
-
-
-def test_pairformer_stack_output_shape(
-    stack: PairformerStack,
-    v: Float[torch.Tensor, "B N_RES N_RES C"],
-) -> None:
-    """PairformerStack returns output of same shape as input.
-
-    Verifies that stacking N_BLOCKS pairformer blocks preserves pair-embedding
-    tensor dimensions end-to-end.
-    """
-    with torch.no_grad():
-        out = stack(s=None, z=v)
-    assert out.shape == (B, N_RES, N_RES, C)
-
-
-def test_pairformer_stack_output_finite(
-    stack: PairformerStack,
-    v: Float[torch.Tensor, "B N_RES N_RES C"],
-) -> None:
-    """Stacking N_BLOCKS pairformer blocks does not produce NaN or Inf values.
-
-    Verifies numerical stability of the full stack on a standard random
-    pair-embedding input.
-    """
-    with torch.no_grad():
-        out = stack(s=None, z=v)
-    assert torch.isfinite(out).all()
-
-
-def test_pairformer_stack_block_count() -> None:
-    """The n_blocks constructor creates exact PairformerBlock amount.
-
-    Verifies that the length of the internal blocks list equals the value
-    passed to the constructor.
-    """
-    s = PairformerStack(C, n_blocks=PAIRFORMER_BLOCK_NUM, n_heads=N_HEADS)
-    assert len(s.blocks) == PAIRFORMER_BLOCK_NUM
-
-
-def test_pairformer_stack_gradient_flows(
-    stack: PairformerStack,
-    v: Float[torch.Tensor, "B N_RES N_RES C"],
-) -> None:
-    """Gradients propagate through all blocks back to input pair embedding.
-
-    Verifies that the backward pass through the entire stack yields a
-    non-None, fully finite gradient on the input tensor.
-    """
-    v_g = v.clone().requires_grad_(True)  # noqa: FBT003
-    out = stack(s=None, z=v_g)
-    torch.autograd.backward([reduce(out, "b n m c -> ", "sum")])
-    assert v_g.grad is not None
-    assert torch.isfinite(v_g.grad).all()
-
-
-def test_pairformer_stack_single_block_matches_pairformer_block(
-    block: PairformerBlock,
-    stack_single_block: PairformerStack,
-) -> None:
-    """Single-block PairformerStack with identical weights == PairformerBlock.
-
-    Verifies that PairformerStack(n_blocks=1) is numerically equivalent to a
-    standalone PairformerBlock after copying all weights, confirming that the
-    stack wrapper introduces no extra transformations.
+    Returns:
+        The module in eval mode.
     """
     _ = manual_seed(0)
-    z_v = torch.randn(B, N_RES, N_RES, C)
-    _ = stack_single_block.blocks[0].load_state_dict(block.state_dict())
-    with torch.no_grad():
-        _, block_z = block(s=None, z=z_v)
-        stack_z = stack_single_block(s=None, z=z_v)
-        assert torch.allclose(block_z, stack_z, atol=TOLERANCE)
-
-
-# ===========================================================================
-# TriangleMultiplicationOutgoing
-#
-# The outgoing update computes (Algorithm 17, step 2):
-#   m[i,j] = sigmoid(gate(z[i,j])) · proj_out(norm_out(Σ_k a[i,k] ⊙ b[k,j]))
-# where
-#   a[i,k] = sigmoid(gate_a(norm(z)[i,k])) · proj_a(norm(z)[i,k])
-#   b[k,j] = sigmoid(gate_b(norm(z)[k,j])) · proj_b(norm(z)[k,j])
-#
-# Design facts verified below:
-#   • outer gate uses raw z (not LayerNorm'd); proj_a / proj_b see norm(z).
-#   • contraction is Σ_k a[i,k]⊙b[k,j]  ("outgoing": row of a, column of b).
-#   • with shared weights, outgoing(z) == incoming(z) iff z is symmetric.
-# ===========================================================================
-
-
-# ---------------------------------------------------------------------------
-# Fixtures - TriangleMultiplicationOutgoing
-# ---------------------------------------------------------------------------
+    return triangle_scenario.value.build(dims.c, dims.c_hidden).eval()
 
 
 @pytest.fixture
-def tmo() -> TriangleMultiplicationOutgoing:
-    """TriangleMultiplicationOutgoing(_C, c_hidden=_C_HIDDEN) in eval mode.
+def tmo(dims: PairDims) -> TriangleMultiplicationOutgoing:
+    """Build a TriangleMultiplicationOutgoing under a fixed seed.
 
-    Instantiated with the module-level _C and _C_HIDDEN constants.
+    Args:
+        dims: Module sizes.
+
+    Returns:
+        The module in eval mode.
     """
-    return TriangleMultiplicationOutgoing(c=_C, c_hidden=_C_HIDDEN).eval()
+    _ = manual_seed(0)
+    return TriangleMultiplicationOutgoing(
+        c=dims.c,
+        c_hidden=dims.c_hidden,
+    ).eval()
 
 
 @pytest.fixture
-def z_pair() -> Float[torch.Tensor, "B N_res N_res C"]:
-    """Random pair-embedding tensor (2, _N, _N, _C).
-
-    Batch size 2 is used so that batch-independence tests can split it.
-    """
-    return torch.randn(2, _N, _N, _C)
-
-
-@pytest.fixture
-def z_sym() -> Float[torch.Tensor, "B N_res N_res C"]:
-    """Spatially symmetric pair tensor: z[b,i,j,c] == z[b,j,i,c].
-
-    Constructed by averaging a random tensor with its spatial transpose so
-    that the symmetry constraint holds exactly.
-    """
-    raw = torch.randn(1, _N, _N, _C)
-    return (raw + rearrange(raw, "b i j c -> b j i c")) * 0.5
-
-
-@pytest.fixture
-def z_no_batch() -> Float[torch.Tensor, "N N C"]:
-    """Random pair tensor (_N, _N, _C) missing the batch dimension.
-
-    Used to verify that beartype/jaxtyping rejects 3-D inputs where a
-    4-D batch-first tensor is expected.
-    """
-    return torch.randn(_N, _N, _C)
-
-
-@pytest.fixture
-def z_nonsquare() -> Float[torch.Tensor, "B N M C"]:
-    """Random pair tensor (1, _N, _N+1, _C) with non-square spatial dims.
-
-    Used to verify that beartype/jaxtyping rejects inputs where the two
-    spatial dimensions are not equal.
-    """
-    return torch.randn(1, _N, _N + 1, _C)
-
-
-@pytest.fixture
-def z_single() -> Float[torch.Tensor, "B N_res N_res C"]:
-    """Random single-batch pair-embedding tensor (1, _N, _N, _C).
-
-    Distinct from z_pair (batch=2); used where a single batch element is
-    needed but z_pair's larger batch would be misleading.
-    """
-    return torch.randn(1, _N, _N, _C)
-
-
-# ---------------------------------------------------------------------------
-# Basic output contracts
-# ---------------------------------------------------------------------------
-
-
-def test_tmo_output_shape(
+def tmi(
     tmo: TriangleMultiplicationOutgoing,
-    z_pair: Float[torch.Tensor, "B N_res N_res C"],
-) -> None:
-    """Output shape equals input shape (B, N, N, C).
+    dims: PairDims,
+) -> TriangleMultiplicationIncoming:
+    """Build a TriangleMultiplicationIncoming sharing ``tmo``'s weights.
 
-    Verifies that TriangleMultiplicationOutgoing does not alter the spatial
-    or channel dimensions of the pair tensor.
+    The two classes have identical parameters, so copying the state dict
+    leaves the contraction direction as the only difference between them.
+
+    Args:
+        tmo: Outgoing module to copy weights from.
+        dims: Module sizes.
+
+    Returns:
+        The module in eval mode.
+    """
+    module = TriangleMultiplicationIncoming(
+        c=dims.c,
+        c_hidden=dims.c_hidden,
+    ).eval()
+    _ = module.load_state_dict(tmo.state_dict())
+    return module
+
+
+@pytest.fixture
+def block(dims: PairDims) -> PairformerBlock:
+    """Build a pair-only PairformerBlock under a fixed seed.
+
+    Args:
+        dims: Module sizes.
+
+    Returns:
+        The block in eval mode, so dropout is off.
+    """
+    _ = manual_seed(0)
+    return PairformerBlock(dims.c, None, dims.n_heads).eval()
+
+
+@pytest.fixture
+def single_track_block(dims: PairDims) -> PairformerBlock:
+    """Build a PairformerBlock that also updates ``s``, under a fixed seed.
+
+    Args:
+        dims: Module sizes.
+
+    Returns:
+        The block in eval mode.
+    """
+    _ = manual_seed(0)
+    return PairformerBlock(dims.c, dims.c_res, dims.n_heads).eval()
+
+
+@pytest.fixture
+def stack(dims: PairDims) -> PairformerStack:
+    """Build a pair-only PairformerStack under a fixed seed.
+
+    Args:
+        dims: Module sizes.
+
+    Returns:
+        The stack in eval mode.
+    """
+    _ = manual_seed(0)
+    return PairformerStack(dims.c, dims.n_blocks, dims.n_heads).eval()
+
+
+def pair_forward(
+    module: (
+        TriangleMultiplicationOutgoing
+        | TriangleMultiplicationIncoming
+        | PairformerStack
+    ),
+    pair: Float[torch.Tensor, "B N_res N_res c"],
+) -> Float[torch.Tensor, "B N_res N_res c"]:
+    """Run ``module`` on ``pair`` alone and return its output pair tensor.
+
+    ``PairformerStack`` takes the single embedding first, and passing
+    ``s=None`` makes it process and return the pair tensor alone; the two
+    triangle modules take the pair tensor only.
+
+    Args:
+        module: Triangle module or pair-only stack under test.
+        pair: Pair embedding.
+
+    Returns:
+        The module's output pair tensor, shaped like ``pair``.
+    """
+    if isinstance(module, PairformerStack):
+        return module(None, pair)
+    return module(pair)
+
+
+@pytest.fixture
+def pair_module(
+    request: pytest.FixtureRequest,
+    pair_module_name: str,
+) -> (
+    TriangleMultiplicationOutgoing
+    | TriangleMultiplicationIncoming
+    | PairformerStack
+):
+    """Return the module fixture named by ``pair_module_name``.
+
+    A pair-only ``PairformerBlock`` is covered through the stack, which
+    ``test_stack_applies_its_blocks_in_order`` ties to its blocks.
+
+    Args:
+        request: Pytest request used to look up the named fixture.
+        pair_module_name: ``"tmo"``, ``"tmi"`` or ``"stack"``, the name
+            of the fixture to use; the requesting test parametrizes it.
+
+    Returns:
+        The module under test.
+    """
+    return cast(
+        TriangleMultiplicationOutgoing
+        | TriangleMultiplicationIncoming
+        | PairformerStack,
+        request.getfixturevalue(pair_module_name),
+    )
+
+
+@pytest.fixture
+def changed_mask(
+    triangle_scenario: TriangleScenario,
+    dims: PairDims,
+) -> Bool[torch.Tensor, "N_res N_res"]:
+    """Build the output positions the scenario says ``z[0, 1]`` reaches.
+
+    Args:
+        triangle_scenario: Holds the rows, columns and points; the
+            requesting test parametrizes it.
+        dims: Supplies ``N_res``.
+
+    Returns:
+        Boolean ``(N_res, N_res)`` mask, True where the output must change.
+    """
+    case = triangle_scenario.value
+    mask = torch.zeros(dims.n_res, dims.n_res, dtype=torch.bool)
+    mask[list(case.rows), :] = True
+    mask[:, list(case.cols)] = True
+    for i, j in case.points:
+        mask[i, j] = True
+    return mask
+
+
+@pytest.fixture
+def direction_input(
+    symmetry_scenario: SymmetryScenario,
+    z: Float[torch.Tensor, "B N_res N_res c"],
+) -> Float[torch.Tensor, "B N_res N_res c"]:
+    """Return ``z``, or ``z`` averaged with its transpose, per the scenario.
+
+    Args:
+        symmetry_scenario: Whether the input must be symmetric; the
+            requesting test parametrizes it.
+        z: Asymmetric pair embedding.
+
+    Returns:
+        A pair embedding that is symmetric in ``i`` and ``j`` exactly
+        when the scenario asks for one.
+    """
+    if not symmetry_scenario.value.symmetric_input:
+        return z
+    return (z + rearrange(z, "b i j c -> b j i c")) / 2
+
+
+@pytest.mark.parametrize(
+    "pair_module_name",
+    ["tmo", "tmi", "stack"],
+    ids=["outgoing", "incoming", "stack"],
+)
+def test_output_shape_dtype_and_finite(
+    z: Float[torch.Tensor, "B N_res N_res c"],
+    pair_module: (
+        TriangleMultiplicationOutgoing
+        | TriangleMultiplicationIncoming
+        | PairformerStack
+    ),
+) -> None:
+    """Each module maps ``(B, N, N, c)`` float32 to the same, all finite.
+
+    Args:
+        z: Valid pair embedding.
+        pair_module: Module under test.
     """
     with torch.no_grad():
-        out = tmo(z_pair)
-    assert out.shape == z_pair.shape
-
-
-def test_tmo_output_dtype_preserved(
-    tmo: TriangleMultiplicationOutgoing,
-    z_pair: Float[torch.Tensor, "B N_res N_res C"],
-) -> None:
-    """Output dtype matches input dtype.
-
-    Verifies that TriangleMultiplicationOutgoing does not inadvertently
-    upcast or downcast the pair tensor during the forward pass.
-    """
-    with torch.no_grad():
-        out = tmo(z_pair)
-    assert out.dtype == z_pair.dtype
-
-
-def test_tmo_output_is_finite(
-    tmo: TriangleMultiplicationOutgoing,
-    z_pair: Float[torch.Tensor, "B N_res N_res C"],
-) -> None:
-    """No NaN or Inf in output for a standard random input.
-
-    Verifies numerical stability of TriangleMultiplicationOutgoing for a
-    typical pair-embedding tensor drawn from a standard normal distribution.
-    """
-    with torch.no_grad():
-        out = tmo(z_pair)
+        out = pair_forward(pair_module, z)
+    assert out.shape == z.shape
+    assert out.dtype == z.dtype
     assert torch.isfinite(out).all()
 
 
-def test_tmo_gradient_flows_to_input(
-    tmo: TriangleMultiplicationOutgoing,
-    z_pair: Float[torch.Tensor, "B N_res N_res C"],
+@pytest.mark.parametrize(
+    "pair_module_name",
+    ["tmo", "tmi", "stack"],
+    ids=["outgoing", "incoming", "stack"],
+)
+def test_gradient_reaches_input(
+    z: Float[torch.Tensor, "B N_res N_res c"],
+    pair_module: (
+        TriangleMultiplicationOutgoing
+        | TriangleMultiplicationIncoming
+        | PairformerStack
+    ),
 ) -> None:
-    """Loss gradient propagates back to z: non-None and fully finite.
+    """The summed output has a finite, nonzero gradient with respect to ``z``.
 
-    Verifies that the backward pass through TriangleMultiplicationOutgoing
-    produces a well-defined gradient on the input pair tensor.
+    Args:
+        z: Valid pair embedding.
+        pair_module: Module under test.
     """
-    z_g = z_pair.clone().requires_grad_(True)  # noqa: FBT003
-    out = tmo(z_g)
-    torch.autograd.backward([reduce(out, "b i j c -> ", "sum")])
-    assert z_g.grad is not None
-    assert torch.isfinite(z_g.grad).all()
+    leaf = z.clone().requires_grad_()
+    out = reduce(pair_forward(pair_module, leaf), "b i j c -> ", "sum")
+    (grad,) = torch.autograd.grad(out, leaf)
+    assert torch.isfinite(grad).all()
+    assert torch.count_nonzero(grad) > 0
 
 
-# ---------------------------------------------------------------------------
-# Batch independence
-# ---------------------------------------------------------------------------
-
-
-def test_tmo_batch_items_are_independent(
-    tmo: TriangleMultiplicationOutgoing,
+@pytest.mark.parametrize(
+    "pair_module_name",
+    ["tmo", "tmi", "stack"],
+    ids=["outgoing", "incoming", "stack"],
+)
+def test_batch_items_are_independent(
+    z: Float[torch.Tensor, "B N_res N_res c"],
+    pair_module: (
+        TriangleMultiplicationOutgoing
+        | TriangleMultiplicationIncoming
+        | PairformerStack
+    ),
 ) -> None:
-    """Processing two inputs in a batch equals processing them separately.
+    """Running each batch item alone matches its slice of the batched run.
 
-    Verifies that TriangleMultiplicationOutgoing processes each batch element
-    independently, with no cross-contamination between samples.
-    """
-    z1 = torch.randn(1, _N, _N, _C)
-    z2 = torch.randn(1, _N, _N, _C)
-    z_cat = torch.cat([z1, z2], dim=0)
-    with torch.no_grad():
-        out1 = tmo(z1)
-        out2 = tmo(z2)
-        out_cat = tmo(z_cat)
-    assert torch.allclose(out1, out_cat[:1], atol=1e-5)
-    assert torch.allclose(out2, out_cat[1:], atol=1e-5)
-
-
-# ---------------------------------------------------------------------------
-# Gating mechanism
-# ---------------------------------------------------------------------------
-
-
-def test_tmo_gate_near_zero_suppresses_output(
-    tmo: TriangleMultiplicationOutgoing,
-    z_pair: Float[torch.Tensor, "B N_res N_res C"],
-) -> None:
-    """Outer gate bias << 0 → sigmoid ≈ 0 → output ≈ 0 for any pair content.
-
-    Verifies that the outer gating mechanism can suppress the full output by
-    driving the gate bias strongly negative, regardless of the pair content.
+    Args:
+        z: Pair embedding whose batch items differ.
+        pair_module: Module under test.
     """
     with torch.no_grad():
-        _ = tmo.gate.bias.fill_(-100.0)
-        _ = tmo.gate.weight.fill_(0.0)
-    with torch.no_grad():
-        out = tmo(z_pair)
-    assert out.abs().max().item() < TOLERANCE
+        batched = pair_forward(pair_module, z)
+        separate = torch.cat(
+            [pair_forward(pair_module, z[i : i + 1]) for i in range(len(z))],
+        )
+    torch.testing.assert_close(batched, separate, atol=1e-5, rtol=0)
 
 
-def test_tmo_gate_near_one_passes_output_through(
-    tmo: TriangleMultiplicationOutgoing,
-    z_pair: Float[torch.Tensor, "B N_res N_res C"],
+@pytest.mark.parametrize(
+    "pair_module_name",
+    ["tmo", "tmi", "stack"],
+    ids=["outgoing", "incoming", "stack"],
+)
+@pytest.mark.parametrize(
+    "malformed_scenario",
+    list(MalformedScenario),
+    ids=[case.name for case in MalformedScenario],
+)
+def test_forward_rejects_malformed_pair(
+    z: Float[torch.Tensor, "B N_res N_res c"],
+    pair_module: (
+        TriangleMultiplicationOutgoing
+        | TriangleMultiplicationIncoming
+        | PairformerStack
+    ),
+    malformed_scenario: MalformedScenario,
 ) -> None:
-    """Outer gate bias >> 0, sigmoid ≈ 1, output driven by z_pair."""
-    with torch.no_grad():
-        _ = tmo.gate.bias.fill_(100.0)
-        _ = tmo.gate.weight.fill_(0.0)
-    with torch.no_grad():
-        out = tmo(z_pair)
-    assert out.abs().mean().item() > TIGHT_TOLERANCE
+    """Each module's jaxtyping contract rejects every malformed layout.
 
-
-# ---------------------------------------------------------------------------
-# Outer gate uses raw z; proj_a / proj_b see LayerNorm(z)
-# ---------------------------------------------------------------------------
-
-
-def test_tmo_gate_responds_to_input_scale(
-    tmo: TriangleMultiplicationOutgoing,
-    z_single: Float[torch.Tensor, "B N_res N_res C"],
-) -> None:
-    """Scaling z changes outer gate output even when LayerNorm is invariant.
-
-    Setup: pin gate_a / gate_b to sigmoid ≈ 1 so proj_a / proj_b are
-        scale-invariant.
-    The outer gate still sees raw z and therefore produces different values for
-    z vs 100·z.
+    Args:
+        z: Valid pair embedding to cut the malformed one from.
+        pair_module: Module under test.
+        malformed_scenario: How to break the shape.
     """
-    with torch.no_grad():
-        _ = tmo.gate_a.bias.fill_(100.0)
-        _ = tmo.gate_a.weight.fill_(0.0)
-        _ = tmo.gate_b.bias.fill_(100.0)
-        _ = tmo.gate_b.weight.fill_(0.0)
-    z_large = 100.0 * z_single
-    with torch.no_grad():
-        out_z = tmo(z_single)
-        out_large = tmo(z_large)
-    assert not torch.allclose(out_z, out_large, atol=1e-4)
-
-
-def test_tmo_proj_layers_are_layernorm_scale_invariant(
-    tmo: TriangleMultiplicationOutgoing,
-    z_pair: Float[torch.Tensor, "B N_res N_res C"],
-) -> None:
-    """With outer gate pinned to 1, output is identical for z and 2·z.
-
-    LayerNorm is scale-invariant in its input, so proj_a and proj_b (which
-    receive norm(z)) produce the same result for z and 2·z. Pinning the outer
-    gate removes the only path that sees raw z.
-    """
-    with torch.no_grad():
-        _ = tmo.gate.bias.fill_(100.0)
-        _ = tmo.gate.weight.fill_(0.0)
-    z_scaled = 2.0 * z_pair
-    with torch.no_grad():
-        out_z = tmo(z_pair)
-        out_scaled = tmo(z_scaled)
-    assert torch.allclose(out_z, out_scaled, atol=1e-4)
-
-
-# ---------------------------------------------------------------------------
-# Hidden dimension
-# ---------------------------------------------------------------------------
-
-
-def test_tmo_default_c_hidden_equals_c() -> None:
-    """Omitting c_hidden defaults to c (proj_a, proj_out, norm_out shapes)."""
-    m = TriangleMultiplicationOutgoing(c=_C).eval()
-    assert m.proj_a.weight.shape == (_C, _C)
-    assert m.proj_out.weight.shape == (_C, _C)
-    assert m.norm_out.normalized_shape == (_C,)
-
-
-def test_tmo_custom_c_hidden_output_shape_is_c(
-    z_single: Float[torch.Tensor, "B N_res N_res C"],
-) -> None:
-    """c_hidden != c: output depth remains c; internal proj are c_hidden."""
-    m = TriangleMultiplicationOutgoing(c=_C, c_hidden=4).eval()
-    with torch.no_grad():
-        out = m(z_single)
-    assert out.shape == (1, _N, _N, _C)
-    assert m.proj_a.weight.shape == (4, _C)
-    assert m.norm_out.normalized_shape == (4,)
-    assert m.proj_out.weight.shape == (_C, 4)
-
-
-# ---------------------------------------------------------------------------
-# Contraction direction: outgoing vs incoming
-# ---------------------------------------------------------------------------
-
-
-def test_tmo_differs_from_incoming_for_asymmetric_input(
-    tmo: TriangleMultiplicationOutgoing,
-    tmi: TriangleMultiplicationIncoming,
-    z_single: Float[torch.Tensor, "B N_res N_res C"],
-) -> None:
-    """Same weights, different contractions, different output for asymmetric z.
-
-    Outgoing:  Σ_k a[i,k] ⊙ b[k,j]
-    Incoming:  Σ_k a[k,i] ⊙ b[j,k]
-    These are not equal when z is not spatially symmetric.
-    """
-    _ = tmi.load_state_dict(tmo.state_dict())
-    with torch.no_grad():
-        out_o = tmo(z_single)
-        out_i = tmi(z_single)
-    assert not torch.allclose(out_o, out_i, atol=1e-4)
-
-
-def test_tmo_equals_incoming_for_symmetric_input_with_shared_weights(
-    tmo: TriangleMultiplicationOutgoing,
-    tmi: TriangleMultiplicationIncoming,
-    z_sym: Float[torch.Tensor, "B N_res N_res C"],
-) -> None:
-    """For spatially symmetric z, outgoing == incoming when weights are shared.
-
-    Proof sketch: with z[b,i,k,c] = z[b,k,i,c], LayerNorm preserves symmetry,
-    so
-      f_a(zn[i,k]) = f_a(zn[k,i])   and   f_b(zn[k,j]) = f_b(zn[j,k]).
-    Substituting into the incoming sum:
-      Σ_k f_a(zn[k,i]) ⊙ f_b(zn[j,k]) = Σ_k f_a(zn[i,k]) ⊙ f_b(zn[k,j])
-    which equals the outgoing sum. The outer gate g[i,j] =
-    sigmoid(gate(z[i,j])) is identical for both since they share weights and
-    receive the same z.
-    """
-    _ = tmi.load_state_dict(tmo.state_dict())
-    with torch.no_grad():
-        out_o = tmo(z_sym)
-        out_i = tmi(z_sym)
-    assert torch.allclose(out_o, out_i, atol=1e-4)
-
-
-# ---------------------------------------------------------------------------
-# Access-pattern sensitivity
-# Output[i,j] = Σ_k a[i,k] ⊙ b[k,j], so it depends on z[i,:] through a
-# and on z[:,j] through b.  Changing row i of z also affects b[i,:], which
-# enters m[i', j] for ALL i' via the k=i summation term.
-# ---------------------------------------------------------------------------
-
-
-def test_tmo_output_row_i_changes_when_row_i_of_z_is_perturbed(
-    tmo: TriangleMultiplicationOutgoing,
-    z_single: Float[torch.Tensor, "B N_res N_res C"],
-) -> None:
-    """Output at row i changes when z[i, :, :] is perturbed.
-
-    (a[i,k] changes for all k)
-    """
-    z_pert = z_single.clone()
-    z_pert[0, 0, :, :] = z_pert[0, 0, :, :] + 5.0
-    with torch.no_grad():
-        out_orig = tmo(z_single)
-        out_pert = tmo(z_pert)
-    assert not torch.allclose(
-        out_orig[0, 0, :, :],
-        out_pert[0, 0, :, :],
-        atol=1e-4,
-    )
-
-
-def test_tmo_output_col_j_changes_when_col_j_of_z_is_perturbed(
-    tmo: TriangleMultiplicationOutgoing,
-    z_single: Float[torch.Tensor, "B N_res N_res C"],
-) -> None:
-    """Output at column j changes when z[:, :, j, :] is perturbed .
-
-    (b[k,j] changes for all k)
-    """
-    z_pert = z_single.clone()
-    z_pert[0, :, 1, :] = z_pert[0, :, 1, :] + 5.0
-    with torch.no_grad():
-        out_orig = tmo(z_single)
-        out_pert = tmo(z_pert)
-    assert not torch.allclose(
-        out_orig[0, :, 1, :],
-        out_pert[0, :, 1, :],
-        atol=1e-4,
-    )
-
-
-def test_tmo_output_other_rows_change_when_row_i_of_z_is_perturbed(
-    tmo: TriangleMultiplicationOutgoing,
-    z_single: Float[torch.Tensor, "B N_res N_res C"],
-) -> None:
-    """Changing row i changes output at row i' != i via b[i, j] in k=i term.
-
-    Even though a[i', k] is independent of z[i, :], b[i, j] enters
-    m[i', j] = Σ_k a[i', k] ⊙ b[k, j] at k=i.  This confirms the full-row
-    dependency that is the hallmark of the outgoing contraction.
-
-    The perturbation must be channel-varying (not a uniform constant shift)
-    because LayerNorm is invariant to uniform additive shifts across channels,
-    which would leave zn — and therefore b — unchanged and make the test
-    trivially pass.
-    """
-    z_pert = z_single.clone()
-    # Channel-varying noise changes relative channel distribution so LayerNorm
-    # cannot cancel it, guaranteeing zn[0,0,:,:] and thus b[0,0,:,:] change.
-    z_pert[0, 0, :, :] = z_pert[0, 0, :, :] + torch.randn(_N, _C) * 5.0
-    with torch.no_grad():
-        out_orig = tmo(z_single)
-        out_pert = tmo(z_pert)
-    # Row i'=1 must also change (b[0, j] contributes to m[1, j] via k=0)
-    assert not torch.allclose(
-        out_orig[0, 1, :, :],
-        out_pert[0, 1, :, :],
-        atol=1e-4,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Type enforcement
-# ---------------------------------------------------------------------------
-
-
-def test_tmo_jaxtyping_rejects_3d_input(
-    tmo: TriangleMultiplicationOutgoing,
-    z_no_batch: Float[torch.Tensor, "N N C"],
-) -> None:
-    """Beartype raises when the batch dimension is missing."""
+    malformed = malformed_scenario.value.malform(z)
     with pytest.raises(TypeCheckError):
-        _ = tmo(z_no_batch)
+        _ = pair_forward(pair_module, malformed)
 
 
-def test_tmo_jaxtyping_rejects_non_square_spatial_dims(
-    tmo: TriangleMultiplicationOutgoing,
-    z_nonsquare: Float[torch.Tensor, "B N M C"],
+@pytest.mark.parametrize(
+    "triangle_scenario",
+    list(TriangleScenario),
+    ids=[case.name for case in TriangleScenario],
+)
+def test_triangle_single_entry_reaches_exactly_its_row_and_column(
+    triangle: TriangleMultiplicationOutgoing | TriangleMultiplicationIncoming,
+    z: Float[torch.Tensor, "B N_res N_res c"],
+    changed_mask: Bool[torch.Tensor, "N_res N_res"],
 ) -> None:
-    """Beartype raises when the two N_res spatial dimensions differ."""
-    with pytest.raises(TypeCheckError):
-        _ = tmo(z_nonsquare)
+    """Perturbing ``z[0, 1]`` changes exactly the positions the scenario lists.
 
+    This pins down the contraction direction: outgoing and incoming reach
+    different rows and columns, so implementing either as the other fails.
+    The perturbation varies across channels, because LayerNorm would cancel
+    a uniform shift.
 
-# ===========================================================================
-# TriangleMultiplicationIncoming
-#
-# The incoming update computes (Algorithm 17, step 3):
-#   m[i,j] = sigmoid(gate(z[i,j])) · proj_out(norm_out(Σ_k a[k,i] ⊙ b[j,k]))
-# where
-#   a[k,i] = sigmoid(gate_a(norm(z)[k,i])) · proj_a(norm(z)[k,i])
-#   b[j,k] = sigmoid(gate_b(norm(z)[j,k])) · proj_b(norm(z)[j,k])
-#
-# Design facts verified below:
-#   • outer gate uses raw z (not LayerNorm'd); proj_a / proj_b see norm(z).
-#   • contraction is Σ_k a[k,i]⊙b[j,k]  ("incoming": column of a, row of b).
-#   • column i of z drives the first output dimension; row j drives the second.
-#   • incoming(z) == outgoing(transpose(z)) when inner gates are pinned to 1.
-#   • with shared weights, incoming(z) == outgoing(z) iff z is symmetric.
-# ===========================================================================
-
-
-# ---------------------------------------------------------------------------
-# Fixtures - TriangleMultiplicationIncoming
-# ---------------------------------------------------------------------------
-
-
-@pytest.fixture
-def tmi() -> TriangleMultiplicationIncoming:
-    """TriangleMultiplicationIncoming(_C, c_hidden=_C_HIDDEN) in eval mode.
-
-    Instantiated with the module-level _C and _C_HIDDEN constants.
+    Args:
+        triangle: Module under test.
+        z: Valid pair embedding.
+        changed_mask: Output positions that must change.
     """
-    return TriangleMultiplicationIncoming(c=_C, c_hidden=_C_HIDDEN).eval()
-
-
-# ---------------------------------------------------------------------------
-# Basic output contracts
-# ---------------------------------------------------------------------------
-
-
-def test_tmi_output_shape(
-    tmi: TriangleMultiplicationIncoming,
-    z_pair: Float[torch.Tensor, "B N_res N_res C"],
-) -> None:
-    """Output shape equals input shape (B, N, N, C)."""
+    perturbed = z.clone()
+    perturbed[:, 0, 1] += 5 * sine_pattern((z.shape[-1],), 1.3)
     with torch.no_grad():
-        out = tmi(z_pair)
-    assert out.shape == z_pair.shape
+        moved = ~torch.isclose(triangle(perturbed), triangle(z), atol=1e-6)
+    changed = reduce(moved.float(), "b i j c -> i j", "max") > 0
+    assert torch.equal(changed, changed_mask)
 
 
-def test_tmi_output_dtype_preserved(
-    tmi: TriangleMultiplicationIncoming,
-    z_pair: Float[torch.Tensor, "B N_res N_res C"],
+@pytest.mark.parametrize(
+    "triangle_scenario",
+    list(TriangleScenario),
+    ids=[case.name for case in TriangleScenario],
+)
+def test_triangle_closed_outer_gate_suppresses_output(
+    triangle: TriangleMultiplicationOutgoing | TriangleMultiplicationIncoming,
+    z: Float[torch.Tensor, "B N_res N_res c"],
 ) -> None:
-    """Output dtype matches input dtype."""
-    with torch.no_grad():
-        out = tmi(z_pair)
-    assert out.dtype == z_pair.dtype
+    """With the outer gate pinned near 0, the output is near 0 everywhere.
 
-
-def test_tmi_output_is_finite(
-    tmi: TriangleMultiplicationIncoming,
-    z_pair: Float[torch.Tensor, "B N_res N_res C"],
-) -> None:
-    """No NaN or Inf in output for a standard random input."""
-    with torch.no_grad():
-        out = tmi(z_pair)
-    assert torch.isfinite(out).all()
-
-
-def test_tmi_gradient_flows_to_input(
-    tmi: TriangleMultiplicationIncoming,
-    z_pair: Float[torch.Tensor, "B N_res N_res C"],
-) -> None:
-    """Loss gradient propagates back to z: non-None and fully finite."""
-    z_g = z_pair.clone().requires_grad_(True)  # noqa: FBT003
-    out = tmi(z_g)
-    torch.autograd.backward([reduce(out, "b i j c -> ", "sum")])
-    assert z_g.grad is not None
-    assert torch.isfinite(z_g.grad).all()
-
-
-# ---------------------------------------------------------------------------
-# Batch independence
-# ---------------------------------------------------------------------------
-
-
-def test_tmi_batch_items_are_independent(
-    tmi: TriangleMultiplicationIncoming,
-) -> None:
-    """Processing two inputs in a batch equals processing them separately."""
-    z1 = torch.randn(1, _N, _N, _C)
-    z2 = torch.randn(1, _N, _N, _C)
-    z_cat = torch.cat([z1, z2], dim=0)
-    with torch.no_grad():
-        out1 = tmi(z1)
-        out2 = tmi(z2)
-        out_cat = tmi(z_cat)
-    assert torch.allclose(out1, out_cat[:1], atol=1e-5)
-    assert torch.allclose(out2, out_cat[1:], atol=1e-5)
-
-
-# ---------------------------------------------------------------------------
-# Gating mechanism
-# ---------------------------------------------------------------------------
-
-
-def test_tmi_gate_near_zero_suppresses_output(
-    tmi: TriangleMultiplicationIncoming,
-    z_pair: Float[torch.Tensor, "B N_res N_res C"],
-) -> None:
-    """Outer gate bias << 0, sigmoid ~ 0,  output ~ 0 for z_pair."""
-    with torch.no_grad():
-        _ = tmi.gate.bias.fill_(-100.0)
-        _ = tmi.gate.weight.fill_(0.0)
-    with torch.no_grad():
-        out = tmi(z_pair)
-    assert out.abs().max().item() < TOLERANCE
-
-
-def test_tmi_gate_near_one_passes_output_through(
-    tmi: TriangleMultiplicationIncoming,
-    z_pair: Float[torch.Tensor, "B N_res N_res C"],
-) -> None:
-    """Outer gate bias >> 0, sigmoid ~ 1, output driven by z_pair."""
-    with torch.no_grad():
-        _ = tmi.gate.bias.fill_(100.0)
-        _ = tmi.gate.weight.fill_(0.0)
-    with torch.no_grad():
-        out = tmi(z_pair)
-    assert out.abs().mean().item() > TIGHT_TOLERANCE
-
-
-# ---------------------------------------------------------------------------
-# Outer gate uses raw z; proj_a / proj_b see LayerNorm(z)
-# ---------------------------------------------------------------------------
-
-
-def test_tmi_gate_responds_to_input_scale(
-    tmi: TriangleMultiplicationIncoming,
-    z_single: Float[torch.Tensor, "B N_res N_res C"],
-) -> None:
-    """Scaling z changes outer gate output even when LayerNorm is invariant.
-
-    Setup: pin gate_a / gate_b to sigmoid ≈ 1 so proj_a / proj_b are
-        scale-invariant.
-    The outer gate still sees raw z and therefore produces different values for
-    z vs 100·z.
+    Args:
+        triangle: Module under test; its gate is pinned here.
+        z: Valid pair embedding.
     """
     with torch.no_grad():
-        _ = tmi.gate_a.bias.fill_(100.0)
-        _ = tmi.gate_a.weight.fill_(0.0)
-        _ = tmi.gate_b.bias.fill_(100.0)
-        _ = tmi.gate_b.weight.fill_(0.0)
-    z_large = 100.0 * z_single
-    with torch.no_grad():
-        out_z = tmi(z_single)
-        out_large = tmi(z_large)
-    assert not torch.allclose(out_z, out_large, atol=1e-4)
+        _ = triangle.gate.weight.fill_(0.0)
+        _ = triangle.gate.bias.fill_(-100.0)
+        out = triangle(z)
+    torch.testing.assert_close(out, torch.zeros_like(out), atol=1e-6, rtol=0)
 
 
-def test_tmi_proj_layers_are_layernorm_scale_invariant(
-    tmi: TriangleMultiplicationIncoming,
-    z_pair: Float[torch.Tensor, "B N_res N_res C"],
+@pytest.mark.parametrize(
+    "triangle_scenario",
+    list(TriangleScenario),
+    ids=[case.name for case in TriangleScenario],
+)
+def test_triangle_outer_gate_sees_unnormalised_input(
+    triangle: TriangleMultiplicationOutgoing | TriangleMultiplicationIncoming,
+    z: Float[torch.Tensor, "B N_res N_res c"],
 ) -> None:
-    """With outer gate pinned to 1, output is identical for z and 2·z.
+    """With inner gates pinned open, scaling ``z`` by 100 changes the output.
 
-    LayerNorm is scale-invariant, so proj_a and proj_b (which receive norm(z))
-    produce the same result for z and 2·z.  Pinning the outer gate removes the
-    only path that sees raw z.
+    The projections see ``LayerNorm(z)``, which is scale-invariant, so the
+    change can only come from the outer gate reading raw ``z``.
+
+    Args:
+        triangle: Module under test; its inner gates are pinned here.
+        z: Valid pair embedding.
     """
     with torch.no_grad():
-        _ = tmi.gate.bias.fill_(100.0)
-        _ = tmi.gate.weight.fill_(0.0)
-    z_scaled = 2.0 * z_pair
-    with torch.no_grad():
-        out_z = tmi(z_pair)
-        out_scaled = tmi(z_scaled)
-    assert torch.allclose(out_z, out_scaled, atol=1e-4)
+        for gate in (triangle.gate_a, triangle.gate_b):
+            _ = gate.weight.fill_(0.0)
+            _ = gate.bias.fill_(100.0)
+        base = triangle(z)
+        scaled = triangle(100.0 * z)
+    assert not torch.allclose(base, scaled, atol=1e-4)
 
 
-# ---------------------------------------------------------------------------
-# Hidden dimension
-# ---------------------------------------------------------------------------
-
-
-def test_tmi_default_c_hidden_equals_c() -> None:
-    """Omitting c_hidden defaults to c (proj_a, proj_out, norm_out)."""
-    m = TriangleMultiplicationIncoming(c=_C).eval()
-    assert m.proj_a.weight.shape == (_C, _C)
-    assert m.proj_out.weight.shape == (_C, _C)
-    assert m.norm_out.normalized_shape == (_C,)
-
-
-def test_tmi_custom_c_hidden_output_shape_is_c(
-    z_single: Float[torch.Tensor, "B N_res N_res C"],
+@pytest.mark.parametrize(
+    "triangle_scenario",
+    list(TriangleScenario),
+    ids=[case.name for case in TriangleScenario],
+)
+def test_triangle_projections_are_scale_invariant(
+    triangle: TriangleMultiplicationOutgoing | TriangleMultiplicationIncoming,
+    z: Float[torch.Tensor, "B N_res N_res c"],
 ) -> None:
-    """c_hidden ≠ c: output depth remains c; internal proj are c_hidden."""
-    m = TriangleMultiplicationIncoming(c=_C, c_hidden=4).eval()
+    """With the outer gate pinned open, ``z`` and ``2 z`` give equal output.
+
+    Pinning the outer gate removes the only path that reads raw ``z``; the
+    rest sees ``LayerNorm(z)``, which ignores scale.
+
+    Args:
+        triangle: Module under test; its outer gate is pinned here.
+        z: Valid pair embedding.
+    """
     with torch.no_grad():
-        out = m(z_single)
-    assert out.shape == (1, _N, _N, _C)
-    assert m.proj_a.weight.shape == (4, _C)
-    assert m.norm_out.normalized_shape == (4,)
-    assert m.proj_out.weight.shape == (_C, 4)
+        _ = triangle.gate.weight.fill_(0.0)
+        _ = triangle.gate.bias.fill_(100.0)
+        base = triangle(z)
+        scaled = triangle(2.0 * z)
+    torch.testing.assert_close(base, scaled, atol=1e-4, rtol=0)
 
 
-# ---------------------------------------------------------------------------
-# Contraction direction: incoming vs outgoing
-# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "triangle_scenario",
+    list(TriangleScenario),
+    ids=[case.name for case in TriangleScenario],
+)
+@pytest.mark.parametrize(
+    ("c_hidden", "expected_hidden"),
+    [pytest.param(None, 16, id="default"), pytest.param(4, 4, id="custom")],
+)
+def test_triangle_c_hidden_sets_internal_width_only(
+    triangle_scenario: TriangleScenario,
+    dims: PairDims,
+    z: Float[torch.Tensor, "B N_res N_res c"],
+    c_hidden: int | None,
+    expected_hidden: int,
+) -> None:
+    """``c_hidden`` sizes the projections; omitted, it defaults to ``c``.
+
+    The output width stays ``c`` either way.
+
+    Args:
+        triangle_scenario: Direction to build.
+        dims: Supplies ``c = 16``.
+        z: Valid pair embedding.
+        c_hidden: Value passed to the constructor.
+        expected_hidden: Internal width the module must use.
+    """
+    module = triangle_scenario.value.build(dims.c, c_hidden)
+    with torch.no_grad():
+        out = module.eval()(z)
+    assert module.proj_a.weight.shape == (expected_hidden, dims.c)
+    assert module.norm_out.normalized_shape == (expected_hidden,)
+    assert module.proj_out.weight.shape == (dims.c, expected_hidden)
+    assert out.shape == z.shape
 
 
-def test_tmi_differs_from_outgoing_for_asymmetric_input(
+@pytest.mark.parametrize(
+    "symmetry_scenario",
+    list(SymmetryScenario),
+    ids=[case.name for case in SymmetryScenario],
+)
+def test_directions_agree_only_on_symmetric_input(
     tmo: TriangleMultiplicationOutgoing,
     tmi: TriangleMultiplicationIncoming,
-    z_single: Float[torch.Tensor, "B N_res N_res C"],
+    symmetry_scenario: SymmetryScenario,
+    direction_input: Float[torch.Tensor, "B N_res N_res c"],
 ) -> None:
-    """Same weights, different contractions, different output for asymmetric z.
+    """With shared weights, outgoing equals incoming iff ``z`` is symmetric.
 
-    Incoming:  Σ_k a[k,i] ⊙ b[j,k]
-    Outgoing:  Σ_k a[i,k] ⊙ b[k,j]
-    These are not equal when z is not spatially symmetric.
+    For ``z[i, k] = z[k, i]``, LayerNorm keeps the symmetry, so
+    ``a[k, i] = a[i, k]`` and ``b[j, k] = b[k, j]`` and the incoming sum
+    ``Σ_k a[k, i] b[j, k]`` becomes the outgoing ``Σ_k a[i, k] b[k, j]``.
+    The outer gate reads the same ``z[i, j]`` in both.
+
+    Args:
+        tmo: Outgoing module.
+        tmi: Incoming module with ``tmo``'s weights.
+        symmetry_scenario: Whether the input is symmetric and whether the
+            two directions must then agree.
+        direction_input: Pair embedding built for ``symmetry_scenario``.
     """
-    _ = tmo.load_state_dict(tmi.state_dict())
     with torch.no_grad():
-        out_i = tmi(z_single)
-        out_o = tmo(z_single)
-    assert not torch.allclose(out_i, out_o, atol=1e-4)
+        out_tmo = tmo(direction_input)
+        out_tmi = tmi(direction_input)
+    agree = torch.allclose(out_tmo, out_tmi, atol=1e-4)
+    assert agree == symmetry_scenario.value.directions_agree
 
 
-def test_tmi_equals_outgoing_for_symmetric_input_with_shared_weights(
+def test_incoming_equals_outgoing_of_transpose_with_gates_pinned(
     tmo: TriangleMultiplicationOutgoing,
     tmi: TriangleMultiplicationIncoming,
-    z_sym: Float[torch.Tensor, "B N_res N_res C"],
+    z: Float[torch.Tensor, "B N_res N_res c"],
 ) -> None:
-    """For spatially symmetric z, incoming == outgoing when weights are shared.
+    """``incoming(z) == outgoing(zᵀ)`` once all gates are constant.
 
-    With z[b,k,i,c] = z[b,i,k,c], LayerNorm preserves symmetry so a[k,i] =
-    a[i,k] and b[j,k] = b[k,j].  Substituting into the incoming sum:
-      Σ_k a[k,i] ⊙ b[j,k] = Σ_k a[i,k] ⊙ b[k,j]  (= outgoing sum).
-    The outer gate g[i,j] is identical for both (shared weights, same z).
+    With every gate pinned, incoming gives ``Σ_k p_a(zn[k, i]) p_b(zn[j, k])``
+    and outgoing on ``zᵀ`` gives ``Σ_k p_a(zn[k, i]) p_b(zn[j, k])`` too,
+    since ``LN(zᵀ[i, k]) = LN(z[k, i])``. This fails if either contraction
+    were implemented as the other. Not parametrized: it is one identity
+    relating the two directions.
+
+    Args:
+        tmo: Outgoing module; its gates are pinned here.
+        tmi: Incoming module with ``tmo``'s weights; gates pinned here.
+        z: Asymmetric pair embedding.
     """
-    _ = tmo.load_state_dict(tmi.state_dict())
     with torch.no_grad():
-        out_i = tmi(z_sym)
-        out_o = tmo(z_sym)
-    assert torch.allclose(out_i, out_o, atol=1e-4)
+        for module in (tmo, tmi):
+            for gate in (module.gate, module.gate_a, module.gate_b):
+                _ = gate.weight.fill_(0.0)
+                _ = gate.bias.fill_(100.0)
+        incoming = tmi(z)
+        outgoing_t = tmo(rearrange(z, "b i j c -> b j i c"))
+    torch.testing.assert_close(incoming, outgoing_t, atol=1e-5, rtol=0)
 
 
-def test_tmi_incoming_z_equals_outgoing_transposed_z_when_inner_gates_pinned(
-    tmo: TriangleMultiplicationOutgoing,
-    tmi: TriangleMultiplicationIncoming,
-    z_single: Float[torch.Tensor, "B N_res N_res C"],
-) -> None:
-    """incoming(z) == outgoing(transpose(z)) when all inner gates pinned to 1.
-
-    Mathematical identity: with gate_a and gate_b pinned (sigmoid ≈ 1), the
-    inner sums reduce to:
-      incoming m[i,j]         = Σ_k proj_a(zn[k,i]) ⊙ proj_b(zn[j,k])
-      outgoing m[i,j] on z_T  = Σ_k proj_a(zn_T[i,k]) ⊙ proj_b(zn_T[k,j])
-                               = Σ_k proj_a(zn[k,i]) ⊙ proj_b(zn[j,k]) ←
-                               identical
-    (because zn_T[i,k] = LN(z_T[i,k]) = LN(z[k,i]) = zn[k,i]). With the outer
-    gate also pinned (gate.weight=0 makes sigmoid constant for both inputs),
-    the final outputs match exactly.  This test would fail if either
-    contraction were implemented as the other.
-    """
-    _ = tmo.load_state_dict(tmi.state_dict())
-
-    with torch.no_grad():
-        _ = tmi.gate.weight.fill_(0.0)
-        _ = tmi.gate.bias.fill_(100.0)
-        _ = tmi.gate_a.weight.fill_(0.0)
-        _ = tmi.gate_a.bias.fill_(100.0)
-        _ = tmi.gate_b.weight.fill_(0.0)
-        _ = tmi.gate_b.bias.fill_(100.0)
-        _ = tmo.gate.weight.fill_(0.0)
-        _ = tmo.gate.bias.fill_(100.0)
-        _ = tmo.gate_a.weight.fill_(0.0)
-        _ = tmo.gate_a.bias.fill_(100.0)
-        _ = tmo.gate_b.weight.fill_(0.0)
-        _ = tmo.gate_b.bias.fill_(100.0)
-
-    z_T = rearrange(z_single, "b i j c -> b j i c")
-
-    with torch.no_grad():
-        out_incoming = tmi(z_single)
-        out_outgoing_T = tmo(z_T)
-
-    assert torch.allclose(out_incoming, out_outgoing_T, atol=1e-5)
-
-
-# ---------------------------------------------------------------------------
-# Access-pattern sensitivity (incoming is the TRANSPOSE of outgoing)
-#
-# m[i,j] = Σ_k a[k,i] ⊙ b[j,k], so:
-#   • a[k,i] derives from z[:,i,:] → column i of z drives first output dim.
-#   • b[j,k] derives from z[j,:,:] → row j of z drives second output dim.
-# Contrast with outgoing, where row i drives first dim and column j the second.
-# ---------------------------------------------------------------------------
-
-
-def test_tmi_output_first_dim_i_changes_when_column_i_of_z_is_perturbed(
-    tmi: TriangleMultiplicationIncoming,
-    z_single: Float[torch.Tensor, "B N_res N_res C"],
-) -> None:
-    """Out at first-dim index i changes when z[:, :, i, :] (column i) changed.
-
-    a[k, i] = f_a(zn[k, i]) depends on z[:, :, i, :] for all k.
-    m[i, j] = Σ_k a[k, i] ⊙ b[j, k] therefore changes for all j.
-    """
-    z_pert = z_single.clone()
-    z_pert[0, :, 0, :] = z_pert[0, :, 0, :] + 5.0
-    with torch.no_grad():
-        out_orig = tmi(z_single)
-        out_pert = tmi(z_pert)
-    assert not torch.allclose(
-        out_orig[0, 0, :, :],
-        out_pert[0, 0, :, :],
-        atol=1e-4,
-    )
-
-
-def test_tmi_output_second_dim_j_changes_when_row_j_of_z_is_perturbed(
-    tmi: TriangleMultiplicationIncoming,
-    z_single: Float[torch.Tensor, "B N_res N_res C"],
-) -> None:
-    """Out at second-dim index j changes when z[:, j, :, :] (row j) perturbed.
-
-    b[j, k] = f_b(zn[j, k]) depends on z[:, j, :, :] for all k.
-    m[i, j] = Σ_k a[k, i] ⊙ b[j, k] therefore changes for all i.
-    """
-    z_pert = z_single.clone()
-    z_pert[0, 1, :, :] = z_pert[0, 1, :, :] + 5.0
-    with torch.no_grad():
-        out_orig = tmi(z_single)
-        out_pert = tmi(z_pert)
-    assert not torch.allclose(
-        out_orig[0, :, 1, :],
-        out_pert[0, :, 1, :],
-        atol=1e-4,
-    )
-
-
-def test_tmi_output_other_first_dims_change_when_column_i_of_z_is_perturbed(
-    tmi: TriangleMultiplicationIncoming,
-    z_single: Float[torch.Tensor, "B N_res N_res C"],
-) -> None:
-    """Chnaging column i changes output at first-dim i' ≠ i via b[j, i] at k=i.
-
-    m[i', j] = Σ_k a[k, i'] ⊙ b[j, k].  At k=i the term b[j, i] = f_b(zn[j, i])
-    changes when z[:, :, i, :] is perturbed, propagating to ALL first-dim
-    indices. This cross-column spread is the hallmark of the incoming
-    contraction (the transpose of outgoing's cross-row spread).
-
-    A channel-varying perturbation is used so LayerNorm cannot cancel the
-    shift.
-    """
-    z_pert = z_single.clone()
-    z_pert[0, :, 0, :] = z_pert[0, :, 0, :] + torch.randn(_N, _C) * 5.0
-    with torch.no_grad():
-        out_orig = tmi(z_single)
-        out_pert = tmi(z_pert)
-    # First-dim i'=1 must also change (b[j, 0] contributes to m[1, j] via k=0)
-    assert not torch.allclose(
-        out_orig[0, 1, :, :],
-        out_pert[0, 1, :, :],
-        atol=1e-4,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Type enforcement
-# ---------------------------------------------------------------------------
-
-
-def test_tmi_jaxtyping_rejects_3d_input(
-    tmi: TriangleMultiplicationIncoming,
-    z_no_batch: Float[torch.Tensor, "N N C"],
-) -> None:
-    """Beartype raises when the batch dimension is missing."""
-    with pytest.raises(TypeCheckError):
-        _ = tmi(z_no_batch)
-
-
-def test_tmi_jaxtyping_rejects_non_square_spatial_dims(
-    tmi: TriangleMultiplicationIncoming,
-    z_nonsquare: Float[torch.Tensor, "B N M C"],
-) -> None:
-    """Beartype raises when the two N_res spatial dimensions differ."""
-    with pytest.raises(TypeCheckError):
-        _ = tmi(z_nonsquare)
-
-
-# ---------------------------------------------------------------------------
-# Shape-contract enforcement — negative tests
-# ---------------------------------------------------------------------------
-
-
-def test_triangle_mult_outgoing_forward_wrong_shape(
-    tmo: TriangleMultiplicationOutgoing,
-    z_3d: Float[torch.Tensor, "B N_RES N_RES"],
-) -> None:
-    """Wrong z ndim (3-D instead of 4-D) triggers TypeCheckError."""
-    with pytest.raises(TypeCheckError):
-        _ = tmo(z_3d)
-
-
-def test_triangle_mult_incoming_forward_wrong_shape(
-    tmi: TriangleMultiplicationIncoming,
-    z_3d: Float[torch.Tensor, "B N_RES N_RES"],
-) -> None:
-    """Wrong z ndim (3-D instead of 4-D) triggers TypeCheckError."""
-    with pytest.raises(TypeCheckError):
-        _ = tmi(z_3d)
-
-
-def test_pairformer_block_forward_wrong_shape(
+def test_block_pair_only_changes_z_and_returns_no_single(
     block: PairformerBlock,
-    z_3d: Float[torch.Tensor, "B N_RES N_RES"],
+    z: Float[torch.Tensor, "B N_res N_res c"],
 ) -> None:
-    """Wrong z ndim (3-D instead of 4-D) triggers TypeCheckError."""
-    with pytest.raises(TypeCheckError):
-        _ = block(None, z_3d)
+    """With ``s=None`` the block returns ``(None, z_out)`` with ``z_out != z``.
+
+    Not parametrized: the single-track case is tested separately because
+    it returns a different structure.
+
+    Args:
+        block: Pair-only block.
+        z: Valid pair embedding.
+    """
+    with torch.no_grad():
+        s_out, z_out = block(None, z)
+    assert s_out is None
+    assert z_out.shape == z.shape
+    assert not torch.allclose(z_out, z)
 
 
-def test_pairformer_stack_forward_wrong_shape(
+def test_block_single_track_updates_s(
+    dims: PairDims,
+    single_track_block: PairformerBlock,
+    s: Float[torch.Tensor, "B N_res c_res"],
+    z: Float[torch.Tensor, "B N_res N_res c"],
+) -> None:
+    """With ``c_res`` set, the block also returns an updated, finite ``s``.
+
+    Not parametrized: one block with a single track covers the branch that
+    adds attention with pair bias and a second transition to ``s``.
+
+    Args:
+        dims: Expected sizes.
+        single_track_block: Block built with ``c_res``.
+        s: Valid single embedding.
+        z: Valid pair embedding.
+    """
+    with torch.no_grad():
+        s_out, z_out = single_track_block(s, z)
+    assert s_out is not None
+    assert s_out.shape == (dims.batch, dims.n_res, dims.c_res)
+    assert torch.isfinite(s_out).all()
+    assert not torch.allclose(s_out, s)
+    assert z_out.shape == z.shape
+
+
+def test_stack_applies_its_blocks_in_order(
+    dims: PairDims,
     stack: PairformerStack,
-    z_3d: Float[torch.Tensor, "B N_RES N_RES"],
+    z: Float[torch.Tensor, "B N_res N_res c"],
 ) -> None:
-    """Wrong z ndim (3-D instead of 4-D) triggers TypeCheckError."""
-    with pytest.raises(TypeCheckError):
-        _ = stack(None, z_3d)
+    """The stack equals running its own blocks one after another.
+
+    Shows the activation-checkpointing wrapper adds nothing and that the
+    stack holds ``n_blocks`` blocks. Not parametrized: the composition is
+    the same for any block count.
+
+    Args:
+        dims: Supplies ``n_blocks``.
+        stack: Pair-only stack.
+        z: Valid pair embedding.
+    """
+    expected = z
+    with torch.no_grad():
+        for blk in stack.blocks:
+            _, expected = blk(None, expected)
+        out = stack(None, z)
+    assert len(stack.blocks) == dims.n_blocks
+    torch.testing.assert_close(out, expected, atol=1e-6, rtol=0)
+
+
+def test_block_rejects_heads_that_do_not_divide_width(dims: PairDims) -> None:
+    """``c_pair`` not divisible by ``n_heads`` raises at construction.
+
+    Not parametrized: the check is a single modulus, so one indivisible
+    pair covers it.
+
+    Args:
+        dims: Supplies a valid ``n_heads``.
+    """
+    with pytest.raises(InvalidPairHeadDimensionError, match="divisible"):
+        _ = PairformerBlock(dims.n_heads + 2, None, dims.n_heads)
