@@ -153,6 +153,15 @@ Rules that must stay on, and why:
   functions, components and hooks also annotate every parameter.
 - **`no-nested-ternary`, `unicorn/no-nested-ternary`:** nested ternaries in
   JSX are hard to read; use a named variable or an early return instead.
+- **`func-style: ["error", "declaration"]`:** named functions, including
+  components, hooks and handlers, are `function` declarations, not
+  `const foo = () => …`. This follows the Google guide, reads like a Python
+  `def`, and keeps names in stack traces. If we choose
+  `eslint-plugin-react`, `react/function-component-definition`
+  (`namedComponents: "function-declaration"`) enforces the same for
+  components.
+- **`prefer-arrow-callback`:** callbacks passed to other functions are
+  arrows, not `function` expressions.
 
 ESLint runs with `--max-warnings 0`, so there is no "warning" tier.
 
@@ -191,6 +200,13 @@ These go in a frontend `CLAUDE.md` and play the role of the "never `Any`,
   JSX, not nested ternaries. Every hook call comes before the first early
   return: a `return` above a `useState` or `useEffect` breaks the Rules of
   Hooks.
+- Named functions, components, hooks and handlers are `function`
+  declarations. Arrows are for short callbacks such as
+  `users.map((user) => user.name)`.
+- Inline arrows in JSX are only for passing an argument, usually in a
+  list: `onClick={() => { onSelect(user.id); }}`. If one grows beyond
+  that, move the row into its own component with a named handler.
+  `react/jsx-no-bind` stays off, because this case needs inline arrows.
 
 ## Testing
 
