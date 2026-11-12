@@ -144,6 +144,15 @@ Rules that must stay on, and why:
   refactor and grep reliably.
 - **`eslint-plugin-testing-library`, `@vitest/eslint-plugin`:** tests query
   by role and text, not implementation details.
+- **`@typescript-eslint/explicit-function-return-type`** with
+  `allowExpressions: true` and `allowTypedFunctionExpressions: true`: every
+  named function, exported or not, declares its return type, like ruff's
+  `ANN` rules. Inline callbacks (JSX handlers, `.map` arguments) are exempt,
+  because their type comes from context and is never part of an API.
+- **`@typescript-eslint/explicit-module-boundary-types`:** exported
+  functions, components and hooks also annotate every parameter.
+- **`no-nested-ternary`, `unicorn/no-nested-ternary`:** nested ternaries in
+  JSX are hard to read; use a named variable or an early return instead.
 
 ESLint runs with `--max-warnings 0`, so there is no "warning" tier.
 
@@ -162,6 +171,26 @@ These go in a frontend `CLAUDE.md` and play the role of the "never `Any`,
 - UI states are discriminated unions
   (`{status: "loading"} | {status: "error"; error: Error} | {status: "ok"; data: T}`),
   not several independent booleans.
+- Event handlers that don't use the event don't accept it:
+  `function handleOpen(): void`, passed as `onClick={handleOpen}`.
+- When a handler needs one value from the event, read it inline and pass a
+  plain value on, e.g.
+  `onChange={(event) => { updateName(event.currentTarget.value); }}`.
+  The logic then lives in a function such as `updateName(name: string)`
+  that can be tested without rendering.
+- A component's own callback props are domain-level, e.g.
+  `onSelect: (userId: string) => void`, not DOM handler types such as
+  `React.MouseEventHandler<HTMLButtonElement>`.
+- When a named handler really needs the event (`preventDefault`, keyboard
+  handling), annotate the parameter:
+  `function handleKeyDown(event: React.KeyboardEvent<HTMLInputElement>): void`.
+- Components that wrap a native element extend its props
+  (`interface ButtonProps extends React.ComponentProps<"button">`) instead
+  of retyping them.
+- Conditional rendering goes in named variables or early returns above the
+  JSX, not nested ternaries. Every hook call comes before the first early
+  return: a `return` above a `useState` or `useEffect` breaks the Rules of
+  Hooks.
 
 ## Testing
 
