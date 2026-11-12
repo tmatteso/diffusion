@@ -1,24 +1,29 @@
 """Tests for the training loop.
 
-Covers to_protein_batch_dynamic, wavg helpers, take_step, process_accum_window,
-component_grad_norms, optimizer_step, evaluate, save/load checkpoint,
-log_epoch, and the end-to-end train() function including gradient
-accumulation and W&B logging.
+Covers take_step in eval and train mode (including gradient scaling and
+gradient reach), process_accum_window's protein-weighted scaling,
+component_grad_norms, optimizer_step with its EMA update, evaluate,
+swapped_in_ema_weights with and without DDP and on error, checkpoint
+save/load, log_epoch's W&B gating, the AlphaFold learning-rate schedule
+through a real LambdaLR, token-budget validation, and train() end to end.
+
+The model, distograms, configuration and loaders are all built by
+module-scoped factory fixtures from one ``TrainModelConfig``, so the trunk
+and the data agree by construction. Each ``train()`` scenario runs once per
+module and the tests read a frozen record of it.
 """
 
-import contextlib
 import copy
 import dataclasses
-import functools
+import enum
 import hashlib
 import json
 import multiprocessing
 import pathlib
-from collections.abc import Callable, Generator
 from datetime import timedelta
-from enum import Enum
 from multiprocessing.queues import SimpleQueue
-from typing import cast
+from typing import Protocol, cast
+from unittest import mock
 
 import numpy as np
 import pytest
@@ -37,6 +42,7 @@ from helpers.atom_utils import (
 from helpers.data import (
     Distogram,
     FeaturizedBatch,
+    build_distogram_module,
     featurize_batch,
     make_bucketed_data_loaders,
 )
@@ -49,7 +55,7 @@ from helpers.useful_objects import (
     ThroughputStatistics,
     manual_seed,
 )
-from jaxtyping import Float
+from jaxtyping import Bool, Float
 from pydantic import ValidationError
 from structlog.typing import FilteringBoundLogger
 from torch.multiprocessing.spawn import spawn
@@ -72,6 +78,7 @@ from train.train_config import (
 )
 from train.train_loop import (
     alphafold_lr_lambda,
+    build_lr_scheduler,
     component_grad_norms,
     evaluate,
     load_checkpoint,
@@ -85,527 +92,602 @@ from train.train_loop import (
     train,
 )
 
-_ = manual_seed(42)
 
+@dataclasses.dataclass(frozen=True)
+class TrainModelConfig:
+    """The model and distogram settings every fixture builds from.
 
-_N_KEEP = 16
-_C_RES = 32
-_C_ATOM = 32
-_C_PAIR = 32
-_C_ATOMPAIR = 16
-_F_REF_DIM = 35
-_N_BINS = 8
-_N_ATOM_BINS = 5
-_K_UNIT = 1
-_BATCH_TOKENS: int = _N_KEEP
-
-N_BLOCKS_ATOM_TRANSFORMER_ENCODER = 3
-N_HEADS_ATOM_TRANSFORMER_ENCODER = 4
-N_BLOCKS_ATOM_TRANSFORMER_DECODER = 3
-N_HEADS_ATOM_TRANSFORMER_DECODER = 4
-N_PAIRFORMER_BLOCKS_TEMPLATE_EMBEDDER = 2
-N_PAIFORMER_HEADS_TEMPLATE_EMBEDDER = 16
-SIGMA_DATA = 16.0
-N_AMINO = RESTYPE_NUM_NO_X
-RESIDUE_NUMBER = 50
-
-EPOCH = 7
-LEARNING_RATE = 1e-4
-TOLERANCE = 1e-5
-TIGHT_TOLERANCE = 1e-3
-EXPECTED_CHECKPOINT_KEYS = frozenset(
-    {"model", "optimizer", "scheduler", "ema", "best_val_loss"},
-)
-_ADAM_EXP_AVG_KEY = "exp_avg"
-
-
-def _make_model_params(
-    trunk: MainTrunk | DDP,
-    train_cfg: TrainConfig,
-    dgram_template: Distogram,
-    dgram_residue: Distogram,
-    dgram_atom: Distogram,
-) -> ModelSetup:
-    """Construct a ModelSetup with Adam optimizer, AlphaFold-style scheduler.
-
-    Args:
-        trunk: The MainTrunk to wrap.
-        train_cfg: Training configuration.
-        dgram_template: Self-conditioning template distogram module.
-        dgram_residue: Residue-level distogram module.
-        dgram_atom: Atom-level distogram module.
-
-    Returns:
-        Fully initialised ModelSetup.
+    Attributes:
+        model: Small trunk sizes, fast on CPU.
+        template: Self-conditioning template distogram.
+        residue: Residue-level distogram head.
+        atom: Atom-level distogram head.
+        noise: Noise schedule.
     """
-    optimizer = Adam(trunk.parameters(), lr=train_cfg.training.lr)
-    scheduler = LambdaLR(
-        optimizer,
-        lr_lambda=functools.partial(
-            alphafold_lr_lambda,
-            warmup_steps=train_cfg.training.lr_warmup_steps,
-            decay_steps=train_cfg.training.lr_decay_steps,
-            decay_factor=train_cfg.training.lr_decay_factor,
-        ),
-    )
-    return ModelSetup(
-        model=trunk,
-        tcfg=train_cfg,
-        distogram_template=dgram_template,
-        distogram_residue=dgram_residue,
-        distogram_atom=dgram_atom,
-        device=torch.device("cpu"),
-        optimizer=optimizer,
-        scheduler=scheduler,
-        ema=EMA(trunk, decay=train_cfg.training.ema_decay),
-    )
+
+    model: ModelParams
+    template: TemplateDistogramParams
+    residue: ResidueDistogramParams
+    atom: AtomDistogramParams
+    noise: NoiseScheduleParams
 
 
-def _make_model() -> MainTrunk:
-    """Build a small MainTrunk for training loop tests.
+@dataclasses.dataclass(frozen=True)
+class Distograms:
+    """The three distogram modules a ModelSetup carries.
 
-    Returns:
-        MainTrunk built with reduced channel widths and block counts to keep
-        tests fast on CPU.
+    Attributes:
+        template: Self-conditioning template distogram.
+        residue: Residue-level distogram.
+        atom: Atom-level distogram.
     """
-    return MainTrunk(
-        model_params=ModelParams(
-            f_ref_dim=_F_REF_DIM,
-            c_atom=_C_ATOM,
-            c_pair=_C_PAIR,
-            c_res=_C_RES,
-            c_atompair=_C_ATOMPAIR,
-            K_unit=_K_UNIT,
-            n_blocks_atom_transformer_encoder=N_BLOCKS_ATOM_TRANSFORMER_ENCODER,
-            n_heads_atom_transformer_encoder=N_HEADS_ATOM_TRANSFORMER_ENCODER,
-            n_blocks_atom_transformer_decoder=N_BLOCKS_ATOM_TRANSFORMER_DECODER,
-            n_heads_atom_transformer_decoder=N_HEADS_ATOM_TRANSFORMER_DECODER,
-            n_pairformer_blocks_template_embedder=N_PAIRFORMER_BLOCKS_TEMPLATE_EMBEDDER,
-            n_paiformer_heads_template_embedder=N_HEADS_ATOM_TRANSFORMER_DECODER,
-            n_amino=N_AMINO,
-            max_residues=RESIDUE_NUMBER,
-        ),
-        template_distogram_params=TemplateDistogramParams(
-            n_bins=_N_BINS,
-            min_dist=3.25,
-            max_dist=50.75,
-        ),
-        residue_distogram_params=ResidueDistogramParams(
-            n_bins=_N_BINS,
-            min_dist=2.0,
-            max_dist=22.0,
-        ),
-        atom_distogram_params=AtomDistogramParams(
-            n_bins=_N_ATOM_BINS,
-            min_dist=0.0,
-            max_dist=10.0,
-        ),
-        noise_params=NoiseScheduleParams(
-            sigma_data=SIGMA_DATA,
-        ),
-    )
+
+    template: Distogram
+    residue: Distogram
+    atom: Distogram
 
 
-def _make_distogram_template() -> Distogram:
-    """Build the self-conditioning template Distogram in eval mode.
+@dataclasses.dataclass(frozen=True)
+class TrainCase:
+    """Training settings for one configuration.
 
-    Returns:
-        Distogram configured for template Cβ distances, set to eval mode.
-    """
-    return Distogram(
-        n_bins=_N_BINS,
-        min_dist=3.25,
-        max_dist=50.75,
-        overflow_bin=False,
-    ).eval()
-
-
-def _make_distogram_residue() -> Distogram:
-    """Build the residue-level Distogram in eval mode.
-
-    Returns:
-        Distogram configured for residue Cβ distances, set to eval mode.
-    """
-    return Distogram(
-        n_bins=_N_BINS,
-        min_dist=2.0,
-        max_dist=22.0,
-        overflow_bin=False,
-    ).eval()
-
-
-def _make_distogram_atom() -> Distogram:
-    """Build the atom-level Distogram in eval mode.
-
-    Returns:
-        Distogram configured for short-range atom distances, set to eval mode.
-    """
-    return Distogram(
-        n_bins=_N_ATOM_BINS,
-        min_dist=0.0,
-        max_dist=10.0,
-        overflow_bin=False,
-    ).eval()
-
-
-def _make_tcfg(
-    checkpoint_path: pathlib.Path,
-    *,
-    num_epochs: int = 1,
-    grad_clip: float | None = 1.0,
-    accumulated_token_budget: int = _BATCH_TOKENS,
-    use_wandb: bool = False,
-) -> TrainConfig:
-    """Build a TrainConfig for the small test model.
-
-    Args:
-        checkpoint_path: Where the best checkpoint is written.
+    Attributes:
         num_epochs: Number of training epochs.
-        grad_clip: Gradient clipping threshold, or None to disable clipping.
-        accumulated_token_budget: Tokens accumulated before an optimizer step.
-        use_wandb: Whether to log to W&B.
-
-    Returns:
-        TrainConfig with the module's small model channel widths.
+        token_budget: Tokens accumulated before an optimizer step.
+        grad_clip: Gradient clipping threshold, or None to disable it.
+        use_wandb: Whether W&B logging is enabled.
     """
-    return TrainConfig(
-        training=TrainingParams(
-            num_epochs=num_epochs,
-            lr=LEARNING_RATE,
-            grad_clip=grad_clip,
-            accumulated_token_budget=accumulated_token_budget,
-        ),
-        model=ModelParams(
-            f_ref_dim=_F_REF_DIM,
-            c_atom=_C_ATOM,
-            c_pair=_C_PAIR,
-            c_res=_C_RES,
-            c_atompair=_C_ATOMPAIR,
-            K_unit=_K_UNIT,
-        ),
-        checkpoint=CheckpointParams(
-            checkpoint_path=checkpoint_path,
-            save_every=100,
-        ),
-        logging=LoggingParams(use_wandb=use_wandb),
+
+    num_epochs: int
+    token_budget: int
+    grad_clip: float | None
+    use_wandb: bool
+
+
+class TrainScenario(enum.Enum):
+    """Configurations ``train()`` runs under, each run once per module.
+
+    A real epoch takes seconds, so ``recorded_train_runs`` runs each
+    member once and every test reads the record. Tests share this enum
+    rather than subclassing it, because members of separate subclasses are
+    separate parameters and would each trigger their own run.
+
+    Every budget, including ``large_token_budget``'s, is below the 168
+    tokens of the two synthetic train batches (84 each). So each epoch
+    flushes the first batch when the second arrives, and flushes the
+    second at the end of the epoch: two optimizer steps per epoch.
+
+    Members:
+        default_budget: One epoch with clipping on and W&B off.
+        no_grad_clip: As ``default_budget`` with clipping disabled.
+        large_token_budget: A budget above one batch's tokens, W&B on.
+        multi_epoch: Two epochs with W&B on, the fewest that can show the
+            logged epoch advancing.
+    """
+
+    default_budget = TrainCase(1, 16, 1.0, use_wandb=False)
+    no_grad_clip = TrainCase(1, 16, None, use_wandb=False)
+    large_token_budget = TrainCase(1, 160, 1.0, use_wandb=True)
+    multi_epoch = TrainCase(2, 16, 1.0, use_wandb=True)
+
+
+@dataclasses.dataclass(frozen=True)
+class TrainRun:
+    """What one ``train()`` run did, recorded once per scenario.
+
+    Attributes:
+        parameters_changed: True if any model parameter changed.
+        reduced_metrics: Every instance ``all_reduce_mean()`` was called on.
+        wandb_payloads: One dict per ``wandb.log`` call.
+        checkpoint: The saved checkpoint, loaded back from disk.
+        num_epochs: Number of epochs the run was configured for.
+    """
+
+    parameters_changed: bool
+    reduced_metrics: list[TensorAccumulatorMixin]
+    wandb_payloads: list[dict[str, object]]
+    checkpoint: dict[str, dict[str, object]]
+    num_epochs: int
+
+
+@dataclasses.dataclass(frozen=True)
+class Loaders:
+    """Train and test loaders over the synthetic proteins.
+
+    Attributes:
+        train: Bucketed training loader.
+        test: Evaluation loader.
+    """
+
+    train: torch.utils.data.DataLoader[FeaturizedBatch]
+    test: torch.utils.data.DataLoader[FeaturizedBatch]
+
+
+@dataclasses.dataclass(frozen=True)
+class SwapSetup:
+    """A setup ready for ``swapped_in_ema_weights``, with reference weights.
+
+    Attributes:
+        setup: Setup whose model may be DDP-wrapped.
+        inner: The underlying MainTrunk, read for its live weights.
+        raw: The trunk's weights before the swap.
+        shadow: The EMA shadow before the swap.
+    """
+
+    setup: ModelSetup
+    inner: MainTrunk
+    raw: dict[str, Float[torch.Tensor, "..."]]
+    shadow: dict[str, Float[torch.Tensor, "..."]]
+
+
+@dataclasses.dataclass(frozen=True)
+class GateCase:
+    """``log_epoch`` flags and how many ``wandb.log`` calls they allow.
+
+    Attributes:
+        do_log: Value of ``log_epoch``'s ``do_log``.
+        use_wandb: Value of ``logging.use_wandb``.
+        calls: Expected number of ``wandb.log`` calls.
+    """
+
+    do_log: bool
+    use_wandb: bool
+    calls: int
+
+
+class WandbGate(enum.Enum):
+    """Flag combinations for ``log_epoch``.
+
+    Members:
+        do_log_false: Logging suppressed for this epoch, W&B on.
+        wandb_disabled: Logging requested, W&B off.
+        wandb_enabled: Logging requested, W&B on: one call.
+    """
+
+    do_log_false = GateCase(do_log=False, use_wandb=True, calls=0)
+    wandb_disabled = GateCase(do_log=True, use_wandb=False, calls=0)
+    wandb_enabled = GateCase(do_log=True, use_wandb=True, calls=1)
+
+
+@dataclasses.dataclass(frozen=True)
+class TrainHarness:
+    """Everything a full ``train()`` run is assembled from.
+
+    The methods build fresh objects from the frozen settings each time they
+    are called, so every run starts from the same seeded trunk.
+
+    Attributes:
+        model_config: Model and distogram settings.
+        distograms: Distogram modules every setup carries.
+        dataset_files: Dataset and splits paths; shard and log paths are
+            replaced per run.
+    """
+
+    model_config: TrainModelConfig
+    distograms: Distograms
+    dataset_files: TrainArgs
+
+    def trunk(self) -> MainTrunk:
+        """Build the small trunk under a fixed seed.
+
+        Returns:
+            A freshly initialised MainTrunk.
+        """
+        _ = manual_seed(0)
+        config = self.model_config
+        return MainTrunk(
+            model_params=config.model,
+            template_distogram_params=config.template,
+            residue_distogram_params=config.residue,
+            atom_distogram_params=config.atom,
+            noise_params=config.noise,
+        )
+
+    def tcfg(
+        self,
+        work_dir: pathlib.Path,
+        case: TrainCase,
+        *,
+        loader_budget: int = 63,
+    ) -> TrainConfig:
+        """Build a TrainConfig for ``case`` matching the shared model.
+
+        Args:
+            work_dir: Directory for the checkpoint.
+            case: Training settings.
+            loader_budget: Token budget of each loader batch.
+
+        Returns:
+            The configuration.
+        """
+        config = self.model_config
+        return TrainConfig(
+            training=TrainingParams(
+                num_epochs=case.num_epochs,
+                lr=1e-4,
+                grad_clip=case.grad_clip,
+                accumulated_token_budget=case.token_budget,
+            ),
+            model=config.model,
+            distogram_template=config.template,
+            distogram_residue=config.residue,
+            distogram_atom=config.atom,
+            noise=config.noise,
+            checkpoint=CheckpointParams(
+                checkpoint_path=work_dir / "best.pt",
+                save_every=100,
+            ),
+            logging=LoggingParams(use_wandb=case.use_wandb),
+            test_loader=LoaderConfig(batch_size=2),
+            train_loader=TrainLoaderConfig(
+                token_budget=loader_budget,
+                noise_magnitude=0,
+                n_shards=1,
+                num_workers=1,
+                epoch_prefetch_depth=1,
+                batch_prefetch_depth=1,
+                n_threads=1,
+            ),
+        )
+
+    def setup(self, trunk: MainTrunk | DDP, tcfg: TrainConfig) -> ModelSetup:
+        """Bundle ``trunk`` with Adam, the training LR schedule and an EMA.
+
+        Args:
+            trunk: Model, plain or DDP-wrapped.
+            tcfg: Training configuration.
+
+        Returns:
+            The setup on CPU.
+        """
+        optimizer = Adam(trunk.parameters(), lr=tcfg.training.lr)
+        return ModelSetup(
+            model=trunk,
+            tcfg=tcfg,
+            distogram_template=self.distograms.template,
+            distogram_residue=self.distograms.residue,
+            distogram_atom=self.distograms.atom,
+            device=torch.device("cpu"),
+            optimizer=optimizer,
+            scheduler=build_lr_scheduler(optimizer, tcfg.training),
+            ema=EMA(trunk, decay=tcfg.training.ema_decay),
+        )
+
+    def loaders(self, work_dir: pathlib.Path, tcfg: TrainConfig) -> Loaders:
+        """Build loaders over the synthetic proteins, sharding in ``work_dir``.
+
+        Args:
+            work_dir: Directory for shards, config and logs.
+            tcfg: Configuration whose loader settings apply.
+
+        Returns:
+            The loaders.
+        """
+        args = dataclasses.replace(
+            self.dataset_files,
+            shard_dir=work_dir / "shards",
+            config=work_dir / "config.json",
+            structlog_jsonl=work_dir / "structlog.jsonl",
+        )
+        train_loader, test_loader, _ = make_bucketed_data_loaders(
+            cfg=tcfg,
+            extra_train_args=args,
+        )
+        return Loaders(train=train_loader, test=test_loader)
+
+
+@dataclasses.dataclass
+class TrainRunCache:
+    """Runs each ``TrainScenario`` at most once per module and keeps the record.
+
+    The cache is explicit because a parametrized module-scoped fixture does
+    not guarantee one run per scenario: pytest groups parameters by their
+    position in each ``parametrize`` list. Each run spies on
+    ``all_reduce_mean`` and captures ``wandb.log`` inside the run itself,
+    since function-scoped ``monkeypatch`` cannot serve a module-scoped
+    cache.
+
+    Attributes:
+        tmp_path_factory: Factory for each run's directory.
+        harness: Builds the trunk, configuration, setup and loaders.
+        runs: Records made so far, by scenario.
+    """
+
+    tmp_path_factory: pytest.TempPathFactory
+    harness: TrainHarness
+    runs: dict[TrainScenario, TrainRun] = dataclasses.field(
+        default_factory=dict,
     )
 
+    def get(self, scenario: TrainScenario) -> TrainRun:
+        """Return the scenario's record, running it on first use.
 
-def _make_loaders(
-    work_dir: pathlib.Path,
-    dataset_jsonl: str,
-    splits_json: str,
-) -> tuple[
-    torch.utils.data.DataLoader[FeaturizedBatch],
-    torch.utils.data.DataLoader[FeaturizedBatch],
-]:
-    """Build train and test loaders over the synthetic proteins.
+        Args:
+            scenario: Configuration to look up.
 
-    Args:
-        work_dir: Directory for shards, config, and structured logs.
-        dataset_jsonl: Path to the synthetic proteins JSONL file.
-        splits_json: Path to the train/val/test splits JSON.
+        Returns:
+            The record.
+        """
+        if scenario not in self.runs:
+            self.runs[scenario] = self.record(scenario)
+        return self.runs[scenario]
+
+    def record(self, scenario: TrainScenario) -> TrainRun:
+        """Run ``train()`` for the scenario and record what it did.
+
+        ``all_reduce_mean`` is wrapped by an autospec mock whose side effect
+        is the real method, so every reduction still runs and the mock
+        records which instance each call reduced.
+
+        Args:
+            scenario: Configuration to run.
+
+        Returns:
+            The record.
+        """
+        work = self.tmp_path_factory.mktemp(scenario.name)
+        tcfg = self.harness.tcfg(work, scenario.value)
+        trunk = self.harness.trunk()
+        built = self.harness.loaders(work, tcfg)
+        before = [p.clone().detach() for p in trunk.parameters()]
+        payloads: list[dict[str, object]] = []
+        with (
+            pytest.MonkeyPatch.context() as patch,
+            mock.patch.object(
+                TensorAccumulatorMixin,
+                "all_reduce_mean",
+                autospec=True,
+                side_effect=TensorAccumulatorMixin.all_reduce_mean,
+            ) as reduce_spy,
+        ):
+            patch.setattr("train.train_loop.wandb.log", payloads.append)
+            train(
+                best_val_loss=torch.tensor(float("inf")),
+                train_loader=built.train,
+                test_loader=built.test,
+                model_params=self.harness.setup(trunk, tcfg),
+                log=cast(FilteringBoundLogger, structlog.get_logger()),
+            )
+        return TrainRun(
+            parameters_changed=any(
+                not torch.equal(b, a)
+                for b, a in zip(before, trunk.parameters(), strict=True)
+            ),
+            reduced_metrics=[
+                cast(TensorAccumulatorMixin, call.args[0])
+                for call in reduce_spy.call_args_list
+            ],
+            wandb_payloads=payloads,
+            checkpoint=cast(
+                dict[str, dict[str, object]],
+                torch.load(work / "best.pt", weights_only=True),
+            ),
+            num_epochs=scenario.value.num_epochs,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class CheckpointWriteCase:
+    """A rank passed to ``save_checkpoint`` and whether it writes a file.
+
+    Attributes:
+        rank: Rank passed to ``save_checkpoint``.
+        writes: Whether a checkpoint file must appear.
+    """
+
+    rank: int
+    writes: bool
+
+
+class CheckpointWriteScenario(enum.Enum):
+    """Ranks that do and do not write the checkpoint.
+
+    Members:
+        rank0: Rank 0 writes every state.
+        rank1: Any other rank writes nothing.
+    """
+
+    rank0 = CheckpointWriteCase(rank=0, writes=True)
+    rank1 = CheckpointWriteCase(rank=1, writes=False)
+
+
+@dataclasses.dataclass(frozen=True)
+class SwapWrapCase:
+    """How the model is wrapped before its EMA weights are swapped in.
+
+    Attributes:
+        ddp: Wrap the model in one-rank DDP, so the swap must reach
+            ``.module``.
+    """
+
+    ddp: bool
+
+
+class SwapWrap(enum.Enum):
+    """Model wrappings the EMA swap must see through.
+
+    Members:
+        plain: The bare ``MainTrunk``.
+        ddp: The trunk inside one-rank DDP.
+    """
+
+    plain = SwapWrapCase(ddp=False)
+    ddp = SwapWrapCase(ddp=True)
+
+
+@pytest.fixture(scope="module")
+def model_config() -> TrainModelConfig:
+    """Return the small model and distogram settings shared by every fixture.
+
+    Module-scoped because the module-scoped train-run cache builds models
+    from it; the settings are frozen pydantic models.
 
     Returns:
-        Train and test loaders streaming the synthetic proteins.
+        The settings.
     """
-    cfg = TrainConfig(
-        training=TrainingParams(
-            num_epochs=1,
-            lr=LEARNING_RATE,
-            grad_clip=1.0,
-            accumulated_token_budget=_BATCH_TOKENS,
-        ),
+    return TrainModelConfig(
         model=ModelParams(
-            f_ref_dim=_F_REF_DIM,
-            c_atom=_C_ATOM,
-            c_pair=_C_PAIR,
-            c_res=_C_RES,
-            c_atompair=_C_ATOMPAIR,
-            K_unit=_K_UNIT,
+            f_ref_dim=35,
+            c_atom=32,
+            c_pair=32,
+            c_res=32,
+            c_atompair=16,
+            K_unit=1,
+            n_blocks_atom_transformer_encoder=3,
+            n_heads_atom_transformer_encoder=4,
+            n_blocks_atom_transformer_decoder=3,
+            n_heads_atom_transformer_decoder=4,
+            n_pairformer_blocks_template_embedder=2,
+            n_paiformer_heads_template_embedder=4,
+            n_amino=RESTYPE_NUM_NO_X,
+            max_residues=50,
         ),
-        distogram_template=TemplateDistogramParams(
-            n_bins=_N_BINS,
+        template=TemplateDistogramParams(
+            n_bins=8,
             min_dist=3.25,
             max_dist=50.75,
         ),
-        distogram_residue=ResidueDistogramParams(
-            n_bins=_N_BINS,
-            min_dist=2.0,
-            max_dist=22.0,
-        ),
-        distogram_atom=AtomDistogramParams(
-            n_bins=_N_ATOM_BINS,
-            min_dist=0.0,
-            max_dist=10.0,
-        ),
-        checkpoint=CheckpointParams(
-            checkpoint_path=work_dir / "loader_best.pt",
-            save_every=100,
-        ),
-        logging=LoggingParams(use_wandb=False),
-        test_loader=LoaderConfig(batch_size=2),
-        train_loader=TrainLoaderConfig(
-            token_budget=63,
-            n_shards=1,
-            num_workers=1,
-            epoch_prefetch_depth=1,
-            batch_prefetch_depth=1,
-            n_threads=1,
+        residue=ResidueDistogramParams(n_bins=8, min_dist=2.0, max_dist=22.0),
+        atom=AtomDistogramParams(n_bins=5, min_dist=0.0, max_dist=10.0),
+        noise=NoiseScheduleParams(sigma_data=16.0),
+    )
+
+
+@pytest.fixture(scope="module")
+def distograms(model_config: TrainModelConfig) -> Distograms:
+    """Build the three distogram modules from the shared settings.
+
+    Module-scoped: the modules hold only fixed bin edges.
+
+    Args:
+        model_config: Model and distogram settings.
+
+    Returns:
+        The modules in eval mode.
+    """
+    return Distograms(
+        template=build_distogram_module(model_config.template).eval(),
+        residue=build_distogram_module(model_config.residue).eval(),
+        atom=build_distogram_module(model_config.atom).eval(),
+    )
+
+
+@pytest.fixture(scope="module")
+def dataset_files(tmp_path_factory: pytest.TempPathFactory) -> TrainArgs:
+    """Write six 42-residue all-alanine proteins and their splits.
+
+    Four go to train, one each to validation and test. Coordinates are all
+    zero: the loop only needs well-formed inputs.
+
+    Args:
+        tmp_path_factory: Factory for the module's data directory.
+
+    Returns:
+        TrainArgs pointing at the files; shard and log paths are replaced
+        per run.
+    """
+    root = tmp_path_factory.mktemp("dataset")
+    names = ["1aa.A", "2bb.A", "3cc.A", "4dd.A", "5ee.A", "6ff.A"]
+    coords = {atom: [[0.0] * 3] * 42 for atom in ("N", "CA", "C", "O")}
+    jsonl = root / "proteins.jsonl"
+    _ = jsonl.write_text(
+        "".join(
+            json.dumps({"name": n, "seq": "A" * 42, "coords": coords}) + "\n"
+            for n in names
         ),
     )
-    args = TrainArgs(
-        dataset_jsonl=pathlib.Path(dataset_jsonl),
-        shard_dir=work_dir / "shards",
-        keys_for_splits_json=pathlib.Path(splits_json),
-        config=work_dir / "config.json",
-        structlog_jsonl=work_dir / "structlog.jsonl",
+    splits = root / "splits.json"
+    _ = splits.write_text(
+        json.dumps(
+            {
+                "train": ["1aa.A", "2bb.A", "3cc.A", "6ff.A"],
+                "validation": ["4dd.A"],
+                "test": ["5ee.A"],
+            },
+        ),
+    )
+    return TrainArgs(
+        dataset_jsonl=jsonl,
+        shard_dir=root / "shards",
+        keys_for_splits_json=splits,
+        config=root / "config.json",
+        structlog_jsonl=root / "structlog.jsonl",
         ddp=False,
         debug_run=False,
     )
-    train_loader, test_loader, _ = make_bucketed_data_loaders(
-        cfg=cfg,
-        extra_train_args=args,
-    )
-    return train_loader, test_loader
 
 
-def _make_epoch_metrics(
-    epoch: int,
-    global_step: int = 0,
-    loss_metrics: LossMetrics | None = None,
-    throughput: ThroughputStatistics | None = None,
-    component_norms: ComponentNorms | None = None,
-) -> EpochMetrics:
-    """Build a minimal EpochMetrics with zero-valued fields for log_epoch tests.
+@pytest.fixture(scope="module")
+def harness(
+    model_config: TrainModelConfig,
+    distograms: Distograms,
+    dataset_files: TrainArgs,
+) -> TrainHarness:
+    """Bundle the settings and data a full ``train()`` run is built from.
+
+    Module-scoped: every field is frozen settings, fixed modules or paths.
 
     Args:
-        epoch: Epoch number to embed.
-        global_step: Global step count.
-        loss_metrics: LossMetrics with all-zero fields; built internally
-            if None.
-        throughput: ThroughputStatistics with all-zero fields; built
-            internally if None.
-        component_norms: ComponentNorms with all-zero fields; built
-            internally if None.
+        model_config: Model and distogram settings.
+        distograms: Distogram modules.
+        dataset_files: Dataset and splits paths.
 
     Returns:
-        EpochMetrics suitable for passing to log_epoch.
+        The harness.
     """
-    z = torch.tensor(0.0)
-    lm = loss_metrics or LossMetrics(
-        total_loss=z,
-        Kabsch_aligned_MSE_loss=z,
-        CE_loss=z,
-        smooth_lddt_loss=z,
-        res_distogram_loss=z,
-        atom_distogram_loss=z,
-        intermediate_loss=z,
-        RMSD=z,
-    )
-    tp = throughput or ThroughputStatistics(
-        avg_batch_size=z,
-        token_pack_rate=z,
-        residues_per_sec=z,
-        atoms_per_sec=z,
-    )
-    cn = component_norms or ComponentNorms(
-        template_embedder=z,
-        atom_encoder=z,
-        atom_decoders=z,
-        residue_distogram_head=z,
-        atom_distogram_head=z,
-        inter_proj_seq=z,
-        inter_seq_logits=z,
-        proj_seq=z,
-        seq_logits=z,
-    )
-    return EpochMetrics(
-        epoch=epoch,
-        global_step=global_step,
-        train_loss_metrics=lm,
-        train_throughput_stats=tp,
-        train_gradient_norms=cn,
-        val_loss_metrics=lm,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
-
-
-@pytest.fixture
-def zero_loss_metrics() -> LossMetrics:
-    """Build a LossMetrics with all fields set to zero.
-
-    Returns:
-        LossMetrics with torch.tensor(0.0) in every field.
-    """
-    z = torch.tensor(0.0)
-    return LossMetrics(
-        total_loss=z,
-        Kabsch_aligned_MSE_loss=z,
-        CE_loss=z,
-        smooth_lddt_loss=z,
-        res_distogram_loss=z,
-        atom_distogram_loss=z,
-        intermediate_loss=z,
-        RMSD=z,
+    return TrainHarness(
+        model_config=model_config,
+        distograms=distograms,
+        dataset_files=dataset_files,
     )
 
 
 @pytest.fixture
-def zero_throughput() -> ThroughputStatistics:
-    """Build a ThroughputStatistics with all fields set to zero.
-
-    Returns:
-        ThroughputStatistics with torch.tensor(0.0) in every field.
-    """
-    z = torch.tensor(0.0)
-    return ThroughputStatistics(
-        avg_batch_size=z,
-        token_pack_rate=z,
-        residues_per_sec=z,
-        atoms_per_sec=z,
-    )
-
-
-@pytest.fixture
-def zero_component_norms() -> ComponentNorms:
-    """Build a ComponentNorms with all fields set to zero.
-
-    Returns:
-        ComponentNorms with torch.tensor(0.0) in every field.
-    """
-    z = torch.tensor(0.0)
-    return ComponentNorms(
-        template_embedder=z,
-        atom_encoder=z,
-        atom_decoders=z,
-        residue_distogram_head=z,
-        atom_distogram_head=z,
-        inter_proj_seq=z,
-        inter_seq_logits=z,
-        proj_seq=z,
-        seq_logits=z,
-    )
-
-
-@pytest.fixture
-def distogram_template() -> Distogram:
-    """Provide a self-conditioning template Distogram in eval mode.
-
-    Returns:
-        Distogram configured for template Cβ distances, set to eval mode.
-    """
-    return _make_distogram_template()
-
-
-@pytest.fixture
-def distogram_residue() -> Distogram:
-    """Provide a residue-level Distogram in eval mode.
-
-    Returns:
-        Distogram configured for residue Cβ distances, set to eval mode.
-    """
-    return _make_distogram_residue()
-
-
-@pytest.fixture
-def distogram_atom() -> Distogram:
-    """Provide an atom-level Distogram in eval mode.
-
-    Returns:
-        Distogram configured for short-range atom distances, set to eval mode.
-    """
-    return _make_distogram_atom()
-
-
-@pytest.fixture
-def model() -> MainTrunk:
-    """Provide a small MainTrunk instance for training loop tests.
-
-    Returns:
-        MainTrunk built by ``_make_model``.
-    """
-    return _make_model()
-
-
-@pytest.fixture
-def tcfg(tmp_path: pathlib.Path) -> TrainConfig:
-    """Provide a single-epoch TrainConfig with a temporary checkpoint path.
+def model_params(tmp_path: pathlib.Path, harness: TrainHarness) -> ModelSetup:
+    """Build a fresh setup with the default one-epoch configuration.
 
     Args:
-        tmp_path: Pytest-provided temporary directory for checkpoint files.
+        tmp_path: Per-test directory for the checkpoint.
+        harness: Builds the trunk, configuration and setup.
 
     Returns:
-        TrainConfig configured for one epoch with Adam learning rate and
-        W&B disabled, writing checkpoints under pytest's tmp_path.
+        The setup, with W&B off.
     """
-    return _make_tcfg(tmp_path / "best.pt")
+    tcfg = harness.tcfg(tmp_path, TrainScenario.default_budget.value)
+    return harness.setup(harness.trunk(), tcfg)
 
 
 @pytest.fixture
-def model_params(
-    model: MainTrunk,
-    tcfg: TrainConfig,
-    distogram_template: Distogram,
-    distogram_residue: Distogram,
-    distogram_atom: Distogram,
-) -> ModelSetup:
-    """Provide a ModelSetup bundling model, optimizer, scheduler, and config.
+def featurized_batch(model_params: ModelSetup) -> FeaturizedBatch:
+    """Featurize ten copies of a deterministic 16-residue protein.
+
+    Residue ``r`` is residue type ``r % RESTYPE_NUM`` and atom ``a`` of it
+    sits at ``(3.8 r + 0.1 a, sin(r + a), 0)``.
 
     Args:
-        model: Fixture providing the MainTrunk model.
-        tcfg: Fixture providing the single-epoch TrainConfig.
-        distogram_template: Fixture providing the self-conditioning template
-            distogram head.
-        distogram_residue: Fixture providing the residue-level distogram head.
-        distogram_atom: Fixture providing the atom-level distogram head.
+        model_params: Supplies the configuration and distograms.
 
     Returns:
-        ModelSetup wrapping the model fixture with an Adam optimizer and
-        AlphaFold-style warmup/decay LambdaLR scheduler configured from
-        tcfg.
+        The batch.
     """
-    return _make_model_params(
-        model,
-        tcfg,
-        distogram_template,
-        distogram_residue,
-        distogram_atom,
+    n = 16
+    n_atoms = ResidueRepresentation.atom37.value
+    r = rearrange(np.arange(n, dtype=np.float64), "r -> r 1")
+    a = rearrange(np.arange(n_atoms, dtype=np.float64), "a -> 1 a")
+    protein = Protein(
+        atom_positions=np.stack(
+            [3.8 * r + 0.1 * a, np.sin(r + a), np.zeros((n, n_atoms))],
+            axis=-1,
+        ),
+        atom_mask=np.ones((n, n_atoms)),
+        residue_index=np.arange(n, dtype=np.intp),
+        aatype=np.arange(n, dtype=np.intp) % RESTYPE_NUM,
+        chain_index=np.zeros(n, dtype=np.intp),
+        b_factors=np.zeros((n, n_atoms)),
     )
-
-
-@pytest.fixture
-def single_sample() -> Protein:
-    """Provide a single unbatched protein sample."""
-    rng = np.random.default_rng()
-    return Protein(
-        atom_positions=rng.standard_normal((_N_KEEP, 37, 3)),
-        atom_mask=np.ones((_N_KEEP, 37)),
-        residue_index=np.arange(_N_KEEP, dtype=np.intp),
-        aatype=rng.integers(low=0, high=RESTYPE_NUM, size=(_N_KEEP,)),
-        chain_index=np.zeros(_N_KEEP, dtype=np.intp),
-        b_factors=np.zeros((_N_KEEP, 37)),
-    )
-
-
-@pytest.fixture
-def protein_batch(single_sample: Protein) -> list[Protein]:
-    """Provide a list of Protein objects for take_step tests."""
-    return [single_sample] * 10
-
-
-@pytest.fixture
-def featurized_batch(
-    protein_batch: list[Protein],
-    model_params: ModelSetup,
-) -> FeaturizedBatch:
-    """FeaturizedBatch produced from protein_batch for take_step tests."""
+    _ = manual_seed(1)
     return featurize_batch(
-        protein_batch,
+        [protein] * 10,
         model_params.tcfg,
         model_params.distogram_template,
         model_params.distogram_residue,
@@ -616,46 +698,41 @@ def featurized_batch(
 @pytest.fixture
 def loaders(
     tmp_path: pathlib.Path,
-    jsonl_path: str,
-    splits_path: str,
-) -> tuple[
-    torch.utils.data.DataLoader[FeaturizedBatch],
-    torch.utils.data.DataLoader[FeaturizedBatch],
-]:
-    """Provide loaders built by make_bucketed_data_loaders.
+    model_params: ModelSetup,
+    harness: TrainHarness,
+) -> Loaders:
+    """Build loaders over the synthetic proteins in a per-test directory.
 
     Args:
-        tmp_path: Pytest-provided temporary directory for shards and config.
-        jsonl_path: Fixture providing path to synthetic proteins JSONL file.
-        splits_path: Fixture providing path to the train/val/test splits JSON.
+        tmp_path: Per-test directory.
+        model_params: Supplies the configuration.
+        harness: Builds the loaders.
 
     Returns:
-        Train and test loaders streaming the synthetic proteins.
+        The loaders.
     """
-    return _make_loaders(tmp_path, jsonl_path, splits_path)
+    return harness.loaders(tmp_path, model_params.tcfg)
 
 
 @pytest.fixture
 def log() -> FilteringBoundLogger:
-    """Provide a structlog logger for training loop tests.
+    """Return a structlog logger for the functions that take one.
 
     Returns:
-        A structlog bound logger suitable for passing to train(), evaluate(),
-        save_checkpoint(), and related functions.
+        The logger.
     """
     return cast(FilteringBoundLogger, structlog.get_logger())
 
 
 @pytest.fixture
 def wandb_payloads(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, object]]:
-    """Patch wandb.log and return the list of captured payload dicts.
+    """Patch ``wandb.log`` and return the list of captured payloads.
 
     Args:
-        monkeypatch: Pytest fixture for patching attributes at test scope.
+        monkeypatch: Patches the attribute for this test only.
 
     Returns:
-        List that accumulates one dict per wandb.log call; inspect after the
-        system-under-test runs to assert on logged keys and values.
+        List that receives one dict per ``wandb.log`` call.
     """
     captured: list[dict[str, object]] = []
     monkeypatch.setattr("train.train_loop.wandb.log", captured.append)
@@ -663,1132 +740,865 @@ def wandb_payloads(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, object]]:
 
 
 @pytest.fixture
-def wandb_call_counter(monkeypatch: pytest.MonkeyPatch) -> list[object]:
-    """Patch wandb.log and return a list that grows by one entry per call.
-
-    Args:
-        monkeypatch: Pytest fixture for patching attributes at test scope.
+def epoch_metrics() -> EpochMetrics:
+    """Return EpochMetrics for epoch 7 with every metric at zero.
 
     Returns:
-        List whose length equals the number of times wandb.log was invoked;
-        use len() to assert on call count without inspecting payload contents.
+        The metrics.
     """
-    called: list[object] = []
-    monkeypatch.setattr("train.train_loop.wandb.log", called.append)
-    return called
-
-
-# ---------------------------------------------------------------------------
-# take_step — eval mode
-# ---------------------------------------------------------------------------
-
-
-def test_take_step_eval_outputs(
-    featurized_batch: FeaturizedBatch,
-    model_params: ModelSetup,
-) -> None:
-    """Verify take_step eval-mode outputs are well-formed and gradient-free.
-
-    Checks:
-        - Returns a LossMetrics and a ThroughputStatistics instance.
-        - Every LossMetrics field is finite.
-        - RMSD is non-negative.
-        - token_pack_rate is in (0, 1].
-        - residues_per_sec and atoms_per_sec are positive.
-        - No model parameter accumulates a gradient.
-    """
-    model_params.model.zero_grad()
-    loss_metrics, tput = take_step(
-        batch=featurized_batch,
-        model_params=model_params,
-        train_mode=False,
-    )
-    assert isinstance(loss_metrics, LossMetrics)
-    assert isinstance(tput, ThroughputStatistics)
-    for name, v in [
-        ("total_loss", loss_metrics.total_loss),
-        ("Kabsch_aligned_MSE_loss", loss_metrics.Kabsch_aligned_MSE_loss),
-        ("CE_loss", loss_metrics.CE_loss),
-        ("smooth_lddt_loss", loss_metrics.smooth_lddt_loss),
-        ("res_distogram_loss", loss_metrics.res_distogram_loss),
-        ("atom_distogram_loss", loss_metrics.atom_distogram_loss),
-        ("intermediate_loss", loss_metrics.intermediate_loss),
-        ("RMSD", loss_metrics.RMSD),
-    ]:
-        assert torch.isfinite(v), f"Field '{name}' is not finite: {v}"
-    assert 0.0 < tput.token_pack_rate.item() <= 1.0
-    assert tput.residues_per_sec.item() > 0.0
-    assert tput.atoms_per_sec.item() > 0.0
-    for p in model_params.model.parameters():
-        assert p.grad is None
-
-
-# ---------------------------------------------------------------------------
-# take_step — train mode
-# ---------------------------------------------------------------------------
-
-
-def test_take_step_train_produces_gradients(
-    featurized_batch: FeaturizedBatch,
-    model_params: ModelSetup,
-) -> None:
-    """take_step(train_mode=True) back-props grads into model parameters."""
-    _ = model_params.model.train()
-    model_params.model.zero_grad()
-    _ = take_step(
-        batch=featurized_batch,
-        model_params=model_params,
-        train_mode=True,
-    )
-    assert any(p.grad is not None for p in model_params.model.parameters())
-
-
-def test_take_step_grad_scale_halves_gradient_norm(
-    featurized_batch: FeaturizedBatch,
-    model_params: ModelSetup,
-) -> None:
-    """grad_scale=2 yields approx half the gradient L2 norm of grad_scale=1.
-
-    Verifies that doubling grad_scale halves the effective gradient magnitude,
-    confirming that take_step applies gradient scaling inversely.
-    """
-    _ = model_params.model.train()
-
-    _ = manual_seed(0)
-    model_params.model.zero_grad()
-    _ = take_step(
-        batch=featurized_batch,
-        model_params=model_params,
-        train_mode=True,
-        grad_scale=1.0,
-    )
-    norm1 = cast(
-        float,
-        sum(
-            cast(float, reduce(p.grad**2, "... -> ", "sum").item())
-            for p in model_params.model.parameters()
-            if p.grad is not None
-        )
-        ** 0.5,
-    )
-
-    _ = manual_seed(0)
-    model_params.model.zero_grad()
-    _ = take_step(
-        batch=featurized_batch,
-        model_params=model_params,
-        train_mode=True,
-        grad_scale=2.0,
-    )
-    norm2 = cast(
-        float,
-        sum(
-            cast(float, reduce(p.grad**2, "... -> ", "sum").item())
-            for p in model_params.model.parameters()
-            if p.grad is not None
-        )
-        ** 0.5,
-    )
-
-    assert abs(norm2 - norm1 / 2.0) < TIGHT_TOLERANCE
-
-
-# ---------------------------------------------------------------------------
-# process_accum_window
-# ---------------------------------------------------------------------------
-
-
-def test_process_accum_window_outputs(
-    featurized_batch: FeaturizedBatch,
-    model_params: ModelSetup,
-) -> None:
-    """process_accum_window -> finite LossMetrics, ThroughputStatistics."""
-    _ = model_params.model.train()
-    model_params.model.zero_grad()
-    loss_metrics, tput = process_accum_window(
-        [featurized_batch],
-        [1],
-        model_params,
-    )
-    assert isinstance(loss_metrics, LossMetrics)
-    assert isinstance(tput, ThroughputStatistics)
-    for name, v in [
-        ("total_loss", loss_metrics.total_loss),
-        ("Kabsch_aligned_MSE_loss", loss_metrics.Kabsch_aligned_MSE_loss),
-        ("CE_loss", loss_metrics.CE_loss),
-        ("smooth_lddt_loss", loss_metrics.smooth_lddt_loss),
-        ("res_distogram_loss", loss_metrics.res_distogram_loss),
-        ("atom_distogram_loss", loss_metrics.atom_distogram_loss),
-        ("intermediate_loss", loss_metrics.intermediate_loss),
-        ("RMSD", loss_metrics.RMSD),
-    ]:
-        assert torch.isfinite(v), f"Field '{name}' is not finite: {v}"
-
-
-def test_process_accum_window_protein_weighted_grad_scale(
-    featurized_batch: FeaturizedBatch,
-    model_params: ModelSetup,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """process_accum_window grad_scale is protein-count-weighted.
-
-    Verifies that each micro-batch's grad_scale equals total_proteins /
-    batch_proteins, so batches with fewer proteins receive a larger scale.
-    With n_proteins=[1, 3] the total is 4, yielding grad_scale 4/1=4.0 for
-    the first batch and 4/3≈1.333 for the second.
-    """
-    captured_scales: list[float] = []
-    _real_take_step = take_step
-
-    def _recording_take_step(
-        *,
-        batch: FeaturizedBatch,
-        model_params: ModelSetup,  # pylint: disable=redefined-outer-name
-        train_mode: bool,
-        grad_scale: float = 1.0,
-    ) -> tuple[LossMetrics, ThroughputStatistics]:
-        captured_scales.append(grad_scale)
-        return _real_take_step(
-            batch=batch,
-            model_params=model_params,
-            train_mode=train_mode,
-            grad_scale=grad_scale,
-        )
-
-    monkeypatch.setattr("train.train_loop.take_step", _recording_take_step)
-    _ = model_params.model.train()
-    model_params.model.zero_grad()
-    acummulated_batch = [featurized_batch, featurized_batch]
-    _ = process_accum_window(acummulated_batch, [1, 3], model_params)
-
-    assert len(captured_scales) == len(acummulated_batch)
-    assert abs(captured_scales[0] - 4.0) < TOLERANCE
-    assert abs(captured_scales[1] - 4.0 / 3.0) < TOLERANCE
-
-
-# ---------------------------------------------------------------------------
-# component_grad_norms
-# ---------------------------------------------------------------------------
-
-
-def test_component_grad_norms_outputs(
-    featurized_batch: FeaturizedBatch,
-    model_params: ModelSetup,
-) -> None:
-    """Component_grad_norms returns a ComponentNorms with all positive values.
-
-    Checks:
-        - Returns a ComponentNorms instance after a backward pass.
-        - Every per-component gradient norm is positive.
-    """
-    _ = model_params.model.train()
-    model_params.model.zero_grad()
-    _ = take_step(
-        batch=featurized_batch,
-        model_params=model_params,
-        train_mode=True,
-    )
-    norms = component_grad_norms(model_params.model)
-    assert isinstance(norms, ComponentNorms)
-    for f in dataclasses.fields(norms):
-        v = cast(torch.Tensor, getattr(norms, f.name))
-        assert v.item() > 0.0, f"Component norm '{f.name}' is not positive: {v}"
-
-
-# ---------------------------------------------------------------------------
-# optimizer_step
-# ---------------------------------------------------------------------------
-
-
-def test_optimizer_step_outputs(
-    featurized_batch: FeaturizedBatch,
-    model_params: ModelSetup,
-) -> None:
-    """Verify optimizer_step returns valid outputs and updates model parameters.
-
-    Checks:
-        - Returns a LossMetrics instance as the first element.
-        - Returns a ComponentNorms instance as the third element.
-        - Returns global_step + 1 as the fourth element.
-        - Modifies at least one model parameter via gradient descent.
-    """
-    params_before = [
-        p.clone().detach() for p in model_params.model.parameters()
-    ]
-    _ = model_params.model.train()
-    model_params.model.zero_grad()
-    global_step = 5
-    loss_metrics, _, norms, new_step = optimizer_step(
-        [featurized_batch],
-        [1],
-        model_params,
-        global_step=global_step,
-    )
-    assert isinstance(loss_metrics, LossMetrics)
-    assert isinstance(norms, ComponentNorms)
-    assert new_step == global_step + 1
-    assert any(
-        not torch.equal(b, a)
-        for b, a in zip(
-            params_before,
-            model_params.model.parameters(),
-            strict=False,
-        )
+    device = torch.device("cpu")
+    loss = LossMetrics.zero_init(device)
+    return EpochMetrics(
+        epoch=7,
+        global_step=1,
+        train_loss_metrics=loss,
+        train_throughput_stats=ThroughputStatistics.zero_init(device),
+        train_gradient_norms=ComponentNorms.zero_init(device),
+        val_loss_metrics=loss,
     )
 
 
-def test_optimizer_step_updates_ema_shadow(
-    featurized_batch: FeaturizedBatch,
-    model_params: ModelSetup,
-) -> None:
-    """optimizer_step advances the EMA shadow using the pre-step global_step.
+@pytest.fixture
+def diverged_ema(model_params: ModelSetup) -> ModelSetup:
+    """Shift every weight by 1 and update the EMA, so model and shadow differ.
 
-    Verifies the shadow after one optimizer_step call matches the
-    bias-corrected decay formula applied to the model's post-step
-    parameters, confirming optimizer_step actually wires ``EMA.update``
-    into the training loop rather than only stepping the optimizer.
-    """
-    name, _ = next(model_params.model.named_parameters())
-    shadow_before = model_params.ema.shadow[name].clone()
+    Args:
+        model_params: Setup to modify.
 
-    _ = model_params.model.train()
-    model_params.model.zero_grad()
-    global_step = 5
-    _ = optimizer_step(
-        [featurized_batch],
-        [1],
-        model_params,
-        global_step=global_step,
-    )
-
-    param_after = cast(
-        dict[str, torch.Tensor],
-        model_params.model.state_dict(),
-    )[name].clone()
-    decay = model_params.tcfg.training.ema_decay
-    effective_decay = min(decay, (global_step + 1) / (global_step + 10))
-    expected = (
-        effective_decay * shadow_before + (1 - effective_decay) * param_after
-    )
-    assert torch.allclose(
-        model_params.ema.shadow[name],
-        expected,
-        atol=TOLERANCE,
-    )
-
-
-# ---------------------------------------------------------------------------
-# evaluate
-# ---------------------------------------------------------------------------
-
-
-def test_evaluate_outputs(
-    loaders: tuple[
-        torch.utils.data.DataLoader[FeaturizedBatch],
-        torch.utils.data.DataLoader[FeaturizedBatch],
-    ],
-    model_params: ModelSetup,
-    log: FilteringBoundLogger,
-) -> None:
-    """Evaluate returns well-formed, finite outputs and leaves no gradients.
-
-    Checks:
-        - Returns a LossMetrics instance as its first element.
-        - Returns a ThroughputStatistics instance as its second element.
-        - Every LossMetrics field is finite.
-        - total_loss is non-negative.
-        - RMSD is non-negative.
-        - No model parameter accumulates a gradient.
-    """
-    _, test_loader = loaders
-    loss_metrics, tput = evaluate(test_loader, model_params, log)
-    assert isinstance(loss_metrics, LossMetrics)
-    assert isinstance(tput, ThroughputStatistics)
-    for name, v in [
-        ("total_loss", loss_metrics.total_loss),
-        ("Kabsch_aligned_MSE_loss", loss_metrics.Kabsch_aligned_MSE_loss),
-        ("CE_loss", loss_metrics.CE_loss),
-        ("smooth_lddt_loss", loss_metrics.smooth_lddt_loss),
-        ("res_distogram_loss", loss_metrics.res_distogram_loss),
-        ("atom_distogram_loss", loss_metrics.atom_distogram_loss),
-        ("intermediate_loss", loss_metrics.intermediate_loss),
-        ("RMSD", loss_metrics.RMSD),
-    ]:
-        assert torch.isfinite(v), f"Field '{name}' is not finite: {v}"
-    assert loss_metrics.total_loss.item() >= 0.0
-    assert loss_metrics.RMSD.item() >= 0.0
-    for p in model_params.model.parameters():
-        assert p.grad is None
-
-
-# ---------------------------------------------------------------------------
-# swapped_in_ema_weights
-# ---------------------------------------------------------------------------
-
-
-def test_swapped_in_ema_weights_loads_shadow_and_restores_raw_after(
-    model_params: ModelSetup,
-) -> None:
-    """Entering swaps in the EMA shadow; exiting restores the raw weights.
-
-    Advances the EMA shadow away from the model's raw weights first (via a
-    manual perturbation) so the swap is actually observable, then checks
-    the model matches the shadow inside the context and matches the
-    original raw weights again once it exits. ``state_dict()`` is called
-    fresh at each checkpoint rather than reused, since ``swapped_in_ema_
-    weights`` now reassigns ``.data`` in place (zero-copy) instead of
-    copying values -- a state_dict captured before the swap holds
-    ``.detach()``-ed views of the pre-swap storage and would look
-    unchanged forever if reused, regardless of whether the swap actually
-    happened.
+    Returns:
+        The same setup, with raw weights and EMA shadow now distinct.
     """
     with torch.no_grad():
-        for p in model_params.model.parameters():
-            _ = p.add_(1.0)
+        for param in model_params.model.parameters():
+            _ = param.add_(1.0)
     model_params.ema.update(model_params.model, step=0)
+    return model_params
 
-    raw_sd = {
+
+@pytest.fixture
+def swap_setup(
+    request: pytest.FixtureRequest,
+    swap_wrap: SwapWrap,
+    diverged_ema: ModelSetup,
+) -> SwapSetup:
+    """Prepare a swap, wrapping the model in one-rank DDP when asked.
+
+    With DDP the swap must reach ``.module``, whose keys carry no
+    ``module.`` prefix. Reference weights are cloned before any swap.
+
+    Args:
+        request: Pytest request used to start the one-rank process group.
+        swap_wrap: Whether to wrap in DDP; the requesting test
+            parametrizes it.
+        diverged_ema: Setup whose raw weights and shadow differ.
+
+    Returns:
+        The setup and its reference weights.
+    """
+    inner = cast(MainTrunk, diverged_ema.model)
+    setup = diverged_ema
+    if swap_wrap.value.ddp:
+        request.getfixturevalue("single_process_gloo_group")
+        setup = dataclasses.replace(diverged_ema, model=DDP(inner))
+    raw = {
         k: v.clone()
         for k, v in cast(
-            dict[str, torch.Tensor],
-            model_params.model.state_dict(),
+            dict[str, Float[torch.Tensor, "..."]],
+            inner.state_dict(),
         ).items()
     }
-    ema_sd = {k: v.clone() for k, v in model_params.ema.state_dict().items()}
+    shadow = {k: v.clone() for k, v in diverged_ema.ema.state_dict().items()}
+    return SwapSetup(setup=setup, inner=inner, raw=raw, shadow=shadow)
 
-    with swapped_in_ema_weights(model_params):
-        live_sd = cast(dict[str, torch.Tensor], model_params.model.state_dict())
-        for k, v in live_sd.items():
-            assert torch.equal(v, ema_sd[k]), f"Param '{k}' not swapped to EMA"
 
-    live_sd_after = cast(
-        dict[str, torch.Tensor],
-        model_params.model.state_dict(),
+class SteppingOptimizer(Protocol):
+    """An optimizer whose ``step`` takes no closure.
+
+    torch decorates ``Adam.step`` in a way that leaves it untyped, so
+    calling it directly is an unknown member to the type checker. Casting
+    to this protocol states the one call the tests make.
+    """
+
+    def step(self) -> None:
+        """Apply one update from the parameters' gradients."""
+
+
+@dataclasses.dataclass(frozen=True)
+class CorruptedAfterSave:
+    """A setup saved after one step, then corrupted in place.
+
+    Attributes:
+        setup: The setup, with its weights, EMA shadow and Adam first
+            moments zeroed and its scheduler rewound after saving.
+        saved: The checkpoint as written, before the corruption.
+    """
+
+    setup: ModelSetup
+    saved: dict[str, dict[str, object]]
+
+
+@dataclasses.dataclass(frozen=True)
+class PreflushInputs:
+    """Loaders and setup for a run whose token budget forces preflushes.
+
+    Attributes:
+        loaders: Train and test loaders, one protein per test batch.
+        model_params: Fresh setup trained on them.
+    """
+
+    loaders: Loaders
+    model_params: ModelSetup
+
+
+@pytest.fixture
+def lr_schedule_base_lr() -> float:
+    """Return the base learning rate the schedule multiplies.
+
+    Returns:
+        2.0, so a schedule factor of ``f`` gives a learning rate of
+        ``2 f``.
+    """
+    return 2.0
+
+
+@pytest.fixture
+def lr_schedule_optimizer(lr_schedule_base_lr: float) -> Adam:
+    """Return Adam over one dummy parameter at ``lr_schedule_base_lr``.
+
+    Args:
+        lr_schedule_base_lr: Base learning rate.
+
+    Returns:
+        The optimizer.
+    """
+    return Adam([nn.Parameter(torch.zeros(1))], lr=lr_schedule_base_lr)
+
+
+@pytest.fixture
+def lr_schedule_training() -> TrainingParams:
+    """Return 4 warmup steps, then a halving every 3 steps.
+
+    Returns:
+        Training parameters supplying the schedule's shape.
+    """
+    return TrainingParams(
+        lr_warmup_steps=4,
+        lr_decay_steps=3,
+        lr_decay_factor=0.5,
     )
-    for k, v in live_sd_after.items():
-        assert torch.equal(v, raw_sd[k]), f"Param '{k}' not restored after swap"
 
 
-def test_swapped_in_ema_weights_restores_raw_weights_on_exception(
-    model_params: ModelSetup,
-) -> None:
-    """Raw weights are restored even when the wrapped block raises.
+@pytest.fixture
+def lr_scheduler(
+    lr_schedule_optimizer: Adam,
+    lr_schedule_training: TrainingParams,
+) -> LambdaLR:
+    """Build the training LR schedule over ``lr_schedule_optimizer``.
 
-    Ensures a mid-block failure (e.g. an eval-time error) can't leave the
-    model stuck on EMA weights for subsequent training steps. Perturbs the
-    model and advances the EMA shadow first so raw and shadow values
-    genuinely differ -- otherwise this would pass trivially even if the
-    ``finally`` swap-back never ran, since raw and shadow would already be
-    identical.
+    Args:
+        lr_schedule_optimizer: Adam at base rate 2.
+        lr_schedule_training: Warmup and decay settings.
+
+    Returns:
+        The scheduler at step 0.
     """
-    with torch.no_grad():
-        for p in model_params.model.parameters():
-            _ = p.add_(1.0)
-    model_params.ema.update(model_params.model, step=0)
-
-    raw_sd = {
-        k: v.clone()
-        for k, v in cast(
-            dict[str, torch.Tensor],
-            model_params.model.state_dict(),
-        ).items()
-    }
-
-    eval_failure_message = "simulated eval failure"
-    with (
-        pytest.raises(RuntimeError, match=eval_failure_message),
-        swapped_in_ema_weights(model_params),
-    ):
-        raise RuntimeError(eval_failure_message)
-
-    live_sd = cast(dict[str, torch.Tensor], model_params.model.state_dict())
-    for k, v in live_sd.items():
-        assert torch.equal(
-            v,
-            raw_sd[k],
-        ), f"Param '{k}' not restored after error"
+    return build_lr_scheduler(lr_schedule_optimizer, lr_schedule_training)
 
 
-def test_swapped_in_ema_weights_unwraps_ddp(
-    model_params: ModelSetup,
-) -> None:
-    """Swap operates on the unwrapped .module when the model is DDP-wrapped.
+@pytest.fixture(scope="module")
+def recorded_train_runs(
+    tmp_path_factory: pytest.TempPathFactory,
+    harness: TrainHarness,
+) -> TrainRunCache:
+    """Return the module's cache of ``train()`` runs, one per scenario.
 
-    Mirrors test_save_checkpoint_strips_ddp_wrapper_prefix: wraps the model
-    in a single-process gloo DDP group and confirms the swap-in/swap-out
-    still works against the underlying MainTrunk rather than erroring on a
-    "module."-prefix key mismatch.
+    Args:
+        tmp_path_factory: Factory for each run's directory.
+        harness: Builds each run.
+
+    Returns:
+        An empty cache that runs each scenario on first use.
     """
-    with torch.no_grad():
-        for p in model_params.model.parameters():
-            _ = p.add_(1.0)
-    model_params.ema.update(model_params.model, step=0)
-    raw_sd = {
-        k: v.clone()
-        for k, v in cast(
-            dict[str, torch.Tensor],
-            model_params.model.state_dict(),
-        ).items()
-    }
-    ema_sd = {k: v.clone() for k, v in model_params.ema.state_dict().items()}
-
-    with _single_process_gloo_group():
-        ddp_model_params = dataclasses.replace(
-            model_params,
-            model=DDP(model_params.model),
-        )
-        with swapped_in_ema_weights(ddp_model_params):
-            live_sd = cast(
-                dict[str, torch.Tensor],
-                model_params.model.state_dict(),
-            )
-            for k, v in live_sd.items():
-                assert torch.equal(v, ema_sd[k])
-
-        live_sd_after = cast(
-            dict[str, torch.Tensor],
-            model_params.model.state_dict(),
-        )
-        for k, v in live_sd_after.items():
-            assert torch.equal(v, raw_sd[k])
+    return TrainRunCache(tmp_path_factory=tmp_path_factory, harness=harness)
 
 
-def test_swapped_in_ema_weights_unwraps_ddp_and_restores_on_exception(
-    model_params: ModelSetup,
-) -> None:
-    """DDP-wrapped raw weights are restored even when the wrapped block raises.
+@pytest.fixture
+def train_run(
+    train_scenario: TrainScenario,
+    recorded_train_runs: TrainRunCache,
+) -> TrainRun:
+    """Return the shared record for ``train_scenario``.
 
-    Combines test_swapped_in_ema_weights_restores_raw_weights_on_exception
-    and test_swapped_in_ema_weights_unwraps_ddp: a mid-block failure under a
-    DDP-wrapped model must still restore the raw weights via ``.module``
-    rather than leaving the model stuck on EMA weights or erroring on the
-    "module."-prefix key mismatch.
+    The record is a frozen snapshot rather than live training state, so the
+    tests sharing it stay order-independent.
+
+    Args:
+        train_scenario: Run to look up; the requesting test parametrizes
+            it.
+        recorded_train_runs: Module-wide cache of runs.
+
+    Returns:
+        The scenario's record.
     """
-    with torch.no_grad():
-        for p in model_params.model.parameters():
-            _ = p.add_(1.0)
-    model_params.ema.update(model_params.model, step=0)
-    raw_sd = {
-        k: v.clone()
-        for k, v in cast(
-            dict[str, torch.Tensor],
-            model_params.model.state_dict(),
-        ).items()
-    }
-
-    eval_failure_message = "simulated eval failure under ddp"
-    with _single_process_gloo_group():
-        ddp_model_params = dataclasses.replace(
-            model_params,
-            model=DDP(model_params.model),
-        )
-        with (
-            pytest.raises(RuntimeError, match=eval_failure_message),
-            swapped_in_ema_weights(ddp_model_params),
-        ):
-            raise RuntimeError(eval_failure_message)
-
-        live_sd = cast(
-            dict[str, torch.Tensor],
-            model_params.model.state_dict(),
-        )
-        for k, v in live_sd.items():
-            assert torch.equal(
-                v,
-                raw_sd[k],
-            ), f"Param '{k}' not restored after error"
+    return recorded_train_runs.get(train_scenario)
 
 
-# ---------------------------------------------------------------------------
-# save_checkpoint / load_checkpoint
-# ---------------------------------------------------------------------------
-
-
-def test_save_checkpoint_rank0_writes_file_with_expected_keys(
-    model_params: ModelSetup,
+@pytest.fixture
+def corrupted_after_save(
+    diverged_ema: ModelSetup,
     log: FilteringBoundLogger,
-) -> None:
-    """Verify save_checkpoint on rank 0 writes a file with the expected keys.
+) -> CorruptedAfterSave:
+    """Step and save ``diverged_ema``, then corrupt every saved state.
 
-    Checks:
-        - A checkpoint file is created at the configured path.
-        - Checkpoint contains model, optimizer, scheduler, best_val_loss keys.
+    After one optimizer and scheduler step the setup is saved. Its weights
+    and EMA shadow are then zeroed, Adam's first moments zeroed and the
+    scheduler rewound, so a load that skipped any state would leave it
+    corrupted.
+
+    Args:
+        diverged_ema: Setup whose EMA differs from its weights.
+        log: Logger.
+
+    Returns:
+        The corrupted setup and the checkpoint written before corruption.
     """
+    setup = diverged_ema
+    for param in setup.model.parameters():
+        param.grad = torch.ones_like(param)
+    cast(SteppingOptimizer, setup.optimizer).step()
+    setup.scheduler.step()
     save_checkpoint(
-        model_params=model_params,
-        rank=0,
-        log=log,
-        best_val_loss=torch.tensor(0.5),
-    )
-    assert model_params.tcfg.checkpoint.checkpoint_path.exists()
-    ckpt = cast(
-        dict[str, object],
-        torch.load(
-            model_params.tcfg.checkpoint.checkpoint_path,
-            weights_only=True,
-        ),
-    )
-    assert isinstance(ckpt, dict)
-    assert ckpt.keys() >= EXPECTED_CHECKPOINT_KEYS
-
-
-def test_save_checkpoint_rank1_skips_write(
-    model_params: ModelSetup,
-    log: FilteringBoundLogger,
-) -> None:
-    """save_checkpoint does not write a file on rank != 0."""
-    save_checkpoint(
-        model_params=model_params,
-        rank=1,
-        log=log,
-        best_val_loss=torch.tensor(1.0),
-    )
-    assert not model_params.tcfg.checkpoint.checkpoint_path.exists()
-
-
-def test_load_checkpoint_restores_model_state(
-    model_params: ModelSetup,
-    log: FilteringBoundLogger,
-) -> None:
-    """load_checkpoint restores model weights matching the saved state dict."""
-    save_checkpoint(
-        model_params=model_params,
-        rank=0,
-        log=log,
-        best_val_loss=torch.tensor(0.42),
-    )
-    original_sd = cast(
-        dict[str, torch.Tensor],
-        torch.load(
-            model_params.tcfg.checkpoint.checkpoint_path,
-            weights_only=True,
-        )["model"],
-    )
-    for p in model_params.model.parameters():
-        _ = nn.init.zeros_(p)
-    restored, _ = load_checkpoint(model_params=model_params, rank=0, log=log)
-    restored_sd = cast(dict[str, torch.Tensor], restored.model.state_dict())
-    for k, v in restored_sd.items():
-        assert torch.allclose(v, original_sd[k]), f"Param '{k}' not restored"
-
-
-def test_load_checkpoint_restores_ema_state(
-    model_params: ModelSetup,
-    log: FilteringBoundLogger,
-) -> None:
-    """load_checkpoint restores EMA shadow weights matching the saved state.
-
-    Mirrors test_load_checkpoint_restores_model_state but for the EMA
-    shadow: advances it away from its initial (model-matching) values,
-    saves, zeroes the in-memory shadow, then confirms load_checkpoint
-    restores the exact saved values rather than the assertion trivially
-    passing.
-    """
-    with torch.no_grad():
-        for p in model_params.model.parameters():
-            _ = p.add_(1.0)
-    model_params.ema.update(model_params.model, step=0)
-    save_checkpoint(
-        model_params=model_params,
-        rank=0,
-        log=log,
-        best_val_loss=torch.tensor(0.42),
-    )
-    original_ema_sd = {
-        k: v.clone() for k, v in model_params.ema.state_dict().items()
-    }
-
-    for tensor in model_params.ema.shadow.values():
-        _ = tensor.zero_()
-
-    restored, _ = load_checkpoint(model_params=model_params, rank=0, log=log)
-    for k, v in restored.ema.state_dict().items():
-        assert torch.allclose(
-            v,
-            original_ema_sd[k],
-        ), f"EMA param '{k}' not restored"
-
-
-def test_checkpoint_round_trip_preserves_weights_and_loss(
-    model_params: ModelSetup,
-    log: FilteringBoundLogger,
-) -> None:
-    """save→load→save is lossless: second checkpoint matches first.
-
-    Saves a checkpoint, reloads it into a fresh model, saves again, and
-    confirms that the model weights and best_val_loss are identical across
-    both saved files.
-    """
-    best_val_loss = torch.tensor(0.271)
-    path = model_params.tcfg.checkpoint.checkpoint_path
-
-    save_checkpoint(
-        model_params=model_params,
-        rank=0,
-        log=log,
-        best_val_loss=best_val_loss,
-    )
-    model_sd = cast(dict[str, torch.Tensor], model_params.model.state_dict())
-    first_sd = {k: v.clone() for k, v in model_sd.items()}
-
-    for p in model_params.model.parameters():
-        _ = nn.init.zeros_(p)
-
-    restored, loaded_loss = load_checkpoint(
-        model_params=model_params,
-        rank=0,
-        log=log,
-    )
-    save_checkpoint(
-        model_params=restored,
-        rank=0,
-        log=log,
-        best_val_loss=loaded_loss,
-    )
-
-    second_ckpt = cast(
-        dict[str, object],
-        torch.load(path, weights_only=True),
-    )
-    second_ckpt_model = cast(
-        dict[str, torch.Tensor],
-        second_ckpt["model"],
-    )
-    for k, v in first_sd.items():
-        assert torch.allclose(
-            v,
-            second_ckpt_model[k],
-        ), f"Param '{k}' differs after round trip"
-    second_ckpt_loss = cast(torch.Tensor, second_ckpt["best_val_loss"])
-    assert abs(second_ckpt_loss.item() - best_val_loss.item()) < TOLERANCE
-
-
-def test_checkpoint_round_trip_preserves_ema_state(
-    model_params: ModelSetup,
-    log: FilteringBoundLogger,
-) -> None:
-    """save->load->save is lossless for EMA shadow weights.
-
-    Mirrors test_checkpoint_round_trip_preserves_weights_and_loss but for
-    the EMA shadow: saves a checkpoint, reloads it, saves again, and
-    confirms the EMA weights are identical across both saved files.
-    """
-    path = model_params.tcfg.checkpoint.checkpoint_path
-    with torch.no_grad():
-        for p in model_params.model.parameters():
-            _ = p.add_(1.0)
-    model_params.ema.update(model_params.model, step=0)
-
-    save_checkpoint(
-        model_params=model_params,
+        model_params=setup,
         rank=0,
         log=log,
         best_val_loss=torch.tensor(0.271),
     )
-    first_ema_sd = {
-        k: v.clone() for k, v in model_params.ema.state_dict().items()
-    }
+    saved = cast(
+        dict[str, dict[str, object]],
+        torch.load(setup.tcfg.checkpoint.checkpoint_path, weights_only=True),
+    )
+    with torch.no_grad():
+        for param in setup.model.parameters():
+            _ = param.zero_()
+        for tensor in setup.ema.shadow.values():
+            _ = tensor.zero_()
+        live_state = cast(
+            dict[nn.Parameter, dict[str, Float[torch.Tensor, "..."]]],
+            setup.optimizer.state,
+        )
+        for state in live_state.values():
+            _ = state["exp_avg"].zero_()
+    setup.scheduler.last_epoch = -1
+    return CorruptedAfterSave(setup=setup, saved=saved)
 
-    for tensor in model_params.ema.shadow.values():
-        _ = tensor.zero_()
 
-    restored, loaded_loss = load_checkpoint(
+@pytest.fixture
+def ddp_model_params(
+    single_process_gloo_group: None,
+    model_params: ModelSetup,
+) -> ModelSetup:
+    """Return ``model_params`` with its model wrapped in one-rank DDP.
+
+    Args:
+        single_process_gloo_group: Starts the process group DDP needs.
+        model_params: Setup to wrap.
+
+    Returns:
+        The setup, whose model's state-dict keys carry ``module.``.
+    """
+    _ = single_process_gloo_group
+    return dataclasses.replace(model_params, model=DDP(model_params.model))
+
+
+@pytest.fixture
+def gated_wandb_setup(gate: WandbGate, model_params: ModelSetup) -> ModelSetup:
+    """Return ``model_params`` with W&B enabled or not, per the gate.
+
+    Args:
+        gate: Whether W&B is enabled; the requesting test parametrizes it.
+        model_params: Setup to copy.
+
+    Returns:
+        A copy whose config has the gate's ``use_wandb``.
+    """
+    logging = LoggingParams(use_wandb=gate.value.use_wandb)
+    tcfg = model_params.tcfg.model_copy(update={"logging": logging})
+    return dataclasses.replace(model_params, tcfg=tcfg)
+
+
+@pytest.fixture
+def wandb_enabled_setup(model_params: ModelSetup) -> ModelSetup:
+    """Return ``model_params`` with W&B enabled.
+
+    Args:
+        model_params: Setup to copy.
+
+    Returns:
+        A copy whose config has ``use_wandb=True``.
+    """
+    logging = LoggingParams(use_wandb=True)
+    tcfg = model_params.tcfg.model_copy(update={"logging": logging})
+    return dataclasses.replace(model_params, tcfg=tcfg)
+
+
+@pytest.fixture
+def budget_params(budget: int) -> TrainingParams:
+    """Build training parameters with the given token budget.
+
+    Args:
+        budget: Accumulated token budget; the requesting test parametrizes
+            it.
+
+    Returns:
+        The validated parameters.
+    """
+    return TrainingParams(accumulated_token_budget=budget)
+
+
+@pytest.fixture
+def expected_lr(
+    n_steps: int,
+    lr_schedule_base_lr: float,
+    lr_schedule_training: TrainingParams,
+) -> float:
+    """Learning rate ``alphafold_lr_lambda`` prescribes after ``n_steps``.
+
+    Args:
+        n_steps: Scheduler steps taken; the requesting test parametrizes
+            it.
+        lr_schedule_base_lr: Base learning rate.
+        lr_schedule_training: Warmup and decay settings.
+
+    Returns:
+        The base rate times the schedule factor.
+    """
+    factor = alphafold_lr_lambda(
+        n_steps,
+        warmup_steps=lr_schedule_training.lr_warmup_steps,
+        decay_steps=lr_schedule_training.lr_decay_steps,
+        decay_factor=lr_schedule_training.lr_decay_factor,
+    )
+    return lr_schedule_base_lr * factor
+
+
+@pytest.fixture
+def preflush_inputs(
+    tmp_path: pathlib.Path,
+    harness: TrainHarness,
+) -> PreflushInputs:
+    """Build loaders and a setup whose 42-token budget forces preflushes.
+
+    Args:
+        tmp_path: Directory for the run's shards and checkpoint.
+        harness: Builds the configuration, loaders and setup.
+
+    Returns:
+        The loaders and a fresh setup.
+    """
+    tcfg = harness.tcfg(
+        tmp_path,
+        TrainCase(1, 7, 1.0, use_wandb=False),
+        loader_budget=42,
+    )
+    tcfg = tcfg.model_copy(update={"test_loader": LoaderConfig(batch_size=1)})
+    return PreflushInputs(
+        loaders=harness.loaders(tmp_path, tcfg),
+        model_params=harness.setup(harness.trunk(), tcfg),
+    )
+
+
+@pytest.fixture
+def valid_pair_mask(
+    featurized_batch: FeaturizedBatch,
+) -> Bool[torch.Tensor, "B N_res N_res"]:
+    """Mark the residue pairs whose two residues both have a pseudo-Cβ.
+
+    Args:
+        featurized_batch: Supplies the pseudo-Cβ mask.
+
+    Returns:
+        The outer AND of the residue mask with itself.
+    """
+    residue_mask = featurized_batch.f_pseudo_beta_mask.bool()
+    return rearrange(residue_mask, "b i -> b i 1") & rearrange(
+        residue_mask,
+        "b j -> b 1 j",
+    )
+
+
+def test_take_step_eval_reports_finite_metrics_without_gradients(
+    featurized_batch: FeaturizedBatch,
+    model_params: ModelSetup,
+) -> None:
+    """An eval step returns finite losses and sane throughput, no gradients.
+
+    The token pack rate lies in ``(0, 1]`` and both rates are positive. Not
+    parametrized: train mode is tested below.
+
+    Args:
+        featurized_batch: Ten-protein batch.
+        model_params: Setup holding the model.
+    """
+    loss, tput = take_step(
+        batch=featurized_batch,
         model_params=model_params,
-        rank=0,
-        log=log,
+        train_mode=False,
     )
-    save_checkpoint(
-        model_params=restored,
-        rank=0,
-        log=log,
-        best_val_loss=loaded_loss,
-    )
-
-    second_ckpt = cast(
-        dict[str, object],
-        torch.load(path, weights_only=True),
-    )
-    second_ckpt_ema = cast(dict[str, torch.Tensor], second_ckpt["ema"])
-    for k, v in first_ema_sd.items():
-        assert torch.allclose(
-            v,
-            second_ckpt_ema[k],
-        ), f"EMA param '{k}' differs after round trip"
+    losses = torch.tensor(list(loss.to_float_dict().values()))
+    assert bool(torch.isfinite(losses).all())
+    assert 0 < tput.token_pack_rate.item() <= 1
+    assert tput.residues_per_sec.item() > 0
+    assert tput.atoms_per_sec.item() > 0
+    assert all(p.grad is None for p in model_params.model.parameters())
 
 
-def test_checkpoint_round_trip_preserves_optimizer_and_scheduler_state(
+def test_take_step_train_reaches_every_submodule(
+    featurized_batch: FeaturizedBatch,
+    model_params: ModelSetup,
+) -> None:
+    """A train step gives every top-level submodule a finite nonzero gradient.
+
+    Submodules whose parameters get no gradient at all count as missing,
+    so a head cut out of the graph fails. Not parametrized: one step on a
+    full batch reaches every head.
+
+    Args:
+        featurized_batch: Ten-protein batch.
+        model_params: Setup holding the model.
+    """
+    _ = model_params.model.train()
+    _ = take_step(
+        batch=featurized_batch,
+        model_params=model_params,
+        train_mode=True,
+    )
+    usable: dict[str, bool] = {}
+    for name, param in model_params.model.named_parameters():
+        grad = param.grad
+        good = (
+            grad is not None
+            and bool(torch.isfinite(grad).all())
+            and bool(grad.abs().max() > 0)
+        )
+        prefix = name.split(".")[0]
+        usable[prefix] = usable.get(prefix, False) or good
+    assert usable
+    assert usable == dict.fromkeys(usable, True)
+
+
+@pytest.mark.parametrize("scale", [2.0, 4.0])
+def test_take_step_grad_scale_divides_the_gradient(
+    featurized_batch: FeaturizedBatch,
+    model_params: ModelSetup,
+    scale: float,
+) -> None:
+    """``grad_scale = s`` gives ``1/s`` of the unscaled gradient norm.
+
+    The same seed is used for both steps, so only the scale differs.
+
+    Args:
+        featurized_batch: Ten-protein batch.
+        model_params: Setup holding the model.
+        scale: Gradient scale to compare with 1.
+    """
+    _ = model_params.model.train()
+    norms: list[float] = []
+    for grad_scale in (1.0, scale):
+        _ = manual_seed(0)
+        model_params.model.zero_grad()
+        _ = take_step(
+            batch=featurized_batch,
+            model_params=model_params,
+            train_mode=True,
+            grad_scale=grad_scale,
+        )
+        squares = [
+            reduce(p.grad**2, "... -> ", "sum")
+            for p in model_params.model.parameters()
+            if p.grad is not None
+        ]
+        norms.append(float(torch.stack(squares).sum().sqrt()))
+    torch.testing.assert_close(norms[1], norms[0] / scale, rtol=1e-3, atol=0)
+
+
+def test_process_accum_window_scales_each_batch_by_protein_share(
+    featurized_batch: FeaturizedBatch,
+    model_params: ModelSetup,
+) -> None:
+    """Batch ``i`` of the window gets ``grad_scale = total / proteins_i``.
+
+    With 1 and 3 proteins the total is 4, so the scales are 4 and 4/3, and
+    the window's losses are finite. Not parametrized: two unequal batches
+    show the weighting.
+
+    Args:
+        featurized_batch: Batch used for both window slots.
+        model_params: Setup holding the model.
+    """
+    _ = model_params.model.train()
+    with mock.patch(
+        "train.train_loop.take_step",
+        autospec=True,
+        side_effect=take_step,
+    ) as take_step_spy:
+        loss, _ = process_accum_window(
+            [featurized_batch, featurized_batch],
+            [1, 3],
+            model_params,
+        )
+    losses = torch.tensor(list(loss.to_float_dict().values()))
+    scales = [
+        cast(float, call.kwargs["grad_scale"])
+        for call in take_step_spy.call_args_list
+    ]
+    torch.testing.assert_close(
+        torch.tensor(scales),
+        torch.tensor([4.0, 4.0 / 3]),
+    )
+    assert bool(torch.isfinite(losses).all())
+
+
+def test_component_grad_norms_are_positive_after_a_step(
+    featurized_batch: FeaturizedBatch,
+    model_params: ModelSetup,
+) -> None:
+    """After a train step every component's gradient norm is positive.
+
+    Not parametrized: one backward pass fills every component.
+
+    Args:
+        featurized_batch: Ten-protein batch.
+        model_params: Setup holding the model.
+    """
+    _ = model_params.model.train()
+    _ = take_step(
+        batch=featurized_batch,
+        model_params=model_params,
+        train_mode=True,
+    )
+    norms = component_grad_norms(model_params.model).to_float_dict()
+    assert {k: v > 0 for k, v in norms.items()} == dict.fromkeys(norms, True)
+
+
+def test_optimizer_step_moves_weights_and_blends_the_ema(
+    featurized_batch: FeaturizedBatch,
+    model_params: ModelSetup,
+) -> None:
+    """One optimizer step changes the weights, bumps the step, updates EMA.
+
+    The shadow afterwards is ``d * before + (1 - d) * after`` with the
+    bias-corrected ``d = min(decay, (step + 1) / (step + 10))`` at the
+    pre-step count. Not parametrized: the EMA formula has its own
+    parametrized test in ``test_main_trunk``.
+
+    Args:
+        featurized_batch: Ten-protein batch.
+        model_params: Setup holding the model and EMA.
+    """
+    name, _ = next(model_params.model.named_parameters())
+    shadow_before = model_params.ema.shadow[name].clone()
+    before = [p.clone().detach() for p in model_params.model.parameters()]
+    _ = model_params.model.train()
+    step = 5
+    _, _, norms, new_step = optimizer_step(
+        [featurized_batch],
+        [1],
+        model_params,
+        global_step=step,
+    )
+    after = cast(
+        dict[str, Float[torch.Tensor, "..."]],
+        model_params.model.state_dict(),
+    )[name]
+    ramp = (step + 1) / (step + 10)
+    decay = min(model_params.tcfg.training.ema_decay, ramp)
+    expected = decay * shadow_before + (1 - decay) * after
+    assert new_step == step + 1
+    assert isinstance(norms, ComponentNorms)
+    assert any(
+        not torch.equal(b, a)
+        for b, a in zip(before, model_params.model.parameters(), strict=True)
+    )
+    torch.testing.assert_close(model_params.ema.shadow[name], expected)
+
+
+def test_evaluate_reports_finite_metrics_without_gradients(
+    loaders: Loaders,
     model_params: ModelSetup,
     log: FilteringBoundLogger,
 ) -> None:
-    """save->load restores Adam moments and scheduler step count exactly.
+    """Evaluation over the test loader gives finite, non-negative losses.
 
-    Populates optimizer/scheduler state with a manual step, saves it,
-    corrupts the in-memory state, then confirms load_checkpoint restores the
-    original values rather than the assertions trivially passing.
+    It must leave no gradients. Not parametrized: one loader covers it.
+
+    Args:
+        loaders: Train and test loaders.
+        model_params: Setup holding the model.
+        log: Logger.
     """
-    for p in model_params.model.parameters():
-        p.grad = torch.ones_like(p)
-    _ = (
-        model_params.optimizer.step()  # pyright: ignore[reportUnknownMemberType]
-    )
-    model_params.scheduler.step()
-    model_params.optimizer.zero_grad()
+    loss, _ = evaluate(loaders.test, model_params, log)
+    losses = torch.tensor(list(loss.to_float_dict().values()))
+    assert bool(torch.isfinite(losses).all())
+    assert loss.total_loss.item() >= 0
+    assert loss.RMSD.item() >= 0
+    assert all(p.grad is None for p in model_params.model.parameters())
 
+
+@pytest.mark.parametrize(
+    "swap_wrap",
+    list(SwapWrap),
+    ids=[case.name for case in SwapWrap],
+)
+def test_swapped_in_ema_weights_swaps_in_and_back(
+    swap_setup: SwapSetup,
+) -> None:
+    """Inside the block the model holds the shadow; after it, the raw weights.
+
+    Args:
+        swap_setup: Setup, plain or DDP-wrapped, with reference weights.
+    """
+    x = swap_setup
+    with swapped_in_ema_weights(x.setup):
+        inside = cast(
+            dict[str, Float[torch.Tensor, "..."]],
+            x.inner.state_dict(),
+        )
+        matched = all(torch.equal(inside[k], v) for k, v in x.shadow.items())
+    after = cast(dict[str, Float[torch.Tensor, "..."]], x.inner.state_dict())
+    assert matched
+    assert all(torch.equal(after[k], v) for k, v in x.raw.items())
+
+
+@pytest.mark.parametrize(
+    "swap_wrap",
+    list(SwapWrap),
+    ids=[case.name for case in SwapWrap],
+)
+def test_swapped_in_ema_weights_restores_raw_weights_on_error(
+    swap_setup: SwapSetup,
+) -> None:
+    """An exception in the block propagates and the raw weights come back.
+
+    Otherwise a failed evaluation would leave training on EMA weights.
+
+    Args:
+        swap_setup: Setup, plain or DDP-wrapped, with reference weights.
+
+    Raises:
+        RuntimeError: Raised inside the block to exercise the error path;
+            caught by ``pytest.raises``.
+    """
+    x = swap_setup
+    message = "simulated eval failure"
+    with (
+        pytest.raises(RuntimeError, match=message),
+        swapped_in_ema_weights(x.setup),
+    ):
+        raise RuntimeError(message)
+    after = cast(dict[str, Float[torch.Tensor, "..."]], x.inner.state_dict())
+    assert all(torch.equal(after[k], v) for k, v in x.raw.items())
+
+
+@pytest.mark.parametrize(
+    "checkpoint_write_scenario",
+    list(CheckpointWriteScenario),
+    ids=[case.name for case in CheckpointWriteScenario],
+)
+def test_save_checkpoint_writes_only_on_rank_zero(
+    model_params: ModelSetup,
+    log: FilteringBoundLogger,
+    checkpoint_write_scenario: CheckpointWriteScenario,
+) -> None:
+    """Rank 0 writes a checkpoint with every state; other ranks write none.
+
+    Args:
+        model_params: Setup to save.
+        log: Logger.
+        checkpoint_write_scenario: Rank and whether it must write a file.
+    """
+    case = checkpoint_write_scenario.value
+    writes = case.writes
+    path = model_params.tcfg.checkpoint.checkpoint_path
     save_checkpoint(
         model_params=model_params,
+        rank=case.rank,
+        log=log,
+        best_val_loss=torch.tensor(0.5),
+    )
+    saved = (
+        cast(dict[str, object], torch.load(path, weights_only=True))
+        if path.exists()
+        else {}
+    )
+    expected = {"model", "optimizer", "scheduler", "ema", "best_val_loss"}
+    assert path.exists() == writes
+    assert set(saved) == (expected if writes else set())
+
+
+def test_load_checkpoint_restores_every_saved_state(
+    corrupted_after_save: CorruptedAfterSave,
+    log: FilteringBoundLogger,
+) -> None:
+    """Loading undoes corruption of the weights, EMA, Adam and scheduler.
+
+    After one optimizer and scheduler step, the setup is saved, then its
+    weights and shadow are zeroed, Adam's first moments zeroed and the
+    scheduler rewound. Loading must restore each saved value and the best
+    validation loss. Not parametrized: every state goes in one file.
+
+    Args:
+        corrupted_after_save: Corrupted setup and its saved checkpoint.
+        log: Logger.
+    """
+    saved = corrupted_after_save.saved
+    restored, best = load_checkpoint(
+        model_params=corrupted_after_save.setup,
         rank=0,
         log=log,
-        best_val_loss=torch.tensor(0.1),
     )
-    saved_opt_state = cast(
-        dict[int, dict[str, torch.Tensor]],
-        cast(
-            dict[str, object],
-            model_params.optimizer.state_dict(),
-        )["state"],
+    model_sd = cast(dict[str, Float[torch.Tensor, "..."]], saved["model"])
+    ema_sd = cast(dict[str, Float[torch.Tensor, "..."]], saved["ema"])
+    opt_sd = cast(
+        dict[int, dict[str, Float[torch.Tensor, "..."]]],
+        saved["optimizer"]["state"],
     )
-    saved_exp_avg = {
-        i: state[_ADAM_EXP_AVG_KEY].clone()
-        for i, state in saved_opt_state.items()
-    }
-    saved_last_epoch = cast(
-        int,
-        cast(dict[str, object], model_params.scheduler.state_dict())[
-            "last_epoch"
-        ],
+    restored_opt = cast(
+        dict[int, dict[str, Float[torch.Tensor, "..."]]],
+        cast(dict[str, object], restored.optimizer.state_dict())["state"],
     )
-
-    live_opt_state = cast(
-        dict[torch.nn.Parameter, dict[str, torch.Tensor]],
-        model_params.optimizer.state,
+    live = cast(
+        dict[str, Float[torch.Tensor, "..."]],
+        restored.model.state_dict(),
     )
-    for state in live_opt_state.values():
-        _ = state[_ADAM_EXP_AVG_KEY].zero_()
-    model_params.scheduler.last_epoch = -1
-
-    restored, _ = load_checkpoint(model_params=model_params, rank=0, log=log)
-
-    restored_opt_state = cast(
-        dict[int, dict[str, torch.Tensor]],
-        cast(
-            dict[str, object],
-            restored.optimizer.state_dict(),
-        )["state"],
+    assert all(torch.equal(live[k], v) for k, v in model_sd.items())
+    assert all(
+        torch.equal(restored.ema.shadow[k], v) for k, v in ema_sd.items()
     )
-    for i, exp_avg in saved_exp_avg.items():
-        assert torch.allclose(
-            restored_opt_state[i][_ADAM_EXP_AVG_KEY],
-            exp_avg,
-        ), f"Adam exp_avg for param {i} not restored"
-    restored_last_epoch = cast(
-        int,
-        cast(dict[str, object], restored.scheduler.state_dict())["last_epoch"],
+    assert all(
+        torch.equal(restored_opt[i]["exp_avg"], s["exp_avg"])
+        for i, s in opt_sd.items()
     )
-    assert restored_last_epoch == saved_last_epoch
-
-
-@contextlib.contextmanager
-def _single_process_gloo_group() -> Generator[None]:
-    """Init and tear down a single-process gloo group for DDP-wrapping tests."""
-    # HashStore is a private torch.distributed C-extension symbol that
-    # isn't officially re-exported; getattr() sidesteps the static
-    # private-import check, whose result is otherwise inconsistent
-    # across torch's per-platform packaging.
-    dist.init_process_group(
-        backend="gloo",
-        store=getattr(  # noqa: B009  # pyright: ignore[reportAny]
-            dist,
-            "HashStore",
-        )(),
-        rank=0,
-        world_size=1,
-    )
-    try:
-        yield
-    finally:
-        dist.destroy_process_group()
+    assert restored.scheduler.last_epoch == saved["scheduler"]["last_epoch"]
+    torch.testing.assert_close(best, torch.tensor(0.271))
 
 
 def test_save_checkpoint_strips_ddp_wrapper_prefix(
     model_params: ModelSetup,
+    ddp_model_params: ModelSetup,
     log: FilteringBoundLogger,
 ) -> None:
-    """Checkpoint saved from a DDP-wrapped model has unprefixed model keys.
+    """A checkpoint saved from a DDP model has the plain model's keys.
 
-    Wraps model_params.model in DDP under a single-process gloo group (no
-    network ports or GPUs needed) and confirms save_checkpoint unwraps
-    ``.module`` before calling state_dict(), so the saved keys match the
-    plain model and never carry a "module." prefix.
+    ``save_checkpoint`` must unwrap ``.module`` before ``state_dict()``, so
+    no key carries a ``module.`` prefix. Not parametrized: the plain case
+    is the rank-0 test above.
+
+    Args:
+        model_params: Unwrapped setup, for the expected keys.
+        ddp_model_params: The same setup with its model in DDP.
+        log: Logger.
     """
-    plain_keys = set(model_params.model.state_dict().keys())
-    with _single_process_gloo_group():
-        ddp_model_params = dataclasses.replace(
-            model_params,
-            model=DDP(model_params.model),
-        )
-        save_checkpoint(
-            model_params=ddp_model_params,
-            rank=0,
-            log=log,
-            best_val_loss=torch.tensor(0.3),
-        )
-
-    ckpt = cast(
-        dict[str, object],
+    plain_keys = set(model_params.model.state_dict())
+    save_checkpoint(
+        model_params=ddp_model_params,
+        rank=0,
+        log=log,
+        best_val_loss=torch.tensor(0.3),
+    )
+    saved = cast(
+        dict[str, dict[str, Float[torch.Tensor, "..."]]],
         torch.load(
             model_params.tcfg.checkpoint.checkpoint_path,
             weights_only=True,
         ),
     )
-    model_sd = cast(dict[str, torch.Tensor], ckpt["model"])
-    assert not any(k.startswith("module.") for k in model_sd)
-    assert model_sd.keys() == plain_keys
+    assert set(saved["model"]) == plain_keys
 
 
-# ---------------------------------------------------------------------------
-# log_epoch
-# ---------------------------------------------------------------------------
-
-
-def _tcfg_with_wandb(*, base: TrainConfig, use_wandb: bool) -> TrainConfig:
-    """Return a copy of base with use_wandb overridden.
+@pytest.mark.parametrize(
+    "gate",
+    list(WandbGate),
+    ids=[case.name for case in WandbGate],
+)
+def test_log_epoch_calls_wandb_only_when_asked_and_enabled(
+    gated_wandb_setup: ModelSetup,
+    epoch_metrics: EpochMetrics,
+    log: FilteringBoundLogger,
+    wandb_payloads: list[dict[str, object]],
+    gate: WandbGate,
+) -> None:
+    """``wandb.log`` runs once when ``do_log`` and ``use_wandb`` are both set.
 
     Args:
-        base: Base TrainConfig to copy from.
-        use_wandb: Whether to enable W&B logging.
-
-    Returns:
-        New TrainConfig with logging.use_wandb set to use_wandb.
+        gated_wandb_setup: Setup with the gate's ``use_wandb``.
+        epoch_metrics: Metrics to log.
+        log: Logger.
+        wandb_payloads: Captured ``wandb.log`` calls.
+        gate: ``do_log`` and the expected call count.
     """
-    return TrainConfig(
-        training=base.training,
-        model=base.model,
-        checkpoint=base.checkpoint,
-        logging=LoggingParams(use_wandb=use_wandb),
-    )
-
-
-def test_log_epoch_do_log_false_skips_wandb(
-    model_params: ModelSetup,
-    log: FilteringBoundLogger,
-    wandb_call_counter: list[object],
-) -> None:
-    """log_epoch(do_log=False) does not call wandb.log if use_wandb=True."""
-    mp = dataclasses.replace(
-        model_params,
-        tcfg=_tcfg_with_wandb(base=model_params.tcfg, use_wandb=True),
-    )
+    case = gate.value
     log_epoch(
-        epoch_metrics=_make_epoch_metrics(epoch=1, global_step=1),
-        model_params=mp,
+        epoch_metrics=epoch_metrics,
+        model_params=gated_wandb_setup,
         log=log,
-        do_log=False,
+        do_log=case.do_log,
     )
-    assert len(wandb_call_counter) == 0
+    assert len(wandb_payloads) == case.calls
 
 
-def test_log_epoch_wandb_disabled_skips_call(
-    model_params: ModelSetup,
-    log: FilteringBoundLogger,
-    wandb_call_counter: list[object],
-) -> None:
-    """log_epoch(use_wandb=False) does not call wandb.log if do_log=True."""
-    log_epoch(
-        epoch_metrics=_make_epoch_metrics(epoch=1, global_step=1),
-        model_params=model_params,
-        log=log,
-        do_log=True,
-    )
-    assert len(wandb_call_counter) == 0
-
-
-def test_log_epoch_wandb_enabled_calls_once(
-    model_params: ModelSetup,
+def test_log_epoch_payload_names_the_epoch_and_both_splits(
+    wandb_enabled_setup: ModelSetup,
+    epoch_metrics: EpochMetrics,
     log: FilteringBoundLogger,
     wandb_payloads: list[dict[str, object]],
 ) -> None:
-    """log_epoch with do_log=True and use_wandb=True calls wandb.log once."""
-    mp = dataclasses.replace(
-        model_params,
-        tcfg=_tcfg_with_wandb(base=model_params.tcfg, use_wandb=True),
-    )
+    """The payload carries the epoch and ``train/`` and ``val/`` metrics.
+
+    Not parametrized: the gating is the test above.
+
+    Args:
+        wandb_enabled_setup: Setup with W&B enabled.
+        epoch_metrics: Metrics to log.
+        log: Logger.
+        wandb_payloads: Captured ``wandb.log`` calls.
+    """
     log_epoch(
-        epoch_metrics=_make_epoch_metrics(epoch=3, global_step=1),
-        model_params=mp,
+        epoch_metrics=epoch_metrics,
+        model_params=wandb_enabled_setup,
         log=log,
         do_log=True,
     )
-    assert len(wandb_payloads) == 1
+    payload = wandb_payloads[0]
+    assert payload["epoch"] == epoch_metrics.epoch
+    assert any(k.startswith("train/") for k in payload)
+    assert any(k.startswith("val/") for k in payload)
 
 
-def test_log_epoch_wandb_payload_keys(
-    model_params: ModelSetup,
-    log: FilteringBoundLogger,
-    wandb_payloads: list[dict[str, object]],
+@pytest.mark.parametrize("budget", [0, -5], ids=["zero", "negative"])
+def test_accumulated_token_budget_rejects_non_positive_values(
+    budget: int,
 ) -> None:
-    """Verify W&B payload from log_epoch has expected epoch and key prefixes.
+    """A token budget of zero or less fails validation.
 
-    Checks:
-        - The 'epoch' key equals the epoch embedded in EpochMetrics.
-        - At least one key is prefixed with 'train/'.
-        - At least one key is prefixed with 'val/'.
+    Args:
+        budget: Invalid budget.
     """
-    mp = dataclasses.replace(
-        model_params,
-        tcfg=_tcfg_with_wandb(base=model_params.tcfg, use_wandb=True),
-    )
-    log_epoch(
-        epoch_metrics=_make_epoch_metrics(epoch=EPOCH, global_step=1),
-        model_params=mp,
-        log=log,
-        do_log=True,
-    )
-    assert wandb_payloads[0]["epoch"] == EPOCH
-    assert any(k.startswith("train/") for k in wandb_payloads[0])
-    assert any(k.startswith("val/") for k in wandb_payloads[0])
-
-
-# ---------------------------------------------------------------------------
-# train
-# ---------------------------------------------------------------------------
-
-
-def test_train_token_budget_preflush_fires_before_oversized_batch(
-    model_params: ModelSetup,
-    jsonl_path: str,
-    splits_path: str,
-    log: FilteringBoundLogger,
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: pathlib.Path,
-) -> None:
-    """Pre-flush fires when the next batch would push tokens over the budget.
-
-    Loader yields 4 batches of _N_RES_BUCKET tokens each with budget=7:
-    - batch1 (buffer empty): added, no pre-flush
-    - batch2: tokens+tokens > 7 → pre-flush batch1, then batch2 added
-    - batch3: tokens+tokens > 7 → pre-flush batch2, then batch3 added
-    - batch4: tokens+tokens > 7 → pre-flush batch3, then batch4 added
-    - epoch end: batch4 remains in buffer → end-of-epoch flush of batch4
-    Result: four optimizer windows each of size 1; no batch is dropped.
-    """
-    window_sizes: list[int] = []
-    _real_process = process_accum_window
-
-    def _tracking_process(
-        micro_buffer: list[FeaturizedBatch],
-        n_proteins_per_batch: list[int],
-        model_params: ModelSetup,  # pylint: disable=redefined-outer-name
-    ) -> tuple[LossMetrics, ThroughputStatistics]:
-        window_sizes.append(len(micro_buffer))
-        return _real_process(
-            micro_buffer,
-            n_proteins_per_batch,
-            model_params,
-        )
-
-    monkeypatch.setattr(
-        "train.train_loop.process_accum_window",
-        _tracking_process,
-    )
-
-    budget: int = 7  # tokens+tokens > 7 forces a pre-flush on every 2nd batch
-    tcfg_b = TrainConfig(
-        training=TrainingParams(
-            num_epochs=1,
-            lr=1e-4,
-            grad_clip=1.0,
-            accumulated_token_budget=budget,
-        ),
-        model=model_params.tcfg.model,
-        distogram_template=TemplateDistogramParams(
-            n_bins=_N_BINS,
-            min_dist=3.25,
-            max_dist=50.75,
-        ),
-        distogram_residue=ResidueDistogramParams(
-            n_bins=_N_BINS,
-            min_dist=2.0,
-            max_dist=22.0,
-        ),
-        distogram_atom=AtomDistogramParams(
-            n_bins=_N_ATOM_BINS,
-            min_dist=0.0,
-            max_dist=10.0,
-        ),
-        checkpoint=CheckpointParams(
-            checkpoint_path=tmp_path / "flush.pt",
-            save_every=100,
-        ),
-        logging=LoggingParams(use_wandb=False),
-        test_loader=LoaderConfig(batch_size=1),
-        train_loader=TrainLoaderConfig(
-            token_budget=_N_RES_BUCKET,
-            noise_magnitude=0,
-            n_shards=1,
-            num_workers=1,
-            epoch_prefetch_depth=1,
-            batch_prefetch_depth=1,
-            n_threads=1,
-        ),
-    )
-    mp_b = _make_model_params(
-        model_params.model,
-        tcfg_b,
-        model_params.distogram_template,
-        model_params.distogram_residue,
-        model_params.distogram_atom,
-    )
-    args = TrainArgs(
-        dataset_jsonl=pathlib.Path(jsonl_path),
-        shard_dir=tmp_path / "shards",
-        keys_for_splits_json=pathlib.Path(splits_path),
-        config=tmp_path / "config.json",
-        structlog_jsonl=tmp_path / "structlog.jsonl",
-        ddp=False,
-        debug_run=False,
-    )
-    train_loader, test_loader, _ = make_bucketed_data_loaders(
-        cfg=tcfg_b,
-        extra_train_args=args,
-    )
-    train(
-        best_val_loss=torch.tensor(float("inf")),
-        train_loader=train_loader,
-        test_loader=test_loader,
-        model_params=mp_b,
-        log=log,
-    )
-    assert window_sizes == [1, 1, 1, 1]
-
-
-# ---------------------------------------------------------------------------
-# Config validation
-# ---------------------------------------------------------------------------
-
-
-def test_accumulated_token_budget_rejects_zero() -> None:
-    """TrainingParams raises ValidationError when token budget zero."""
     with pytest.raises(ValidationError):
-        _ = TrainingParams(accumulated_token_budget=0)
+        _ = TrainingParams(accumulated_token_budget=budget)
 
 
-def test_train_config_accepts_any_positive_token_budget() -> None:
-    """TrainConfig accepts any positive accumulated_token_budget."""
-    cfg = TrainConfig(training=TrainingParams(accumulated_token_budget=1))
-    assert cfg.training.accumulated_token_budget == 1
+@pytest.mark.parametrize("budget", [1, 1_000_000], ids=["one", "large"])
+def test_accumulated_token_budget_accepts_any_positive_value(
+    budget_params: TrainingParams,
+    budget: int,
+) -> None:
+    """Any positive token budget is accepted as given.
 
-
-_WARMUP_DECAY_BASE_LR = 2.0
-_WARMUP_DECAY_WARMUP_STEPS = 4
-_WARMUP_DECAY_DECAY_STEPS = 3
-_WARMUP_DECAY_DECAY_FACTOR = 0.5
-
-
-@pytest.fixture
-def warmup_decay_optimizer() -> Adam:
-    """Adam optimizer over a single dummy parameter at a fixed base LR."""
-    param = nn.Parameter(torch.zeros(1))
-    return Adam([param], lr=_WARMUP_DECAY_BASE_LR)
+    Args:
+        budget_params: Parameters built with the budget.
+        budget: The budget passed in.
+    """
+    assert budget_params.accumulated_token_budget == budget
 
 
 @pytest.mark.parametrize(
@@ -1804,434 +1614,154 @@ def warmup_decay_optimizer() -> Adam:
         "second_decay_boundary_reached",
     ],
 )
-def test_lambda_lr_matches_alphafold_lr_lambda_through_real_scheduler(
-    warmup_decay_optimizer: Adam,
+def test_build_lr_scheduler_follows_alphafold_lr_lambda(
+    lr_schedule_optimizer: Adam,
+    lr_scheduler: LambdaLR,
     n_steps: int,
+    expected_lr: float,
 ) -> None:
-    """A real LambdaLR driven by alphafold_lr_lambda reproduces its outputs.
+    """The training LR schedule reproduces ``alphafold_lr_lambda`` exactly.
 
-    Steps a genuine torch.optim.lr_scheduler.LambdaLR n_steps times beyond
-    its construction-time initial value, then checks the optimizer's live
-    LR equals base_lr times alphafold_lr_lambda evaluated at the same step
-    count -- exercising the real PyTorch scheduler machinery end to end
-    rather than just the bare multiplier function in isolation.
-    """
-    scheduler = LambdaLR(
-        warmup_decay_optimizer,
-        lr_lambda=functools.partial(
-            alphafold_lr_lambda,
-            warmup_steps=_WARMUP_DECAY_WARMUP_STEPS,
-            decay_steps=_WARMUP_DECAY_DECAY_STEPS,
-            decay_factor=_WARMUP_DECAY_DECAY_FACTOR,
-        ),
-    )
-    for _ in range(n_steps):
-        scheduler.step()
-    expected = _WARMUP_DECAY_BASE_LR * alphafold_lr_lambda(
-        n_steps,
-        warmup_steps=_WARMUP_DECAY_WARMUP_STEPS,
-        decay_steps=_WARMUP_DECAY_DECAY_STEPS,
-        decay_factor=_WARMUP_DECAY_DECAY_FACTOR,
-    )
-    actual = cast(float, warmup_decay_optimizer.param_groups[0]["lr"])
-    expected_approx = pytest.approx(  # pyright: ignore[reportUnknownMemberType]
-        expected,
-        rel=TOLERANCE,
-    )
-    assert actual == expected_approx
-
-
-_N_RES_BUCKET = 42
-_ENTRY_NAMES_BUCKET = ["1aa.A", "2bb.A", "3cc.A", "4dd.A", "5ee.A", "6ff.A"]
-_TRAIN_NAMES_BUCKET = ["1aa.A", "2bb.A", "3cc.A", "6ff.A"]
-_VAL_NAMES_BUCKET = ["4dd.A"]
-_TEST_NAMES_BUCKET = ["5ee.A"]
-
-
-@pytest.fixture(scope="module")
-def jsonl_path(tmp_path_factory: pytest.TempPathFactory) -> str:
-    """Write JSONL file with synthetic protein entries and return its path."""
-    path = tmp_path_factory.mktemp("dataset") / "proteins.jsonl"
-    with path.open("w") as f:
-        for name in _ENTRY_NAMES_BUCKET:
-            entry = {
-                "name": name,
-                "seq": "A" * _N_RES_BUCKET,
-                "coords": {
-                    atom: np.zeros((_N_RES_BUCKET, 3)).tolist()
-                    for atom in ("N", "CA", "C", "O")
-                },
-            }
-            _ = f.write(json.dumps(entry) + "\n")
-    return str(path)
-
-
-@pytest.fixture(scope="module")
-def splits_path(tmp_path_factory: pytest.TempPathFactory) -> str:
-    """Write splits JSON with train/val/test name lists and return its path."""
-    path = tmp_path_factory.mktemp("splits") / "splits.json"
-    with path.open("w") as f:
-        json.dump(
-            {
-                "train": _TRAIN_NAMES_BUCKET,
-                "validation": _VAL_NAMES_BUCKET,
-                "test": _TEST_NAMES_BUCKET,
-            },
-            f,
-        )
-    return str(path)
-
-
-class TrainScenario(Enum):
-    """Configurations train() runs under, each exercised by one shared run.
-
-    A real ``train()`` epoch takes seconds, so ``recorded_train_runs`` runs
-    each scenario once per module and every test asserts on the result.
-    Each member is a ``(num_epochs, budget_multiplier, grad_clip, use_wandb)``
-    tuple read through properties; the budget multiplier scales
-    ``_BATCH_TOKENS``. Tests share this one enum rather than each subclassing
-    a base enum, because members of separate subclasses are separate
-    parameters and would each trigger their own ``train()`` run.
-
-    Every budget here, including ``large_token_budget``, is below the 168
-    tokens of the two synthetic train batches (84 tokens each). So each
-    epoch flushes the first batch when the second arrives, and flushes the
-    second at the end of the epoch: two optimizer steps per epoch.
-
-    Members:
-        default_budget: One epoch with clipping on and W&B off.
-        no_grad_clip: As ``default_budget`` with gradient clipping disabled.
-        large_token_budget: A budget above one batch's tokens, with W&B on.
-        multi_epoch: Two epochs with W&B on, the fewest that can show the
-            logged epoch advancing.
-    """
-
-    default_budget = (1, 1, 1.0, False)
-    no_grad_clip = (1, 1, None, False)
-    large_token_budget = (1, 10, 1.0, True)
-    multi_epoch = (2, 1, 1.0, True)
-
-    @property
-    def num_epochs(self) -> int:
-        """Number of training epochs."""
-        return self.value[0]
-
-    @property
-    def accumulated_token_budget(self) -> int:
-        """Tokens accumulated before an optimizer step."""
-        return self.value[1] * _BATCH_TOKENS
-
-    @property
-    def grad_clip(self) -> float | None:
-        """Gradient clipping threshold, or None to disable clipping."""
-        return self.value[2]
-
-    @property
-    def use_wandb(self) -> bool:
-        """Whether W&B logging is enabled."""
-        return self.value[3]
-
-
-@dataclasses.dataclass(frozen=True)
-class TrainRun:
-    """What one train() run did, recorded by ``_record_train_run``.
-
-    Attributes:
-        parameters_changed: True if any model parameter changed in the run.
-        reduced_metrics: Every instance all_reduce_mean() was called on.
-        wandb_payloads: One dict per wandb.log call.
-        checkpoint: The saved checkpoint, loaded back from disk.
-        num_epochs: Number of epochs the run was configured for.
-    """
-
-    parameters_changed: bool
-    reduced_metrics: list[TensorAccumulatorMixin]
-    wandb_payloads: list[dict[str, object]]
-    checkpoint: dict[str, dict[str, object]]
-    num_epochs: int
-
-
-def _record_train_run(
-    scenario: TrainScenario,
-    work_dir: pathlib.Path,
-    dataset_jsonl: str,
-    splits_json: str,
-) -> TrainRun:
-    """Run train() once for a scenario and record what it did.
-
-    Arrange: build a fresh model and config, spy on all_reduce_mean(), and
-    capture wandb.log. Function-scoped ``monkeypatch`` cannot serve a
-    module-scoped cache, so the patches use ``MonkeyPatch.context``.
-    Act: run train() on the real loaders.
+    With 4 warmup steps, decay every 3 steps by 0.5 and base rate 2, the
+    optimizer's live rate after ``n_steps`` must equal
+    ``2 * alphafold_lr_lambda(n_steps)``, through PyTorch's scheduler.
 
     Args:
-        scenario: Configuration to run.
-        work_dir: Directory for the checkpoint, shards, and logs.
-        dataset_jsonl: Path to the synthetic proteins JSONL file.
-        splits_json: Path to the train/val/test splits JSON.
-
-    Returns:
-        TrainRun recording the scenario's outcome.
+        lr_schedule_optimizer: Optimizer the schedule drives.
+        lr_scheduler: The training schedule, at step 0.
+        n_steps: Scheduler steps to take.
+        expected_lr: Learning rate the schedule must give.
     """
-    _ = manual_seed(0)
-    trunk = _make_model()
-    setup = _make_model_params(
-        trunk,
-        _make_tcfg(
-            work_dir / "best.pt",
-            num_epochs=scenario.num_epochs,
-            grad_clip=scenario.grad_clip,
-            accumulated_token_budget=scenario.accumulated_token_budget,
-            use_wandb=scenario.use_wandb,
-        ),
-        _make_distogram_template(),
-        _make_distogram_residue(),
-        _make_distogram_atom(),
-    )
-    train_loader, test_loader = _make_loaders(
-        work_dir,
-        dataset_jsonl,
-        splits_json,
-    )
-    params_before = [p.clone().detach() for p in trunk.parameters()]
-    reduced_metrics: list[TensorAccumulatorMixin] = []
-    logged_payloads: list[dict[str, object]] = []
-    original_reduce = TensorAccumulatorMixin.all_reduce_mean
+    for _ in range(n_steps):
+        lr_scheduler.step()
+    actual = cast(float, lr_schedule_optimizer.param_groups[0]["lr"])
+    torch.testing.assert_close(actual, expected_lr)
 
-    def _spy(self: TensorAccumulatorMixin) -> None:
-        """Record the instance, then run the real all_reduce_mean()."""
-        reduced_metrics.append(self)
-        original_reduce(self)
 
-    with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(TensorAccumulatorMixin, "all_reduce_mean", _spy)
-        patch.setattr("train.train_loop.wandb.log", logged_payloads.append)
+def test_train_preflushes_before_an_oversized_batch(
+    preflush_inputs: PreflushInputs,
+    log: FilteringBoundLogger,
+) -> None:
+    """Each window is flushed before a batch that would exceed the budget.
+
+    The loader yields 4 one-protein batches; with a budget of 7 tokens, two
+    batches always exceed it, so batches 1 to 3 are each flushed alone
+    when the next arrives, and the end-of-epoch flush takes batch 4 so no
+    batch is dropped: four windows of one. Not parametrized: the
+    budget is chosen so every arrival triggers a flush.
+
+    Args:
+        preflush_inputs: Loaders and a fresh setup with a 42-token budget.
+        log: Logger.
+    """
+    built = preflush_inputs.loaders
+    with mock.patch(
+        "train.train_loop.process_accum_window",
+        autospec=True,
+        side_effect=process_accum_window,
+    ) as process_spy:
         train(
             best_val_loss=torch.tensor(float("inf")),
-            train_loader=train_loader,
-            test_loader=test_loader,
-            model_params=setup,
-            log=cast(FilteringBoundLogger, structlog.get_logger()),
+            train_loader=built.train,
+            test_loader=built.test,
+            model_params=preflush_inputs.model_params,
+            log=log,
         )
-    return TrainRun(
-        parameters_changed=any(
-            not torch.equal(before, after)
-            for before, after in zip(
-                params_before,
-                trunk.parameters(),
-                strict=True,
-            )
-        ),
-        reduced_metrics=reduced_metrics,
-        wandb_payloads=logged_payloads,
-        checkpoint=cast(
-            dict[str, dict[str, object]],
-            torch.load(work_dir / "best.pt", weights_only=True),
-        ),
-        num_epochs=scenario.num_epochs,
-    )
-
-
-@pytest.fixture(scope="module")
-def recorded_train_runs(
-    tmp_path_factory: pytest.TempPathFactory,
-    jsonl_path: str,
-    splits_path: str,
-) -> Callable[[TrainScenario], TrainRun]:
-    """Provide a lookup that runs each TrainScenario at most once per module.
-
-    The cache is explicit because a parametrized module-scoped fixture does
-    not guarantee one run per scenario: pytest groups parameters by their
-    position in each ``parametrize`` list, so the same member in two lists
-    is torn down and built again.
-
-    Args:
-        tmp_path_factory: Factory for each run's temporary directory.
-        jsonl_path: Fixture providing path to synthetic proteins JSONL file.
-        splits_path: Fixture providing path to the train/val/test splits JSON.
-
-    Returns:
-        Callable returning the scenario's TrainRun, running it on first use.
-    """
-    runs: dict[TrainScenario, TrainRun] = {}
-
-    def _lookup(scenario: TrainScenario) -> TrainRun:
-        """Return the scenario's recorded run, running it on first use."""
-        if scenario not in runs:
-            runs[scenario] = _record_train_run(
-                scenario,
-                tmp_path_factory.mktemp(scenario.name),
-                jsonl_path,
-                splits_path,
-            )
-        return runs[scenario]
-
-    return _lookup
-
-
-@pytest.fixture
-def train_run(
-    request: pytest.FixtureRequest,
-    recorded_train_runs: Callable[[TrainScenario], TrainRun],
-) -> TrainRun:
-    """Provide the shared recorded run for a scenario.
-
-    Factory fixture: receives a ``TrainScenario`` through ``request.param``.
-    The result is a frozen snapshot rather than live training state, so the
-    tests sharing it stay order-independent.
-
-    Args:
-        request: Pytest request carrying the ``TrainScenario``.
-        recorded_train_runs: Module-wide lookup of recorded runs.
-
-    Returns:
-        TrainRun recording the scenario's outcome.
-    """
-    return recorded_train_runs(cast(TrainScenario, request.param))
+    windows = [
+        len(cast(list[FeaturizedBatch], call.kwargs["micro_buffer"]))
+        for call in process_spy.call_args_list
+    ]
+    assert windows == [1, 1, 1, 1]
 
 
 @pytest.mark.parametrize(
-    "train_run",
+    "train_scenario",
     list(TrainScenario),
     ids=[case.name for case in TrainScenario],
-    indirect=True,
 )
 def test_train_updates_model_parameters(train_run: TrainRun) -> None:
-    """Train changes model parameters under every scenario.
+    """Training changes the model's parameters under every scenario.
 
     Args:
-        train_run: Recorded run for the scenario.
+        train_run: Recorded run.
     """
     assert train_run.parameters_changed
 
 
 @pytest.mark.parametrize(
-    "train_run",
-    [pytest.param(TrainScenario.default_budget, id="default_budget")],
-    indirect=True,
+    "train_scenario",
+    [TrainScenario.default_budget],
+    ids=["default_budget"],
 )
-def test_train_calls_all_reduce_mean_on_all_epoch_metrics(
+def test_train_reduces_every_epoch_metric_across_ranks(
     train_run: TrainRun,
 ) -> None:
-    """train() calls all_reduce_mean() on every metric feeding EpochMetrics.
+    """``all_reduce_mean`` runs on exactly the four EpochMetrics fields.
 
-    Arrange: ``train_run`` wraps TensorAccumulatorMixin.all_reduce_mean with
-    a spy that records every instance before delegating to the real
-    implementation (which no-ops here, since no distributed process group
-    is active -- the reduction arithmetic itself is proven separately, with
-    real multi-rank processes, by
-    test_all_reduce_mean_averages_across_real_ranks in
-    test_useful_objects.py). This test only proves train() invokes the
-    reduction on the right objects, not the arithmetic.
-    Act: run train() for one epoch.
-    Assert: the spy was invoked on exactly four metric instances: two
-    LossMetrics (train and val), one ThroughputStatistics, and one
-    ComponentNorms -- matching every metric field of EpochMetrics.
-
-    One scenario is enough: the reduction calls do not depend on the
-    configuration.
+    Train and validation LossMetrics, the train ThroughputStatistics and
+    the train ComponentNorms. The reduction itself no-ops without a process
+    group; ``test_useful_objects`` proves its arithmetic on real ranks.
+    One scenario suffices: the calls do not depend on configuration.
 
     Args:
         train_run: Recorded one-epoch run.
     """
-    calls = train_run.reduced_metrics
-    expected_loss_metrics_calls = 2  # train_loss_metrics + val_loss_metrics
-    expected_throughput_calls = 1  # train_throughput_stats
-    expected_norms_calls = 1  # train_gradient_norms
-    expected_total_calls = (
-        expected_loss_metrics_calls
-        + expected_throughput_calls
-        + expected_norms_calls
-    )
-
-    assert len(calls) == expected_total_calls
-    assert (
-        sum(isinstance(c, LossMetrics) for c in calls)
-        == expected_loss_metrics_calls
-    )
-    assert (
-        sum(isinstance(c, ThroughputStatistics) for c in calls)
-        == expected_throughput_calls
-    )
-    assert (
-        sum(isinstance(c, ComponentNorms) for c in calls)
-        == expected_norms_calls
+    kinds = [type(m).__name__ for m in train_run.reduced_metrics]
+    assert sorted(kinds) == sorted(
+        [
+            "LossMetrics",
+            "LossMetrics",
+            "ThroughputStatistics",
+            "ComponentNorms",
+        ],
     )
 
 
 @pytest.mark.parametrize(
-    "train_run",
-    [
-        pytest.param(TrainScenario.default_budget, id="default_budget"),
-        pytest.param(TrainScenario.no_grad_clip, id="no_grad_clip"),
-    ],
-    indirect=True,
+    "train_scenario",
+    [TrainScenario.default_budget, TrainScenario.no_grad_clip],
+    ids=["default_budget", "no_grad_clip"],
 )
-def test_train_wandb_not_called_when_disabled(train_run: TrainRun) -> None:
-    """Train does not call wandb.log when use_wandb=False.
+def test_train_does_not_call_wandb_when_disabled(train_run: TrainRun) -> None:
+    """With ``use_wandb`` off, ``wandb.log`` is never called.
 
     Args:
-        train_run: Recorded run with W&B disabled.
+        train_run: Recorded run with W&B off.
     """
     assert train_run.wandb_payloads == []
 
 
 @pytest.mark.parametrize(
-    "train_run",
-    [pytest.param(TrainScenario.large_token_budget, id="large_token_budget")],
-    indirect=True,
+    "train_scenario",
+    [TrainScenario.large_token_budget],
+    ids=["large_token_budget"],
 )
 def test_train_logs_nonzero_loss_under_large_token_budget(
     train_run: TrainRun,
 ) -> None:
-    """train/total_loss logged to W&B is non-zero under a large token budget.
+    """A budget above one batch but below two still runs an optimizer step.
 
-    The budget is well above one batch's tokens but below the two batches'
-    combined total (see ``TrainScenario``), so an optimizer step still runs.
-    A budget above that total would train nothing, because ``train()`` has
-    no end-of-epoch flush.
+    The first batch is flushed when the second would overflow the budget,
+    so a real optimizer step runs mid-epoch, before the epoch-end flush.
 
     Args:
-        train_run: Recorded run with W&B enabled.
+        train_run: Recorded run with W&B on.
     """
     assert len(train_run.wandb_payloads) == 1
     train_loss = train_run.wandb_payloads[0]["train/total_loss"]
     assert isinstance(train_loss, float)
-    assert train_loss > 0.0, "train/total_loss is 0 — no optimizer step ran"
+    assert train_loss > 0
 
 
 @pytest.mark.parametrize(
-    "train_run",
-    [pytest.param(TrainScenario.default_budget, id="default_budget")],
-    indirect=True,
+    "train_scenario",
+    [TrainScenario.default_budget],
+    ids=["default_budget"],
 )
-def test_train_optimizer_state_non_zero_after_one_step(
+def test_train_checkpoint_holds_stepped_optimizer_and_scheduler(
     train_run: TrainRun,
 ) -> None:
-    """Adam exp_avg in saved checkpoint is non-zero after one training step.
-
-    Args:
-        train_run: Recorded one-epoch run.
-    """
-    opt_state = cast(
-        dict[int, dict[str, torch.Tensor]],
-        train_run.checkpoint["optimizer"]["state"],
-    )
-    assert len(opt_state) > 0
-    first_state = next(iter(opt_state.values()))
-    assert _ADAM_EXP_AVG_KEY in first_state
-    assert first_state[_ADAM_EXP_AVG_KEY].abs().max().item() > 0
-
-
-@pytest.mark.parametrize(
-    "train_run",
-    [pytest.param(TrainScenario.default_budget, id="default_budget")],
-    indirect=True,
-)
-def test_train_scheduler_state_matches_optimizer_step_count(
-    train_run: TrainRun,
-) -> None:
-    """Checkpointed scheduler last_epoch equals the optimizer step count.
+    """The saved Adam moments are nonzero and the scheduler counts steps.
 
     The LR schedule is per optimizer step (AlphaFold 3-style warmup), so
     the scheduler advances once per optimizer step, not once per epoch.
@@ -2243,59 +1773,30 @@ def test_train_scheduler_state_matches_optimizer_step_count(
         train_run: Recorded one-epoch run.
     """
     opt_state = cast(
-        dict[int, dict[str, torch.Tensor]],
+        dict[int, dict[str, Float[torch.Tensor, "..."]]],
         train_run.checkpoint["optimizer"]["state"],
     )
-    adam_steps = int(next(iter(opt_state.values()))["step"].item())
+    first = next(iter(opt_state.values()))
+    adam_steps = int(first["step"].item())
+    assert bool(first["exp_avg"].abs().max() > 0)
     assert adam_steps > 0
     assert train_run.checkpoint["scheduler"]["last_epoch"] == adam_steps
 
 
 @pytest.mark.parametrize(
-    "train_run",
-    [pytest.param(TrainScenario.multi_epoch, id="multi_epoch")],
-    indirect=True,
+    "train_scenario",
+    [TrainScenario.multi_epoch],
+    ids=["multi_epoch"],
 )
-def test_train_wandb_epoch_increments_across_epochs(
+def test_train_logs_once_per_epoch_with_the_epoch_advancing(
     train_run: TrainRun,
 ) -> None:
-    """W&B logs exactly once per epoch, with the epoch number advancing.
+    """Two epochs give two W&B payloads, for epochs 1 and 2.
 
     Args:
-        train_run: Recorded two-epoch run with W&B enabled.
+        train_run: Recorded two-epoch run with W&B on.
     """
     assert [p["epoch"] for p in train_run.wandb_payloads] == [1, 2]
-
-
-def test_integration_gradient_flow_through_all_submodules(
-    featurized_batch: FeaturizedBatch,
-    model_params: ModelSetup,
-) -> None:
-    """take_step(train_mode) back-props nonzero grads to every submodule."""
-    _ = model_params.model.train()
-    model_params.model.zero_grad()
-    _ = take_step(
-        batch=featurized_batch,
-        model_params=model_params,
-        train_mode=True,
-    )
-
-    buckets: dict[str, list[torch.Tensor]] = {}
-    for name, param in model_params.model.named_parameters():
-        if param.grad is not None:
-            buckets.setdefault(name.split(".")[0], []).append(param.grad)
-
-    assert buckets, "no parameters have gradients — backward was not called"
-    for prefix, grads in buckets.items():
-        assert any(
-            torch.isfinite(g).all().item() and g.abs().max().item() > 0
-            for g in grads
-        ), f"submodule '{prefix}' has no finite nonzero gradients"
-
-
-# ---------------------------------------------------------------------------
-# DDP: collective flush decision keeps ranks in lockstep
-# ---------------------------------------------------------------------------
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2474,7 +1975,7 @@ class LockstepCase:
     expected_steps: int
 
 
-class LockstepScenario(Enum):
+class LockstepScenario(enum.Enum):
     """Named DDP lockstep cases, each a ``LockstepCase``.
 
     Members:
@@ -2494,20 +1995,6 @@ class LockstepScenario(Enum):
 
 
 @pytest.fixture
-def lockstep_scenario(request: pytest.FixtureRequest) -> LockstepScenario:
-    """Expose the indirect scenario to the factories and the test.
-
-    Args:
-        request: Pytest fixture request whose ``.param`` attribute is a
-            LockstepScenario member.
-
-    Returns:
-        The scenario member for the current test case.
-    """
-    return cast(LockstepScenario, request.param)
-
-
-@pytest.fixture
 def lockstep_setup(
     lockstep_scenario: LockstepScenario,
     model_params: ModelSetup,
@@ -2519,7 +2006,8 @@ def lockstep_setup(
     scenario's ``budget_per_rank`` times its number of ranks.
 
     Args:
-        lockstep_scenario: Scenario naming the per-rank budget and, through
+        lockstep_scenario: Scenario, parametrized by the requesting test,
+            naming the per-rank budget and, through
             the length of ``residues.by_rank``, the number of ranks.
         model_params: Fixture providing the small model, optimizer,
             scheduler, EMA and base TrainConfig.
@@ -2558,7 +2046,8 @@ def lockstep_run(
     ``lockstep_scenario.value.residues.by_rank[r]``.
 
     Args:
-        lockstep_scenario: Scenario naming each rank's batch lengths.
+        lockstep_scenario: Scenario naming each rank's batch lengths; the
+            requesting test parametrizes it.
         lockstep_setup: Fixture providing the model setup with the
             scenario's token budget.
         tmp_path: Pytest-provided directory for the rendezvous store and the
@@ -2590,7 +2079,6 @@ def lockstep_run(
     "lockstep_scenario",
     list(LockstepScenario),
     ids=[case.name for case in LockstepScenario],
-    indirect=True,
 )
 def test_train_ddp_keeps_ranks_in_lockstep(
     lockstep_scenario: LockstepScenario,
@@ -2636,11 +2124,6 @@ def test_train_ddp_keeps_ranks_in_lockstep(
     assert len({digest for _, digest in reported}) == 1
 
 
-# ---------------------------------------------------------------------------
-# self_conditioned_template — the training-side self-conditioning pass
-# ---------------------------------------------------------------------------
-
-
 @dataclasses.dataclass(frozen=True)
 class TrunkCall:
     """What the trunk saw on one forward call.
@@ -2652,6 +2135,39 @@ class TrunkCall:
 
     grad_enabled: bool
     template: Float[torch.Tensor, "B N_res N_res n_templ_bins"]
+
+
+@dataclasses.dataclass(frozen=True)
+class RecordingForward:
+    """Stand-in ``forward`` that records each call, then runs the real one.
+
+    The real forward is reached through the class, ``MainTrunk.forward``,
+    which the instance attribute set by ``monkeypatch`` does not shadow.
+
+    Attributes:
+        trunk: The trunk whose calls are recorded.
+        calls: Receives one ``TrunkCall`` per call.
+    """
+
+    trunk: MainTrunk
+    calls: list[TrunkCall]
+
+    def __call__(self, batch: FeaturizedBatch) -> PredictedOutputs:
+        """Record the autograd state and template, then run the trunk.
+
+        Args:
+            batch: The trunk's input.
+
+        Returns:
+            The real trunk's prediction.
+        """
+        self.calls.append(
+            TrunkCall(
+                grad_enabled=torch.is_grad_enabled(),
+                template=batch.noised_res_distogram.detach().clone(),
+            ),
+        )
+        return MainTrunk.forward(self.trunk, batch)
 
 
 @pytest.fixture
@@ -2679,25 +2195,13 @@ def recorded_trunk_calls(
     Returns:
         One ``TrunkCall`` per trunk forward made by the pass.
     """
-    calls: list[TrunkCall] = []
     trunk = cast(MainTrunk, model_params.model)
-    real_forward = trunk.forward
-
-    def recording_forward(batch: FeaturizedBatch) -> PredictedOutputs:
-        """Record the autograd state and template, then run the trunk."""
-        calls.append(
-            TrunkCall(
-                grad_enabled=torch.is_grad_enabled(),
-                template=batch.noised_res_distogram.detach().clone(),
-            ),
-        )
-        return real_forward(batch)
-
-    monkeypatch.setattr(trunk, "forward", recording_forward)
+    recorder = RecordingForward(trunk=trunk, calls=[])
+    monkeypatch.setattr(trunk, "forward", recorder)
     _ = trunk.train()
     with torch.enable_grad():
         _ = self_conditioned_template(featurized_batch, model_params)
-    return calls
+    return recorder.calls
 
 
 def test_self_conditioning_pass_runs_detached_on_null(
@@ -2710,6 +2214,9 @@ def test_self_conditioning_pass_runs_detached_on_null(
     not the featurizer's noised ground truth, which leaks true pair geometry
     the sampler never has. No parametrization: the caller's grad-enabled
     train mode is the one state in which either property can fail.
+
+    Args:
+        recorded_trunk_calls: What the trunk saw on each call.
     """
     assert len(recorded_trunk_calls) == 1
     assert not recorded_trunk_calls[0].grad_enabled
@@ -2759,7 +2266,7 @@ def template_pair(
 
 
 def test_self_conditioned_template_is_binned_prediction(
-    featurized_batch: FeaturizedBatch,
+    valid_pair_mask: Bool[torch.Tensor, "B N_res N_res"],
     template_pair: TemplatePair,
 ) -> None:
     """The template is a one-hot per valid pair and follows the noisy input.
@@ -2768,16 +2275,15 @@ def test_self_conditioned_template_is_binned_prediction(
     a binned structure; changing with ``r_gt_noised`` shows that structure
     is the model's prediction. No parametrization: the batch's noisy
     coordinates are the only input the prediction is built from.
+
+    Args:
+        valid_pair_mask: Pairs whose residues both have a pseudo-Cβ.
+        template_pair: Templates before and after the input moved.
     """
-    residue_mask = featurized_batch.f_pseudo_beta_mask.bool()
-    pair_mask = rearrange(residue_mask, "b i -> b i 1") & rearrange(
-        residue_mask,
-        "b j -> b 1 j",
-    )
     bin_sums = reduce(template_pair.baseline, "b i j k -> b i j", "sum")
     assert torch.equal(
-        bin_sums[pair_mask],
-        torch.ones_like(bin_sums[pair_mask]),
+        bin_sums[valid_pair_mask],
+        torch.ones_like(bin_sums[valid_pair_mask]),
     )
     assert not torch.equal(template_pair.baseline, template_pair.perturbed)
 
@@ -2795,7 +2301,7 @@ class TemplateSourceCase:
     self_condition: bool
 
 
-class TemplateSource(Enum):
+class TemplateSource(enum.Enum):
     """Where ``take_step`` gets the template it feeds the trunk.
 
     Members:
