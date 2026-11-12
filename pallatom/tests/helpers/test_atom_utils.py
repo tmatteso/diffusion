@@ -69,14 +69,12 @@ from helpers.atom_utils import (
     truncate_to_length,
 )
 from helpers.errors import InvalidAAtypesError
-from jaxtyping import Float, TypeCheckError
-
-type Array = npt.NDArray[np.float64] | npt.NDArray[np.intp]
-type Example = dict[str, Array]
-type AnyFloat = Float[torch.Tensor, "..."]
+from jaxtyping import Bool, Float, TypeCheckError
 
 
-def feature_example(n: int) -> Example:
+def feature_example(
+    n: int,
+) -> dict[str, npt.NDArray[np.float64] | npt.NDArray[np.intp]]:
     """Build an ``n``-residue numpy feature mapping.
 
     A mapping rather than a dataclass because ``make_fixed_size`` and
@@ -379,7 +377,10 @@ class ProteinBreak(abc.ABC):
     field: str
 
     @abc.abstractmethod
-    def malform(self, array: Array) -> Array:
+    def malform(
+        self,
+        array: npt.NDArray[np.float64] | npt.NDArray[np.intp],
+    ) -> npt.NDArray[np.float64] | npt.NDArray[np.intp]:
         """Map the field's valid array to the malformed one.
 
         Args:
@@ -403,7 +404,10 @@ class SelectBreak(ProteinBreak):
     index: int
 
     @override
-    def malform(self, array: Array) -> Array:
+    def malform(
+        self,
+        array: npt.NDArray[np.float64] | npt.NDArray[np.intp],
+    ) -> npt.NDArray[np.float64] | npt.NDArray[np.intp]:
         """Select ``index`` along ``axis``.
 
         Args:
@@ -412,7 +416,10 @@ class SelectBreak(ProteinBreak):
         Returns:
             ``array`` with ``axis`` removed.
         """
-        return cast(Array, np.take(array, self.index, axis=self.axis))
+        return cast(
+            npt.NDArray[np.float64] | npt.NDArray[np.intp],
+            np.take(array, self.index, axis=self.axis),
+        )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -426,7 +433,10 @@ class DropFirstBreak(ProteinBreak):
     axis: int
 
     @override
-    def malform(self, array: Array) -> Array:
+    def malform(
+        self,
+        array: npt.NDArray[np.float64] | npt.NDArray[np.intp],
+    ) -> npt.NDArray[np.float64] | npt.NDArray[np.intp]:
         """Drop index 0 along ``axis``.
 
         Args:
@@ -449,7 +459,10 @@ class RepeatFirstBreak(ProteinBreak):
     axis: int
 
     @override
-    def malform(self, array: Array) -> Array:
+    def malform(
+        self,
+        array: npt.NDArray[np.float64] | npt.NDArray[np.intp],
+    ) -> npt.NDArray[np.float64] | npt.NDArray[np.intp]:
         """Append index 0 along ``axis`` to the end.
 
         Args:
@@ -459,7 +472,7 @@ class RepeatFirstBreak(ProteinBreak):
             ``array`` with ``axis`` one longer.
         """
         return cast(
-            Array,
+            npt.NDArray[np.float64] | npt.NDArray[np.intp],
             np.concatenate(
                 [array, np.take(array, [0], axis=self.axis)],
                 axis=self.axis,
@@ -478,7 +491,10 @@ class AddAxisBreak(ProteinBreak):
     axis: int
 
     @override
-    def malform(self, array: Array) -> Array:
+    def malform(
+        self,
+        array: npt.NDArray[np.float64] | npt.NDArray[np.intp],
+    ) -> npt.NDArray[np.float64] | npt.NDArray[np.intp]:
         """Insert a new axis at ``axis``.
 
         Args:
@@ -487,7 +503,10 @@ class AddAxisBreak(ProteinBreak):
         Returns:
             ``array`` with one more axis.
         """
-        return cast(Array, np.expand_dims(array, self.axis))
+        return cast(
+            npt.NDArray[np.float64] | npt.NDArray[np.intp],
+            np.expand_dims(array, self.axis),
+        )
 
 
 class InvalidProteinShape(enum.Enum):
@@ -566,7 +585,11 @@ class WrongShape(abc.ABC):
     mask_shape: tuple[int, ...]
 
     @abc.abstractmethod
-    def convert(self, positions: AnyFloat, mask: AnyFloat) -> object:
+    def convert(
+        self,
+        positions: Float[torch.Tensor, "..."],
+        mask: Float[torch.Tensor, "..."],
+    ) -> object:
         """Run the conversion under test.
 
         Args:
@@ -583,7 +606,11 @@ class Atom37ToAtom5Shape(WrongShape):
     """Calls ``atom37_to_atom5(positions, mask)``."""
 
     @override
-    def convert(self, positions: AnyFloat, mask: AnyFloat) -> object:
+    def convert(
+        self,
+        positions: Float[torch.Tensor, "..."],
+        mask: Float[torch.Tensor, "..."],
+    ) -> object:
         """Call ``atom37_to_atom5``.
 
         Args:
@@ -601,7 +628,11 @@ class Atom5ToAtom37Shape(WrongShape):
     """Calls ``atom5_to_atom37(positions, mask)``."""
 
     @override
-    def convert(self, positions: AnyFloat, mask: AnyFloat) -> object:
+    def convert(
+        self,
+        positions: Float[torch.Tensor, "..."],
+        mask: Float[torch.Tensor, "..."],
+    ) -> object:
         """Call ``atom5_to_atom37``.
 
         Args:
@@ -619,7 +650,11 @@ class Atom37ToCbShape(WrongShape):
     """Calls ``atom37_to_cb(positions, mask)``."""
 
     @override
-    def convert(self, positions: AnyFloat, mask: AnyFloat) -> object:
+    def convert(
+        self,
+        positions: Float[torch.Tensor, "..."],
+        mask: Float[torch.Tensor, "..."],
+    ) -> object:
         """Call ``atom37_to_cb``.
 
         Args:
@@ -891,7 +926,8 @@ def coords_dict() -> dict[str, list[list[float]]]:
     """Return backbone coordinates for 6 residues, as JSONL entries hold them.
 
     Atom ``k`` of residue ``r`` (N, CA, C, O for ``k`` = 0..3) has
-    coordinates ``(r + k, r + k + 1, r + k + 2)``.
+    coordinates ``(r + k, r + k + 1, r + k + 2)``. A mapping because
+    ``make_np_example`` takes one, keyed by atom name.
 
     Returns:
         Mapping from atom name to a ``(6, 3)`` nested list.
@@ -903,7 +939,9 @@ def coords_dict() -> dict[str, list[list[float]]]:
 
 
 @pytest.fixture
-def np_example_to_center(center_scenario: CenterPositionsScenario) -> Example:
+def np_example_to_center(
+    center_scenario: CenterPositionsScenario,
+) -> dict[str, npt.NDArray[np.float64] | npt.NDArray[np.intp]]:
     """Build the input mapping for a ``center_positions`` scenario.
 
     A mapping because ``center_positions`` writes its result back to the
@@ -931,7 +969,10 @@ def np_example_to_center(center_scenario: CenterPositionsScenario) -> Example:
 @pytest.fixture
 def expected_centered_positions(
     center_scenario: CenterPositionsScenario,
-    np_example_to_center: Example,
+    np_example_to_center: dict[
+        str,
+        npt.NDArray[np.float64] | npt.NDArray[np.intp],
+    ],
 ) -> npt.NDArray[np.float64]:
     """Shift the input by the scenario's CA centre and zero absent atoms.
 
@@ -982,8 +1023,11 @@ def roundtrip_protein() -> Protein:
 @pytest.fixture
 def resize_input(
     resize_scenario: FixedSizeScenario | TruncateScenario,
-) -> Example:
+) -> dict[str, npt.NDArray[np.float64] | npt.NDArray[np.intp]]:
     """Return the scenario's input mapping.
+
+    A mapping because ``make_fixed_size`` and ``truncate_to_length`` take
+    one and resize every array in it in place.
 
     Args:
         resize_scenario: Residue count before resizing; the requesting test
@@ -998,8 +1042,10 @@ def resize_input(
 @pytest.fixture
 def resize_reference(
     resize_scenario: FixedSizeScenario | TruncateScenario,
-) -> Example:
+) -> dict[str, npt.NDArray[np.float64] | npt.NDArray[np.intp]]:
     """Return the mapping of just the residues the resize must keep.
+
+    A mapping so it can be compared key by key with ``resize_input``.
 
     Args:
         resize_scenario: Number of residues kept; the requesting test
@@ -1091,6 +1137,183 @@ def gapped_pdb(tmp_path: pathlib.Path) -> pathlib.Path:
     return write_pdb(tmp_path / "model.pdb", "N ALA A5;N ALA A10")
 
 
+@pytest.fixture
+def atom5_mask_argument(
+    atom_scenario: Atom5ToAtom37Scenario,
+    atom_tensors: AtomTensors,
+) -> Float[torch.Tensor, "B N_res 5"] | None:
+    """Return the mask to pass to ``atom5_to_atom37``, or None to omit it.
+
+    Args:
+        atom_scenario: Whether to pass the mask; the requesting test
+            parametrizes it.
+        atom_tensors: Atom5 positions and mask.
+
+    Returns:
+        The built mask, or None to exercise the all-present default.
+    """
+    return atom_tensors.mask if atom_scenario.value.provide_mask else None
+
+
+@pytest.fixture
+def expected_backbone_mask(
+    atom_scenario: Atom5ToAtom37Scenario,
+    atom_tensors: AtomTensors,
+) -> Float[torch.Tensor, "B N_res 5"]:
+    """Return the mask the atom37 backbone slots must hold after scattering.
+
+    Args:
+        atom_scenario: Whether the mask is passed; the requesting test
+            parametrizes it.
+        atom_tensors: Atom5 positions and mask.
+
+    Returns:
+        The passed mask, or all ones when it is omitted.
+    """
+    mask = atom_tensors.mask
+    return mask if atom_scenario.value.provide_mask else torch.ones_like(mask)
+
+
+@pytest.fixture
+def expected_cb_present(
+    atom_scenario: Atom37ToCbScenario,
+) -> Bool[torch.Tensor, "B N_res"]:
+    """Mark CB present from the scenario's ``present_from`` residue on.
+
+    Args:
+        atom_scenario: Batch, residue count and first residue with CB; the
+            requesting test parametrizes it.
+
+    Returns:
+        The expected ``present`` flags.
+    """
+    case = atom_scenario.value
+    expected = torch.zeros(case.batch, case.n_res, dtype=torch.bool)
+    expected[:, case.present_from :] = True
+    return expected
+
+
+@pytest.fixture
+def wrong_shape_positions(
+    wrong_atom_shape: WrongAtomShape,
+) -> Float[torch.Tensor, "..."]:
+    """Build zero positions of the scenario's invalid shape.
+
+    Args:
+        wrong_atom_shape: Supplies the shape; the requesting test
+            parametrizes it.
+
+    Returns:
+        Positions the conversion must reject.
+    """
+    return torch.zeros(wrong_atom_shape.value.positions_shape)
+
+
+@pytest.fixture
+def wrong_shape_mask(
+    wrong_atom_shape: WrongAtomShape,
+) -> Float[torch.Tensor, "..."]:
+    """Build an all-present mask of the scenario's valid mask shape.
+
+    Args:
+        wrong_atom_shape: Supplies the shape; the requesting test
+            parametrizes it.
+
+    Returns:
+        A mask the conversion accepts.
+    """
+    return torch.ones(wrong_atom_shape.value.mask_shape)
+
+
+@pytest.fixture
+def expected_backbone_positions(
+    coords_dict: dict[str, list[list[float]]],
+) -> Float[torch.Tensor, "6 4 3"]:
+    """Stack ``coords_dict`` into ``(residue, backbone atom, xyz)`` order.
+
+    Args:
+        coords_dict: Backbone coordinates keyed by atom name.
+
+    Returns:
+        N, CA, C and O coordinates for every residue.
+    """
+    stacked = torch.tensor([coords_dict[a] for a in ("N", "CA", "C", "O")])
+    return einops.rearrange(stacked, "a r d -> r a d")
+
+
+@pytest.fixture
+def coords_with_nan(
+    coords_dict: dict[str, list[list[float]]],
+    atom: str,
+) -> dict[str, list[list[float]]]:
+    """Return ``coords_dict`` with residue 0's ``atom`` set to NaN.
+
+    A mapping because ``make_np_example`` takes one, keyed by atom name.
+
+    Args:
+        coords_dict: Backbone coordinates keyed by atom name.
+        atom: Atom whose first coordinate becomes NaN; the requesting test
+            parametrizes it.
+
+    Returns:
+        A copy with that one coordinate replaced.
+    """
+    coords = {
+        name: [list(xyz) for xyz in rows] for name, rows in coords_dict.items()
+    }
+    coords[atom][0] = [float("nan")] * 3
+    return coords
+
+
+@pytest.fixture
+def expected_mol_types(
+    pdb_scenario: PdbScenario,
+) -> Float[torch.Tensor, " N_res"]:
+    """Map the scenario's per-residue molecule letters to their codes.
+
+    Args:
+        pdb_scenario: Molecule letter per residue; the requesting test
+            parametrizes it.
+
+    Returns:
+        ``MOL_TYPE_PROTEIN``, ``MOL_TYPE_DNA`` or ``MOL_TYPE_RNA`` for each
+        residue, as stored in ``b_factors``.
+    """
+    codes = {"p": MOL_TYPE_PROTEIN, "d": MOL_TYPE_DNA, "r": MOL_TYPE_RNA}
+    types = [codes[c] for c in pdb_scenario.value.mol_types]
+    return torch.tensor(types, dtype=torch.float64)
+
+
+@pytest.fixture
+def nucleotide_residues(
+    expected_mol_types: Float[torch.Tensor, " N_res"],
+) -> Bool[torch.Tensor, " N_res"]:
+    """Flag the residues whose molecule type is DNA or RNA.
+
+    Args:
+        expected_mol_types: Molecule code per residue.
+
+    Returns:
+        True where the residue is not protein.
+    """
+    return expected_mol_types != MOL_TYPE_PROTEIN
+
+
+@pytest.fixture
+def atomless_pdb(tmp_path: pathlib.Path) -> pathlib.Path:
+    """Write a PDB file with header records but no ATOM records.
+
+    Args:
+        tmp_path: Per-test directory.
+
+    Returns:
+        The file path.
+    """
+    path = tmp_path / "empty.pdb"
+    _ = path.write_text("REMARK empty structure\nHEADER test\n")
+    return path
+
+
 @pytest.mark.parametrize(
     "atom_scenario",
     list(Atom37ToAtom5Scenario),
@@ -1129,6 +1352,8 @@ def test_atom37_to_atom5_copies_the_five_backbone_slots(
 def test_atom5_to_atom37_scatters_into_backbone_slots_only(
     atom_scenario: Atom5ToAtom37Scenario,
     atom_tensors: AtomTensors,
+    atom5_mask_argument: Float[torch.Tensor, "B N_res 5"] | None,
+    expected_backbone_mask: Float[torch.Tensor, "B N_res 5"],
 ) -> None:
     """Each atom5 slot lands at its atom37 index; every other slot is zero.
 
@@ -1137,21 +1362,19 @@ def test_atom5_to_atom37_scatters_into_backbone_slots_only(
     Args:
         atom_scenario: Sizes and whether to pass the mask.
         atom_tensors: Atom5 positions and mask.
+        atom5_mask_argument: Mask to pass, or None.
+        expected_backbone_mask: Mask the backbone slots must hold.
     """
     atom_spec = atom_scenario.value
     x = atom_tensors
-    mask_in = x.mask if atom_spec.provide_mask else None
-    expected_mask = (
-        x.mask if atom_spec.provide_mask else torch.ones_like(x.mask)
-    )
-    positions, mask = atom5_to_atom37(x.positions, mask_in)
+    positions, mask = atom5_to_atom37(x.positions, atom5_mask_argument)
     other = sorted(set(range(37)) - set(ATOM5_TO_ATOM37))
     n_atoms = ResidueRepresentation.atom37.value
     shape = (atom_spec.batch, atom_spec.n_res, n_atoms)
     assert (positions.shape, mask.shape) == ((*shape, 3), shape)
     assert (positions.dtype, mask.dtype) == (x.positions.dtype, x.mask.dtype)
     assert torch.equal(positions[:, :, ATOM5_TO_ATOM37], x.positions)
-    assert torch.equal(mask[:, :, ATOM5_TO_ATOM37], expected_mask)
+    assert torch.equal(mask[:, :, ATOM5_TO_ATOM37], expected_backbone_mask)
     assert torch.count_nonzero(positions[:, :, other]) == 0
     assert torch.count_nonzero(mask[:, :, other]) == 0
 
@@ -1164,6 +1387,7 @@ def test_atom5_to_atom37_scatters_into_backbone_slots_only(
 def test_atom37_to_cb_uses_cb_when_present_and_a_pseudo_cb_otherwise(
     atom_scenario: Atom37ToCbScenario,
     atom_tensors: AtomTensors,
+    expected_cb_present: Bool[torch.Tensor, "B N_res"],
 ) -> None:
     """Present CBs are copied; absent ones become a finite pseudo-Cβ.
 
@@ -1172,23 +1396,21 @@ def test_atom37_to_cb_uses_cb_when_present_and_a_pseudo_cb_otherwise(
     product vanish; the pseudo-Cβ must still be finite.
 
     Args:
-        atom_scenario: Where CB is present and whether the fallback is
-            distinct.
+        atom_scenario: Where CB is present and whether the fallback is distinct.
         atom_tensors: Atom37 positions and mask.
+        expected_cb_present: Residues that must report CB present.
     """
     atom_spec = atom_scenario.value
     x = atom_tensors
     cb, present = atom37_to_cb(x.positions, x.mask)
-    expected = torch.zeros(atom_spec.batch, atom_spec.n_res, dtype=torch.bool)
-    expected[:, atom_spec.present_from :] = True
-    absent = ~expected
+    absent = ~expected_cb_present
     stored_cb = x.positions[:, :, ATOM37_CB]
     ca = x.positions[:, :, ATOM37_CA]
     moved_off_cb = not torch.allclose(cb[absent], stored_cb[absent])
     moved_off_ca = not torch.allclose(cb[absent], ca[absent])
     assert cb.shape == (atom_spec.batch, atom_spec.n_res, 3)
-    assert torch.equal(present, expected)
-    assert torch.equal(cb[expected], stored_cb[expected])
+    assert torch.equal(present, expected_cb_present)
+    assert torch.equal(cb[expected_cb_present], stored_cb[expected_cb_present])
     assert torch.isfinite(cb[absent]).all()
     assert (moved_off_cb, moved_off_ca) == (atom_spec.distinct,) * 2
 
@@ -1200,17 +1422,21 @@ def test_atom37_to_cb_uses_cb_when_present_and_a_pseudo_cb_otherwise(
 )
 def test_atom_conversions_reject_wrong_shapes(
     wrong_atom_shape: WrongAtomShape,
+    wrong_shape_positions: Float[torch.Tensor, "..."],
+    wrong_shape_mask: Float[torch.Tensor, "..."],
 ) -> None:
     """Each conversion's contract rejects positions of the wrong shape.
 
     Args:
         wrong_atom_shape: Conversion and shapes.
+        wrong_shape_positions: Positions of the invalid shape.
+        wrong_shape_mask: Mask of the valid shape.
     """
-    wrong_shape = wrong_atom_shape.value
-    positions = torch.zeros(wrong_shape.positions_shape)
-    mask = torch.ones(wrong_shape.mask_shape)
     with pytest.raises(TypeCheckError):
-        _ = wrong_shape.convert(positions, mask)
+        _ = wrong_atom_shape.value.convert(
+            wrong_shape_positions,
+            wrong_shape_mask,
+        )
 
 
 @pytest.mark.parametrize(
@@ -1232,7 +1458,10 @@ def test_protein_rejects_invalid_shapes(
         invalid_protein_shape: Field and malformation.
     """
     protein_break = invalid_protein_shape.value
-    old = cast(Array, getattr(valid_protein, protein_break.field))
+    old = cast(
+        npt.NDArray[np.float64] | npt.NDArray[np.intp],
+        getattr(valid_protein, protein_break.field),
+    )
     with pytest.raises(TypeCheckError):
         _ = dataclasses.replace(
             valid_protein,
@@ -1259,6 +1488,7 @@ def test_restype_x_is_the_index_after_the_canonical_twenty(
 
 def test_make_np_example_packs_backbone_into_atom37(
     coords_dict: dict[str, list[list[float]]],
+    expected_backbone_positions: Float[torch.Tensor, "6 4 3"],
 ) -> None:
     """Backbone coordinates land in their atom37 slots, marked present.
 
@@ -1266,17 +1496,17 @@ def test_make_np_example_packs_backbone_into_atom37(
     0. Not parametrized: the NaN case is the next test.
 
     Args:
-        coords_dict: Six residues of N, CA, C, O coordinates.
+        coords_dict: Backbone coordinates for 6 residues.
+        expected_backbone_positions: Those coordinates in atom order.
     """
     example = {
         k: torch.tensor(v) for k, v in make_np_example(coords_dict).items()
     }
-    names = ("N", "CA", "C", "O")
-    backbone = [atom_types.index(name) for name in names]
+    backbone = [atom_types.index(name) for name in ("N", "CA", "C", "O")]
     other = sorted(set(range(37)) - set(backbone))
-    expected = torch.tensor([coords_dict[a] for a in names]).transpose(0, 1)
-    assert torch.equal(example["atom_positions"][:, backbone], expected)
-    assert torch.count_nonzero(example["atom_positions"][:, other]) == 0
+    positions = example["atom_positions"]
+    assert torch.equal(positions[:, backbone], expected_backbone_positions)
+    assert torch.count_nonzero(positions[:, other]) == 0
     assert bool(example["atom_mask"][:, backbone].all())
     assert torch.count_nonzero(example["atom_mask"][:, other]) == 0
     assert torch.equal(example["residue_index"], torch.arange(6))
@@ -1284,7 +1514,7 @@ def test_make_np_example_packs_backbone_into_atom37(
 
 @pytest.mark.parametrize("atom", ["N", "CA", "O"])
 def test_make_np_example_masks_and_zeroes_nan_coordinates(
-    coords_dict: dict[str, list[list[float]]],
+    coords_with_nan: dict[str, list[list[float]]],
     atom: str,
 ) -> None:
     """A NaN coordinate is set to zero and its atom marked absent.
@@ -1292,12 +1522,11 @@ def test_make_np_example_masks_and_zeroes_nan_coordinates(
     Other atoms of the same residue stay present.
 
     Args:
-        coords_dict: Coordinates; residue 0's ``atom`` is set to NaN here.
-        atom: Backbone atom to corrupt.
+        coords_with_nan: Coordinates with one NaN atom.
+        atom: The atom set to NaN.
     """
-    coords_dict[atom][0] = [float("nan")] * 3
     example = {
-        k: torch.tensor(v) for k, v in make_np_example(coords_dict).items()
+        k: torch.tensor(v) for k, v in make_np_example(coords_with_nan).items()
     }
     slot = atom_types.index(atom)
     assert bool(torch.isfinite(example["atom_positions"]).all())
@@ -1313,8 +1542,8 @@ def test_make_np_example_masks_and_zeroes_nan_coordinates(
 )
 def test_make_fixed_size_pads_or_truncates_to_ten(
     resize_scenario: FixedSizeScenario,
-    resize_input: Example,
-    resize_reference: Example,
+    resize_input: dict[str, npt.NDArray[np.float64] | npt.NDArray[np.intp]],
+    resize_reference: dict[str, npt.NDArray[np.float64] | npt.NDArray[np.intp]],
 ) -> None:
     """Every array ends with 10 residues: the first kept, the rest zero.
 
@@ -1338,8 +1567,8 @@ def test_make_fixed_size_pads_or_truncates_to_ten(
     ids=[case.name for case in TruncateScenario],
 )
 def test_truncate_to_length_cuts_but_never_pads(
-    resize_input: Example,
-    resize_reference: Example,
+    resize_input: dict[str, npt.NDArray[np.float64] | npt.NDArray[np.intp]],
+    resize_reference: dict[str, npt.NDArray[np.float64] | npt.NDArray[np.intp]],
 ) -> None:
     """Arrays longer than 50 residues are cut to 50; shorter ones are kept.
 
@@ -1359,7 +1588,10 @@ def test_truncate_to_length_cuts_but_never_pads(
     ids=[case.name for case in CenterPositionsScenario],
 )
 def test_center_positions(
-    np_example_to_center: Example,
+    np_example_to_center: dict[
+        str,
+        npt.NDArray[np.float64] | npt.NDArray[np.intp],
+    ],
     expected_centered_positions: npt.NDArray[np.float64],
 ) -> None:
     """``center_positions`` writes CA-centred, masked positions to the mapping.
@@ -1461,8 +1693,18 @@ def test_to_pdb_and_protein_from_pdb_round_trip(
     fields = sorted(every_field - {"b_factors"})
     same = {
         name: torch.equal(
-            torch.tensor(cast(Array, getattr(recovered, name))),
-            torch.tensor(cast(Array, getattr(roundtrip_protein, name))),
+            torch.tensor(
+                cast(
+                    npt.NDArray[np.float64] | npt.NDArray[np.intp],
+                    getattr(recovered, name),
+                ),
+            ),
+            torch.tensor(
+                cast(
+                    npt.NDArray[np.float64] | npt.NDArray[np.intp],
+                    getattr(roundtrip_protein, name),
+                ),
+            ),
         )
         for name in fields
     }
@@ -1479,6 +1721,8 @@ def test_to_pdb_and_protein_from_pdb_round_trip(
 def test_protein_from_pdb_classifies_molecules_and_chains(
     pdb_scenario: PdbScenario,
     scenario_pdb: pathlib.Path,
+    expected_mol_types: Float[torch.Tensor, " N_res"],
+    nucleotide_residues: Bool[torch.Tensor, " N_res"],
 ) -> None:
     """Each residue's molecule type goes to ``b_factors``; chains are indexed.
 
@@ -1486,23 +1730,21 @@ def test_protein_from_pdb_classifies_molecules_and_chains(
 
     Args:
         pdb_scenario: Records and expected classification.
-        scenario_pdb: PDB file holding the scenario's records.
+        scenario_pdb: The scenario's PDB file.
+        expected_mol_types: Molecule code per residue.
+        nucleotide_residues: True for DNA and RNA residues.
     """
     case = pdb_scenario.value
-    codes = {"p": MOL_TYPE_PROTEIN, "d": MOL_TYPE_DNA, "r": MOL_TYPE_RNA}
-    is_nucleotide = {"p": False, "d": True, "r": True}
     protein = protein_from_pdb(scenario_pdb)
     b_factors = torch.tensor(protein.b_factors[:, 0])
     aatype = torch.tensor(protein.aatype)
-    nucleotide = torch.tensor([is_nucleotide[c] for c in case.mol_types])
-    expected_types = torch.tensor([codes[c] for c in case.mol_types])
     assert protein.atom_positions.shape == (len(case.mol_types), 37, 3)
-    assert torch.equal(b_factors, expected_types.double())
+    assert torch.equal(b_factors, expected_mol_types)
     assert torch.equal(
         torch.tensor(protein.chain_index),
         torch.tensor(case.chains),
     )
-    assert bool((aatype[nucleotide] == RESTYPE_NUM_NO_X).all())
+    assert bool((aatype[nucleotide_residues] == RESTYPE_NUM_NO_X).all())
 
 
 @pytest.mark.parametrize(
@@ -1540,19 +1782,17 @@ def test_protein_from_pdb_keeps_pdb_residue_numbers(
 
 
 def test_protein_from_pdb_rejects_a_file_without_atoms(
-    tmp_path: pathlib.Path,
+    atomless_pdb: pathlib.Path,
 ) -> None:
     """A PDB with only REMARK and HEADER lines raises ``ValueError``.
 
     Not parametrized: any file without ATOM records takes this path.
 
     Args:
-        tmp_path: Per-test directory.
+        atomless_pdb: PDB file with no ATOM records.
     """
-    path = tmp_path / "empty.pdb"
-    _ = path.write_text("REMARK empty structure\nHEADER test\n")
     with pytest.raises(ValueError, match="No ATOM records"):
-        _ = protein_from_pdb(path)
+        _ = protein_from_pdb(atomless_pdb)
 
 
 @pytest.mark.parametrize(
