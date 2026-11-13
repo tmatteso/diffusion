@@ -617,6 +617,210 @@ def test_atom_loss_rotation_invariant(
     )
 
 
+@dataclasses.dataclass(frozen=True)
+class MixedNoiseCase:
+    """Six-point structure whose last two points sit at a second noise level.
+
+    The prediction equals the ground truth on the first four (clean) points
+    and is the ground truth shifted by ``noisy_shift`` on the last two
+    (noisy) points.
+
+    Attributes:
+        clean_lambda: EDM weight of each of the four clean points.
+        noisy_lambda: EDM weight of each of the two noisy points.
+        noisy_shift: Displacement (x, y, z) of the two noisy points, in
+            angstroms.
+    """
+
+    clean_lambda: float
+    noisy_lambda: float
+    noisy_shift: tuple[float, float, float]
+
+
+class MixedLambda(enum.Enum):
+    """Clean and noisy points carry different EDM weights.
+
+    Members:
+        x_shift_ratio_100: Noisy points moved 4 A along x, lambda 100 vs 1.
+        z_shift_ratio_100: Noisy points moved 4 A along z, lambda 100 vs 1.
+        diag_shift_ratio_10: Noisy points moved diagonally, lambda 10 vs 1.
+    """
+
+    x_shift_ratio_100 = MixedNoiseCase(100.0, 1.0, (4.0, 0.0, 0.0))
+    z_shift_ratio_100 = MixedNoiseCase(100.0, 1.0, (0.0, 0.0, 4.0))
+    diag_shift_ratio_10 = MixedNoiseCase(10.0, 1.0, (2.0, 2.0, 2.0))
+
+
+class UniformLambda(enum.Enum):
+    """Every point carries the same EDM weight, as without Self-Flow.
+
+    Members:
+        unit_lambda: All points weighted 1.
+        large_lambda: All points weighted 25, as at sigma of about 3 A.
+    """
+
+    unit_lambda = MixedNoiseCase(1.0, 1.0, (4.0, 0.0, 0.0))
+    large_lambda = MixedNoiseCase(25.0, 25.0, (0.0, 3.0, 1.0))
+
+
+@pytest.fixture
+def mixed_noise_gt() -> Float[torch.Tensor, "1 N_point 3"]:
+    """Ground truth of six points on the corners of a 3.8 A box.
+
+    Not a factory: every scenario shares this structure, and only the
+    prediction and weights vary between cases.
+
+    Returns:
+        Float tensor of shape (1, 6, 3).
+    """
+    return torch.tensor(
+        [
+            [
+                [0.0, 0.0, 0.0],
+                [3.8, 0.0, 0.0],
+                [3.8, 3.8, 0.0],
+                [0.0, 3.8, 0.0],
+                [0.0, 0.0, 3.8],
+                [3.8, 0.0, 3.8],
+            ],
+        ],
+    )
+
+
+@pytest.fixture
+def mixed_noise_pred(
+    mixed_noise_gt: Float[torch.Tensor, "1 N_point 3"],
+    mixed_noise_scenario: MixedLambda | UniformLambda,
+) -> Float[torch.Tensor, "1 N_point 3"]:
+    """Prediction exact on the four clean points, shifted on the two noisy.
+
+    Args:
+        mixed_noise_gt: Ground-truth points.
+        mixed_noise_scenario: The case to build; the requesting test
+            parametrizes it.
+
+    Returns:
+        Float tensor of shape (1, 6, 3).
+    """
+    case = mixed_noise_scenario.value
+    shift = torch.tensor(
+        [[(0.0, 0.0, 0.0)] * 4 + [case.noisy_shift] * 2],
+    )
+    return mixed_noise_gt + shift
+
+
+@pytest.fixture
+def mixed_noise_lambda(
+    mixed_noise_scenario: MixedLambda | UniformLambda,
+) -> Float[torch.Tensor, "1 N_point"]:
+    """EDM weight of each point: four clean points, then two noisy points.
+
+    Args:
+        mixed_noise_scenario: The case to build; the requesting test
+            parametrizes it.
+
+    Returns:
+        Float tensor of shape (1, 6).
+    """
+    case = mixed_noise_scenario.value
+    return torch.tensor([[case.clean_lambda] * 4 + [case.noisy_lambda] * 2])
+
+
+@pytest.fixture
+def mask_only_alignment_lambda() -> Float[torch.Tensor, "1 N_point"]:
+    """Unit alignment weight, which reduces the Kabsch fit to the mask alone.
+
+    Not a factory: a constant weight of one is the only mask-only setting.
+
+    Returns:
+        Float tensor of shape (1, 6), all ones.
+    """
+    return torch.ones(1, 6)
+
+
+@pytest.fixture
+def mixed_noise_aa_indices() -> Int[torch.Tensor, "1 N_point"]:
+    """One nonpolar residue type per point, so residue weighting is constant.
+
+    Not a factory: every scenario uses the same residue types.
+
+    Returns:
+        Integer tensor of shape (1, 6), all 0 ('A').
+    """
+    return torch.zeros(1, 6, dtype=torch.long)
+
+
+@pytest.mark.parametrize(
+    "mixed_noise_scenario",
+    list(MixedLambda),
+    ids=[case.name for case in MixedLambda],
+)
+def test_atom_loss_lambda_alignment_lowers_mixed_noise_loss(
+    mixed_noise_pred: Float[torch.Tensor, "1 N_point 3"],
+    mixed_noise_gt: Float[torch.Tensor, "1 N_point 3"],
+    mixed_noise_lambda: Float[torch.Tensor, "1 N_point"],
+    mask_only_alignment_lambda: Float[torch.Tensor, "1 N_point"],
+    mixed_noise_aa_indices: Int[torch.Tensor, "1 N_point"],
+) -> None:
+    """Aligning by lambda gives a lower loss than aligning by the mask alone.
+
+    The default alignment weights each point by its EDM weight, which makes
+    it the rigid fit that minimises the lambda-weighted loss. A mask-only
+    fit is pulled toward the shifted noisy points, leaving an offset on the
+    clean points that their large lambda then multiplies. So whenever the
+    weights differ within a sample, the default must score strictly lower.
+    """
+    lambda_aligned = atom_loss(
+        mixed_noise_pred,
+        mixed_noise_gt,
+        aa_indices=mixed_noise_aa_indices,
+        lambda_sigma_weight=mixed_noise_lambda,
+    )
+    mask_aligned = atom_loss(
+        mixed_noise_pred,
+        mixed_noise_gt,
+        aa_indices=mixed_noise_aa_indices,
+        lambda_sigma_weight=mixed_noise_lambda,
+        alignment_lambda=mask_only_alignment_lambda,
+    )
+    assert (lambda_aligned < mask_aligned).all()
+
+
+@pytest.mark.parametrize(
+    "mixed_noise_scenario",
+    list(UniformLambda),
+    ids=[case.name for case in UniformLambda],
+)
+def test_atom_loss_lambda_alignment_matches_mask_alignment_when_uniform(
+    mixed_noise_pred: Float[torch.Tensor, "1 N_point 3"],
+    mixed_noise_gt: Float[torch.Tensor, "1 N_point 3"],
+    mixed_noise_lambda: Float[torch.Tensor, "1 N_point"],
+    mask_only_alignment_lambda: Float[torch.Tensor, "1 N_point"],
+    mixed_noise_aa_indices: Int[torch.Tensor, "1 N_point"],
+) -> None:
+    """With one noise level per sample, lambda alignment changes nothing.
+
+    The Kabsch fit ignores a constant scale on its weights, so when lambda
+    is the same for every point the default alignment equals the mask-only
+    one. This is what keeps training without Self-Flow, and all validation,
+    unchanged.
+    """
+    lambda_aligned = atom_loss(
+        mixed_noise_pred,
+        mixed_noise_gt,
+        aa_indices=mixed_noise_aa_indices,
+        lambda_sigma_weight=mixed_noise_lambda,
+    )
+    mask_aligned = atom_loss(
+        mixed_noise_pred,
+        mixed_noise_gt,
+        aa_indices=mixed_noise_aa_indices,
+        lambda_sigma_weight=mixed_noise_lambda,
+        alignment_lambda=mask_only_alignment_lambda,
+    )
+    assert torch.allclose(lambda_aligned, mask_aligned, atol=TOLERANCE)
+
+
 def test_pairwise_sq_dist_shape_symmetric() -> None:
     """The helper returns an [N, N] symmetric matrix with zero diagonal.
 
