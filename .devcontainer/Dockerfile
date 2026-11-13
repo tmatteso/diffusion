@@ -43,6 +43,29 @@ RUN mkdir -p -m 755 /etc/apt/keyrings \
     && apt-get install -y --no-install-recommends gh \
     && rm -rf /var/lib/apt/lists/*
 
+# Install Node.js 22 from the NodeSource apt repository, for the web/ frontend.
+# apt reads the ASCII-armored key directly (.asc), so gnupg isn't needed.
+# Both base images get Node from here, so the arm64 and cuda containers can't
+# drift apart.
+RUN wget -qO /etc/apt/keyrings/nodesource.asc \
+        https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
+    && chmod go+r /etc/apt/keyrings/nodesource.asc \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/nodesource.asc] https://deb.nodesource.com/node_22.x nodistro main" \
+        > /etc/apt/sources.list.d/nodesource.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+# Activate pnpm through corepack, which ships with Node 22. pnpm fetches its
+# native binary into corepack's cache on first run, so run it once here: the
+# image then carries it, and the first `pnpm` call in the container needs no
+# network access and shows no download prompt. web/package.json's
+# `packageManager` field pins the version a project uses; keep the two in step.
+ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0
+RUN corepack enable pnpm \
+    && corepack install --global pnpm@12.16.1 \
+    && pnpm --version
+
 # Install uv
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 ENV UV_COMPILE_BYTECODE=1
