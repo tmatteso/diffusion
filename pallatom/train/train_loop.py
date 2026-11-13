@@ -1107,6 +1107,11 @@ def _parse_args() -> TrainArgs:
         action="store_true",
         help="restrict to 252 proteins for fast iteration",
     )
+    parser.add_argument(  # pyright: ignore[reportUnusedCallResult]
+        "--allow_cpu",
+        action="store_true",
+        help="train on the CPU when no GPU is visible instead of exiting",
+    )
     ns = parser.parse_args()
     return TrainArgs(
         dataset_jsonl=cast("Path", ns.dataset_jsonl),
@@ -1116,6 +1121,7 @@ def _parse_args() -> TrainArgs:
         structlog_jsonl=cast("Path", ns.structlog_jsonl),
         ddp=cast("bool", ns.ddp),
         debug_run=cast("bool", ns.debug_run),
+        allow_cpu=cast("bool", ns.allow_cpu),
     )
 
 
@@ -1180,12 +1186,63 @@ def build_lr_scheduler(
     )
 
 
+class CudaUnavailableError(RuntimeError):
+    """Raised when CUDA is missing and CPU training was not requested.
+
+    Training this model on the CPU is orders of magnitude slower than on a
+    GPU, so an unrequested fallback is treated as an error rather than a
+    warning: a long queue of runs that quietly lands on the CPU wastes days
+    before anyone notices.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "CUDA is not available, so training would fall back to the CPU "
+            + "and run orders of magnitude slower. Check that the GPUs are "
+            + "visible (nvidia-smi), or pass --allow_cpu to train on the "
+            + "CPU deliberately.",
+        )
+
+
+def resolve_train_device(
+    *,
+    cuda_available: bool,
+    allow_cpu: bool,
+) -> torch.device:
+    """Pick the device for a single-process run, refusing a silent fallback.
+
+    Takes ``cuda_available`` as an argument rather than calling
+    ``torch.cuda.is_available`` itself, so the decision is a pure function of
+    its inputs and is testable without patching a torch global.
+
+    Args:
+        cuda_available: Whether torch reports a usable CUDA device, as
+            returned by ``torch.cuda.is_available``.
+        allow_cpu: Whether the caller explicitly opted in to CPU training;
+            set by the ``--allow_cpu`` command-line flag.
+
+    Returns:
+        ``cuda:0`` whenever CUDA is available, otherwise ``cpu``.
+
+    Raises:
+        CudaUnavailableError: If CUDA is unavailable and ``allow_cpu`` is
+            False.
+    """
+    if cuda_available:
+        return torch.device("cuda:0")
+    if allow_cpu:
+        return torch.device("cpu")
+    raise CudaUnavailableError
+
+
 def main(args: TrainArgs, tcfg: TrainConfig) -> None:
     """Entry point for training; dispatches to DDP or not based on args.ddp.
 
     Uses ExitStack so both paths share all setup code after context init.
     DistProcessGroup is only entered under --ddp; device/rank/world_size are
-    resolved to plain values before the shared path begins.
+    resolved to plain values before the shared path begins. The DDP path
+    needs no CUDA check of its own, since the NCCL backend fails to
+    initialise without a CUDA device.
     """
     with contextlib.ExitStack() as stack:
         if args.ddp:
@@ -1196,8 +1253,9 @@ def main(args: TrainArgs, tcfg: TrainConfig) -> None:
         else:
             rank = 0
             is_rank_zero = True
-            device = torch.device(
-                "cuda:0" if torch.cuda.is_available() else "cpu",
+            device = resolve_train_device(
+                cuda_available=torch.cuda.is_available(),
+                allow_cpu=args.allow_cpu,
             )
 
         _ = stack.enter_context(

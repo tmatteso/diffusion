@@ -482,6 +482,10 @@ class TrainArgs:
         structlog_jsonl: Path to write structured JSON log lines.
         ddp: If True, use DistributedDataParallel training.
         debug_run: If True, restrict to 252 proteins for fast iteration.
+        allow_cpu: If True, fall back to CPU training when no CUDA device is
+            visible. Defaults to False, so a missing GPU raises
+            ``CudaUnavailableError`` instead of silently training on the CPU
+            orders of magnitude slower.
     """
 
     dataset_jsonl: pathlib.Path
@@ -491,3 +495,4 @@ class TrainArgs:
     structlog_jsonl: pathlib.Path
     ddp: bool
     debug_run: bool
+    allow_cpu: bool = False

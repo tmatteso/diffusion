@@ -35,10 +35,16 @@ train(best_val_loss, train_loader, test_loader, model_params, log)
 
 1. Parses CLI args (`_parse_args` → `TrainArgs`): dataset JSONL, shard
    directory, train/val/test split keys, a `TrainConfig` JSON path, a
-   structured-log output path, and `--ddp`/`--debug_run` flags.
+   structured-log output path, and `--ddp`/`--debug_run`/`--allow_cpu` flags.
 2. If `--ddp`, enters `DistProcessGroup("nccl")` to initialise the
    distributed process group and resolve `rank`/`is_rank_zero`/`device`;
-   otherwise runs single-device with `rank=0`.
+   otherwise runs single-device with `rank=0` and picks the device via
+   `resolve_train_device`, which raises `CudaUnavailableError` when no CUDA
+   device is visible unless `--allow_cpu` was passed. Training on the CPU is
+   orders of magnitude slower, so the fallback is opt-in rather than
+   silent — a queue of runs that quietly lands on the CPU wastes days before
+   anyone notices. The DDP path needs no such check, since the NCCL backend
+   cannot initialise without a CUDA device.
 3. Enters `StructlogConfig` (JSON log lines, rank-0-only) and `FatalOnError`
    (logs any uncaught exception via structlog, then exits) for the rest of
    the run.
