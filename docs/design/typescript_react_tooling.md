@@ -1,6 +1,9 @@
 # Design: static analysis and style for TypeScript + React
 
 **Status:** Draft, for discussion. Nothing here is implemented yet.
+**First consumer:** the sampling website frontend in `web/`
+([`sampling_website.md`](sampling_website.md)). That doc's §10 holds the
+delivery plan and the decisions that reconcile the two docs.
 
 ## Context
 
@@ -294,8 +297,9 @@ These go in a frontend `CLAUDE.md` and play the role of the "never `Any`,
   tool versions come from the lockfile, not a `rev:` pin. ESLint's typed
   linting builds a full TypeScript program, so it runs once per project
   with `pass_filenames: false` and `--cache`, not once per file.
-- **Devcontainer:** add Node and pnpm so CI's rebuilt container can run the
-  hooks.
+- **Devcontainer:** install Node and pnpm in the shared
+  `.devcontainer/Dockerfile`, so the ARM64 and CUDA images cannot diverge
+  and CI's rebuilt container can run the hooks.
 - **CI:** ARM64 CI already runs `pre-commit run --all-files`, so the new
   hooks run there automatically. Add `vitest run` (and later Playwright) as
   a test step alongside `pytest pallatom`. CUDA CI needs no change.
@@ -303,15 +307,20 @@ These go in a frontend `CLAUDE.md` and play the role of the "never `Any`,
 ## Rollout
 
 Each step is its own PR. Per repo convention, guide changes are kept out of
-tooling PRs.
+tooling PRs. These are PRs B1–B4 in
+[`sampling_website.md` §10](sampling_website.md#10-delivery-plan):
 
-1. Scaffold the frontend package: `package.json`, `tsconfig.json`,
-   `eslint.config.ts`, Prettier config, one trivial component and test.
-2. Wire the hooks into `.pre-commit-config.yaml` and add Node to the
-   devcontainer.
-3. Add the frontend test step to CI.
+1. Add Node and pnpm to the devcontainer (B1).
+2. Scaffold the frontend package in `web/`: `package.json`,
+   `tsconfig.json`, `eslint.config.ts`, Prettier config, one trivial
+   component and test (B2).
+3. Wire the hooks into `.pre-commit-config.yaml` and add the frontend test
+   and build steps to CI (B3).
 4. Add a frontend `CLAUDE.md` and update `docs/best_practices.md` and the
-   root `CLAUDE.md` hook inventory.
+   root `CLAUDE.md` hook inventory (B4).
+
+Playwright and `@axe-core/playwright` (see [Testing](#testing)) land after
+the MVP ships, as their own PR (B11).
 
 Turning everything on before any real code exists is deliberate: adopting
 strict rules on an empty codebase costs nothing, and retrofitting them later
@@ -319,10 +328,10 @@ is expensive.
 
 ## Open questions
 
-- Where the frontend lives (`frontend/`, `web/`, ...) and whether it needs
-  its own devcontainer image.
-- Vite SPA or a server-rendering framework. This affects the ESLint
-  config's environment, not the tool choices.
+- ~~Where the frontend lives~~ Resolved: `web/`, in the existing
+  devcontainer image.
+- ~~Vite SPA or a server-rendering framework~~ Resolved: Vite SPA on
+  GitHub Pages.
 - Whether the `all` presets prove workable, or we fall back to
   `strictTypeChecked` plus an explicit list.
 - Exact major versions. They should be checked when the scaffold PR is

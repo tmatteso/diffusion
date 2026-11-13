@@ -74,7 +74,7 @@ lists the MVP decisions that exist to make them cheap.
 | `CLAUDE.md` bans `Any` and `TypedDict`. | Every payload is a Pydantic model. The handlers do not use `app.state`, which is `Any`; they are bound methods on typed objects (§5.4). |
 | GitHub Pages serves over **HTTPS** from a different origin than the API. | The API must be reachable over HTTPS, or browsers block it as mixed content, and it must send **CORS** headers for the Pages origin (§5.5). |
 | The GPU box has two RTX 4070 SUPERs. | The MVP runs one worker on one GPU (`--device cuda:0`). The second GPU becomes a second consumer in Phase 2. |
-| The devcontainer has no Node toolchain. | Add the `node` devcontainer feature (§7). |
+| The devcontainer has no Node toolchain. | Install Node and pnpm in the shared `.devcontainer/Dockerfile` (§7). |
 
 ## 5. Backend (Phase 1)
 
@@ -288,7 +288,8 @@ lines to Loki as they are.
 
 ### 6.1 Stack
 
-- **Vite + React 19 + TypeScript**, strict. No router and no state library.
+- **Vite + React 19 + TypeScript**, strict. No router and no client-state
+  library; server data goes through **TanStack Query** (decision 3, §10).
   Scaffold with the `react-ts` template, which uses `@vitejs/plugin-react`
   rather than the SWC variant. At this size SWC's dev-speed edge is
   negligible, `plugin-react` is the officially supported path for the React
@@ -299,11 +300,14 @@ lines to Loki as they are.
   `function SampleCard({ sample }: SampleCardProps): React.JSX.Element`.
   Don't use `React.FC`. State and effects use hooks (`useState`,
   `useReducer`, `useEffect`), and shared logic lives in custom hooks rather
-  than higher-order components or render props:
-  - `useHealth()` polls `/api/health`.
-  - `useModelInfo()` fetches `/api/model` once.
-  - `useJob(jobId)` holds the polling state machine for
-    `/api/jobs/{id}`: queued → running → succeeded or failed.
+  than higher-order components or render props. The three data hooks are
+  thin wrappers over TanStack Query's `useQuery`, so retries, caching and
+  polling are not hand-written:
+  - `useHealth()` polls `/api/health` (`refetchInterval`).
+  - `useModelInfo()` fetches `/api/model` once (`staleTime: Infinity`).
+  - `useJob(jobId)` polls `/api/jobs/{id}` every 1.5 s through queued →
+    running → succeeded or failed. `refetchInterval` returns `false` once
+    the job reaches a terminal state, which stops the polling.
 
   The one thing React still has no hook for is an **error boundary**. Use
   the `react-error-boundary` package's `<ErrorBoundary>` component rather
@@ -324,7 +328,7 @@ web/src/
   components/  SampleForm.tsx  SampleGallery.tsx  SampleCard.tsx
                StructureViewer.tsx  HealthIndicator.tsx
   hooks/       useHealth.ts  useModelInfo.ts  useJob.ts
-  api/         client.ts  schema.d.ts   # schema.d.ts generated (§6.3)
+  api/         client.ts  generated/    # generated/ is types + Zod schemas (§6.3)
   styles/      tokens.stylex.ts  reset.css
 ```
 
@@ -443,7 +447,7 @@ const styles = stylex.create({
 - In dev, styles are injected at runtime for fast reloads. Production builds
   extract them into a single static `.css` file.
 - Vitest reuses the Vite config, so tests see the same transform.
-- StyleX's Vite integration has been evolving. At PR 3, use whatever package
+- StyleX's Vite integration has been evolving. In PR B2, use whatever package
   the StyleX docs currently recommend for Vite, and record the choice in
   `web/README.md`.
 
@@ -478,15 +482,25 @@ const styles = stylex.create({
 
 ### 6.3 Keeping types in sync
 
-`npm run gen:api` runs `openapi-typescript` against the app's
-`/openapi.json` and writes `src/api/schema.d.ts`, which is committed. CI
-regenerates the file from a CPU-only app instance and fails on a diff.
+TypeScript types are erased at runtime, so the frontend parses every API
+response instead of trusting it (decision 4, §10). `pnpm gen:api` reads the
+app's OpenAPI spec and writes both the TypeScript types and matching Zod
+schemas to `src/api/generated/`, which is committed. `client.ts` parses
+every response with the generated schema, so the types and the runtime
+checks come from one source and cannot drift apart. Pick the generator in
+PR B5 (for example `@hey-api/openapi-ts` with its Zod plugin, or `orval`),
+and record the choice in `web/README.md`.
+
+The spec comes from `python pallatom/serve/app.py --dump-openapi`, which
+builds the app without loading a model, so it runs on CPU-only CI. CI
+regenerates `src/api/generated/` and fails on a diff.
 
 ### 6.4 GitHub Pages deployment
 
 - A new workflow, `.github/workflows/pages.yml`, runs on `push` to `main`
   when files under `web/**` change, and on `workflow_dispatch`. It runs
-  `actions/configure-pages`, `setup-node`, `npm ci`, `npm run build`,
+  `actions/configure-pages`, `pnpm/action-setup`, `setup-node`,
+  `pnpm install --frozen-lockfile`, `pnpm build`,
   `actions/upload-pages-artifact` (`web/dist`) and `actions/deploy-pages`.
 - Vite sets `base: "/diffusion/"` so asset paths resolve under the project
   site.
@@ -498,14 +512,16 @@ regenerates the file from a CPU-only app instance and fails on a diff.
 
 ### 6.5 Strictness
 
-- `tsconfig`: `strict`, `noUncheckedIndexedAccess`,
-  `exactOptionalPropertyTypes`, `noImplicitOverride`.
-- ESLint with `typescript-eslint` `strictTypeChecked`;
-  `no-explicit-any` and the `no-unsafe-*` rules are errors, mirroring the
-  repo's `Any` ban. `explicit-module-boundary-types` is also an error,
-  mirroring the repo's rule that every function is annotated.
-- `eslint-plugin-react-hooks`: `rules-of-hooks` and `exhaustive-deps` are
-  errors.
+The base is the full toolchain in
+[`typescript_react_tooling.md`](typescript_react_tooling.md) (decision 2,
+§10): `@tsconfig/strictest` plus the extra compiler flags listed there;
+ESLint starting from the `all` presets, with type-aware typescript-eslint
+rules, `eslint-plugin-jsdoc`, unicorn, sonarjs and `react-hooks`; Prettier;
+`type-coverage --strict --at-least 100`; and knip. `no-explicit-any` and the
+`no-unsafe-*` rules mirror the repo's `Any` ban, and
+`explicit-module-boundary-types` mirrors its rule that every function is
+annotated. This website adds the rules below on top of that base.
+
 - Class components are banned by a `no-restricted-syntax` rule that matches
   any class extending `Component` or `PureComponent`, whether imported bare
   or as `React.Component`. Other classes, such as an `ApiError extends Error`
@@ -526,15 +542,18 @@ regenerates the file from a CPU-only app instance and fails on a diff.
 
 ## 7. Tooling, devcontainer and CI (Phase 1)
 
-- **Devcontainer:** add `"features": {"ghcr.io/devcontainers/features/node:1":
-  {"version": "22"}}` to both the `cuda/` and `arm64/` devcontainers. ARM64
-  CI runs every pre-commit hook, including the new frontend ones.
+- **Devcontainer:** install Node 22 and pnpm (through `corepack`) in the
+  shared `.devcontainer/Dockerfile`, which both the `cuda/` and `arm64/`
+  devcontainers build from, so the two cannot diverge (decision 5, §10).
+  ARM64 CI runs every pre-commit hook, including the new frontend ones.
 - **`.gitignore`:** `web/node_modules/`, `web/dist/`.
 - **Pre-commit** (`language: system`, `files: ^web/`, with versions taken
-  from `web/package-lock.json`): `tsc --noEmit`, `eslint`,
-  `prettier --check`.
-- **CI:** add `npm ci && npm run build && npm test` and the OpenAPI drift
-  check to the `test` job, next to `pytest pallatom`.
+  from `web/pnpm-lock.yaml`, decision 1, §10): `pnpm exec` for
+  `tsc --noEmit`, `eslint --max-warnings 0`, `prettier --check`,
+  `type-coverage` and `knip`.
+- **CI:** add `pnpm install --frozen-lockfile && pnpm build && pnpm test`
+  and the OpenAPI drift check (§6.3) to the `test` job, next to
+  `pytest pallatom`.
 - **Running it on the box:** a short `pallatom/serve/README.md` section
   covers how to start uvicorn and `cloudflared` in `tmux`. The MVP has no
   systemd units or containers; Phase 3 replaces all of this.
@@ -561,12 +580,16 @@ regenerates the file from a CPU-only app instance and fails on a diff.
 - A regression test for the refactor: the old and new CLI output match for a
   fixed seed.
 
-**Frontend** (Vitest + React Testing Library)
+**Frontend** (Vitest + React Testing Library, with MSW mocking the API at
+the request level)
 
 - The form respects the limits from `/api/model`. The polling state machine
   goes through queued, running and succeeded or failed (with timers mocked).
-  `429` and offline states render. The `?api=` override is used.
+  `429` and offline states render. The `?api=` override is used. A response
+  that fails its Zod schema surfaces as an error, not a crash.
   `StructureViewer` is smoke-tested with `3dmol` mocked.
+- Playwright end-to-end tests with `@axe-core/playwright` follow once the MVP
+  is live (PR B11, decision 6 in §10).
 
 **Manual acceptance:** on the GPU box, take `pallatom_toy_best.pt` and its
 config, open the Pages URL through the tunnel, sample 4 × 100 residues, and
@@ -732,14 +755,67 @@ sends the same `SIGTERM`, so Phase 3 only adds the manifests around it.
 
 ## 10. Delivery plan
 
-| PR | Content |
-|----|---------|
-| 1 | Refactor `sampling.py` into `load_model` / `run_sampling` / `to_samples`, plus the regression test |
-| 2 | `pallatom/serve/`: messages, `execute_job`, in-process queue and store, `SamplerApi`, CORS, rate limit, tests |
-| 3 | `web/` scaffold, Node devcontainer feature, pre-commit hooks, CI steps |
-| 4 | Frontend UI, OpenAPI type generation, `pages.yml`, tunnel and run docs. **The MVP is complete.** |
-| 5+ | Phase 2: RabbitMQ queue and store implementations, worker process with graceful `SIGTERM` shutdown, ARM64 gateway deployment, auth |
-| later | Phase 3 (k3s + GPU Operator + `HTTPRoute` + KEDA), then Phase 4 (observability) |
+### 10.1 Decisions reconciling this doc with the tooling doc
+
+[`typescript_react_tooling.md`](typescript_react_tooling.md) sets the
+TypeScript bar for the repo. Where it and this doc disagreed, these
+decisions apply, and the sections above have been updated to match.
+
+| # | Topic | Decision | Why |
+|---|-------|----------|-----|
+| 1 | Package manager | **pnpm**, `web/pnpm-lock.yaml` committed | Stricter dependency resolution: packages can't import dependencies they don't declare. |
+| 2 | Lint bar | **The tooling doc's full toolchain** (`all` presets, jsdoc, unicorn, sonarjs, type-coverage, knip); §6.5 lists only this site's additions | Matches the Python side's `select = ["ALL"]`. |
+| 3 | Fetching server data | **TanStack Query** behind `useHealth`, `useModelInfo` and `useJob` | Retries, caching and polling are not hand-written; the hook names stay the same. |
+| 4 | Checking API payloads at runtime | **Generate types and Zod schemas** from the OpenAPI spec | TS types are erased at runtime; one source means the types and checks can't drift. |
+| 5 | Node in the devcontainer | **The shared `.devcontainer/Dockerfile`**, not a devcontainer feature | The ARM64 and CUDA images can't diverge. |
+| 6 | Browser (end-to-end) tests | **Playwright with axe after the MVP ships**, as PR B11 | Keeps the MVP path short. |
+| 7 | Frontend style guide | **Its own PR** (B4) | Repo convention keeps guide changes out of tooling PRs. |
+
+### 10.2 PR sequence
+
+Each PR passes ARM64 CI and CUDA CI on its own. Tracks A and B don't depend
+on each other until B5, so they can be worked on alternately.
+
+**A. Backend (`pallatom/serve/`)**
+
+| PR | Type | Content | Depends on |
+|----|------|---------|------------|
+| A1 | `refactor(sample)` | Split `sampling.py::main` into `load_model`, `run_sampling` and `to_samples`, with frozen `LoadedModel` and `SampledProtein` (§5.1). Regression test: old and new CLI output match for a fixed seed. | — |
+| A2 | `feat(serve)` | `messages.py` (the Pydantic models and limits) and `worker.execute_job`. Tests: `SampleJob` JSON round trip; `execute_job` is deterministic on a tiny CPU model. | A1 |
+| A3 | `feat(serve)` | `queue.py`: the `JobQueue` and `JobStore` protocols, `InProcessJobQueue` (one worker thread, raises `QueueFull`) and `InMemoryJobStore` (TTL). | A2 |
+| A4 | `feat(serve)` | `api.py` and `app.py`: `SamplerApi` with bound-method handlers, CORS, `429` with `Retry-After` when the queue is full, `503` when the model fails to load, structlog lines per job transition (§5.6), the CLI, and `--dump-openapi` (§6.3). Tests through `TestClient`. | A3 |
+| A5 | `feat(serve)` | Per-IP token-bucket rate limit keyed on `CF-Connecting-IP` (§5.5), with tests. | A4 |
+
+**B. Frontend (`web/`)**
+
+| PR | Type | Content | Depends on |
+|----|------|---------|------------|
+| B1 | `build(devcontainer)` | Node 22 and pnpm in the shared Dockerfile; `web/node_modules/` and `web/dist/` in `.gitignore`. | — |
+| B2 | `feat(web)` | Scaffold: Vite `react-ts`, `tsconfig` from `@tsconfig/strictest`, ESLint flat config with the full rule set (tooling doc plus §6.5), Prettier, the StyleX Babel plugin, Vitest with Testing Library, type-coverage and knip. One trivial component and one test. | B1 |
+| B3 | `ci` | Pre-commit hooks for `web/` (§7), plus `pnpm build` and `pnpm test` in the `test` job of `devcontainer-checks.yml`. | B2 |
+| B4 | `docs` | `web/CLAUDE.md` style guide; update the root `CLAUDE.md` hook inventory and `docs/best_practices.md`. | B3 |
+| B5 | `feat(web)` | API layer: generated types and Zod schemas (§6.3), `client.ts` with `ApiError`, the `?api=` override in `localStorage`, and the CI drift check. | A4, B3 |
+| B6 | `feat(web)` | `useHealth`, `useModelInfo` and `useJob` on TanStack Query, tested with MSW and fake timers. | B5 |
+| B7 | `feat(web)` | Design tokens, `reset.css`, the `App` shell, `HealthIndicator` and `SampleForm` (limits from `/api/model`; `429` and offline states). | B6 |
+| B8 | `feat(web)` | `StructureViewer` (3Dmol, sized container, cleanup on unmount), `SampleCard`, `SampleGallery`, PDB download, and `ErrorBoundary`. | B7 |
+| B9 | `ci(pages)` | `pages.yml`, `base: "/diffusion/"`, the `SAMPLER_API_URL` repository variable, and `pallatom/serve/README.md` on running uvicorn and `cloudflared`. **The MVP goes live.** | A5, B8 |
+| B10 | `chore(serve)` | Manual acceptance and the timing and GPU-memory measurements (§8); tune the limits. | B9 |
+| B11 | `test(web)` | Playwright with `@axe-core/playwright`. Optional. | B9 |
+
+**C. Phases 2–4.** Each phase gets a short design addendum before it is
+split into PRs.
+
+- **Phase 2:** store the training config in checkpoints (open question 1;
+  can land any time); a standalone worker process with graceful `SIGTERM`
+  shutdown; `RabbitMQJobQueue` and the result consumer (a new dependency,
+  plus a RabbitMQ service in CI); a persistent `JobStore` (Redis or
+  Postgres); deploy the gateway on the ARM64 host and one worker per GPU;
+  auth, once the domain question is settled.
+- **Phase 3:** multi-arch images; split `/healthz` and `/readyz`; k3s with
+  the GPU Operator; the RabbitMQ Cluster Operator; `Gateway` and
+  `HTTPRoute`; the KEDA `ScaledObject`; worker Deployment manifests.
+- **Phase 4:** `kube-prometheus-stack`; `/metrics` on the gateway and the
+  workers; alert rules; Loki with Alloy; dashboards.
 
 ## 11. Open questions
 
