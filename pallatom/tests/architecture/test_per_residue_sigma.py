@@ -263,12 +263,36 @@ class WeightPair(enum.Enum):
 
 
 @pytest.fixture
+def fixed_alignment_weight(
+    weight_pair_scenario: WeightPair,
+) -> Float[torch.Tensor, "B N"]:
+    """Unit Kabsch weight shared by every loss in a linearity check.
+
+    ``atom_loss`` aligns by its loss weight by default, so the alignment
+    would change between the two tables and their sum. Linearity in the
+    per-point weight holds at a fixed alignment, which is how
+    ``noise_group_shares`` uses it, so all three losses take this one.
+
+    Args:
+        weight_pair_scenario: Weight tables, used only for their shape; the
+            requesting test parametrizes it.
+
+    Returns:
+        Float tensor of ones, shaped like the weight tables.
+    """
+    return torch.ones_like(
+        torch.tensor(weight_pair_scenario.value.first, dtype=torch.float32),
+    )
+
+
+@pytest.fixture
 def first_weight_loss(
     weight_pair_scenario: WeightPair,
     perturbed_points: Float[torch.Tensor, "B N 3"],
     reference_points: Float[torch.Tensor, "B N 3"],
     point_mask: Float[torch.Tensor, "B N"],
     residue_types: Int[torch.Tensor, "B N_aa"],
+    fixed_alignment_weight: Float[torch.Tensor, "B N"],
 ) -> Float[torch.Tensor, "B"]:
     """``atom_loss`` with the scenario's first weight table.
 
@@ -279,6 +303,7 @@ def first_weight_loss(
         reference_points: Ground-truth points.
         point_mask: Valid-point mask.
         residue_types: Residue amino-acid indices.
+        fixed_alignment_weight: Kabsch weight shared by all three losses.
 
     Returns:
         The loss of each sample under the first table.
@@ -288,6 +313,7 @@ def first_weight_loss(
         reference_points,
         point_mask,
         aa_indices=residue_types,
+        alignment_lambda=fixed_alignment_weight,
         lambda_sigma_weight=torch.tensor(
             weight_pair_scenario.value.first,
             dtype=torch.float32,
@@ -302,6 +328,7 @@ def second_weight_loss(
     reference_points: Float[torch.Tensor, "B N 3"],
     point_mask: Float[torch.Tensor, "B N"],
     residue_types: Int[torch.Tensor, "B N_aa"],
+    fixed_alignment_weight: Float[torch.Tensor, "B N"],
 ) -> Float[torch.Tensor, "B"]:
     """``atom_loss`` with the scenario's second weight table.
 
@@ -312,6 +339,7 @@ def second_weight_loss(
         reference_points: Ground-truth points.
         point_mask: Valid-point mask.
         residue_types: Residue amino-acid indices.
+        fixed_alignment_weight: Kabsch weight shared by all three losses.
 
     Returns:
         The loss of each sample under the second table.
@@ -321,6 +349,7 @@ def second_weight_loss(
         reference_points,
         point_mask,
         aa_indices=residue_types,
+        alignment_lambda=fixed_alignment_weight,
         lambda_sigma_weight=torch.tensor(
             weight_pair_scenario.value.second,
             dtype=torch.float32,
@@ -335,6 +364,7 @@ def summed_weight_loss(
     reference_points: Float[torch.Tensor, "B N 3"],
     point_mask: Float[torch.Tensor, "B N"],
     residue_types: Int[torch.Tensor, "B N_aa"],
+    fixed_alignment_weight: Float[torch.Tensor, "B N"],
 ) -> Float[torch.Tensor, "B"]:
     """``atom_loss`` with the sum of the scenario's two weight tables.
 
@@ -345,6 +375,7 @@ def summed_weight_loss(
         reference_points: Ground-truth points.
         point_mask: Valid-point mask.
         residue_types: Residue amino-acid indices.
+        fixed_alignment_weight: Kabsch weight shared by all three losses.
 
     Returns:
         The loss of each sample under the summed table.
@@ -355,6 +386,7 @@ def summed_weight_loss(
         reference_points,
         point_mask,
         aa_indices=residue_types,
+        alignment_lambda=fixed_alignment_weight,
         lambda_sigma_weight=torch.tensor(case.first, dtype=torch.float32)
         + torch.tensor(case.second, dtype=torch.float32),
     )
@@ -374,7 +406,8 @@ def test_atom_loss_is_linear_in_per_point_weight(
 
     Arrange: two non-uniform per-point weight tables.
     Act: score the same structures with each table and with their sum.
-    Assert: the summed-table loss is the sum of the two losses. So each
+    Assert: at one fixed alignment, the summed-table loss is the sum of the
+    two losses. So each
     weight multiplies its own point's squared error inside the weighted
     mean, which is what lets residues at different noise levels carry
     different weights in one sample.
