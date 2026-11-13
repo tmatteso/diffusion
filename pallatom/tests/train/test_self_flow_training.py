@@ -57,8 +57,9 @@ class SelfFlowStep(enum.Enum):
 def step_config(self_flow_step_scenario: SelfFlowStep) -> TrainConfig:
     """Small-trunk training config with Self-Flow as the scenario sets it.
 
-    Two decoder units keep the step fast on CPU. Half the residues are
-    masked when Self-Flow is on.
+    Three decoder units keep the step fast on CPU and are the fewest that
+    give Self-Flow distinct student and teacher units. Half the residues
+    are masked when Self-Flow is on.
 
     Args:
         self_flow_step_scenario: Self-Flow on or off; the requesting test
@@ -68,7 +69,7 @@ def step_config(self_flow_step_scenario: SelfFlowStep) -> TrainConfig:
         The training configuration.
     """
     return TrainConfig(
-        model=ModelParams(K_unit=2),
+        model=ModelParams(K_unit=3),
         self_flow=SelfFlowParams(
             enabled=self_flow_step_scenario.value.enabled,
             mask_ratio=0.5,

@@ -30,6 +30,46 @@ class InvalidSigmaRangeError(ValueError):
         )
 
 
+class SelfFlowUnitsError(ValueError):
+    """Raised when Self-Flow's student unit is not before its teacher unit."""
+
+    def __init__(
+        self,
+        student_unit: int,
+        teacher_unit: int,
+        k_unit: int,
+    ) -> None:
+        units = f"student {student_unit}, teacher {teacher_unit}"
+        super().__init__(
+            f"Self-Flow needs student unit < teacher unit ({units} of "
+            + f"{k_unit}); raise K_unit or widen the unit fractions",
+        )
+
+
+def self_flow_unit_indices(
+    k_unit: int,
+    student_unit_frac: float,
+    teacher_unit_frac: float,
+) -> tuple[int, int]:
+    """Zero-based decoder units Self-Flow aligns, from fractions of depth.
+
+    Unit ``max(1, round(frac * k_unit))`` counted from 1, so 0.3 and 0.7 of
+    8 units give the 2nd and 6th units, indices 1 and 5. Python's ``round``
+    rounds halves to even.
+
+    Args:
+        k_unit: Number of decoder units.
+        student_unit_frac: Student's depth fraction (0.3D in the paper).
+        teacher_unit_frac: Teacher's depth fraction (0.7D in the paper).
+
+    Returns:
+        The student and teacher unit indices.
+    """
+    student = max(1, round(student_unit_frac * k_unit)) - 1
+    teacher = max(1, round(teacher_unit_frac * k_unit)) - 1
+    return student, teacher
+
+
 class InsufficientShardsError(ValueError):
     """Raised when num_workers exceeds n_shards.
 
@@ -307,6 +347,10 @@ class LossParams(BaseModel):
         alpha_2: Weight for the residue-level distogram loss.
         alpha_3: Weight for the atom-pair distogram loss.
         alpha_4: Weight for the auxiliary loss at intermediate steps.
+        alpha_5: Weight of the Self-Flow loss, the Kabsch-aligned MSE between
+            a student decoder unit and the EMA teacher's deeper unit (gamma
+            in the paper). It only applies when Self-Flow is enabled, and 0
+            skips the teacher pass entirely.
 
 
         gamma: Exponential moving average decay used when computing auxiliary
@@ -324,6 +368,7 @@ class LossParams(BaseModel):
     alpha_2: float = Field(default=0.5, ge=0)
     alpha_3: float = Field(default=0.5, ge=0)
     alpha_4: float = Field(default=1.0, ge=0)
+    alpha_5: float = Field(default=0.8, ge=0)
     gamma: float = Field(default=0.99, gt=0, lt=1)
     smooth_lddt_cutoff: int = Field(default=15, gt=0)
 
@@ -347,6 +392,11 @@ class SelfFlowParams(BaseModel):
             all; the rest have every residue at the first noise level, so
             the student and teacher views coincide. Lowering it exposes the
             model to the uniform noise it sees at sampling time.
+        student_unit_frac: Depth of the student decoder unit whose
+            coordinates are aligned to the teacher, as a fraction of
+            ``K_unit`` (0.3D in the paper; unit 2 of 8).
+        teacher_unit_frac: Depth of the EMA teacher's decoder unit used as
+            the target (0.7D in the paper; unit 6 of 8).
     """
 
     model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True)
@@ -354,6 +404,8 @@ class SelfFlowParams(BaseModel):
     enabled: bool = False
     mask_ratio: float = Field(default=0.25, ge=0, le=0.5)
     apply_prob: float = Field(default=1.0, ge=0, le=1)
+    student_unit_frac: float = Field(default=0.3, gt=0, lt=1)
+    teacher_unit_frac: float = Field(default=0.7, gt=0, lt=1)
 
 
 class CheckpointParams(BaseModel):
@@ -498,6 +550,30 @@ class TrainConfig(BaseModel):
     logging: LoggingParams = Field(default_factory=LoggingParams)
     train_loader: TrainLoaderConfig = Field(default_factory=TrainLoaderConfig)
     test_loader: LoaderConfig = Field(default_factory=LoaderConfig)
+
+    @model_validator(mode="after")
+    def self_flow_units_ordered(self) -> "TrainConfig":
+        """Validate that Self-Flow's student unit precedes its teacher unit.
+
+        Checked only when Self-Flow is enabled, so small test models with
+        few decoder units stay valid otherwise.
+
+        Returns:
+            The validated model instance.
+
+        Raises:
+            SelfFlowUnitsError: If the rounded student unit is not strictly
+                before the rounded teacher unit.
+        """
+        if self.self_flow.enabled:
+            student, teacher = self_flow_unit_indices(
+                self.model.K_unit,
+                self.self_flow.student_unit_frac,
+                self.self_flow.teacher_unit_frac,
+            )
+            if student >= teacher:
+                raise SelfFlowUnitsError(student, teacher, self.model.K_unit)
+        return self
 
 
 @dataclasses.dataclass
