@@ -30,6 +30,9 @@ __pycache__/
 # web/ frontend (pnpm)
 web/node_modules/
 web/dist/
+# pnpm's package store, created next to the project when ~ is on another
+# filesystem
+.pnpm-store/
 # Build / packaging
 dist/
 build/

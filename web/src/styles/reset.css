@@ -1,0 +1,14 @@
+/*
+ * The only hand-written stylesheet. Everything else is StyleX. StyleX's Vite
+ * plugin appends its compiled CSS to this file's bundle asset; without any
+ * imported CSS it would write a stylesheet that index.html never links.
+ */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+}
