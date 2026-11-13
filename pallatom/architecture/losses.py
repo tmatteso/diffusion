@@ -108,6 +108,7 @@ def atom_loss(
     *,
     aa_indices: Int[torch.Tensor, "B N_aa"],
     lambda_sigma_weight: Float[torch.Tensor, "B N_res"],
+    alignment_lambda: Float[torch.Tensor, "B N_res"] | None = None,
 ) -> Float[torch.Tensor, "B"]:
     """Kabsch-aligned atom-coordinate MSE loss with EDM noise weighting.
 
@@ -146,6 +147,11 @@ def atom_loss(
         lambda_sigma_weight: Per-point EDM loss weight
             ``(t̂² + sigma_data²) / (t̂ · sigma_data)²``, shape
             ``(B, N_res)``, from ``edm_loss_weight``.
+        alignment_lambda: Per-point weight for the Kabsch fit, shape
+            ``(B, N_res)``. Defaults to ``lambda_sigma_weight``. Pass the
+            full EDM weight here when ``lambda_sigma_weight`` is a masked
+            copy of it (as ``noise_group_shares`` does), so a partial loss
+            is measured in the same frame as the full one.
 
     Returns:
         (B,) EDM-weighted loss per batch element.
@@ -156,19 +162,35 @@ def atom_loss(
         LossComputationError: If the computed loss contains NaN values.
 
     Notes:
-        • Alignment is done with float weights derived from `mask` only
-          (not residue type), so missing / padded residues do not pollute
-          the rotation estimate and polarity doesn't bias the SVD.
+        • Alignment is weighted by ``mask * alignment_lambda`` (not residue
+          type), so missing / padded residues do not pollute the rotation
+          estimate and polarity doesn't bias the SVD. Weighting the fit by
+          the same EDM weight as the loss makes it the rigid transform that
+          minimises the weighted loss. When points of one sample sit at
+          different noise levels (Self-Flow's dual-timestep schedule), a
+          mask-only fit is set by the noisy points, and the residual rigid
+          offset it leaves on the clean points is multiplied by their large
+          lambda. With one noise level per sample lambda is constant within
+          the sample, and the Kabsch fit ignores a constant weight scale, so
+          this matches the mask-only fit exactly.
         • Gradients flow through r_denoised (r_aligned is treated as a
           constant frame — the GT is being moved, not the prediction).
     """
     # Align GT → denoised  (mobile=r_gt, target=r_denoised).
     # Detach so gradients flow only through r_denoised, not through the SVD.
     with torch.no_grad():
+        align_lambda: Float[torch.Tensor, "B N_res"] = (
+            lambda_sigma_weight
+            if alignment_lambda is None
+            else alignment_lambda
+        )
+        align_weights: Float[torch.Tensor, "B N_res"] = (
+            align_lambda if mask is None else mask * align_lambda
+        )
         (r_aligned,) = kabsch_align(  # pylint: disable=unpacking-non-sequence
             r_gt,
             r_denoised,
-            weights=mask,
+            weights=align_weights,
             return_transform=False,
         )
 
@@ -277,6 +299,7 @@ def noise_group_shares(
             mask,
             aa_indices=batch.aa_indices,
             lambda_sigma_weight=lambda_sigma_weight * low_atoms,
+            alignment_lambda=lambda_sigma_weight,
         )
         weights = (
             repeat(
