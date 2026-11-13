@@ -77,6 +77,7 @@ from train.train_config import (
     TrainLoaderConfig,
 )
 from train.train_loop import (
+    CudaUnavailableError,
     alphafold_lr_lambda,
     build_lr_scheduler,
     component_grad_norms,
@@ -85,6 +86,7 @@ from train.train_loop import (
     log_epoch,
     optimizer_step,
     process_accum_window,
+    resolve_train_device,
     save_checkpoint,
     self_conditioned_template,
     swapped_in_ema_weights,
@@ -2381,3 +2383,157 @@ def test_take_step_trains_template_embedder(
     assert grads
     assert all(torch.isfinite(g).all() for g in grads)
     assert any(g.any() for g in grads)
+
+
+# ---------------------------------------------------------------------------
+# resolve_train_device — no unrequested CPU fallback
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class DeviceRequest:
+    """Inputs to ``resolve_train_device``.
+
+    Attributes:
+        cuda: Stands in for ``torch.cuda.is_available()``, which the function
+            under test takes as an argument so no torch global needs
+            patching.
+        allow_cpu: Whether the caller opted in to CPU training.
+    """
+
+    cuda: bool
+    allow_cpu: bool
+
+
+@dataclasses.dataclass(frozen=True)
+class DeviceCase(DeviceRequest):
+    """A device request together with the device it must resolve to.
+
+    Attributes:
+        expected: String form of the ``torch.device`` the request resolves
+            to, such as ``cuda:0`` or ``cpu``.
+    """
+
+    expected: str
+
+
+class ResolvedScenario(enum.Enum):
+    """Device requests that resolve to a device instead of raising.
+
+    Members:
+        gpu: CUDA present and CPU not requested — the normal training path.
+        gpu_and_flag: CUDA present and ``--allow_cpu`` passed anyway; the
+            flag only permits a fallback, it never forces one, so the GPU is
+            still chosen.
+        cpu_allowed: No CUDA but ``--allow_cpu`` passed, which is the
+            opt-in used for CPU-only machines such as the arm64 devcontainer.
+    """
+
+    gpu = DeviceCase(cuda=True, allow_cpu=False, expected="cuda:0")
+    gpu_and_flag = DeviceCase(cuda=True, allow_cpu=True, expected="cuda:0")
+    cpu_allowed = DeviceCase(cuda=False, allow_cpu=True, expected="cpu")
+
+
+@pytest.fixture
+def resolved_device(resolved_scenario: ResolvedScenario) -> torch.device:
+    """Resolve the scenario's request into a device.
+
+    Args:
+        resolved_scenario: Case to resolve; the requesting test parametrizes
+            this name directly.
+
+    Returns:
+        The device chosen for the scenario's request.
+    """
+    return resolve_train_device(
+        cuda_available=resolved_scenario.value.cuda,
+        allow_cpu=resolved_scenario.value.allow_cpu,
+    )
+
+
+@pytest.fixture
+def cpu_refused_request() -> DeviceRequest:
+    """Build the one request that must be refused.
+
+    Returns:
+        A request with no CUDA device and no opt-in to CPU training.
+    """
+    return DeviceRequest(cuda=False, allow_cpu=False)
+
+
+@pytest.mark.parametrize(
+    "resolved_scenario",
+    list(ResolvedScenario),
+    ids=[case.name for case in ResolvedScenario],
+)
+def test_resolve_train_device_picks_expected_device(
+    resolved_device: torch.device,
+    resolved_scenario: ResolvedScenario,
+) -> None:
+    """Every request that is allowed to resolve picks the right device.
+
+    Args:
+        resolved_device: Device the function returned for this scenario.
+        resolved_scenario: Case supplying the expected device.
+    """
+    assert resolved_device == torch.device(resolved_scenario.value.expected)
+
+
+def test_resolve_train_device_refuses_unrequested_cpu(
+    cpu_refused_request: DeviceRequest,
+) -> None:
+    """A missing GPU raises instead of silently falling back to the CPU.
+
+    This test is not parametrized because exactly one of the four input
+    combinations raises: a fallback is refused only when CUDA is absent and
+    the caller did not pass ``--allow_cpu``. The other three combinations
+    return a device and are covered by
+    ``test_resolve_train_device_picks_expected_device``.
+
+    Args:
+        cpu_refused_request: The request that must be refused.
+    """
+    with pytest.raises(CudaUnavailableError):
+        _ = resolve_train_device(
+            cuda_available=cpu_refused_request.cuda,
+            allow_cpu=cpu_refused_request.allow_cpu,
+        )
+
+
+@pytest.fixture
+def unflagged_train_args(tmp_path: pathlib.Path) -> TrainArgs:
+    """Build training args the way a caller that omits ``--allow_cpu`` does.
+
+    Args:
+        tmp_path: Pytest temporary directory for the arg paths, which are
+            never read because no training is started.
+
+    Returns:
+        Training args leaving ``allow_cpu`` at its default.
+    """
+    return TrainArgs(
+        dataset_jsonl=tmp_path / "chain_set.jsonl",
+        shard_dir=tmp_path / "shards",
+        keys_for_splits_json=tmp_path / "splits.json",
+        config=tmp_path / "config.json",
+        structlog_jsonl=tmp_path / "structlog.jsonl",
+        ddp=False,
+        debug_run=False,
+    )
+
+
+def test_train_args_default_forbids_cpu(
+    unflagged_train_args: TrainArgs,
+) -> None:
+    """Omitting ``--allow_cpu`` leaves the fail-loud default in place.
+
+    This test is not parametrized because the default has a single value;
+    its only edge case, passing the flag explicitly, is what
+    ``ResolvedScenario.cpu_allowed`` covers. The default is what makes the
+    guard effective, so flipping it would disable the check for every run
+    that does not name the flag.
+
+    Args:
+        unflagged_train_args: Args built without naming ``allow_cpu``.
+    """
+    assert not unflagged_train_args.allow_cpu
