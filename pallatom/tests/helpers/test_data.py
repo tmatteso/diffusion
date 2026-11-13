@@ -2655,7 +2655,10 @@ def log_sigma_ratios(tcfg: TrainConfig) -> Float[torch.Tensor, "n"]:
     """
     _ = manual_seed(0)
     draws = torch.stack(
-        [sample_training_sigma(tcfg.noise) for _ in range(4000)],
+        [
+            sample_training_sigma(tcfg.noise, tcfg.noise.length_shift_ref)
+            for _ in range(4000)
+        ],
     )
     return torch.log(draws / tcfg.noise.sigma_data)
 
@@ -2695,6 +2698,7 @@ def clean_geometry() -> NoisingGeometry:
         atom5_mask=torch.ones(2, 5),
         atom37_mask=torch.ones(2, 37),
         residue_mask=torch.ones(2, dtype=torch.bool),
+        n_res_real=2,
     )
 
 
@@ -2841,4 +2845,68 @@ def test_per_residue_view_with_uniform_sigma_matches_the_single_view(
     torch.testing.assert_close(
         per_residue.noised_res_distogram,
         single.noised_res_distogram,
+    )
+
+
+@pytest.fixture
+def length_shifted_batch(
+    ramp_proteins: list[Protein],
+    tcfg: TrainConfig,
+    template_distogram_fn: Distogram,
+    residue_distogram_fn: Distogram,
+    atom_distogram_fn: Distogram,
+) -> FeaturizedBatch:
+    """``plain_batch``'s featurization, same seed, with a length shift on.
+
+    ``length_shift_beta`` 0.5 and ``length_shift_ref`` 24 give the
+    six-residue protein a shift of ``sqrt(6 / 24) = 0.5`` and the
+    four-residue one ``sqrt(4 / 24) ≈ 0.40825``.
+
+    Args:
+        ramp_proteins: Proteins to featurize.
+        tcfg: Default config, to which the length shift is added.
+        template_distogram_fn: Template distogram module.
+        residue_distogram_fn: Residue distogram module.
+        atom_distogram_fn: Atom distogram module.
+
+    Returns:
+        The featurized batch.
+    """
+    shifted = tcfg.model_copy(
+        update={
+            "noise": tcfg.noise.model_copy(
+                update={"length_shift_beta": 0.5, "length_shift_ref": 24},
+            ),
+        },
+    )
+    _ = manual_seed(1)
+    return featurize_batch(
+        ramp_proteins,
+        shifted,
+        template_distogram_fn,
+        residue_distogram_fn,
+        atom_distogram_fn,
+    )
+
+
+def test_length_shift_scales_each_protein_training_sigma(
+    length_shifted_batch: FeaturizedBatch,
+    plain_batch: FeaturizedBatch,
+) -> None:
+    """Each protein's sigma is multiplied by its own length shift.
+
+    No other cases: two proteins of different lengths in one batch show
+    both the per-protein shift and that it uses the unpadded length (the
+    four-residue protein is padded to six).
+
+    Args:
+        length_shifted_batch: Batch with the length shift on.
+        plain_batch: The same draws without the shift.
+    """
+    ratio = length_shifted_batch.t_hat[:, 0] / plain_batch.t_hat[:, 0]
+    torch.testing.assert_close(
+        ratio,
+        torch.tensor([0.5, 0.40825]),
+        atol=1e-4,
+        rtol=0,
     )

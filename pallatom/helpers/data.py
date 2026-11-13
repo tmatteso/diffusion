@@ -76,6 +76,7 @@ from train.train_config import (
     NoiseScheduleParams,
     TrainArgs,
     TrainConfig,
+    length_noise_shift,
 )
 from webdataset.writer import TarWriter
 
@@ -639,6 +640,8 @@ class NoisingGeometry:
         atom5_mask: Atom5 presence per residue.
         atom37_mask: Atom37 presence per residue, used to place Cβ.
         residue_mask: True for residues that exist (not padding).
+        n_res_real: The protein's unpadded length, which sets the
+            length-dependent noise shift of every view.
     """
 
     flat_pos: Float[torch.Tensor, "N_atom 3"]
@@ -646,26 +649,34 @@ class NoisingGeometry:
     atom5_mask: Float[torch.Tensor, "N_res 5"]
     atom37_mask: Float[torch.Tensor, "N_res 37"]
     residue_mask: Bool[torch.Tensor, "N_res"]
+    n_res_real: int
 
 
 @jaxtyped(typechecker=beartype)
 def sample_training_sigma(
     noise_params: NoiseScheduleParams,
+    n_res: int,
 ) -> Float[torch.Tensor, ""]:
     """Draw one training noise level from the EDM log-normal.
 
     ``ln(sigma / sigma_data) ~ N(P_mean, P_std^2)``, drawn with the
-    reparameterization trick as in AF3.
+    reparameterization trick as in AF3, then multiplied by the
+    length-dependent shift for ``n_res`` residues (1 by default).
 
     Args:
-        noise_params: Schedule supplying ``sigma_data``, ``P_mean`` and
-            ``P_std``.
+        noise_params: Schedule supplying ``sigma_data``, ``P_mean``,
+            ``P_std`` and the length shift.
+        n_res: Number of real (unpadded) residues of the protein.
 
     Returns:
         The sampled sigma.
     """
-    return noise_params.sigma_data * torch.exp(
-        torch.randn(()) * noise_params.P_std + noise_params.P_mean,
+    return (
+        noise_params.sigma_data
+        * torch.exp(
+            torch.randn(()) * noise_params.P_std + noise_params.P_mean,
+        )
+        * length_noise_shift(n_res, noise_params)
     )
 
 
@@ -819,7 +830,7 @@ def self_flow_views(
     n_res = geometry.residue_mask.shape[0]
     sigmas = dual_timestep_sigmas(
         first_sigma,
-        sample_training_sigma(tcfg.noise),
+        sample_training_sigma(tcfg.noise, geometry.n_res_real),
         sample_residue_mask(
             n_res,
             tcfg.self_flow.mask_ratio,
@@ -921,7 +932,10 @@ def featurize_single_item(
     # Pmean = -1.2, Pstd = 1.5, sigma_data = 16,
     # ~ N(0, I) * Pstd + Pmean == ~ N(Pmean, Pstd**2).
     # The reparameterization trick. sigma is the sampled noise level per AF3.
-    sigma: Float[torch.Tensor, ""] = sample_training_sigma(noise_params)
+    sigma: Float[torch.Tensor, ""] = sample_training_sigma(
+        noise_params,
+        unpadded_N_res,
+    )
 
     atom5_pos, atom5_mask = atom37_to_atom5(
         rearrange(atom37_positions, "n a d -> 1 n a d"),
@@ -976,6 +990,7 @@ def featurize_single_item(
         atom5_mask=atom5_mask,
         atom37_mask=atom37_mask,
         residue_mask=residue_mask,
+        n_res_real=unpadded_N_res,
     )
     # One view at sigma, or the Self-Flow student and teacher views. The
     # template is the noised Cβ distogram of each view; t_normalized is its

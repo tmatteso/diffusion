@@ -6,6 +6,7 @@ distogram binning, loss weights, checkpointing, logging, and data-loading.
 """
 
 import dataclasses
+import math
 import pathlib
 from typing import ClassVar
 
@@ -28,6 +29,27 @@ class InvalidSigmaRangeError(ValueError):
         super().__init__(
             f"sigma_min ({sigma_min}) must be < sigma_max ({sigma_max})",
         )
+
+
+def length_noise_shift(n_res: int, noise: "NoiseScheduleParams") -> float:
+    """Multiplier on sigma for a protein of ``n_res`` residues.
+
+    ``(n_res / length_shift_ref) ** length_shift_beta``, the EDM form of the
+    resolution-dependent timestep shift of Esser et al. (2024): a timestep
+    shift ``t' = a*t / (1 + (a - 1)*t)`` is ``sigma' = a * sigma`` since
+    ``sigma = t / (1 - t)``. Longer proteins are more redundant, so a given
+    sigma destroys less of their structure; ``beta > 0`` noises them more.
+    Exactly 1.0 when ``length_shift_beta`` is 0.
+
+    Args:
+        n_res: Number of real (unpadded) residues.
+        noise: Schedule supplying ``length_shift_beta`` and
+            ``length_shift_ref``.
+
+    Returns:
+        The multiplier.
+    """
+    return math.pow(n_res / noise.length_shift_ref, noise.length_shift_beta)
 
 
 class InsufficientShardsError(ValueError):
@@ -160,6 +182,13 @@ class NoiseScheduleParams(BaseModel):
             than on the sampler config because training also needs it: the
             template weight ``t_normalized`` is the schedule's inverse applied
             to ``t_hat``, so training and sampling must agree on ``rho``.
+        length_shift_beta: Exponent of the length-dependent noise shift
+            ``sigma -> (N_res / length_shift_ref) ** beta * sigma``, applied to
+            training draws and the sampling schedule alike. 0 (the default)
+            turns it off. Esser et al. (2024) derive 0.5 for image
+            resolution; for proteins it is a tuned value in ``[0, 0.5]``.
+        length_shift_ref: Reference length ``N_ref`` (residues) at which the
+            length shift is 1. Irrelevant while ``length_shift_beta`` is 0.
     """
 
     model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True)
@@ -170,6 +199,8 @@ class NoiseScheduleParams(BaseModel):
     P_mean: float = Field(default=-1.2)
     P_std: float = Field(default=1.5, gt=0)
     rho: float = Field(default=7.0, gt=0)
+    length_shift_beta: float = Field(default=0.0, ge=0, le=1)
+    length_shift_ref: int = Field(default=128, gt=0)
 
     @model_validator(mode="after")
     def sigma_min_lt_max(self) -> "NoiseScheduleParams":
