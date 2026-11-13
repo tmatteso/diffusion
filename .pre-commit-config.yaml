@@ -31,6 +31,9 @@ repos:
     hooks:
       - id: check-yaml
         name: "📄 yaml · Validate YAML files"
+        # web/pnpm-lock.yaml holds two YAML documents: pnpm's own version
+        # pin, then the project's dependencies.
+        args: [--allow-multiple-documents]
         stages: [pre-commit]
 
   ### Data & Config Validation ###

@@ -1,0 +1,13 @@
+diff --git a/lib/index.d.ts b/lib/index.d.ts
+index bed0064889ae42e00609eeec465c64421a4b107f..6a01cd8aba49a5ab9c64bd7ed6572cce52461854 100644
+--- a/lib/index.d.ts
++++ b/lib/index.d.ts
+@@ -19,7 +19,7 @@ declare const stylex: {
+   rollup: (options?: Partial<UserOptions>) => any;
+   rspack: (options?: Partial<UserOptions>) => any;
+   unloader: (options?: Partial<UserOptions>) => any;
+-  vite: (options?: Partial<UserOptions>) => any;
++  vite: (options?: Partial<UserOptions>) => import('vite').Plugin;
+   webpack: (options?: Partial<UserOptions>) => any;
+   raw: typeof import('./core').unpluginFactory;
+ };

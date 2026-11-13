@@ -1,0 +1,23 @@
+# pnpm settings for web/. There is only one package, so no `packages:` list.
+
+# Refuse any package version, direct or transitive, published less than two
+# weeks ago (the value is in minutes). Most malicious releases are caught and
+# pulled within days.
+minimumReleaseAge: 20160
+
+# Dependency install scripts are blocked unless listed here. unrs-resolver's
+# postinstall only downloads its native binding when the matching optional
+# package is missing; pnpm installs that package, so the script isn't needed.
+allowBuilds:
+  unrs-resolver: false
+
+# @stylexjs/unplugin's vite() is typed as returning `any`. The patch below
+# types it as Vite's `Plugin`, which only resolves if the package can see
+# vite, so declare vite as its peer dependency.
+packageExtensions:
+  "@stylexjs/unplugin@0.19.1":
+    peerDependencies:
+      vite: "*"
+
+patchedDependencies:
+  "@stylexjs/unplugin@0.19.1": patches/@stylexjs__unplugin@0.19.1.patch
